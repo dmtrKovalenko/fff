@@ -14,9 +14,12 @@ use tempfile::TempDir;
 use super::handle_debounced_events;
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
+use crate::frecency::FrecencyTracker;
 use crate::git_status_worker::GitStatusWorker;
 use crate::rescan_stats::{RescanReason, RescanStats};
 use crate::shared::{SharedFilePicker, SharedFrecency};
+use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
+use std::sync::mpsc;
 
 #[test]
 fn saving_an_indexed_file_stays_incremental() {
@@ -483,6 +486,178 @@ fn a_throttled_ignore_file_event_is_still_applied_incrementally() {
     );
 }
 
+#[test]
+fn renaming_a_file_carries_frecency_and_keeps_the_old_entry() {
+    let f = Fixture::with_frecency();
+    f.write("src/old.rs", "fn old() {}");
+    f.index();
+
+    for _ in 0..3 {
+        f.track_access("src/old.rs");
+    }
+    let before = f.access_score("src/old.rs");
+    assert!(before > 0, "precondition: source must be ranked");
+
+    // A real rename so size and mtime are genuinely preserved.
+    std::fs::rename(f.path("src/old.rs"), f.path("src/new.rs")).unwrap();
+    let delta = f.feed([
+        remove_file(f.path("src/old.rs")),
+        create(f.path("src/new.rs")),
+    ]);
+
+    f.assert_no_rescan(&delta, "a rename");
+    assert!(f.is_indexed("src/new.rs"), "destination must be indexed");
+    assert_eq!(
+        f.access_score("src/new.rs"),
+        before,
+        "destination inherits the history"
+    );
+    assert_eq!(
+        f.access_score("src/old.rs"),
+        before,
+        "source keeps its history so old revisions still rank"
+    );
+    assert!(
+        f.indexed_access_score("src/new.rs") > 0,
+        "in-memory score must be refreshed, not left at zero until the next git pass"
+    );
+}
+
+#[test]
+fn renaming_a_file_emits_a_single_renamed_event() {
+    let f = Fixture::new();
+    f.write("src/old.rs", "fn old() {}");
+    f.index();
+    let events = f.subscribe("**");
+
+    std::fs::rename(f.path("src/old.rs"), f.path("src/new.rs")).unwrap();
+    f.feed([
+        remove_file(f.path("src/old.rs")),
+        create(f.path("src/new.rs")),
+    ]);
+
+    let received = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(received.len(), 1, "expected one event, got {received:?}");
+    assert_eq!(received[0].kind, WatchEventKind::Renamed);
+    assert_eq!(received[0].path, f.path("src/new.rs"));
+    assert_eq!(
+        received[0].from.as_deref(),
+        Some(f.path("src/old.rs").as_path())
+    );
+}
+
+#[test]
+fn paired_rename_events_are_trusted_over_the_heuristic() {
+    let f = Fixture::new();
+    f.write("src/old.rs", "fn old() {}");
+    f.index();
+    let events = f.subscribe("**");
+
+    std::fs::rename(f.path("src/old.rs"), f.path("src/new.rs")).unwrap();
+    // Linux/inotify pairs the halves for us and hands over both paths at once.
+    f.feed([DebouncedEvent::new(
+        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(f.path("src/old.rs"))
+            .add_path(f.path("src/new.rs")),
+        Instant::now(),
+    )]);
+
+    let received = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(received.len(), 1, "expected one event, got {received:?}");
+    assert_eq!(received[0].kind, WatchEventKind::Renamed);
+    assert_eq!(received[0].path, f.path("src/new.rs"));
+    assert_eq!(
+        received[0].from.as_deref(),
+        Some(f.path("src/old.rs").as_path())
+    );
+}
+
+#[test]
+fn editing_an_indexed_file_is_never_mistaken_for_a_rename() {
+    let f = Fixture::new();
+    f.write("src/keep.rs", "same size!!");
+    f.write("src/gone.rs", "same size!!");
+    f.index();
+    let events = f.subscribe("**");
+
+    // Both files share a size; copying the mtime across makes their identities
+    // collide. `keep.rs` is still indexed, so it is an edit, not a destination.
+    let mtime = std::fs::metadata(f.path("src/gone.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::remove_file(f.path("src/gone.rs")).unwrap();
+    std::fs::File::open(f.path("src/keep.rs"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+
+    f.feed([
+        remove_file(f.path("src/gone.rs")),
+        modify(f.path("src/keep.rs")),
+    ]);
+
+    let received = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        received.iter().all(|e| e.kind != WatchEventKind::Renamed),
+        "an edit to a live file must not be reported as a rename: {received:?}"
+    );
+}
+
+#[test]
+fn unrelated_delete_and_create_never_share_history() {
+    let f = Fixture::with_frecency();
+    f.write("src/tracked.rs", "fn tracked() {}");
+    f.index();
+
+    for _ in 0..3 {
+        f.track_access("src/tracked.rs");
+    }
+    assert!(f.access_score("src/tracked.rs") > 0);
+
+    f.remove("src/tracked.rs");
+    f.write(
+        "src/unrelated.rs",
+        "fn unrelated() { /* different size */ }",
+    );
+    f.feed([
+        remove_file(f.path("src/tracked.rs")),
+        create(f.path("src/unrelated.rs")),
+    ]);
+
+    assert_eq!(
+        f.access_score("src/unrelated.rs"),
+        0,
+        "an unrelated file must not inherit anyone's history"
+    );
+}
+
+#[test]
+fn ambiguous_batch_falls_back_to_remove_and_create() {
+    let f = Fixture::new();
+    f.write("src/a.rs", "same");
+    f.write("src/b.rs", "same");
+    f.index();
+    let events = f.subscribe("**");
+
+    // Two identical files renamed at once: nothing can be paired safely.
+    std::fs::rename(f.path("src/a.rs"), f.path("src/x.rs")).unwrap();
+    std::fs::rename(f.path("src/b.rs"), f.path("src/y.rs")).unwrap();
+    f.feed([
+        remove_file(f.path("src/a.rs")),
+        remove_file(f.path("src/b.rs")),
+        create(f.path("src/x.rs")),
+        create(f.path("src/y.rs")),
+    ]);
+
+    let received = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        received.iter().all(|e| e.kind != WatchEventKind::Renamed),
+        "ambiguous identities must not be guessed: {received:?}"
+    );
+    assert_eq!(received.len(), 4, "{received:?}");
+}
+
 struct Fixture {
     base: PathBuf,
     picker: SharedFilePicker,
@@ -492,18 +667,25 @@ struct Fixture {
     // Dropped last so background work started by a triggered rescan still
     // sees the tree it was asked to walk.
     _tmp: TempDir,
+    _frecency_tmp: Option<TempDir>,
 }
 
 impl Fixture {
     fn new() -> Self {
-        Self::build(false)
+        Self::build(false, false)
     }
 
     fn with_git() -> Self {
-        Self::build(true)
+        Self::build(true, false)
     }
 
-    fn build(git: bool) -> Self {
+    // `SharedFrecency::noop()` silently drops `init`, so any test asserting on
+    // scores needs a real LMDB-backed tracker instead.
+    fn with_frecency() -> Self {
+        Self::build(false, true)
+    }
+
+    fn build(git: bool, frecency: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
         let git_workdir = git.then(|| {
@@ -516,14 +698,68 @@ impl Fixture {
             base.clone()
         });
 
+        let (shared_frecency, frecency_tmp) = if frecency {
+            let db = tempfile::tempdir().unwrap();
+            let shared = SharedFrecency::default();
+            shared
+                .init(FrecencyTracker::open(db.path().join("frecency.mdb")).expect("open frecency"))
+                .expect("init frecency");
+            (shared, Some(db))
+        } else {
+            (SharedFrecency::noop(), None)
+        };
+
         Self {
             base,
             picker: SharedFilePicker::default(),
-            frecency: SharedFrecency::noop(),
+            frecency: shared_frecency,
             git_workdir,
             git_worker: GitStatusWorker::new(),
             _tmp: tmp,
+            _frecency_tmp: frecency_tmp,
         }
+    }
+
+    fn track_access(&self, rel: &str) {
+        let guard = self.frecency.read().unwrap();
+        guard
+            .as_ref()
+            .expect("fixture built without frecency")
+            .track_access(&self.path(rel))
+            .expect("track access");
+    }
+
+    fn access_score(&self, rel: &str) -> i64 {
+        let guard = self.frecency.read().unwrap();
+        guard
+            .as_ref()
+            .expect("fixture built without frecency")
+            .get_access_score(&self.path(rel), FFFMode::Neovim)
+    }
+
+    fn indexed_access_score(&self, rel: &str) -> i16 {
+        let guard = self.picker.read().unwrap();
+        guard
+            .as_ref()
+            .and_then(|p| p.get_file_by_path(self.path(rel)))
+            .map(|file| file.access_frecency_score)
+            .unwrap_or(0)
+    }
+
+    fn subscribe(&self, pattern: &str) -> mpsc::Receiver<Vec<WatchEvent>> {
+        let (sender, receiver) = mpsc::channel();
+        self.picker
+            .watch_registry()
+            .subscribe(
+                &self.base,
+                pattern,
+                WatchOptions::default(),
+                Box::new(move |_, events| {
+                    let _ = sender.send(events.to_vec());
+                }),
+            )
+            .expect("subscribe");
+        receiver
     }
 
     fn index(&self) {

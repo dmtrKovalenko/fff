@@ -117,6 +117,34 @@ def test_watch_reports_removed_events(finder: FileFinder, watch_dir: str) -> Non
         assert ev.kind == "removed"
 
 
+def test_watch_reports_renames_with_both_paths(finder: FileFinder, watch_dir: str) -> None:
+    events: list[WatchEvent] = []
+    lock = threading.Lock()
+
+    def on_events(batch: list[WatchEvent]) -> None:
+        with lock:
+            events.extend(batch)
+
+    source = Path(watch_dir) / "docs" / "move-me.txt"
+    target = Path(watch_dir) / "docs" / "moved.txt"
+    with finder.watch("**/*.txt", on_events):
+        source.write_text("move me\n")
+        wait_for_event(events, lock, "move-me.txt")
+        with lock:
+            events.clear()
+
+        source.rename(target)
+        ev = wait_for_event(events, lock, "moved.txt")
+        assert ev.kind == "renamed"
+        assert ev.path == str(target)
+        assert ev.from_path == str(source)
+        # The move is one event, not a removal plus a creation.
+        with lock:
+            assert not [
+                e for e in events if e.kind == "removed" and e.path == str(source)
+            ]
+
+
 def test_multiple_subscriptions_are_filtered_independently(
     finder: FileFinder, watch_dir: str
 ) -> None:

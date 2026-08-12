@@ -414,7 +414,12 @@ typedef struct FffMixedSearchResult {
 
 /**
  * A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
- * 3 = rescan (events were lost; re-stat what you care about).
+ * 3 = rescan (events were lost; re-stat what you care about),
+ * 4 = renamed (`path` is the destination; read the source with
+ * `fff_watch_events_get_from_path`).
+ *
+ * Layout is frozen: this is an array element, so growing it would change the
+ * stride every existing binding compiled against.
  */
 typedef struct FffWatchEvent {
   /**
@@ -426,10 +431,17 @@ typedef struct FffWatchEvent {
 
 /**
  * A batch of watch events. Free with `fff_free_watch_events`.
+ * Versioned by append only: existing field offsets never move.
  */
 typedef struct FffWatchEventBatch {
   struct FffWatchEvent *events;
   uint32_t count;
+  /**
+   * Parallel to `events`, `count` long: the pre-rename path for entries
+   * with `kind == 4`, null for every other entry. Null when the batch holds
+   * no renames at all.
+   */
+  char **rename_sources;
 } FffWatchEventBatch;
 
 /**
@@ -1378,10 +1390,22 @@ uint32_t fff_watch_events_count(const struct FffWatchEventBatch *batch);
 const char *fff_watch_events_get_path(const struct FffWatchEventBatch *batch, uint32_t index);
 
 /**
- * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan)
+ * Pre-rename path of event `index`, null unless its kind is 4 (renamed).
+ * Owned by the batch; do not free separately.
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+const char *fff_watch_events_get_from_path(const struct FffWatchEventBatch *batch, uint32_t index);
+
+/**
+ * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
+ * 4 = renamed).
  * 3 (rescan aka "re-stat something" kind) returned when OS based buffer
  * has been overflown and some events might be loss. Paths will contain a list of
  * directories that needs to be rescanned to ensure consistency.
+ * 4 reports a move: `path` is the destination and
+ * `fff_watch_events_get_from_path` yields the source.
  *
  * ## Safety
  * `batch` must be a valid `FffWatchEventBatch` pointer or null.

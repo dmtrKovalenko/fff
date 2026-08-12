@@ -147,7 +147,8 @@ class GrepCursor:
 
 class WatchEvent:
     path: str
-    kind: Literal["created", "modified", "removed", "rescan"]
+    kind: Literal["created", "modified", "removed", "rescan", "renamed"]
+    from_path: str | None
     def __repr__(self) -> str: ...
 
 class WatchSubscription:

@@ -27,6 +27,8 @@ static int watch_glob_hits = 0;
 static int watch_dir_hits = 0;
 static int watch_all_hits = 0;
 static int watch_ignored_leaks = 0;
+static int watch_rename_hits = 0;
+static int watch_rename_bad_source = 0;
 static uint64_t watch_glob_id = 0;
 static uint64_t watch_dir_id = 0;
 static uint64_t watch_all_id = 0;
@@ -46,6 +48,16 @@ static void on_watch_batch(uint64_t watch_id, struct FffWatchEventBatch *batch, 
         }
         if (watch_id == watch_all_id && strstr(path, "hello.txt")) {
             watch_all_hits++;
+        }
+        /* kind 4 = renamed: the source rides in the parallel array */
+        if (watch_id == watch_all_id && fff_watch_events_get_kind(batch, i) == 4 &&
+            strstr(path, "renamed.txt")) {
+            const char *from = fff_watch_events_get_from_path(batch, i);
+            if (from && strstr(from, "to_rename.txt")) {
+                watch_rename_hits++;
+            } else {
+                watch_rename_bad_source++;
+            }
         }
     }
 
@@ -156,6 +168,26 @@ static int watch_smoke(void) {
         usleep(100 * 1000);
     }
 
+    /* a rename must arrive as one kind-4 event carrying both paths */
+    char rename_src[512];
+    char rename_dst[512];
+    snprintf(rename_src, sizeof(rename_src), "%s/to_rename.txt", dir);
+    snprintf(rename_dst, sizeof(rename_dst), "%s/renamed.txt", dir);
+    FILE *rf = fopen(rename_src, "w");
+    if (rf) {
+        fputs("move me\n", rf);
+        fclose(rf);
+    }
+    usleep(500 * 1000); /* let the create land before the move */
+    if (rename(rename_src, rename_dst) != 0) {
+        fprintf(stderr, "watch_smoke: rename failed\n");
+        fff_destroy(picker);
+        return 1;
+    }
+    for (int attempt = 0; attempt < 100 && watch_rename_hits == 0; attempt++) {
+        usleep(100 * 1000);
+    }
+
     r = fff_unwatch(picker, watch_glob_id);
     fff_free_result(r);
     r = fff_unwatch(picker, watch_dir_id);
@@ -191,9 +223,18 @@ static int watch_smoke(void) {
         fprintf(stderr, "watch_smoke FAIL: repeated unwatch was not a no-op\n");
         return 1;
     }
+    if (watch_rename_hits == 0) {
+        fprintf(stderr, "watch_smoke FAIL: no renamed event with a source path\n");
+        return 1;
+    }
+    if (watch_rename_bad_source > 0) {
+        fprintf(stderr, "watch_smoke FAIL: %d renamed events had a wrong source\n",
+                watch_rename_bad_source);
+        return 1;
+    }
 
-    fprintf(stderr, "watch_smoke PASS (glob=%d dir=%d all=%d)\n", watch_glob_hits, watch_dir_hits,
-            watch_all_hits);
+    fprintf(stderr, "watch_smoke PASS (glob=%d dir=%d all=%d rename=%d)\n", watch_glob_hits,
+            watch_dir_hits, watch_all_hits, watch_rename_hits);
     return 0;
 }
 
