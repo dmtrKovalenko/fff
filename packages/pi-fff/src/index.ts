@@ -82,12 +82,20 @@ function resolveToolNames(mode: FffMode): ToolNames {
 // Cursor store — simple bounded Map for pagination cursors
 // ---------------------------------------------------------------------------
 
-const cursorCache = new Map<string, GrepCursor>();
+// Fuzzy-fallback cursors must resume a fuzzy query: the engine cursor is bound
+// to the match stream that produced it, so replaying it against the literal
+// query (which matched nothing) would turn every resume into "No matches found".
+interface StoredCursor {
+  cursor: GrepCursor;
+  fuzzy: boolean;
+}
+
+const cursorCache = new Map<string, StoredCursor>();
 let cursorCounter = 0;
 
-function storeCursor(cursor: GrepCursor): string {
+function storeCursor(cursor: GrepCursor, fuzzy: boolean): string {
   const id = `fff_c${++cursorCounter}`;
-  cursorCache.set(id, cursor);
+  cursorCache.set(id, { cursor, fuzzy });
   if (cursorCache.size > 200) {
     const first = cursorCache.keys().next().value;
     if (first) cursorCache.delete(first);
@@ -95,7 +103,7 @@ function storeCursor(cursor: GrepCursor): string {
   return id;
 }
 
-function getCursor(id: string): GrepCursor | undefined {
+function getCursor(id: string): StoredCursor | undefined {
   return cursorCache.get(id);
 }
 
@@ -920,12 +928,15 @@ export default function fffExtension(pi: ExtensionAPI) {
       // (case-insensitive when pattern is all lowercase).
       const smartCase = params.caseSensitive !== true;
 
+      const storedCursor = params.cursor ? getCursor(params.cursor) : undefined;
+      const resumeFuzzy = storedCursor?.fuzzy === true;
+
       const grepResult = picker.grep(query, {
-        mode,
+        mode: resumeFuzzy ? "fuzzy" : mode,
         smartCase,
         maxMatchesPerFile: GREP_MAX_MATCHES_PER_FILE,
         pageSize,
-        cursor: (params.cursor ? getCursor(params.cursor) : null) ?? null,
+        cursor: storedCursor?.cursor ?? null,
         beforeContext: context,
         afterContext: context,
         classifyDefinitions: true,
@@ -977,7 +988,9 @@ export default function fffExtension(pi: ExtensionAPI) {
         notices.push(`Invalid regex: ${result.regexFallbackError}, used literal match`);
       }
       if (result.nextCursor) {
-        notices.push(`Continue with cursor="${storeCursor(result.nextCursor)}"`);
+        notices.push(
+          `Continue with cursor="${storeCursor(result.nextCursor, fuzzyNotice !== null || resumeFuzzy)}"`,
+        );
       }
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
@@ -1209,7 +1222,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           maxMatchesPerFile: GREP_MAX_MATCHES_PER_FILE,
           pageSize,
           smartCase: true,
-          cursor: (params.cursor ? getCursor(params.cursor) : null) ?? null,
+          cursor: (params.cursor ? getCursor(params.cursor)?.cursor : null) ?? null,
           beforeContext: context,
           afterContext: context,
         });
@@ -1224,7 +1237,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           notices.push(`${effectiveLimit}+ matches (refine patterns)`);
         if (result.nextCursor)
           notices.push(
-            `More available. cursor="${storeCursor(result.nextCursor)}" to continue`,
+            `More available. cursor="${storeCursor(result.nextCursor, false)}" to continue`,
           );
 
         if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
