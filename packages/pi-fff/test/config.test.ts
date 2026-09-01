@@ -39,6 +39,12 @@ describe("loadConfig", () => {
     expect(loadConfig(agentDir)).toEqual(config);
   });
 
+  test("accepts ui-only mode", () => {
+    writeConfig({ mode: "ui-only" });
+
+    expect(loadConfig(agentDir)).toEqual({ mode: "ui-only" });
+  });
+
   test("rejects malformed JSON", () => {
     fs.writeFileSync(configPath, '{"mode":');
 

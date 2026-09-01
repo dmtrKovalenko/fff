@@ -637,7 +637,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   };
 
   const pendingTools: (() => string)[] = [];
-  let toolsRegistered = false;
+  let sessionPrepared = false;
 
   function queueTool<TParams extends TSchema, TDetails = unknown, TState = any>(
     resolveName: () => string,
@@ -657,17 +657,14 @@ export default function fffExtension(pi: ExtensionAPI) {
   }
 
   function registerPendingTools(): void {
-    if (toolsRegistered) return;
-
     const registeredNames = pendingTools.map((register) => register());
     pi.setActiveTools([...new Set([...pi.getActiveTools(), ...registeredNames])]);
-    toolsRegistered = true;
   }
 
   // --- Flags / lifecycle ---
 
   pi.registerFlag("fff-mode", {
-    description: "FFF mode: tools-and-ui | tools-only | override",
+    description: `FFF mode: ${VALID_MODES.join(" | ")}`,
     type: "string",
   });
 
@@ -715,13 +712,12 @@ export default function fffExtension(pi: ExtensionAPI) {
   function prepareSession(ctx: ExtensionContext): void {
     activeCwd = ctx.cwd;
     uiCtx = ctx;
-    if (toolsRegistered) return;
+    if (sessionPrepared) return;
 
     // Pi populates extension flag values after loading extensions.
     resolveStartupConfig();
 
-    // Restore persisted mode before registering tools so a saved override
-    // can safely change their names after /reload or session resume.
+    // Restore the persisted mode before deciding whether and how to register tools.
     const entries = ctx.sessionManager?.getEntries();
     if (entries) {
       const modeEntry = [...entries]
@@ -741,7 +737,8 @@ export default function fffExtension(pi: ExtensionAPI) {
     }
 
     initializeFinderFactories();
-    registerPendingTools();
+    if (currentMode !== "ui-only") registerPendingTools();
+    sessionPrepared = true;
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -769,10 +766,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     }
   });
 
-  // SDK callers can prompt without binding session_start. Prepare on the first
-  // agent turn as a fallback so the tools still reach that turn's tool set.
+  // SDK callers can prompt without session_start, so prepare on the first turn.
   pi.on("before_agent_start", (_event, ctx) => {
-    if (toolsRegistered) return;
+    if (sessionPrepared) return;
     try {
       prepareSession(ctx);
     } catch (error: unknown) {
@@ -1262,9 +1258,9 @@ export default function fffExtension(pi: ExtensionAPI) {
   // --- commands ---
 
   pi.registerCommand("fff-mode", {
-    description: "Show or set FFF mode: /fff-mode [tools-and-ui | tools-only | override]",
+    description: `Show or set FFF mode: /fff-mode [${VALID_MODES.join(" | ")}]`,
     handler: async (args, ctx) => {
-      if (!toolsRegistered) {
+      if (!sessionPrepared) {
         try {
           prepareSession(ctx);
         } catch (error: unknown) {
@@ -1293,11 +1289,10 @@ export default function fffExtension(pi: ExtensionAPI) {
       const oldMode = getMode();
       pi.appendEntry("fff-mode", { mode: newMode });
 
-      if ((oldMode === "override") !== (newMode === "override")) {
-        ctx.ui.notify(
-          `Mode '${newMode}' saved. Run /reload to apply the tool name change.`,
-          "info",
-        );
+      const changesToolRegistration = (oldMode === "ui-only") !== (newMode === "ui-only");
+      const changesToolNames = (oldMode === "override") !== (newMode === "override");
+      if (changesToolRegistration || changesToolNames) {
+        ctx.ui.notify(`Mode '${newMode}' saved. Run /reload to apply it.`, "info");
         return;
       }
 

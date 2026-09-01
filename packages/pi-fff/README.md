@@ -116,12 +116,13 @@ Parameters:
 
 - `/fff-health` — show FFF status (indexed files, git info, frecency/history DB status)
 - `/fff-rescan` — trigger a file rescan
-- `/fff-mode <mode>` — switch mode (tool name changes require `/reload`)
+- `/fff-mode <mode>` — switch mode (tool registration changes require `/reload`)
 
 ## Modes
 
 - `tools-and-ui` (default): registers `fffind`, `ffgrep`, `fff-multi-grep` as additional tools + FFF-backed `@` autocomplete
 - `tools-only`: additional tools only; keep pi's default `@` autocomplete
+- `ui-only`: Only `@`-file autocomplete with FFF; no FFF agent tools
 - `override`: replaces pi's built-in `find`, `grep` and adds `multi_grep` + FFF-backed `@` autocomplete
 
 Startup mode precedence:
@@ -130,7 +131,7 @@ Startup mode precedence:
 3. `mode` in the global config file
 4. default (`tools-and-ui`)
 
-When a session resumes, its most recent `/fff-mode` selection takes precedence over the startup resolution above. Switching to or from `override` takes effect after `/reload`, when the tools are registered again.
+When a session resumes, its most recent `/fff-mode` selection takes precedence over the startup resolution above. Switching to or from `ui-only` or `override` takes effect after `/reload`, when tool registration is applied.
 
 ## Configuration
 
@@ -154,7 +155,7 @@ All fields are optional:
 | Field | Type | Default |
 |---|---|---|
 | `$schema` | non-empty string | none |
-| `mode` | `tools-and-ui`, `tools-only`, or `override` | `tools-and-ui` |
+| `mode` | `tools-and-ui`, `tools-only`, `ui-only`, or `override` | `tools-and-ui` |
 | `frecencyDbPath` | non-empty string | See [Data](#data) |
 | `historyDbPath` | non-empty string | See [Data](#data) |
 | `enableFsRootScanning` | boolean | `false` |

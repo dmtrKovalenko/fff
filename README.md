@@ -133,12 +133,13 @@ pi install npm:@ff-labs/pi-fff
 
 ### Modes
 
-Three operating modes, switchable at runtime with `/fff-mode`:
+Four operating modes, switchable at runtime with `/fff-mode`:
 
 | Mode                     | What it does                                                                      |
 | ------------------------ | --------------------------------------------------------------------------------- |
 | `tools-and-ui` (default) | Adds `ffgrep` and `fffind` tools, replaces `@`-mention autocomplete with FFF.     |
 | `tools-only`             | Only tool injection. Keeps pi's native editor autocomplete.                       |
+| `ui-only`                | Only `@`-file autocomplete with FFF; no FFF agent tools.                         |
 | `override`               | Replaces pi's built-in `grep`, `find`, and `multi_grep` with FFF implementations. |
 
 Env vars: `PI_FFF_MODE`, `FFF_FRECENCY_DB`, `FFF_HISTORY_DB`. Flags: `--fff-mode`, `--fff-frecency-db`, `--fff-history-db`. The databases default to your existing fff.nvim ones when present, otherwise `~/.pi/agent/fff/`.
@@ -150,7 +151,7 @@ Env vars: `PI_FFF_MODE`, `FFF_FRECENCY_DB`, `FFF_HISTORY_DB`. Flags: `--fff-mode
 
 ### Commands
 
-- `/fff-mode [tools-and-ui | tools-only | override]`. Show or switch the mode.
+- `/fff-mode [tools-and-ui | tools-only | ui-only | override]`. Show or switch the mode.
 - `/fff-health`. Picker, frecency, and git integration status.
 - `/fff-rescan`. Force a rescan.
 

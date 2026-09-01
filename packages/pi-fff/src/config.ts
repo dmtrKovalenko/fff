@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { piDataDir } from "./paths";
 
 export const CONFIG_FILE_NAME = "pi-fff.json";
-export const VALID_MODES = ["tools-and-ui", "tools-only", "override"] as const;
+export const VALID_MODES = ["tools-and-ui", "tools-only", "ui-only", "override"] as const;
 
 export type FffMode = (typeof VALID_MODES)[number];
 

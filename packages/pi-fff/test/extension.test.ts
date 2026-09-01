@@ -387,13 +387,36 @@ describe("pi-fff session mode", () => {
       mode: "override",
     });
     expect(setup.ctx.ui.notify).toHaveBeenLastCalledWith(
-      "Mode 'override' saved. Run /reload to apply the tool name change.",
+      "Mode 'override' saved. Run /reload to apply it.",
       "info",
     );
 
     await setup.commands.get("fff-mode").handler("", setup.ctx);
     expect(setup.ctx.ui.notify).toHaveBeenLastCalledWith(
       "Current mode: 'tools-and-ui' (flag: unset)",
+      "info",
+    );
+    await shutdown(setup);
+  });
+
+  test("ui-only keeps tools unregistered and requires reload to add them", async () => {
+    const setup = await start("ui-only");
+
+    expect(setup.pi.registerTool).not.toHaveBeenCalled();
+    expect(setup.pi.setActiveTools).not.toHaveBeenCalled();
+
+    await setup.commands.get("fff-mode").handler("tools-only", setup.ctx);
+
+    expect(setup.pi.appendEntry).toHaveBeenCalledWith("fff-mode", {
+      mode: "tools-only",
+    });
+    expect(setup.ctx.ui.notify).toHaveBeenLastCalledWith(
+      "Mode 'tools-only' saved. Run /reload to apply it.",
+      "info",
+    );
+    await setup.commands.get("fff-mode").handler("", setup.ctx);
+    expect(setup.ctx.ui.notify).toHaveBeenLastCalledWith(
+      "Current mode: 'ui-only' (flag: ui-only)",
       "info",
     );
     await shutdown(setup);
@@ -554,7 +577,7 @@ describe("pi-fff autocomplete registration", () => {
     expect(finders[0].mixedSearch).not.toHaveBeenCalled();
   });
 
-  test("returns FFF-backed @ mention suggestions", async () => {
+  test("returns @ mention suggestions with FFF", async () => {
     mixedSearchImpl = (query, options) => {
       expect(query).toBe("src");
       expect(options).toEqual({ pageSize: 20 });
@@ -644,6 +667,41 @@ describe("pi-fff autocomplete registration", () => {
     expect(result).toEqual({ items: [{ value: "base", label: "base" }], prefix: "ba" });
     expect(current.getSuggestions).toHaveBeenCalledTimes(1);
     expect(finders[0].mixedSearch).not.toHaveBeenCalled();
+  });
+
+  test("ui-only keeps FFF mentions without registering agent tools", async () => {
+    mixedSearchImpl = () => ({
+      ok: true,
+      value: {
+        items: [
+          {
+            type: "file",
+            item: { relativePath: "src/index.ts", fileName: "index.ts" },
+          },
+        ],
+      },
+    });
+
+    const { ctx, pi } = await start("ui-only");
+    const factory = ctx.ui.addAutocompleteProvider.mock.calls[0][0];
+    const current = currentProvider();
+    const provider = factory(current);
+
+    const result = await provider.getSuggestions(["@src"], 0, 4, abortOptions());
+
+    expect(pi.registerTool).not.toHaveBeenCalled();
+    expect(pi.setActiveTools).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      prefix: "@src",
+      items: [
+        {
+          value: "@src/index.ts",
+          label: "index.ts",
+          description: "src/index.ts",
+        },
+      ],
+    });
+    expect(current.getSuggestions).not.toHaveBeenCalled();
   });
 
   test("/fff-mode changes mention behavior without touching the editor", async () => {
