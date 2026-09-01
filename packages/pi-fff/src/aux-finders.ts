@@ -24,6 +24,7 @@ export interface AuxOpts {
 
 export class AuxFinderPool {
   private entries: AuxPicker[] = [];
+  private destroyed = false;
   // In-flight creations keyed by root. Concurrent acquire() calls for the same
   // (or a covering) root share one finder/scan instead of each starting a full
   // duplicate traversal — issue #746. Mirrors the main finder's finderPromise.
@@ -31,8 +32,9 @@ export class AuxFinderPool {
   constructor(private opts: AuxOpts) {}
 
   destroy(): void {
+    this.destroyed = true;
     for (const e of this.entries) {
-      e.finder.destroy();
+      this.opts.pickers.release(e.finder);
     }
 
     this.entries = [];
@@ -43,7 +45,7 @@ export class AuxFinderPool {
     const kept: AuxPicker[] = [];
     for (const e of this.entries) {
       if (now - e.lastUsed > IDLE_TTL_MS) {
-        if (!e.finder.isDestroyed) e.finder.destroy();
+        this.opts.pickers.release(e.finder);
       } else {
         kept.push(e);
       }
@@ -55,6 +57,7 @@ export class AuxFinderPool {
     maybeRoot: string,
     opts?: { exact?: boolean },
   ): Promise<{ finder: FileFinderApi; root: string }> {
+    if (this.destroyed) throw new Error("FFF auxiliary finder pool is destroyed");
     this.sweepIdle();
     let covering: AuxPicker | null = null;
     for (const e of this.entries) {
@@ -90,7 +93,7 @@ export class AuxFinderPool {
     if (this.entries.length >= MAX_AUX) {
       let oldest = this.entries[0];
       for (const e of this.entries) if (e.lastUsed < oldest.lastUsed) oldest = e;
-      if (!oldest.finder.isDestroyed) oldest.finder.destroy();
+      this.opts.pickers.release(oldest.finder);
       this.entries = this.entries.filter((e) => e !== oldest);
     }
 
@@ -107,6 +110,10 @@ export class AuxFinderPool {
       enableFsRootScanning: this.opts.enableFsRootScanning,
       followSymlinks: this.opts.followSymlinks,
     });
+    if (this.destroyed) {
+      this.opts.pickers.release(finder);
+      throw new Error("FFF auxiliary finder pool was destroyed during initialization");
+    }
 
     const entry: AuxPicker = { root, finder, lastUsed: Date.now() };
     this.entries.push(entry);

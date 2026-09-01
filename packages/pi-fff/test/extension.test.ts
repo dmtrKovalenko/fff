@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,11 +17,12 @@ let finders: MockFinder[] = [];
 let mixedSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
 let grepImpl: ((query: string, options: unknown) => unknown) | undefined;
 let scanProgressImpl: (() => unknown) | undefined;
+let waitForScanImpl: (() => Promise<void>) | undefined;
 
 function createMockFinder(): MockFinder {
   return {
     isDestroyed: false,
-    waitForScan: mock(async () => undefined),
+    waitForScan: mock(async () => waitForScanImpl?.()),
     getScanProgress: mock(() => {
       if (scanProgressImpl) return scanProgressImpl();
       return {
@@ -169,6 +170,8 @@ function createContext(cwd = "/tmp/workspace") {
   };
 }
 
+const activeSetups: Array<{ events: Map<string, EventHandler> }> = [];
+
 async function start(mode?: string, cwd?: string, flags: Record<string, unknown> = {}) {
   const setup = createPi(mode, flags);
   const ctx = createContext(cwd);
@@ -177,6 +180,7 @@ async function start(mode?: string, cwd?: string, flags: Record<string, unknown>
   const sessionStart = setup.events.get("session_start");
   expect(sessionStart).toBeDefined();
   await sessionStart?.({ reason: "startup" }, ctx);
+  activeSetups.push(setup);
 
   return { ...setup, ctx };
 }
@@ -222,10 +226,15 @@ beforeEach(() => {
   mixedSearchImpl = undefined;
   grepImpl = undefined;
   scanProgressImpl = undefined;
+  waitForScanImpl = undefined;
 
   for (const key of CONFIG_ENV_KEYS) delete process.env[key];
   process.env.PI_CODING_AGENT_DIR = agentDir;
   fs.rmSync(configPath, { force: true });
+});
+
+afterEach(async () => {
+  await Promise.all(activeSetups.splice(0).map(shutdown));
 });
 
 afterAll(() => {
@@ -330,6 +339,57 @@ describe("pi-fff global config", () => {
 function writeConfig(config: Record<string, unknown>): void {
   fs.writeFileSync(configPath, JSON.stringify(config));
 }
+
+describe("pi-fff shared finders", () => {
+  test("same-workspace subagent sessions share one finder", async () => {
+    const sessions = await Promise.all(
+      Array.from({ length: 42 }, () => start(undefined, "/tmp/shared-workspace")),
+    );
+
+    expect(createCalls).toHaveLength(1);
+    expect(finders).toHaveLength(1);
+
+    await Promise.all(sessions.slice(0, -1).map(shutdown));
+    expect(finders[0].isDestroyed).toBe(false);
+
+    await shutdown(sessions.at(-1)!);
+    expect(finders[0].destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test("shutdown releases a finder whose scan is still starting", async () => {
+    let finishScan!: () => void;
+    waitForScanImpl = () =>
+      new Promise<void>((resolve) => {
+        finishScan = resolve;
+      });
+
+    const setup = createPi();
+    const ctx = createContext("/tmp/pending-workspace");
+    fffExtension(setup.pi as any);
+    const starting = setup.events.get("session_start")?.({ reason: "startup" }, ctx);
+
+    while (createCalls.length === 0) await Promise.resolve();
+    await shutdown(setup);
+    finishScan();
+    await starting;
+
+    expect(finders[0].destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test("different workspaces keep separate finders", async () => {
+    const first = await start(undefined, "/tmp/workspace-one");
+    const second = await start(undefined, "/tmp/workspace-two");
+
+    expect(createCalls).toHaveLength(2);
+    expect(finders).toHaveLength(2);
+
+    await shutdown(first);
+    expect(finders[0].isDestroyed).toBe(true);
+    expect(finders[1].isDestroyed).toBe(false);
+
+    await shutdown(second);
+  });
+});
 
 describe("pi-fff session mode", () => {
   test("registers tools only after restoring the saved mode", async () => {
@@ -539,6 +599,7 @@ describe("pi-fff autocomplete registration", () => {
 
     expect(ctx.ui.notify).not.toHaveBeenCalled();
     expect(createCalls).toHaveLength(1);
+    await shutdown(setup);
   });
 
   test("delegates non-@ completions to the current provider", async () => {

@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import os from "node:os";
 import path from "node:path";
 
@@ -52,16 +52,20 @@ mock.module("@ff-labs/fff-bun", () => finderModule);
 const { AuxFinderPool } = await import("../src/aux-finders");
 const { FilePickerFactory } = await import("../src/file-picker");
 
+const activePools: Array<InstanceType<typeof AuxFinderPool>> = [];
+
 function makePool(opts: Record<string, unknown> = {}) {
   created.length = 0;
   createOptions.length = 0;
   failDbCreates = false;
   failAllCreates = false;
-  return new AuxFinderPool({
+  const pool = new AuxFinderPool({
     enableFsRootScanning: false,
     pickers: makePickers(),
     ...opts,
   });
+  activePools.push(pool);
+  return pool;
 }
 
 function makePickers(onDbFailure?: (error: string) => void) {
@@ -71,6 +75,10 @@ function makePickers(onDbFailure?: (error: string) => void) {
     onDbFailure,
   });
 }
+
+afterEach(() => {
+  for (const pool of activePools.splice(0)) pool.destroy();
+});
 
 describe("AuxFinderPool covering reuse", () => {
   test("reuses a picker rooted at an ancestor of the requested path", async () => {
@@ -199,6 +207,7 @@ describe("AuxFinderPool covering reuse", () => {
     expect(createOptions[0].frecencyDbPath).toBeUndefined();
     expect(createOptions[0].historyDbPath).toBeUndefined();
     expect(failures).toEqual(["db locked"]);
+    pickers.release(main as any);
   });
 
   test("create throws when the picker cannot be opened at all", async () => {
