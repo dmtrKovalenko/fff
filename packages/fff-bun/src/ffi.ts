@@ -239,6 +239,10 @@ const ffiDefinition = {
     args: [FFIType.ptr, FFIType.u32],
     returns: FFIType.u8,
   },
+  fff_watch_events_get_from_path: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
 
   // Git
   fff_refresh_git_status: {
@@ -1392,6 +1396,7 @@ const WATCH_EVENT_KINDS: readonly WatchEventKind[] = [
   "modified",
   "removed",
   "rescan",
+  "renamed",
 ];
 
 /**
@@ -1412,10 +1417,16 @@ export function readWatchEventBatch(batchPtr: Pointer | number | null): WatchEve
   for (let i = 0; i < count; i++) {
     const path = symbols.fff_watch_events_get_path(bp, i) as Pointer | null;
     const kind = symbols.fff_watch_events_get_kind(bp, i) as number;
-    events.push({
+    const event: WatchEvent = {
       path: readCString(path) ?? "",
       kind: WATCH_EVENT_KINDS[kind] ?? "rescan",
-    });
+    };
+    if (event.kind === "renamed") {
+      const from = symbols.fff_watch_events_get_from_path(bp, i) as Pointer | null;
+      const decoded = readCString(from);
+      if (decoded) event.from = decoded;
+    }
+    events.push(event);
   }
 
   symbols.fff_free_watch_events(bp);

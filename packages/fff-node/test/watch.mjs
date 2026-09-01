@@ -11,7 +11,7 @@
 import { after, before, describe, it, mock } from "node:test";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -40,9 +40,10 @@ let baseDir = "";
 
 describe("fff-node watch", { concurrency: 1 }, () => {
   before(async () => {
-    // realpath: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
-    // won't prefix-match the core's canonicalized base when used as a pattern
-    baseDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
+    // realpathSync.native: Windows tmpdir() may return an 8.3 short path
+    // (RUNNER~1); only the native variant expands it to the long form the
+    // core reports in event paths.
+    baseDir = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
     const dbDir = mkdtempSync(join(tmpdir(), "fff-watch-db-"));
 
     // Seed files so the initial scan has content
@@ -109,7 +110,7 @@ describe("fff-node watch", { concurrency: 1 }, () => {
     for (const event of deliveredEvents(callback)) {
       assert.equal(typeof event.path, "string");
       assert.ok(
-        ["created", "modified", "removed", "rescan"].includes(event.kind),
+        ["created", "modified", "removed", "rescan", "renamed"].includes(event.kind),
         `unexpected kind: ${event.kind}`,
       );
     }
@@ -128,6 +129,42 @@ describe("fff-node watch", { concurrency: 1 }, () => {
     );
 
     // Idempotent unsubscribe must not throw
+    sub.value();
+  });
+
+  it("a rename arrives as one renamed event carrying both paths", async () => {
+    const callback = mock.fn();
+    const sub = finder.watch(callback);
+    assert.ok(sub.ok, `watch failed: ${!sub.ok ? sub.error : ""}`);
+
+    const from = join(baseDir, "move-me.txt");
+    const to = join(baseDir, "moved.txt");
+    writeFileSync(from, "move me\n");
+    // Let the create land so the rename lands in its own batch.
+    const created = await waitFor(() =>
+      deliveredEvents(callback).some((e) => e.path.endsWith("move-me.txt")),
+    );
+    assert.ok(created, "the create event for move-me.txt never arrived");
+    callback.mock.resetCalls();
+
+    renameSync(from, to);
+
+    const renamed = await waitFor(() =>
+      deliveredEvents(callback).find((e) => e.kind === "renamed" && e.path === to),
+    );
+    assert.ok(
+      renamed,
+      `expected a renamed event for ${JSON.stringify(to)}, got: ${JSON.stringify(deliveredEvents(callback))}`,
+    );
+    assert.equal(renamed.from, from);
+    // The move is one event, not a removal plus a creation.
+    assert.ok(
+      deliveredEvents(callback).every(
+        (e) => !(e.kind === "removed" && e.path === from),
+      ),
+      "a recognised rename must not also report the source as removed",
+    );
+
     sub.value();
   });
 

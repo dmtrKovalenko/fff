@@ -1616,8 +1616,9 @@ export function ffiGetHistoricalQuery(
 // is only supported as a top-level parameter.
 //
 // Batch contents are read through the C accessors (fff_watch_events_count /
-// fff_watch_events_get_path / fff_watch_events_get_kind), so no struct
-// layout knowledge lives on this side.
+// fff_watch_events_get_path / fff_watch_events_get_kind /
+// fff_watch_events_get_from_path), so no struct layout knowledge lives on
+// this side.
 
 /** Map the C kind byte to the public WatchEventKind. */
 function watchKindFromU8(kind: number): WatchEventKind {
@@ -1628,6 +1629,8 @@ function watchKindFromU8(kind: number): WatchEventKind {
       return "modified";
     case 2:
       return "removed";
+    case 4:
+      return "renamed";
     default:
       return "rescan";
   }
@@ -1685,10 +1688,22 @@ function consumeWatchBatch(address: number): WatchEvent[] {
       paramsType: [DataType.External, DataType.U32],
       paramsValue: [batchPtr, i],
     }) as unknown as number;
-    events.push({
+    const event: WatchEvent = {
       path: readCString(path) ?? "",
       kind: watchKindFromU8(kind),
-    });
+    };
+    if (event.kind === "renamed") {
+      const from = load({
+        library: LIBRARY_KEY,
+        funcName: "fff_watch_events_get_from_path",
+        retType: DataType.External,
+        paramsType: [DataType.External, DataType.U32],
+        paramsValue: [batchPtr, i],
+      }) as unknown as JsExternal;
+      const decoded = readCString(from);
+      if (decoded) event.from = decoded;
+    }
+    events.push(event);
   }
 
   load({

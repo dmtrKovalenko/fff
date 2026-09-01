@@ -293,14 +293,24 @@ export interface ScanProgress {
  *
  * rescan = internal OS buffers were overloaded, some events might be missing.
  * The `path` is going to be a folder needs to be rescanned
+ *
+ * renamed = the file moved and kept its identity. `path` is the destination
+ * and `from` the source; no separate removed/created pair is emitted. A move
+ * in or out of the indexed tree stays a plain created/removed instead.
  */
-export type WatchEventKind = "created" | "modified" | "removed" | "rescan";
+export type WatchEventKind = "created" | "modified" | "removed" | "rescan" | "renamed";
 
-/** A single filesystem change notification. */
+/**
+ * A single filesystem change notification. Paths are canonicalized: on
+ * Windows, 8.3 short names (`RUNNER~1`) are expanded, so compare against a
+ * canonicalized base (e.g. `fs.realpathSync.native`).
+ */
 export interface WatchEvent {
-  /** Absolute path of the affected file (base path to rescan if `kind ==rescan`) */
+  /** Absolute path of the affected file (base path to rescan if `kind == rescan`) */
   path: string;
   kind: WatchEventKind;
+  /** Absolute path the file moved from. Only set when `kind == "renamed"`. */
+  from?: string;
 }
 
 /** Options for watch subscriptions. */
@@ -632,7 +642,7 @@ export interface FileFinderApi {
    * Patterns may be base-relative globs (./ works), exact paths inside the indexed
    * tree, or existing directories. An empty pattern watches the whole tree.
    *
-   * Events are debounced and submitted in batches per 100-ms window at most 128 events.
+   * Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
    * Gitignored and other ignored files are never triggering watcher.
    */
   watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;

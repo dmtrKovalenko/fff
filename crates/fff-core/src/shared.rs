@@ -286,7 +286,7 @@ impl SharedFilePicker {
     /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
     /// tree, or existing directories. An empty pattern watches the whole tree.
     ///
-    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
     /// Gitignored and other ignored files are never triggering watcher.
     pub fn watch(
         &self,

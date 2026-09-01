@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WatchEvent } from "../src/fff-api";
@@ -96,8 +96,41 @@ describe("FileFinder - Watch Subscriptions", () => {
     expect(received.some((e) => e.path.endsWith(".js"))).toBe(false);
     expect(batchSizes.every((n) => n > 0)).toBe(true);
     for (const event of received) {
-      expect(["created", "modified", "removed", "rescan"]).toContain(event.kind);
+      expect(["created", "modified", "removed", "rescan", "renamed"]).toContain(
+        event.kind,
+      );
     }
+
+    sub.value();
+  }, 20_000);
+
+  test("a rename arrives as one renamed event carrying both paths", async () => {
+    const received: WatchEvent[] = [];
+
+    const sub = finder.watch((events) => {
+      received.push(...events);
+    });
+    expect(sub.ok).toBe(true);
+    if (!sub.ok) return;
+
+    const from = join(baseDir, "move-me.txt");
+    const to = join(baseDir, "moved.txt");
+    writeFileSync(from, "move me\n");
+    // Let the create land so the rename is its own batch.
+    expect(await waitFor(() => hasEventFor(received, "move-me.txt"))).toBe(true);
+    received.length = 0;
+
+    renameSync(from, to);
+
+    const gotRename = await waitFor(() =>
+      received.some((e) => e.kind === "renamed" && e.path === to),
+    );
+    expect(gotRename).toBe(true);
+
+    const renamed = received.find((e) => e.kind === "renamed");
+    expect(renamed?.from).toBe(from);
+    // The move is one event, not a removal plus a creation.
+    expect(received.some((e) => e.kind === "removed" && e.path === from)).toBe(false);
 
     sub.value();
   }, 20_000);

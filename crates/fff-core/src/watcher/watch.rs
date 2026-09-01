@@ -26,6 +26,8 @@ pub enum WatchEventKind {
     Removed = 2,
     /// Individual events were lost; rescan the reported path.
     Rescan = 3,
+    /// The file moved. `path` is the destination, `from` the source.
+    Renamed = 4,
 }
 
 impl WatchEventKind {
@@ -35,6 +37,7 @@ impl WatchEventKind {
             WatchEventKind::Modified => "modified",
             WatchEventKind::Removed => "removed",
             WatchEventKind::Rescan => "rescan",
+            WatchEventKind::Renamed => "renamed",
         }
     }
 }
@@ -45,6 +48,8 @@ pub struct WatchEvent {
     /// Absolute affected path (the indexed base path for `Rescan`).
     pub path: PathBuf,
     pub kind: WatchEventKind,
+    /// Source path, set only for [`WatchEventKind::Renamed`].
+    pub from: Option<PathBuf>,
 }
 
 /// Per-subscription options.
@@ -61,6 +66,7 @@ pub(crate) struct RawWatchEvent {
     pub(crate) path: PathBuf,
     pub(crate) kind: WatchEventKind,
     pub(crate) is_ignored: bool,
+    pub(crate) from: Option<PathBuf>,
 }
 
 enum WatchMatcher {
@@ -219,17 +225,23 @@ impl WatchSub {
         }
 
         // Subtract per-subscription ignores from the match mask.
+        mask & !self.ignore_mask(paths, scratch)
+    }
+
+    fn ignore_mask(&self, paths: &[&str], scratch: &mut Vec<usize>) -> WatchMask {
+        let mut mask = 0;
+
         for g in &self.ignore.globs {
             scratch.clear();
             glob_matches_into(g, paths, scratch);
             for &index in scratch.iter() {
-                mask &= !(1 << index);
+                mask |= 1 << index;
             }
         }
         if !self.ignore.prefixes.is_empty() {
             for (index, path) in paths.iter().enumerate() {
                 if self.ignore.prefix_matches(Path::new(path)) {
-                    mask &= !(1 << index);
+                    mask |= 1 << index;
                 }
             }
         }
@@ -473,6 +485,10 @@ impl WatchRegistry {
             let mut paths = Vec::with_capacity(batch.len());
             let mut visible_mask = 0;
             let mut rescan_mask = 0;
+            let has_renames = batch.iter().any(|event| event.from.is_some());
+            // Parallel array of rename sources, so a subscription matching only
+            // the pre-rename path still hears about the move.
+            let mut from_paths = Vec::with_capacity(if has_renames { batch.len() } else { 0 });
 
             for (index, event) in batch.iter().enumerate() {
                 let relative = event
@@ -480,6 +496,15 @@ impl WatchRegistry {
                     .strip_prefix(base_path)
                     .expect("watch event path must be inside the indexed base path");
                 paths.push(relative.to_string_lossy().replace('\\', "/"));
+
+                if has_renames {
+                    let source = event
+                        .from
+                        .as_deref()
+                        .and_then(|from| from.strip_prefix(base_path).ok())
+                        .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+                    from_paths.push(source.unwrap_or_else(|| paths[index].clone()));
+                }
 
                 let bit = 1 << index;
                 if event.kind == WatchEventKind::Rescan {
@@ -490,10 +515,17 @@ impl WatchRegistry {
             }
 
             let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let from_refs: Vec<&str> = from_paths.iter().map(String::as_str).collect();
             let mut scratch = Vec::new();
             let mut deliveries = Vec::with_capacity(state.subs.len());
             for sub in &state.subs {
-                let matched = sub.filter_mask(&path_refs, &mut scratch);
+                let mut matched = sub.filter_mask(&path_refs, &mut scratch);
+                if has_renames {
+                    // A source-path hit never resurrects an event whose
+                    // destination this subscription ignores.
+                    matched |= sub.filter_mask(&from_refs, &mut scratch)
+                        & !sub.ignore_mask(&path_refs, &mut scratch);
+                }
                 let mut delivery_mask = (matched & visible_mask) | rescan_mask;
                 if delivery_mask == 0 {
                     continue;
@@ -506,6 +538,7 @@ impl WatchRegistry {
                     filtered.push(WatchEvent {
                         path: event.path.clone(),
                         kind: event.kind,
+                        from: event.from.clone(),
                     });
                     delivery_mask &= delivery_mask - 1;
                 }
@@ -533,6 +566,7 @@ impl WatchRegistry {
                 path: base_path.to_path_buf(),
                 kind: WatchEventKind::Rescan,
                 is_ignored: false,
+                from: None,
             }],
         );
     }
@@ -556,6 +590,7 @@ mod tests {
             path: PathBuf::from(path),
             kind,
             is_ignored,
+            from: None,
         }
     }
 

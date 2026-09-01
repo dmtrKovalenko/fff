@@ -25,7 +25,12 @@ pub struct FffWatchOptions {
 }
 
 /// A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
-/// 3 = rescan (events were lost; re-stat what you care about).
+/// 3 = rescan (events were lost; re-stat what you care about),
+/// 4 = renamed (`path` is the destination; read the source with
+/// `fff_watch_events_get_from_path`).
+///
+/// Layout is frozen: this is an array element, so growing it would change the
+/// stride every existing binding compiled against.
 #[repr(C)]
 pub struct FffWatchEvent {
     /// Absolute path (heap C string owned by the parent batch).
@@ -34,10 +39,15 @@ pub struct FffWatchEvent {
 }
 
 /// A batch of watch events. Free with `fff_free_watch_events`.
+/// Versioned by append only: existing field offsets never move.
 #[repr(C)]
 pub struct FffWatchEventBatch {
     pub events: *mut FffWatchEvent,
     pub count: u32,
+    /// Parallel to `events`, `count` long: the pre-rename path for entries
+    /// with `kind == 4`, null for every other entry. Null when the batch holds
+    /// no renames at all.
+    pub rename_sources: *mut *mut c_char,
 }
 
 /// Instance-wide callback invoked with `(watch_id, batch)` for every `fff_watch`
@@ -49,27 +59,49 @@ fn batch_into_raw(events: &[WatchEvent]) -> *mut FffWatchEventBatch {
     let items: Vec<FffWatchEvent> = events
         .iter()
         .map(|ev| FffWatchEvent {
-            path: CString::new(ev.path.to_string_lossy().as_bytes())
-                .unwrap_or_default()
-                .into_raw(),
+            path: path_into_raw(&ev.path),
             kind: ev.kind as u8,
         })
         .collect();
 
     let count = items.len() as u32;
-    let events_ptr = if items.is_empty() {
-        ptr::null_mut()
+    let events_ptr = leak_slice(items);
+
+    let rename_sources = if events.iter().any(|ev| ev.from.is_some()) {
+        let sources: Vec<*mut c_char> = events
+            .iter()
+            .map(|ev| {
+                ev.from
+                    .as_ref()
+                    .map_or(ptr::null_mut(), |p| path_into_raw(p))
+            })
+            .collect();
+        leak_slice(sources)
     } else {
-        let mut boxed = items.into_boxed_slice();
-        let p = boxed.as_mut_ptr();
-        std::mem::forget(boxed);
-        p
+        ptr::null_mut()
     };
 
     Box::into_raw(Box::new(FffWatchEventBatch {
         events: events_ptr,
         count,
+        rename_sources,
     }))
+}
+
+fn path_into_raw(path: &std::path::Path) -> *mut c_char {
+    CString::new(path.to_string_lossy().as_bytes())
+        .unwrap_or_default()
+        .into_raw()
+}
+
+fn leak_slice<T>(items: Vec<T>) -> *mut T {
+    if items.is_empty() {
+        return ptr::null_mut();
+    }
+    let mut boxed = items.into_boxed_slice();
+    let p = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    p
 }
 
 unsafe fn watch_options_from_ffi(
@@ -270,10 +302,33 @@ pub unsafe extern "C" fn fff_watch_events_get_path(
     }
 }
 
-/// Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan)
+/// Pre-rename path of event `index`, null unless its kind is 4 (renamed).
+/// Owned by the batch; do not free separately.
+///
+/// ## Safety
+/// `batch` must be a valid `FffWatchEventBatch` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_watch_events_get_from_path(
+    batch: *const FffWatchEventBatch,
+    index: u32,
+) -> *const c_char {
+    if batch.is_null() {
+        return ptr::null();
+    }
+    let batch = unsafe { &*batch };
+    if batch.rename_sources.is_null() || index >= batch.count {
+        return ptr::null();
+    }
+    unsafe { *batch.rename_sources.add(index as usize) }
+}
+
+/// Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
+/// 4 = renamed).
 /// 3 (rescan aka "re-stat something" kind) returned when OS based buffer
 /// has been overflown and some events might be loss. Paths will contain a list of
 /// directories that needs to be rescanned to ensure consistency.
+/// 4 reports a move: `path` is the destination and
+/// `fff_watch_events_get_from_path` yields the source.
 ///
 /// ## Safety
 /// `batch` must be a valid `FffWatchEventBatch` pointer or null.
@@ -313,12 +368,20 @@ pub unsafe extern "C" fn fff_free_watch_events(batch: *mut FffWatchEventBatch) {
     }
     unsafe {
         let batch = Box::from_raw(batch);
+        let count = batch.count as usize;
         if !batch.events.is_null() {
-            let events =
-                Vec::from_raw_parts(batch.events, batch.count as usize, batch.count as usize);
+            let events = Vec::from_raw_parts(batch.events, count, count);
             for ev in events {
                 if !ev.path.is_null() {
                     drop(CString::from_raw(ev.path));
+                }
+            }
+        }
+        if !batch.rename_sources.is_null() {
+            let sources = Vec::from_raw_parts(batch.rename_sources, count, count);
+            for source in sources {
+                if !source.is_null() {
+                    drop(CString::from_raw(source));
                 }
             }
         }
@@ -344,8 +407,12 @@ mod layout_tests {
         assert_eq!(offset_of!(FffWatchEvent, path), 0);
         assert_eq!(offset_of!(FffWatchEvent, kind), 8);
 
-        assert_eq!(size_of::<FffWatchEventBatch>(), 16);
         assert_eq!(offset_of!(FffWatchEventBatch, events), 0);
         assert_eq!(offset_of!(FffWatchEventBatch, count), 8);
+        // Appended in the renamed-event release. The batch is a single
+        // library-allocated struct reached only through a pointer, so growing
+        // its tail leaves every previously published offset valid.
+        assert_eq!(size_of::<FffWatchEventBatch>(), 24);
+        assert_eq!(offset_of!(FffWatchEventBatch, rename_sources), 16);
     }
 }

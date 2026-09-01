@@ -742,7 +742,7 @@ impl FileFinder {
     /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
     /// tree, or existing directories. An empty pattern watches the whole tree.
     ///
-    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
     /// Gitignored and other ignored files are never triggering watcher.
     #[pyo3(signature = (pattern, callback, *, ignore = None))]
     fn watch(
@@ -779,6 +779,10 @@ impl FileFinder {
                             .map(|ev| WatchEvent {
                                 path: ev.path.to_string_lossy().to_string(),
                                 kind: ev.kind.as_str().to_string(),
+                                from_path: ev
+                                    .from
+                                    .as_ref()
+                                    .map(|p| p.to_string_lossy().to_string()),
                             })
                             .collect();
                         if let Err(e) = callback.call1(py, (batch,)) {

@@ -7,7 +7,7 @@ use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
-use notify::event::{AccessKind, AccessMode};
+use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
 use notify::{Config, EventKind, EventKindMask, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
@@ -350,6 +350,7 @@ pub(crate) fn handle_debounced_events(
     let mut paths_to_add_or_modify = Vec::new();
     let mut new_dirs_to_watch = Vec::new();
     let mut affected_paths_count = 0usize;
+    let mut explicit_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     let watch_registry = shared_picker.watch_registry();
     let need_events_propagation = watch_registry.is_active();
@@ -402,6 +403,15 @@ pub(crate) fn handle_debounced_events(
         }
 
         tracing::debug!(event = ?debounced_event.event, "Processing FS event");
+
+        // Backends that pair the halves for us hand over [from, to] directly.
+        // The per-path pass below still classifies both, we only note the link.
+        if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = debounced_event.event.kind
+            && let [from, to] = debounced_event.event.paths.as_slice()
+        {
+            explicit_renames.push((from.clone(), to.clone()));
+        }
+
         for path in &debounced_event.event.paths {
             if matches!(
                 path.file_name().and_then(|f| f.to_str()),
@@ -527,7 +537,12 @@ pub(crate) fn handle_debounced_events(
     let mut index_update_rejected = false;
     let mut overflow_count = 0;
     let mut removed_from_dirs = Vec::new();
-    let mut watch_events = ahash::AHashMap::new();
+    // Destination path -> (kind, rename source). One entry per path, so a
+    // remove+add pair recognised as a rename collapses into a single event.
+    let mut watch_events: ahash::AHashMap<PathBuf, (WatchEventKind, Option<PathBuf>)> =
+        ahash::AHashMap::new();
+    // Destination -> source for every rename recognised in this batch.
+    let mut renames: ahash::AHashMap<PathBuf, PathBuf> = ahash::AHashMap::new();
 
     if !paths_to_remove.is_empty()
         || !dirs_to_remove.is_empty()
@@ -549,12 +564,22 @@ pub(crate) fn handle_debounced_events(
             return new_dirs_to_watch;
         };
 
+        // Must run before the removals below, while the vanished files still
+        // carry their indexed size/mtime.
+        renames.extend(detect_renames(
+            picker,
+            base_path,
+            &paths_to_remove,
+            &paths_to_add_or_modify,
+            &explicit_renames,
+        ));
+
         for (path, may_be_dir) in &paths_to_remove {
             let removed = picker.remove_file_by_path(path);
 
             if removed {
                 if need_events_propagation {
-                    watch_events.insert(path.to_path_buf(), WatchEventKind::Removed);
+                    watch_events.insert(path.to_path_buf(), (WatchEventKind::Removed, None));
                 }
             } else if *may_be_dir {
                 // Not an indexed file: likely a dir renamed out of the tree
@@ -579,7 +604,7 @@ pub(crate) fn handle_debounced_events(
 
         if need_events_propagation {
             for path in removed_from_dirs.drain(..) {
-                watch_events.insert(path, WatchEventKind::Removed);
+                watch_events.insert(path, (WatchEventKind::Removed, None));
             }
         }
 
@@ -597,16 +622,28 @@ pub(crate) fn handle_debounced_events(
             if picker.handle_create_or_modify(path).is_some() {
                 files_to_update_git_status.push(path.to_path_buf());
                 if need_events_propagation {
-                    let kind = if existed {
-                        WatchEventKind::Modified
-                    } else {
-                        WatchEventKind::Created
+                    let event = match renames.get(*path) {
+                        Some(from) => (WatchEventKind::Renamed, Some(from.clone())),
+                        None if existed => (WatchEventKind::Modified, None),
+                        None => (WatchEventKind::Created, None),
                     };
 
-                    watch_events.insert(path.to_path_buf(), kind);
+                    watch_events.insert(path.to_path_buf(), event);
                 }
             } else {
                 index_update_rejected = true;
+            }
+        }
+
+        // A recognised move is one change, not a removal plus a creation. Drop
+        // the source's own event only where the destination really reported the
+        // pair — a destination that never made it into the index still needs
+        // its source announced as removed.
+        if need_events_propagation {
+            for (to, from) in &renames {
+                if matches!(watch_events.get(to), Some((WatchEventKind::Renamed, _))) {
+                    watch_events.remove(from);
+                }
             }
         }
 
@@ -638,13 +675,45 @@ pub(crate) fn handle_debounced_events(
             base_path,
             watch_events
                 .into_iter()
-                .map(|(path, kind)| RawWatchEvent {
+                .map(|(path, (kind, from))| RawWatchEvent {
                     path,
                     kind,
                     is_ignored: false,
+                    from,
                 })
                 .collect(),
         );
+    }
+
+    // Carry the access history onto the new path. Copied, not moved: checking
+    // out a revision where the old path exists again must still rank it.
+    if !renames.is_empty() {
+        let mut carried = Vec::new();
+        if let Ok(frecency_guard) = shared_frecency.read()
+            && let Some(ref frecency) = *frecency_guard
+        {
+            let pairs: Vec<_> = renames
+                .iter()
+                .map(|(to, from)| (from.clone(), to.clone()))
+                .collect();
+            match frecency.copy_history_many(&pairs) {
+                Ok(paths) => carried = paths,
+                Err(e) => error!("Failed to carry frecency over renames: {:?}", e),
+            }
+        }
+
+        if !carried.is_empty() {
+            info!(count = carried.len(), "Carried frecency across renames");
+            if let Ok(mut picker_guard) = shared_picker.write()
+                && let Some(ref mut picker) = *picker_guard
+                && let Ok(frecency_guard) = shared_frecency.read()
+                && let Some(ref frecency) = *frecency_guard
+            {
+                for path in &carried {
+                    let _ = picker.update_single_file_frecency(path, frecency);
+                }
+            }
+        }
     }
 
     // AI mode: auto-track frecency for all modified/created files.
@@ -791,6 +860,7 @@ fn index_new_directory(
                 path: path.clone(),
                 kind: WatchEventKind::Created,
                 is_ignored: false,
+                from: None,
             })
             .collect();
 
@@ -954,6 +1024,129 @@ fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBu
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    size: u64,
+    mtime: u64,
+}
+
+// Returns destination -> source. Explicit pairs from the OS win outright; the
+// rest is inferred from files that kept their exact size and mtime. Call while
+// the removed paths are still indexed — that is the only source of their
+// metadata once they are gone from disk.
+fn detect_renames(
+    picker: &crate::file_picker::FilePicker,
+    base_path: &Path,
+    paths_to_remove: &[(&Path, bool)],
+    paths_to_add_or_modify: &[&Path],
+    explicit: &[(PathBuf, PathBuf)],
+) -> ahash::AHashMap<PathBuf, PathBuf> {
+    // Subscribers only ever see paths relative to the base, so a move that
+    // crosses the boundary stays a plain removal or creation.
+    let mut renames: ahash::AHashMap<PathBuf, PathBuf> = explicit
+        .iter()
+        .filter(|(from, to)| from != to && from.starts_with(base_path) && to.starts_with(base_path))
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+
+    if paths_to_remove.is_empty() || paths_to_add_or_modify.is_empty() {
+        return renames;
+    }
+
+    let removed: Vec<(PathBuf, FileIdentity)> = paths_to_remove
+        .iter()
+        .filter(|(path, _)| !renames.values().any(|from| from == path))
+        .filter_map(|(path, _)| {
+            let file = picker.get_file_by_path(path)?;
+            Some((
+                path.to_path_buf(),
+                FileIdentity {
+                    size: file.size,
+                    mtime: file.modified,
+                },
+            ))
+        })
+        .collect();
+
+    let added: Vec<(PathBuf, FileIdentity)> = paths_to_add_or_modify
+        .iter()
+        .filter(|path| !renames.contains_key(**path))
+        // A path already live in the index was edited, not moved into place.
+        .filter(|path| {
+            picker
+                .get_file_by_path(path)
+                .is_none_or(|file| file.is_deleted())
+        })
+        .filter_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((
+                path.to_path_buf(),
+                FileIdentity {
+                    size: meta.len(),
+                    mtime,
+                },
+            ))
+        })
+        .collect();
+
+    for (from, to) in pair_renames_by_identity(&removed, &added) {
+        renames.insert(to, from);
+    }
+
+    renames
+}
+
+// Pair a removed with an added path when they are the only two files in the
+// batch sharing a (size, mtime) — a rename preserves both exactly. Uniqueness
+// on both sides is what stops bulk operations from cross-wiring histories.
+fn pair_renames_by_identity(
+    removed: &[(PathBuf, FileIdentity)],
+    added: &[(PathBuf, FileIdentity)],
+) -> Vec<(PathBuf, PathBuf)> {
+    if removed.is_empty() || added.is_empty() {
+        return Vec::new();
+    }
+
+    // `None` marks an identity claimed by more than one distinct path. The OS
+    // repeats a path within a batch (FSEvents does routinely), and a repeat is
+    // still one candidate, not a collision.
+    fn index_by_identity(
+        entries: &[(PathBuf, FileIdentity)],
+    ) -> ahash::AHashMap<FileIdentity, Option<&Path>> {
+        let mut by_identity: ahash::AHashMap<FileIdentity, Option<&Path>> =
+            ahash::AHashMap::default();
+        for (path, identity) in entries {
+            by_identity
+                .entry(*identity)
+                .and_modify(|slot| {
+                    if *slot != Some(path.as_path()) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(path.as_path()));
+        }
+        by_identity
+    }
+
+    let sources = index_by_identity(removed);
+    let targets = index_by_identity(added);
+
+    targets
+        .into_iter()
+        .filter_map(|(identity, target)| {
+            let target = target?;
+            let source = (*sources.get(&identity)?)?;
+            Some((source.to_path_buf(), target.to_path_buf()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,6 +1219,112 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].path, path);
         assert_eq!(received[0].kind, WatchEventKind::Modified);
+    }
+
+    fn identity(size: u64, mtime: u64) -> FileIdentity {
+        FileIdentity { size, mtime }
+    }
+
+    fn entry(path: &str, size: u64, mtime: u64) -> (PathBuf, FileIdentity) {
+        (PathBuf::from(path), identity(size, mtime))
+    }
+
+    #[test]
+    fn unique_size_and_mtime_pairs_as_a_rename() {
+        let pairs = pair_renames_by_identity(
+            &[entry("/w/old.rs", 120, 1_700_000_000)],
+            &[entry("/w/new.rs", 120, 1_700_000_000)],
+        );
+
+        assert_eq!(
+            pairs,
+            vec![(PathBuf::from("/w/old.rs"), PathBuf::from("/w/new.rs"))]
+        );
+    }
+
+    #[test]
+    fn ambiguous_identities_are_never_paired() {
+        let two_removed = pair_renames_by_identity(
+            &[entry("/w/a.rs", 10, 5), entry("/w/b.rs", 10, 5)],
+            &[entry("/w/c.rs", 10, 5)],
+        );
+        assert!(
+            two_removed.is_empty(),
+            "two removed files sharing an identity are ambiguous: {two_removed:?}"
+        );
+
+        let two_added = pair_renames_by_identity(
+            &[entry("/w/a.rs", 10, 5)],
+            &[entry("/w/b.rs", 10, 5), entry("/w/c.rs", 10, 5)],
+        );
+        assert!(
+            two_added.is_empty(),
+            "two added files sharing an identity are ambiguous: {two_added:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_path_is_one_candidate_not_a_collision() {
+        // FSEvents routinely reports the same path several times per batch.
+        let pairs = pair_renames_by_identity(
+            &[entry("/w/old.rs", 15, 99), entry("/w/old.rs", 15, 99)],
+            &[entry("/w/new.rs", 15, 99), entry("/w/new.rs", 15, 99)],
+        );
+
+        assert_eq!(
+            pairs,
+            vec![(PathBuf::from("/w/old.rs"), PathBuf::from("/w/new.rs"))]
+        );
+    }
+
+    #[test]
+    fn empty_files_are_paired_only_when_unambiguous() {
+        let unique = pair_renames_by_identity(&[entry("/w/a", 0, 7)], &[entry("/w/b", 0, 7)]);
+        assert_eq!(
+            unique,
+            vec![(PathBuf::from("/w/a"), PathBuf::from("/w/b"))],
+            "a lone empty file still has a usable identity"
+        );
+
+        let colliding = pair_renames_by_identity(
+            &[entry("/w/a", 0, 7), entry("/w/b", 0, 7)],
+            &[entry("/w/c", 0, 7), entry("/w/d", 0, 7)],
+        );
+        assert!(colliding.is_empty(), "{colliding:?}");
+    }
+
+    #[test]
+    fn differing_metadata_is_not_a_rename() {
+        // git checkout rewrites mtime, so branch switches must never pair.
+        let fresh_mtime = pair_renames_by_identity(
+            &[entry("/w/old.rs", 120, 1_700_000_000)],
+            &[entry("/w/new.rs", 120, 1_700_000_900)],
+        );
+        assert!(fresh_mtime.is_empty(), "{fresh_mtime:?}");
+
+        let other_size = pair_renames_by_identity(
+            &[entry("/w/old.rs", 120, 1_700_000_000)],
+            &[entry("/w/new.rs", 121, 1_700_000_000)],
+        );
+        assert!(other_size.is_empty(), "{other_size:?}");
+    }
+
+    #[test]
+    fn independent_identities_pair_side_by_side() {
+        let pairs = pair_renames_by_identity(
+            &[entry("/w/a.rs", 10, 1), entry("/w/b.rs", 20, 2)],
+            &[entry("/w/y.rs", 20, 2), entry("/w/x.rs", 10, 1)],
+        );
+
+        let mut pairs = pairs;
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (PathBuf::from("/w/a.rs"), PathBuf::from("/w/x.rs")),
+                (PathBuf::from("/w/b.rs"), PathBuf::from("/w/y.rs")),
+            ]
+        );
     }
 
     #[test]
