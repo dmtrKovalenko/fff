@@ -646,12 +646,8 @@ pub unsafe extern "C" fn fff_live_grep(
     }
 }
 
-/// [`fff_live_grep`] plus `enforce_time_budget`.
-///
-/// When false (what [`fff_live_grep`] passes) plain/regex grep only starts
-/// counting `time_budget_ms` once matches exist, so a zero-match query scans
-/// every candidate file. When true the budget is a hard bound and
-/// `next_file_offset` resumes at the first unsearched file.
+/// [`fff_live_grep`] plus `enforce_time_budget`: when true the budget also bounds
+/// zero-match searches and `next_file_offset` resumes at the first unsearched file.
 ///
 /// ## Safety
 /// Same as [`fff_live_grep`].

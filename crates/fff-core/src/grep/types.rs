@@ -94,9 +94,8 @@ pub struct GrepSearchOptions {
     /// Maximum time in milliseconds to spend searching before returning partial
     /// results. Prevents UI freezes on pathological queries. 0 = no limit.
     pub time_budget_ms: u64,
-    /// Apply `time_budget_ms` even when nothing matched yet. Off by default:
-    /// plain/regex grep historically only started counting after the first
-    /// matches, so a zero-match query always scanned every candidate file.
+    /// Apply `time_budget_ms` even before anything matched. Off by default: plain/regex
+    /// grep only starts counting once matches exist, so a zero-match query scans everything.
     pub enforce_time_budget: bool,
     /// Number of context lines to include before each match. 0 = disabled.
     pub before_context: usize,
@@ -178,8 +177,7 @@ impl<'a> GrepResult<'a> {
         options: &GrepSearchOptions,
         total_files: usize,
         filtered_file_count: usize,
-        // Set when an abort stopped the search: the lowest index in files_to_search
-        // that was not searched, i.e. the exact resume point for the next page.
+        // Lowest unsearched index when an abort stopped the search.
         abort_resume: Option<usize>,
     ) -> Self {
         let page_limit = options.page_limit;
@@ -198,8 +196,8 @@ impl<'a> GrepResult<'a> {
         let mut files_consumed: usize = 0;
 
         for (batch_idx, file, file_matches) in per_file_results {
-            // Matches past the abort point are dropped; the cursor re-searches them.
-            if abort_resume.is_some_and(|resume_at| batch_idx >= resume_at) {
+            // Matches past the abort point are dropped; the next page re-searches them.
+            if abort_resume.is_some_and(|at| batch_idx >= at) {
                 continue;
             }
 
@@ -226,8 +224,7 @@ impl<'a> GrepResult<'a> {
             }
         }
 
-        // An abort stopped us at a known index. Otherwise, zero matches means the
-        // whole slice was searched.
+        // Abort stops at a known index; otherwise zero matches means a full scan.
         match abort_resume {
             Some(resume_at) => files_consumed = resume_at.min(files_to_search_len),
             None if result_files.is_empty() => files_consumed = files_to_search_len,

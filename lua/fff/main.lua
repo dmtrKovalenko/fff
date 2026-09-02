@@ -348,6 +348,7 @@ function M.content_search(query, opts)
     opts = { opts, 'table', true },
   })
   opts = opts or {}
+  vim.validate({ enforce_time_budget = { opts.enforce_time_budget, 'boolean', true } })
 
   local mode = opts.mode or 'plain'
   if mode ~= 'plain' and mode ~= 'regex' and mode ~= 'fuzzy' then

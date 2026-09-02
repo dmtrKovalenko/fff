@@ -561,15 +561,15 @@ where
 
     let search_start = std::time::Instant::now();
     let page_limit = options.page_limit;
-    let budget_exceeded = AtomicBool::new(false);
-    // Lowest index in files_to_search an abort skipped. Everything below it was
-    // searched, so it is the exact resume point for the next page.
+    // Lowest index an abort skipped; everything below it was searched, so it is
+    // the resume point for the next page. usize::MAX means no abort happened.
     let first_skipped = AtomicUsize::new(usize::MAX);
 
     let mut result_files: Vec<&'a FileItem> = Vec::new();
     let mut all_matches: Vec<GrepMatch> = Vec::new();
     let mut files_consumed: usize = 0;
     let mut page_filled = false;
+    let mut aborted = false;
 
     // Each chunk is a rayon barrier. A flat small chunk over 500k files = ~7800
     // barriers; x2 growth makes it logarithmic. But a too-aggressive growth
@@ -596,8 +596,7 @@ where
         chunk_size = (chunk_size * growth).min(max_chunk);
         let chunk_offset = files_consumed;
 
-        // Unless enforcement is requested the budget stays dormant until matches
-        // exist, so a zero-match query keeps its historical full-scan behaviour.
+        // Unless enforced, the budget stays dormant until something matched.
         let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
 
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
@@ -609,18 +608,16 @@ where
                 // scoped threads with a predefined local scratch buffers because of spawn cost
                 || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false),
                 |(buf, mmap_slot, aborted), (local_idx, file)| {
-                    // perform all the atomic machinery on every 8th; `aborted`
-                    // latches so the rest of this worker's range bails out for free.
-                    // File 0 is never skipped: a cursor of 0 reads as "done", so
-                    // the page must always consume at least one file.
-                    if !*aborted && local_idx % 8 == 0 && chunk_offset + local_idx > 0 {
+                    // check the clock on every 8th file only; `aborted` latches for the
+                    // rest of this worker's range. File 0 is never skipped so a page
+                    // always consumes at least one file (cursor 0 means "done").
+                    let idx = chunk_offset + local_idx;
+                    if !*aborted && local_idx % 8 == 0 && idx > 0 {
                         *aborted = ctx.abort_signal.load(Ordering::Relaxed)
                             || budget.is_some_and(|b| search_start.elapsed() > b);
                     }
-
                     if *aborted {
-                        budget_exceeded.store(true, Ordering::Relaxed);
-                        first_skipped.fetch_min(chunk_offset + local_idx, Ordering::Relaxed);
+                        first_skipped.fetch_min(idx, Ordering::Relaxed);
                         return None;
                     }
 
@@ -647,26 +644,20 @@ where
                         return None;
                     }
 
-                    Some((chunk_offset + local_idx, *file, file_matches))
+                    Some((idx, *file, file_matches))
                 },
             )
             .flatten()
             .collect();
 
-        // Every file in the chunk was visited by rayon (matched or not), unless an
-        // abort cut it short — then we only consumed up to the first skipped file.
-        let abort_resume = budget_exceeded
-            .load(Ordering::Relaxed)
-            .then(|| first_skipped.load(Ordering::Relaxed));
-        files_consumed = chunk_offset + chunk.len();
-        if let Some(resume_at) = abort_resume {
-            files_consumed = files_consumed.min(resume_at);
-        }
+        // Every file in the chunk was visited unless an abort cut it short.
+        let resume_at = first_skipped.load(Ordering::Relaxed);
+        aborted = resume_at != usize::MAX;
+        files_consumed = resume_at.min(chunk_offset + chunk.len());
 
-        // Flatten this chunk's results into the accumulator.
         for (batch_idx, file, file_matches) in chunk_results {
-            // Matches past the abort point are dropped; the cursor re-searches them.
-            if abort_resume.is_some_and(|resume_at| batch_idx >= resume_at) {
+            // Matches past the abort point are dropped; the next page re-searches them.
+            if batch_idx >= resume_at {
                 continue;
             }
 
@@ -690,15 +681,12 @@ where
             }
         }
 
-        if page_filled || budget_exceeded.load(Ordering::Relaxed) {
+        if page_filled || aborted {
             break;
         }
     }
 
-    let aborted = budget_exceeded.load(Ordering::Relaxed);
-
-    // If no file had any match, we searched the entire slice. An abort is the
-    // exception: files_consumed already holds how far we actually got.
+    // No match and no abort means the whole slice was searched.
     if result_files.is_empty() && !aborted {
         files_consumed = files_to_search.len();
     }
