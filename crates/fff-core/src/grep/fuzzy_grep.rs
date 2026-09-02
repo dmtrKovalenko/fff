@@ -3,7 +3,7 @@ use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::lines::LineStep;
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::sink::{
     char_indices_to_byte_offsets, classify_definition, strip_line_terminators,
@@ -107,7 +107,8 @@ pub(super) fn fuzzy_grep_search<'a>(
         None
     };
     let search_start = std::time::Instant::now();
-    let budget_exceeded = AtomicBool::new(false);
+    // Lowest index an abort skipped, i.e. the resume point; usize::MAX means no abort.
+    let first_skipped = AtomicUsize::new(usize::MAX);
     let max_matches_per_file = options.max_matches_per_file;
 
     // for fuzzy match we need a bit smarter chunking as the amount of work we have to perform is
@@ -153,15 +154,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                     )
                 },
                 |(matcher, buf, mmap_slot), (local_idx, file)| {
-                    if abort_signal.load(Ordering::Relaxed) {
-                        budget_exceeded.store(true, Ordering::Relaxed);
-                        return None;
-                    }
-
-                    if let Some(budget) = time_budget
-                        && search_start.elapsed() > budget
+                    // File 0 is never skipped so a page always consumes at least one
+                    // file (cursor 0 means "done").
+                    let idx = chunk_offset + local_idx;
+                    if idx > 0
+                        && (abort_signal.load(Ordering::Relaxed)
+                            || time_budget.is_some_and(|b| search_start.elapsed() > b))
                     {
-                        budget_exceeded.store(true, Ordering::Relaxed);
+                        first_skipped.fetch_min(idx, Ordering::Relaxed);
                         return None;
                     }
 
@@ -331,7 +331,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                         return None;
                     }
 
-                    Some((chunk_offset + local_idx, *file, file_matches))
+                    Some((idx, *file, file_matches))
                 },
             )
             .flatten()
@@ -342,17 +342,18 @@ pub(super) fn fuzzy_grep_search<'a>(
             per_file_results.push(result);
         }
 
-        if running_matches >= page_limit || budget_exceeded.load(Ordering::Relaxed) {
+        if running_matches >= page_limit || first_skipped.load(Ordering::Relaxed) != usize::MAX {
             break;
         }
     }
 
+    let abort_resume = Some(first_skipped.load(Ordering::Relaxed)).filter(|&i| i != usize::MAX);
     GrepResult::collect(
         per_file_results,
         files_to_search.len(),
         options,
         total_files,
         filtered_file_count,
-        budget_exceeded.load(Ordering::Relaxed),
+        abort_resume,
     )
 }

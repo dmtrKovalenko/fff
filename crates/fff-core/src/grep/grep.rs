@@ -16,7 +16,7 @@ use fff_query_parser::{FFFQuery, GrepConfig, QueryParser};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::Level;
 
 #[allow(clippy::large_enum_variant)]
@@ -561,12 +561,15 @@ where
 
     let search_start = std::time::Instant::now();
     let page_limit = options.page_limit;
-    let budget_exceeded = AtomicBool::new(false);
+    // Lowest index an abort skipped; everything below it was searched, so it is
+    // the resume point for the next page. usize::MAX means no abort happened.
+    let first_skipped = AtomicUsize::new(usize::MAX);
 
     let mut result_files: Vec<&'a FileItem> = Vec::new();
     let mut all_matches: Vec<GrepMatch> = Vec::new();
     let mut files_consumed: usize = 0;
     let mut page_filled = false;
+    let mut aborted = false;
 
     // Each chunk is a rayon barrier. A flat small chunk over 500k files = ~7800
     // barriers; x2 growth makes it logarithmic. But a too-aggressive growth
@@ -593,6 +596,9 @@ where
         chunk_size = (chunk_size * growth).min(max_chunk);
         let chunk_offset = files_consumed;
 
+        // Unless enforced, the budget stays dormant until something matched.
+        let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
+
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
             .par_iter()
             .enumerate()
@@ -600,23 +606,19 @@ where
                 // tested it out a few times, this is just fine for rayon worker in this specific
                 // case it doesn't reallocate this many times and it is actually faster than using
                 // scoped threads with a predefined local scratch buffers because of spawn cost
-                || (Vec::with_capacity(64 * 1024), MmapSlot::default()),
-                |(buf, mmap_slot), (local_idx, file)| {
-                    // perform all the atomic machinery on every 8th
-                    if local_idx % 8 == 0 {
-                        let mut need_abort = ctx.abort_signal.load(Ordering::Relaxed);
-                        if !need_abort
-                            && let Some(budget) = time_budget
-                            && all_matches.len() > 1
-                            && search_start.elapsed() > budget
-                        {
-                            need_abort = true;
-                        }
-
-                        if need_abort {
-                            budget_exceeded.store(true, Ordering::Relaxed);
-                            return None;
-                        }
+                || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false),
+                |(buf, mmap_slot, aborted), (local_idx, file)| {
+                    // check the clock on every 8th file only; `aborted` latches for the
+                    // rest of this worker's range. File 0 is never skipped so a page
+                    // always consumes at least one file (cursor 0 means "done").
+                    let idx = chunk_offset + local_idx;
+                    if !*aborted && local_idx % 8 == 0 && idx > 0 {
+                        *aborted = ctx.abort_signal.load(Ordering::Relaxed)
+                            || budget.is_some_and(|b| search_start.elapsed() > b);
+                    }
+                    if *aborted {
+                        first_skipped.fetch_min(idx, Ordering::Relaxed);
+                        return None;
                     }
 
                     let content = file.get_content_for_search(
@@ -642,17 +644,23 @@ where
                         return None;
                     }
 
-                    Some((chunk_offset + local_idx, *file, file_matches))
+                    Some((idx, *file, file_matches))
                 },
             )
             .flatten()
             .collect();
 
-        // Every file in the chunk was visited by rayon (matched or not).
-        files_consumed = chunk_offset + chunk.len();
+        // Every file in the chunk was visited unless an abort cut it short.
+        let resume_at = first_skipped.load(Ordering::Relaxed);
+        aborted = resume_at != usize::MAX;
+        files_consumed = resume_at.min(chunk_offset + chunk.len());
 
-        // Flatten this chunk's results into the accumulator.
         for (batch_idx, file, file_matches) in chunk_results {
+            // Matches past the abort point are dropped; the next page re-searches them.
+            if batch_idx >= resume_at {
+                continue;
+            }
+
             let file_result_idx = result_files.len();
             result_files.push(file);
 
@@ -673,18 +681,17 @@ where
             }
         }
 
-        if page_filled || budget_exceeded.load(Ordering::Relaxed) {
+        if page_filled || aborted {
             break;
         }
     }
 
-    // If no file had any match, we searched the entire slice.
-    if result_files.is_empty() {
+    // No match and no abort means the whole slice was searched.
+    if result_files.is_empty() && !aborted {
         files_consumed = files_to_search.len();
     }
 
-    let has_more = budget_exceeded.load(Ordering::Relaxed)
-        || (page_filled && files_consumed < files_to_search.len());
+    let has_more = (aborted || page_filled) && files_consumed < files_to_search.len();
 
     let next_file_offset = if has_more {
         options.file_offset + files_consumed

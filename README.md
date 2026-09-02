@@ -278,6 +278,7 @@ local r = require('fff').content_search('TODO', {
   page_size             = 50,
   file_offset           = 0,
   time_budget_ms        = 0,
+  enforce_time_budget   = false,    -- also bound zero-match searches
   trim_whitespace       = false,
   cwd                   = nil,      -- switch indexed root if different
   wait_for_index_ms     = nil,      -- override the default scan wait timeout
@@ -431,6 +432,7 @@ require('fff').setup({
     max_matches_per_file = 100,
     smart_case = true,
     time_budget_ms = 150,
+    enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
     enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text

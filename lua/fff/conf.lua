@@ -63,6 +63,7 @@ local M = {}
 --- @field max_matches_per_file number
 --- @field smart_case boolean
 --- @field time_budget_ms number
+--- @field enforce_time_budget boolean
 --- @field modes string[]
 --- @field trim_whitespace boolean
 --- @field location_format string
@@ -463,6 +464,7 @@ local function init()
       max_matches_per_file = 100, -- Maximum matches per file (set 0 to unlimited)
       smart_case = true, -- Case-insensitive unless query has uppercase
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
+      enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
       -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a

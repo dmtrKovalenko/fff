@@ -71,6 +71,7 @@ fn make_grep_options(
             page_limit: 50,
             mode,
             time_budget_ms: 0,
+            enforce_time_budget: false,
             before_context: ctx_lines,
             after_context: after_ctx,
             classify_definitions: true,

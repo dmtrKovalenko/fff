@@ -373,6 +373,7 @@ fn grep_opts() -> GrepSearchOptions {
         page_limit: 200,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,

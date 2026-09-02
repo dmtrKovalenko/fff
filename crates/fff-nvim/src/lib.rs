@@ -437,6 +437,7 @@ pub fn live_grep(
         grep_mode,
         time_budget_ms,
         trim_whitespace,
+        enforce_time_budget,
     ): (
         String,
         Option<usize>,
@@ -446,6 +447,7 @@ pub fn live_grep(
         Option<bool>,
         Option<String>,
         Option<u64>,
+        Option<bool>,
         Option<bool>,
     ),
 ) -> LuaResult<LuaValue> {
@@ -469,6 +471,7 @@ pub fn live_grep(
         page_limit: page_size.unwrap_or(50),
         mode,
         time_budget_ms: time_budget_ms.unwrap_or(0),
+        enforce_time_budget: enforce_time_budget.unwrap_or(false),
         before_context: 0,
         after_context: 0,
         classify_definitions: false,

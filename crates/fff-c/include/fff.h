@@ -637,6 +637,27 @@ struct FffResult *fff_live_grep(void *fff_handle,
                                 bool classify_definitions);
 
 /**
+ * [`fff_live_grep`] plus `enforce_time_budget`: when true the budget also bounds
+ * zero-match searches and `next_file_offset` resumes at the first unsearched file.
+ *
+ * ## Safety
+ * Same as [`fff_live_grep`].
+ */
+struct FffResult *fff_live_grep_ex(void *fff_handle,
+                                   const char *query,
+                                   uint8_t mode,
+                                   uint64_t max_file_size,
+                                   uint32_t max_matches_per_file,
+                                   bool smart_case,
+                                   uint32_t file_offset,
+                                   uint32_t page_limit,
+                                   uint64_t time_budget_ms,
+                                   bool enforce_time_budget,
+                                   uint32_t before_context,
+                                   uint32_t after_context,
+                                   bool classify_definitions);
+
+/**
  * Multi-pattern OR search (SIMD Aho-Corasick): lines matching ANY pattern.
  *
  * `patterns_joined` is `\n`-separated (e.g. `"foo\nbar"`); `constraints` is an
@@ -659,6 +680,26 @@ struct FffResult *fff_multi_grep(void *fff_handle,
                                  uint32_t before_context,
                                  uint32_t after_context,
                                  bool classify_definitions);
+
+/**
+ * [`fff_multi_grep`] plus `enforce_time_budget`, as in [`fff_live_grep_ex`].
+ *
+ * ## Safety
+ * Same as [`fff_multi_grep`].
+ */
+struct FffResult *fff_multi_grep_ex(void *fff_handle,
+                                    const char *patterns_joined,
+                                    const char *constraints,
+                                    uint64_t max_file_size,
+                                    uint32_t max_matches_per_file,
+                                    bool smart_case,
+                                    uint32_t file_offset,
+                                    uint32_t page_limit,
+                                    uint64_t time_budget_ms,
+                                    bool enforce_time_budget,
+                                    uint32_t before_context,
+                                    uint32_t after_context,
+                                    bool classify_definitions);
 
 /**
  * Trigger a rescan of the file index.
@@ -1321,7 +1362,7 @@ struct FffResult *fff_watch_args(void *fff_handle,
 struct FffResult *fff_unwatch(void *fff_handle, uint64_t watch_id);
 
 /**
- * Number of events in a batch; 0 if `batch` is null.
+ * Number of events in a batch, 0 if `batch` is null.
  *
  * ## Safety
  * `batch` must be a valid `FffWatchEventBatch` pointer or null.
