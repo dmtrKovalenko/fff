@@ -7,9 +7,8 @@ use std::{
 };
 
 /// Process-wide libgit2 tuning for read-heavy local use. By default libgit2
-/// never caches trees over 4KB (large repos re-inflate every directory tree on
-/// every diff) and SHA-verifies each object read; measured on chromium this
-/// takes a 10-commit recency walk from 1.4s down to 0.56s.
+/// never caches trees over 4KB and additionally verifies every object. This roughly costs 150% of
+/// its valuable runtime
 pub(crate) fn tune_libgit2_for_local_reads() {
     static TUNE: std::sync::Once = std::sync::Once::new();
     TUNE.call_once(|| {

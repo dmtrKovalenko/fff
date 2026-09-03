@@ -22,7 +22,7 @@ impl Default for GitRecencyConfig {
 
 const MAX_COMMITS_HARD_CAP: usize = 128;
 
-/// Computes per file recency bonsuses
+// Computes per file recency bonuses
 #[tracing::instrument(skip(repo), level = tracing::Level::DEBUG)]
 pub(crate) fn compute_git_recency(
     repo: &Repository,
@@ -68,8 +68,7 @@ pub(crate) fn compute_git_recency(
             continue;
         };
 
-        // Merge commits carry no authored changes; the merged commits are
-        // walked on their own anyway.
+        // if merge commit
         if commit.parent_count() > 1 {
             continue;
         }
@@ -77,8 +76,6 @@ pub(crate) fn compute_git_recency(
         let Ok(tree) = commit.tree() else { continue };
         let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
-        // Pathspec prunes the tree recursion to the indexed subtree — libgit2
-        // sets the tree iterators' start/end range from the pathspec prefix.
         let mut diff_opts = DiffOptions::new();
         if let Some(subdir) = subdir.as_deref() {
             diff_opts.pathspec(subdir);
@@ -143,18 +140,29 @@ fn base_path_within_repo(repo: &Repository, base_path: &Path) -> Option<String> 
     (!subdir.is_empty()).then_some(subdir)
 }
 
-/// The branch feature work is measured against: `init.defaultBranch` when configured, else `main`, else `master`.
+// The branch feature work is measured against: `origin/HEAD`, else
+// `init.defaultBranch` when configured, else `main`, else `master`.
 fn resolve_base_branch(repo: &Repository) -> Option<(String, Oid)> {
+    let remote_head = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|r| {
+            r.symbolic_target()
+                .ok()??
+                .strip_prefix("refs/remotes/origin/")
+                .map(str::to_owned)
+        });
+
     let configured = repo
         .config()
         .and_then(|config| config.get_string("init.defaultBranch"))
         .ok()
         .filter(|name| !name.is_empty());
 
-    configured
+    remote_head
         .as_deref()
         .into_iter()
-        // why not
+        .chain(configured.as_deref())
         .chain(["main", "master"])
         .find_map(|branch| {
             Some((branch.to_owned(), {

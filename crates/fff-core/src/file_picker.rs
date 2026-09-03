@@ -219,8 +219,8 @@ impl FileSync {
         self.find_by_relative_path(&crate::path_utils::to_canonical_slashes(&rel_path_owned))
     }
 
-    /// Lookup for a base-relative, '/'-canonical path — the form paths are
-    /// stored in, so no normalization is needed.
+    // Lookup for a base-relative, '/'-canonical path — the form paths are
+    // stored in, so no normalization is needed.
     fn find_by_relative_path(&self, rel_path: &str) -> Option<usize> {
         let arena = self.arena_base_ptr();
 
@@ -1561,8 +1561,8 @@ impl FilePicker {
         Ok(())
     }
 
-    /// Replaces every recency score with a freshly computed set. `None` zeroes
-    /// them, so a vanished window (orphan HEAD, repo gone) leaves no stale boost.
+    // Replaces every recency score with a freshly computed set. `None` zeroes
+    // them, so a vanished window (orphan HEAD, repo gone) leaves no stale boost.
     pub(crate) fn apply_git_recency(&mut self, scores: Option<&AHashMap<String, i16>>) {
         if !self.git_recency_config.enabled {
             return;

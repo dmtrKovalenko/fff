@@ -350,7 +350,7 @@ impl SharedFilePicker {
     /// Refresh git statuses for all indexed files
     #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
-        let (git_root, recency_config, base_path) = {
+        let (git_root, recency_config, base_path, picker_id) = {
             // we do the libgit2 off lock cause it might take quite some time on very large repos
             let guard = self.read()?;
             let Some(ref picker) = *guard else {
@@ -360,6 +360,7 @@ impl SharedFilePicker {
                 picker.git_root().map(|p| p.to_path_buf()),
                 picker.git_recency_config(),
                 picker.base_path().to_path_buf(),
+                picker.trace_id().to_owned(),
             )
         };
 
@@ -382,6 +383,11 @@ impl SharedFilePicker {
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+
+        // ensure consistency
+        if picker.trace_id() != picker_id {
+            return Ok(0);
+        }
 
         let statuses_count = if let Some(git_status) = git_status {
             let count = git_status.statuses_len();
