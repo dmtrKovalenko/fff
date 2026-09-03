@@ -290,6 +290,11 @@ Defaults are sensible. Override only what you care about.
       },
       git = {
         status_text_color = false, -- true to color filenames by git status
+        recency = {
+          enabled = true, -- boost files from recent commits of the current branch
+          max_commits = 10, -- analyze the last N branch-specific commits
+          max_files_per_commit = 50, -- skip bulk commits touching more files than this
+        },
       },
       select = {
         -- Return winid to open the chosen file in, or nil to open in the original window
@@ -394,6 +399,36 @@ GIT STATUS HIGHLIGHTING ~
 Sign-column indicators are on by default. To color filename text by git status,
 set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help
 fff.nvim` for the full list.
+
+
+GIT RECENCY RANKING ~
+
+Files that participated in recent commits of your current branch get a small
+additive score bonus: +1 point per commit within the analyzed window. A file
+touched by all of the last 10 commits gets +10; if your branch only has 2
+commits, its files get at most +2. This surfaces the files you are actively
+working on — especially right after switching branches or pulling.
+
+- Only commits unique to the current branch are counted (against the merge
+  base with `origin/HEAD`/`main`/`master`); on the base branch itself the last
+  `max_commits` commits are used.
+- Merge commits and bulk commits touching more than
+  `git.recency.max_files_per_commit` files are ignored.
+- Scores refresh automatically after commits, checkouts, and rebases;
+  refreshes are skipped entirely while `HEAD` stays put, so it costs nothing
+  during regular editing.
+
+>lua
+    require('fff').setup({
+      git = {
+        recency = {
+          enabled = true, -- default: true
+          max_commits = 10, -- window of branch commits to analyze (also the max bonus)
+          max_files_per_commit = 50, -- skip merge/bulk commits touching more files
+        },
+      },
+    })
+<
 
 
 FLOAT COLORS ~

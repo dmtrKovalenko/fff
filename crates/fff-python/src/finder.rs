@@ -252,6 +252,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
+                    git_recency: Default::default(),
                 },
             )
             .map_err(py_err)
@@ -809,7 +810,16 @@ impl FileFinder {
             }
             let canonical = fff::path_utils::canonicalize(&new_path).map_err(py_err)?;
 
-            let (warmup_caches, content_indexing, watch, mode, fs_root, home_dir, follow_symlinks) = {
+            let (
+                warmup_caches,
+                content_indexing,
+                watch,
+                mode,
+                fs_root,
+                home_dir,
+                follow_symlinks,
+                git_recency,
+            ) = {
                 let guard = picker.read().map_err(py_err)?;
                 if let Some(ref picker) = *guard {
                     (
@@ -820,9 +830,20 @@ impl FileFinder {
                         picker.fs_root_scanning_enabled(),
                         picker.home_dir_scanning_enabled(),
                         picker.follows_symlinks(),
+                        picker.git_recency_config(),
                     )
                 } else {
-                    (false, true, true, FFFMode::default(), false, false, false)
+                    (
+                        // just the defaults
+                        false,
+                        true,
+                        true,
+                        FFFMode::default(),
+                        false,
+                        false,
+                        false,
+                        Default::default(),
+                    )
                 }
             };
 
@@ -843,6 +864,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
+                    git_recency,
                 },
             )
             .map_err(py_err)

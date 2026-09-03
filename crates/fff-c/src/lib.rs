@@ -266,6 +266,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             follow_symlinks: opts.version >= 2 && opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            git_recency: Default::default(),
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -932,6 +933,10 @@ pub unsafe extern "C" fn fff_restart_index(
         } else {
             (false, true, true, FFFMode::default(), false, false, false)
         };
+    let git_recency = guard
+        .as_ref()
+        .map(|p| p.git_recency_config())
+        .unwrap_or_default();
 
     drop(guard);
 
@@ -948,6 +953,7 @@ pub unsafe extern "C" fn fff_restart_index(
             follow_symlinks,
             enable_fs_root_scanning: fs_root,
             enable_home_dir_scanning: home_dir,
+            git_recency,
         },
     ) {
         Ok(()) => FffResult::ok_empty(),

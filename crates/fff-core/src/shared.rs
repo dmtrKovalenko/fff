@@ -7,6 +7,7 @@ use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
+use crate::git_recency;
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
 use crate::rescan_throttle::RescanThrottle;
@@ -349,31 +350,42 @@ impl SharedFilePicker {
     /// Refresh git statuses for all indexed files
     #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
-        use tracing::debug;
-
-        let git_status = {
-            let git_root = {
-                let guard = self.read()?;
-                let Some(ref picker) = *guard else {
-                    return Err(Error::FilePickerMissing);
-                };
-                picker.git_root().map(|p| p.to_path_buf())
+        let (git_root, recency_config, base_path) = {
+            // we do the libgit2 off lock cause it might take quite some time on very large repos
+            let guard = self.read()?;
+            let Some(ref picker) = *guard else {
+                return Err(Error::FilePickerMissing);
             };
-
-            debug!(?git_root, "Refreshing git status for picker");
-
-            if let Some(ref root) = git_root {
-                wait_for_git_index_lock_release(root);
-            }
-
-            GitStatusCache::read_git_status(
-                git_root.as_deref(),
-                &mut crate::git::default_status_options(),
+            (
+                picker.git_root().map(|p| p.to_path_buf()),
+                picker.git_recency_config(),
+                picker.base_path().to_path_buf(),
             )
         };
 
+        let repo = git_root.as_deref().and_then(|root| {
+            wait_for_git_index_lock_release(root);
+            Repository::open(root)
+                .inspect_err(|e| tracing::error!(?e, "Failed to open repo for git refresh"))
+                .ok()
+        });
+
+        let git_status = repo.as_ref().and_then(|repo| {
+            GitStatusCache::read_status(repo, &mut crate::git::default_status_options())
+                .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
+                .ok()
+        });
+
+        let recency = repo
+            .as_ref()
+            .and_then(|repo| git_recency::compute_git_recency(repo, &recency_config, &base_path));
+
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+        // picker may have been swapped for another directory while we were off the lock
+        if picker.base_path() != base_path {
+            return Ok(0);
+        }
 
         let statuses_count = if let Some(git_status) = git_status {
             let count = git_status.statuses_len();
@@ -382,6 +394,8 @@ impl SharedFilePicker {
         } else {
             0
         };
+
+        picker.apply_git_recency(recency.as_ref());
 
         Ok(statuses_count)
     }

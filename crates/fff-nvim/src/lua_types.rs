@@ -75,6 +75,7 @@ fn file_item_into_lua(item: &FileItem, lua: &Lua, picker: &FilePicker) -> LuaRes
     )?;
     table.set("total_frecency_score", item.total_frecency_score())?;
     table.set("git_status", format_git_status(item.git_status))?;
+    table.set("git_recency_score", item.git_recency_score)?;
     table.set("is_binary", item.is_binary())?;
     Ok(LuaValue::Table(table))
 }
@@ -100,6 +101,8 @@ fn score_into_lua(score: &Score, lua: &Lua) -> LuaResult<LuaValue> {
     table.set("filename_bonus", score.filename_bonus)?;
     table.set("special_filename_bonus", score.special_filename_bonus)?;
     table.set("frecency_boost", score.frecency_boost)?;
+    table.set("git_status_boost", score.git_status_boost)?;
+    table.set("git_recency_boost", score.git_recency_boost)?;
     table.set("distance_penalty", score.distance_penalty)?;
     table.set("current_file_penalty", score.current_file_penalty)?;
     table.set("combo_match_boost", score.combo_match_boost)?;

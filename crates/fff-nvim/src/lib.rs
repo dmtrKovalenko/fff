@@ -6,8 +6,8 @@ use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
     DbHealthChecker, DirSearchConfig, Error, FFFMode, FFFQuery, FileSearchConfig,
-    FuzzySearchOptions, MixedSearchConfig, PaginationArgs, QueryParser, Score, SearchResult,
-    SharedFilePicker, SharedFrecency, SharedQueryTracker,
+    FuzzySearchOptions, GitRecencyConfig, MixedSearchConfig, PaginationArgs, QueryParser, Score,
+    SearchResult, SharedFilePicker, SharedFrecency, SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
 use mlua::prelude::*;
@@ -68,6 +68,7 @@ struct PickerInitOpts {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     enable_filename_constraint: bool,
+    git_recency: Option<GitRecencyConfig>,
 }
 
 impl PickerInitOpts {
@@ -92,10 +93,52 @@ impl PickerInitOpts {
                 enable_filename_constraint: t
                     .get::<Option<bool>>("enable_filename_constraint")?
                     .unwrap_or(false),
+                git_recency: Self::git_recency_from_lua(
+                    t.get::<Option<mlua::Value>>("git_recency")?,
+                )?,
             }),
             other => Err(LuaError::RuntimeError(format!(
                 "init opts must be a table, boolean, or nil — got {}",
                 other.type_name()
+            ))),
+        }
+    }
+
+    // Accepts a config table or a plain boolean (`recency = false` disables).
+    fn git_recency_from_lua(value: Option<mlua::Value>) -> LuaResult<Option<GitRecencyConfig>> {
+        let defaults = GitRecencyConfig::default();
+        match value {
+            None | Some(mlua::Value::Nil) => Ok(None),
+            Some(mlua::Value::Boolean(enabled)) => Ok(Some(GitRecencyConfig {
+                enabled,
+                ..defaults
+            })),
+            Some(mlua::Value::Table(t)) => Ok(Some(GitRecencyConfig {
+                enabled: t
+                    .get::<Option<bool>>("enabled")?
+                    .unwrap_or(defaults.enabled),
+                max_commits: Self::non_negative(&t, "max_commits")?.unwrap_or(defaults.max_commits),
+                max_files_per_commit: Self::non_negative(&t, "max_files_per_commit")?
+                    .unwrap_or(defaults.max_files_per_commit),
+            })),
+            Some(other) => Err(LuaError::RuntimeError(format!(
+                "git_recency must be a table, boolean, or nil — got {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    // Rejects invalid limits with the offending key named, instead of failing
+    // picker init with mlua's bare conversion error.
+    fn non_negative(t: &mlua::Table, key: &str) -> LuaResult<Option<usize>> {
+        match t.get::<Option<i64>>(key) {
+            Ok(None) => Ok(None),
+            Ok(Some(v)) if v >= 0 => Ok(Some(v as usize)),
+            Ok(Some(v)) => Err(LuaError::RuntimeError(format!(
+                "git_recency.{key} must be a non-negative integer — got {v}"
+            ))),
+            Err(e) => Err(LuaError::RuntimeError(format!(
+                "git_recency.{key} must be a non-negative integer — {e}"
             ))),
         }
     }
@@ -128,6 +171,7 @@ pub fn init_file_picker(
             follow_symlinks: opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            git_recency: opts.git_recency.unwrap_or_default(),
             ..Default::default()
         },
     )
@@ -175,7 +219,7 @@ pub fn restart_index_in_path(
         // Inherit current picker's scanning flags when caller didn't pass
         // explicit opts — otherwise a `:cd ~` after init would silently lose
         // the user's `enable_home_dir_scanning = true` setting.
-        let (follow_symlinks, fs_root, home_dir) = {
+        let (follow_symlinks, fs_root, home_dir, git_recency) = {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -193,11 +237,13 @@ pub fn restart_index_in_path(
                     p.follows_symlinks() || opts.follow_symlinks,
                     p.fs_root_scanning_enabled() || opts.enable_fs_root_scanning,
                     p.home_dir_scanning_enabled() || opts.enable_home_dir_scanning,
+                    opts.git_recency.unwrap_or_else(|| p.git_recency_config()),
                 ),
                 None => (
                     opts.follow_symlinks,
                     opts.enable_fs_root_scanning,
                     opts.enable_home_dir_scanning,
+                    opts.git_recency.unwrap_or_default(),
                 ),
             }
         };
@@ -220,6 +266,7 @@ pub fn restart_index_in_path(
                 follow_symlinks,
                 enable_fs_root_scanning: fs_root,
                 enable_home_dir_scanning: home_dir,
+                git_recency,
                 ..Default::default()
             },
         ) {
@@ -500,6 +547,7 @@ fn build_file_path_fallback(lua: &Lua, path: &Path, total_files: usize) -> LuaRe
     item.set("modification_frecency_score", 0i32)?;
     item.set("total_frecency_score", 0i32)?;
     item.set("git_status", "")?;
+    item.set("git_recency_score", 0i32)?;
     item.set("is_binary", false)?;
 
     let items_table = lua.create_table()?;
@@ -513,9 +561,11 @@ fn build_file_path_fallback(lua: &Lua, path: &Path, total_files: usize) -> LuaRe
     score.set("special_filename_bonus", 0)?;
     score.set("frecency_boost", 0)?;
     score.set("git_status_boost", 0)?;
+    score.set("git_recency_boost", 0)?;
     score.set("distance_penalty", 0)?;
     score.set("current_file_penalty", 0)?;
     score.set("combo_match_boost", 0)?;
+    score.set("path_alignment_bonus", 0)?;
     score.set("exact_match", true)?;
     score.set("match_type", "path")?;
 

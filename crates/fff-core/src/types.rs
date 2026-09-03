@@ -250,6 +250,7 @@ pub struct FileItem {
     pub modified: u64,
     pub access_frecency_score: i16,
     pub modification_frecency_score: i16,
+    pub git_recency_score: i16,
     pub git_status: Option<git2::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
@@ -268,6 +269,7 @@ impl Clone for FileItem {
             modified: self.modified,
             access_frecency_score: self.access_frecency_score,
             modification_frecency_score: self.modification_frecency_score,
+            git_recency_score: self.git_recency_score,
             git_status: self.git_status,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
             // on clone we have to reset the content lock
@@ -312,6 +314,7 @@ impl FileItem {
             modified,
             access_frecency_score: 0,
             modification_frecency_score: 0,
+            git_recency_score: 0,
             git_status,
             flags: AtomicU8::new(flags),
             #[cfg(not(target_os = "windows"))]
@@ -813,6 +816,7 @@ pub struct Score {
     pub special_filename_bonus: i32,
     pub frecency_boost: i32,
     pub git_status_boost: i32,
+    pub git_recency_boost: i32,
     pub distance_penalty: i32,
     pub current_file_penalty: i32,
     pub combo_match_boost: i32,

@@ -66,6 +66,7 @@ local M = {}
 --- @field modes string[]
 --- @field trim_whitespace boolean
 --- @field location_format string
+--- @field enable_filename_constraint boolean
 
 --- @alias FffSelectAction 'edit' | 'split' | 'vsplit' | 'tab'
 
@@ -426,6 +427,13 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      -- Boost files that participated in recent commits of the current branch:
+      -- +1 score point per commit the file appeared in (max = max_commits)
+      recency = {
+        enabled = true,
+        max_commits = 10, -- Analyze the last N branch-specific commits
+        max_files_per_commit = 50, -- Skip bulk commits (merges, refactors) touching more files
+      },
     },
     debug = {
       enabled = false, -- Show file info panel in preview
