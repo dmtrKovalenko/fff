@@ -154,7 +154,8 @@ pub(crate) struct Args {
 
     /// Maximum number of files whose content is kept persistently in memory.
     /// Files beyond this limit are still searchable via temporary mmaps that
-    /// are released after each grep. Defaults to 30 000.
+    /// are released after each grep. `0` disables persistent caching entirely.
+    /// Unset: auto-sized from the scanned file count.
     /// Also settable via the FFF_MAX_CACHED_FILES environment variable.
     #[arg(long = "max-cached-files", env = "FFF_MAX_CACHED_FILES")]
     max_cached_files: Option<usize>,
@@ -347,7 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: FFFMode::Ai,
             cache_budget: args
                 .max_cached_files
-                .map(fff::ContentCacheBudget::new_for_repo),
+                .map(fff::ContentCacheBudget::with_max_files),
             follow_symlinks: args.follow_symlinks,
             enable_home_dir_scanning: args.enable_home_scan,
             enable_fs_root_scanning: args.enable_root_scan,

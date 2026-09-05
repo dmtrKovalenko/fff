@@ -966,6 +966,16 @@ impl ContentCacheBudget {
         }
     }
 
+    /// Apply an explicit file cap verbatim, keeping the default byte caps.
+    /// `0` means no persistent caching at all — files stay searchable through
+    /// the temporary mmaps that grep releases after each call.
+    pub fn with_max_files(max_files: usize) -> Self {
+        Self {
+            max_files,
+            ..Self::default()
+        }
+    }
+
     /// Build a budget from caller-supplied overrides.
     ///
     /// Each argument is a cap; `0` means "use the library default for that
@@ -1000,5 +1010,40 @@ impl ContentCacheBudget {
 impl Default for ContentCacheBudget {
     fn default() -> Self {
         Self::new_for_repo(30_000)
+    }
+}
+
+#[cfg(test)]
+mod content_cache_budget_tests {
+    use super::*;
+
+    #[test]
+    fn with_max_files_applies_the_cap_verbatim() {
+        // regression: the cap used to be routed through new_for_repo, which
+        // read it as a repo file count and bucketed 2000 up to 30_000
+        assert_eq!(ContentCacheBudget::with_max_files(2000).max_files, 2000);
+        assert_eq!(ContentCacheBudget::with_max_files(7).max_files, 7);
+        assert_eq!(
+            ContentCacheBudget::with_max_files(1_000_000).max_files,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn with_max_files_zero_disables_persistent_caching_but_keeps_grep() {
+        let budget = ContentCacheBudget::with_max_files(0);
+        assert_eq!(budget.max_files, 0);
+        assert!(budget.is_exhausted());
+        // temporary-mmap grep is gated on max_file_size, which must survive
+        assert_eq!(budget.max_file_size, MAX_FFFILE_SIZE);
+        assert!(budget.max_bytes > 0);
+    }
+
+    #[test]
+    fn with_max_files_keeps_default_byte_caps() {
+        let budget = ContentCacheBudget::with_max_files(2000);
+        let default = ContentCacheBudget::default();
+        assert_eq!(budget.max_bytes, default.max_bytes);
+        assert_eq!(budget.max_file_size, default.max_file_size);
     }
 }
