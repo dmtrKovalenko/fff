@@ -78,6 +78,10 @@ function resolveToolNames(mode: FffMode): ToolNames {
   return mode === "override" ? OVERRIDE_TOOL_NAMES : FFF_TOOL_NAMES;
 }
 
+function toolNameList(names: ToolNames): string[] {
+  return [names.grep, names.find, names.multiGrep];
+}
+
 // ---------------------------------------------------------------------------
 // Cursor store — simple bounded Map for pagination cursors
 // ---------------------------------------------------------------------------
@@ -670,11 +674,19 @@ export default function fffExtension(pi: ExtensionAPI) {
     });
   }
 
-  function registerPendingTools(): void {
+  // Pi carries the active tool list across /reload, so names activated under a
+  // previously used mode stay active unless we drop them here (#855).
+  function registerPendingTools(staleNames: readonly string[]): void {
     if (toolsRegistered) return;
 
-    const registeredNames = pendingTools.map((register) => register());
-    pi.setActiveTools([...new Set([...pi.getActiveTools(), ...registeredNames])]);
+    const registeredNames = new Set(pendingTools.map((register) => register()));
+    const stale = new Set(staleNames.filter((name) => !registeredNames.has(name)));
+    pi.setActiveTools([
+      ...new Set([
+        ...pi.getActiveTools().filter((name) => !stale.has(name)),
+        ...registeredNames,
+      ]),
+    ]);
     toolsRegistered = true;
   }
 
@@ -734,24 +746,19 @@ export default function fffExtension(pi: ExtensionAPI) {
     // Pi populates extension flag values after loading extensions.
     resolveStartupConfig();
 
+    // FFF-named tools are ours alone, so they are always safe to drop. Override
+    // names collide with pi's builtins and are only stale once this session ran
+    // in override mode, which is the sole way we could have activated them.
+    const staleNames = toolNameList(FFF_TOOL_NAMES);
+    let usedOverride = currentMode === "override";
+
     // Restore persisted mode before registering tools so a saved override
     // can safely change their names after /reload or session resume.
-    const entries = ctx.sessionManager?.getEntries();
-    if (entries) {
-      const modeEntry = [...entries]
-        .reverse()
-        .find(
-          (e: { type: string; customType?: string }) =>
-            e.type === "custom" && e.customType === "fff-mode",
-        );
-      if (
-        modeEntry &&
-        typeof (modeEntry as any).data?.mode === "string" &&
-        VALID_MODES.includes((modeEntry as any).data.mode as FffMode)
-      ) {
-        const restored = (modeEntry as any).data.mode as FffMode;
-        if (restored !== currentMode) setMode(restored);
-      }
+    const modes = sessionModes(ctx.sessionManager?.getEntries());
+    if (modes.length > 0) {
+      const restored = modes[modes.length - 1];
+      if (restored !== currentMode) setMode(restored);
+      usedOverride = usedOverride || modes.includes("override");
     }
 
     initializeFinderFactories();
@@ -759,10 +766,16 @@ export default function fffExtension(pi: ExtensionAPI) {
     // `override` replaces pi's built-in grep/find. With the cwd opted out of
     // indexing that would leave the session without any working workspace
     // search, so keep the FFF names and let the built-ins stand (issue #857).
-    if (currentMode === "override" && scanOptOutReason(activeCwd))
-      toolNames = FFF_TOOL_NAMES;
+    const keepBuiltins =
+      currentMode === "override" && scanOptOutReason(activeCwd) !== null;
+    if (keepBuiltins) toolNames = FFF_TOOL_NAMES;
 
-    registerPendingTools();
+    // Pruning the override names here would deactivate the built-ins #857 just
+    // chose to keep, so only prune once FFF really takes those names over.
+    if (usedOverride && !keepBuiltins)
+      staleNames.push(...toolNameList(OVERRIDE_TOOL_NAMES));
+
+    registerPendingTools(staleNames);
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1387,4 +1400,23 @@ export default function fffExtension(pi: ExtensionAPI) {
       ctx.ui.notify("FFF rescan triggered", "info");
     },
   });
+}
+
+// Every mode this session selected via /fff-mode, oldest first.
+function sessionModes(entries: unknown): FffMode[] {
+  if (!Array.isArray(entries)) return [];
+
+  const modes: FffMode[] = [];
+  for (const entry of entries as {
+    type?: string;
+    customType?: string;
+    data?: unknown;
+  }[]) {
+    if (entry?.type !== "custom" || entry.customType !== "fff-mode") continue;
+    const mode = (entry.data as { mode?: unknown } | undefined)?.mode;
+    if (typeof mode === "string" && VALID_MODES.includes(mode as FffMode)) {
+      modes.push(mode as FffMode);
+    }
+  }
+  return modes;
 }
