@@ -278,7 +278,7 @@ impl FileSync {
     fn tombstone_files_with_arena<F, T>(&mut self, mut predicate: F, mut on_tombstone: T) -> usize
     where
         F: FnMut(&FileItem, ArenaPtr) -> bool,
-        T: FnMut(&FileItem, ArenaPtr),
+        T: FnMut(&mut FileItem, ArenaPtr),
     {
         let base_arena = self.arena_base_ptr();
         let overflow_arena = self.arena_overflow_ptr();
@@ -1816,6 +1816,7 @@ impl FilePicker {
         }
 
         let base_path = self.base_path.clone();
+        let cache_budget = &self.cache_budget;
         let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         let tombstoned = self.sync_data.tombstone_files_with_arena(
             |file, arena| {
@@ -1824,6 +1825,7 @@ impl FilePicker {
                     .any(|prefix| file.relative_path_starts_with(arena, prefix))
             },
             |file, arena| {
+                file.invalidate_mmap(cache_budget);
                 if let Some(callback) = callback.as_mut() {
                     callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
                 }
@@ -2383,6 +2385,21 @@ fn common_dir_prefix_len(a: &str, b: &str) -> usize {
         }
     }
     last_sep
+}
+
+/// Keep mimalloc off 2 MiB huge pages: with THP the arena is resident at
+/// 2 MiB granularity and idle index memory inflates RSS by ~2x. Env overrides win.
+/// Must run before the first allocation (see `fff_nvim`'s init-array hook).
+#[cfg(feature = "mimalloc-collect")]
+pub extern "C" fn tune_mimalloc() {
+    // SAFETY: getenv/mi_option_set touch static tables only; no allocation happens here.
+    unsafe {
+        let user_set = !libc::getenv(c"MIMALLOC_ALLOW_LARGE_OS_PAGES".as_ptr()).is_null()
+            || !libc::getenv(c"MIMALLOC_LARGE_OS_PAGES".as_ptr()).is_null();
+        if !user_set {
+            libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_large_os_pages, 0);
+        }
+    }
 }
 
 /// Ask the global allocator to return freed pages to the OS.

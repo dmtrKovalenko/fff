@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(not(target_os = "windows"))]
@@ -254,9 +254,17 @@ pub struct FileItem {
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
-    /// Lazy mmap cache. Only populated by the actual file read, controlled by the budget.
+    /// Lazy mmap cache (boxed, set once). Only populated by the actual file
+    /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
-    content: OnceLock<memmap2::Mmap>,
+    content: AtomicPtr<memmap2::Mmap>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for FileItem {
+    fn drop(&mut self) {
+        self.take_content();
+    }
 }
 
 impl Clone for FileItem {
@@ -270,9 +278,9 @@ impl Clone for FileItem {
             modification_frecency_score: self.modification_frecency_score,
             git_status: self.git_status,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
-            // on clone we have to reset the content lock
+            // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
-            content: OnceLock::new(),
+            content: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -315,7 +323,7 @@ impl FileItem {
             git_status,
             flags: AtomicU8::new(flags),
             #[cfg(not(target_os = "windows"))]
-            content: OnceLock::new(),
+            content: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -632,12 +640,25 @@ impl FileItem {
     /// invalidating ensures a fresh read on the next access.
     #[cfg(not(target_os = "windows"))]
     pub fn invalidate_mmap(&mut self, budget: &ContentCacheBudget) {
-        if self.content.get().is_some() {
+        if self.take_content().is_some() {
             budget.cached_count.fetch_sub(1, Ordering::Relaxed);
             budget.cached_bytes.fetch_sub(self.size, Ordering::Relaxed);
         }
+    }
 
-        self.content = OnceLock::new();
+    #[cfg(not(target_os = "windows"))]
+    #[inline]
+    fn cached_content(&self) -> Option<&[u8]> {
+        let ptr = self.content.load(Ordering::Acquire);
+        // SAFETY: a non-null pointer is a leaked Box owned by this item until `take_content`.
+        (!ptr.is_null()).then(|| unsafe { (&*ptr).as_ref() })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn take_content(&mut self) -> Option<Box<memmap2::Mmap>> {
+        let ptr = self.content.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: non-null pointers always come from `Box::into_raw` in `get_cached_content`.
+        (!ptr.is_null()).then(|| unsafe { Box::from_raw(ptr) })
     }
 
     #[cfg(target_os = "windows")]
@@ -694,7 +715,7 @@ impl FileItem {
         base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&[u8]> {
-        if let Some(content) = self.content.get() {
+        if let Some(content) = self.cached_content() {
             return Some(content);
         }
 
@@ -717,12 +738,22 @@ impl FileItem {
         // file updates; the only risk is SIGBUS on a concurrent truncate,
         // which the watcher mitigates by invalidating on modification.
         let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-        let result = self.content.get_or_init(|| mmap);
+        let fresh = Box::into_raw(Box::new(mmap));
+        match self.content.compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                budget.cached_count.fetch_add(1, Ordering::Relaxed);
+                budget.cached_bytes.fetch_add(self.size, Ordering::Relaxed);
+            }
+            // Lost the race: another thread cached first, keep theirs.
+            Err(_) => drop(unsafe { Box::from_raw(fresh) }),
+        }
 
-        budget.cached_count.fetch_add(1, Ordering::Relaxed);
-        budget.cached_bytes.fetch_add(self.size, Ordering::Relaxed);
-
-        Some(result)
+        self.cached_content()
     }
 
     /// Get file content for searching — **always returns content** for eligible

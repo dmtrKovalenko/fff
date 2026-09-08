@@ -27,6 +27,19 @@ mod user_config;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// Runs at load time, before mimalloc maps its first arena.
+#[used]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
+static TUNE_MIMALLOC: extern "C" fn() = fff::tune_mimalloc;
+
 // the global state for neovim lives here for efficiency
 // lua ffi is pretty bad with the overhead of converting raw pointer into tables
 pub static FILE_PICKER: Lazy<SharedFilePicker> = Lazy::new(SharedFilePicker::default);

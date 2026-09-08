@@ -1,18 +1,17 @@
 use ahash::AHashMap;
-use smallvec::SmallVec;
 use std::borrow::Cow;
 
 /// SIMD chunk size in bytes (matches NEON/SSE2 register width).
 /// This must stay in sync with neo_frizbee's internal chunk size.
 pub(crate) const SIMD_CHUNK_BYTES: usize = 16;
 
-/// 4 chunks = 64 bytes inline, covers ~85% of paths without heap fallback.
-const INLINE_CHUNKS: usize = 4;
-
-pub(crate) type ChunkIndices = SmallVec<[u32; INLINE_CHUNKS]>;
-
+/// Read-only view of a path store: 16-byte chunk arena plus the flat table of
+/// per-path chunk indices. Both point into the owning store's Vecs.
 #[derive(Clone, Copy)]
-pub struct ArenaPtr(pub(crate) *const u8);
+pub struct ArenaPtr {
+    chunks: *const u8,
+    indices: *const u32,
+}
 
 // SAFETY: The arena is a read-only immutable part of file sync
 unsafe impl Send for ArenaPtr {}
@@ -20,24 +19,32 @@ unsafe impl Sync for ArenaPtr {}
 
 impl ArenaPtr {
     #[inline]
-    pub fn new(ptr: *const u8) -> Self {
-        Self(ptr)
+    pub fn new(chunks: *const u8, indices: *const u32) -> Self {
+        Self { chunks, indices }
     }
 
     #[inline]
     pub fn null() -> Self {
-        Self(std::ptr::null())
+        Self {
+            chunks: std::ptr::null(),
+            indices: std::ptr::null(),
+        }
     }
 
     #[inline]
     pub fn as_ptr(self) -> *const u8 {
-        self.0
+        self.chunks
+    }
+
+    #[inline]
+    fn chunk_ptr(self, idx: u32) -> *const u8 {
+        unsafe { self.chunks.add(idx as usize * SIMD_CHUNK_BYTES) }
     }
 }
 
 impl std::fmt::Debug for ArenaPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "--arena-raw-pointer-0x({:?})", self.0)
+        write!(f, "--arena-raw-pointer-0x({:?})", self.chunks)
     }
 }
 
@@ -65,13 +72,11 @@ pub use crate::constants::PATH_BUF_SIZE;
 /// Chunk pointer capacity needed for the longest path the platform allows.
 pub(crate) const MAX_PATH_CHUNKS: usize = PATH_BUF_SIZE.div_ceil(SIMD_CHUNK_BYTES);
 
-/// Indices into a shared `SimdChunk` arena representing a file path.
-///
-/// All read methods require an explicit `arena_base` pointer from the owning
-/// `ChunkedPathStore`. The struct itself contains no raw pointers to the arena
+/// A path stored as a run of chunk indices in the owning store's flat index
+/// table. 8 bytes; every read needs the store's `ArenaPtr`.
 #[derive(Clone)]
 pub(crate) struct ChunkedString {
-    indices: ChunkIndices,
+    index_offset: u32,
     pub byte_len: u16,
     /// Byte offset where the filename begins. 0 for root-level files.
     pub filename_offset: u16,
@@ -80,32 +85,41 @@ pub(crate) struct ChunkedString {
 impl ChunkedString {
     pub fn empty() -> Self {
         Self {
-            indices: SmallVec::new(),
+            index_offset: 0,
             byte_len: 0,
             filename_offset: 0,
         }
     }
 
     #[inline]
-    pub fn new(indices: ChunkIndices, byte_len: u16, filename_offset: u16) -> Self {
+    pub fn new(index_offset: u32, byte_len: u16, filename_offset: u16) -> Self {
         Self {
-            indices,
+            index_offset,
             byte_len,
             filename_offset,
         }
     }
 
-    #[cfg(test)]
+    #[inline]
     pub fn chunk_count(&self) -> usize {
-        self.indices.len()
+        chunks_needed(self.byte_len as usize)
+    }
+
+    #[inline]
+    fn indices<'a>(&self, arena: ArenaPtr) -> &'a [u32] {
+        let count = self.chunk_count();
+        if count == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(arena.indices.add(self.index_offset as usize), count) }
     }
 
     #[inline]
     pub fn resolve_ptrs<'a>(&self, arena: ArenaPtr, buf: &'a mut [*const u8]) -> &'a [*const u8] {
-        let count = self.indices.len().min(buf.len());
-        let base = arena.as_ptr();
-        for (i, &idx) in self.indices[..count].iter().enumerate() {
-            buf[i] = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
+        let indices = self.indices(arena);
+        let count = indices.len().min(buf.len());
+        for (slot, &idx) in buf.iter_mut().zip(&indices[..count]) {
+            *slot = arena.chunk_ptr(idx);
         }
         &buf[..count]
     }
@@ -113,15 +127,15 @@ impl ChunkedString {
     #[inline]
     fn write_slice_to_vec(
         indices: &[u32],
-        base: *const u8,
+        arena: ArenaPtr,
         offset_in_chunk: usize,
         len: usize,
         vec: &mut Vec<u8>,
     ) {
         let mut written = 0usize;
         for (i, &idx) in indices.iter().enumerate() {
-            let src = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
-            let chunk_bytes = unsafe { core::slice::from_raw_parts(src, SIMD_CHUNK_BYTES) };
+            let chunk_bytes =
+                unsafe { core::slice::from_raw_parts(arena.chunk_ptr(idx), SIMD_CHUNK_BYTES) };
             let start = if i == 0 { offset_in_chunk } else { 0 };
             let end = SIMD_CHUNK_BYTES.min(start + (len - written));
             vec.extend_from_slice(&chunk_bytes[start..end]);
@@ -142,12 +156,12 @@ impl ChunkedString {
             return Cow::Borrowed("");
         }
 
-        let base = arena.as_ptr();
+        let indices = self.indices(arena);
         let start_chunk = fname_offset / SIMD_CHUNK_BYTES;
         let offset_in_chunk = fname_offset % SIMD_CHUNK_BYTES;
 
         if offset_in_chunk == 0 && fname_len <= SIMD_CHUNK_BYTES {
-            let ptr = unsafe { base.add(self.indices[start_chunk] as usize * SIMD_CHUNK_BYTES) };
+            let ptr = arena.chunk_ptr(indices[start_chunk]);
             let slice = unsafe { core::slice::from_raw_parts(ptr, fname_len) };
             return Cow::Borrowed(unsafe { core::str::from_utf8_unchecked(slice) });
         }
@@ -155,8 +169,8 @@ impl ChunkedString {
         let mut out = String::with_capacity(fname_len);
         let needed_chunks = chunks_needed(offset_in_chunk + fname_len);
         Self::write_slice_to_vec(
-            &self.indices[start_chunk..start_chunk + needed_chunks],
-            base,
+            &indices[start_chunk..start_chunk + needed_chunks],
+            arena,
             offset_in_chunk,
             fname_len,
             unsafe { out.as_mut_vec() },
@@ -168,17 +182,19 @@ impl ChunkedString {
     #[inline]
     pub fn read_to_buf<'a>(&self, arena: ArenaPtr, buf: &'a mut [u8]) -> &'a str {
         let total = (self.byte_len as usize).min(buf.len());
-        let usable_chunks = total.div_ceil(SIMD_CHUNK_BYTES);
-        let chunks_to_copy = usable_chunks.min(self.indices.len());
-        let base = arena.as_ptr();
+        let indices = self.indices(arena);
+        let chunks_to_copy = total.div_ceil(SIMD_CHUNK_BYTES).min(indices.len());
 
-        for (i, &idx) in self.indices[..chunks_to_copy].iter().enumerate() {
-            let src = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
+        for (i, &idx) in indices[..chunks_to_copy].iter().enumerate() {
             let dst_offset = i * SIMD_CHUNK_BYTES;
             let take = SIMD_CHUNK_BYTES.min(total - dst_offset);
 
             unsafe {
-                core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr().add(dst_offset), take);
+                core::ptr::copy_nonoverlapping(
+                    arena.chunk_ptr(idx),
+                    buf.as_mut_ptr().add(dst_offset),
+                    take,
+                );
             }
         }
 
@@ -191,13 +207,14 @@ impl ChunkedString {
 
         let dir_len = self.filename_offset as usize;
         out.reserve(dir_len);
-        let dir_chunks = chunks_needed(dir_len).min(self.indices.len());
-        let base = arena.as_ptr();
+        let indices = self.indices(arena);
+        let dir_chunks = chunks_needed(dir_len).min(indices.len());
         let vec = unsafe { out.as_mut_vec() };
-        for (i, &idx) in self.indices[..dir_chunks].iter().enumerate() {
-            let src = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
+        for (i, &idx) in indices[..dir_chunks].iter().enumerate() {
             let take = SIMD_CHUNK_BYTES.min(dir_len - i * SIMD_CHUNK_BYTES);
-            vec.extend_from_slice(unsafe { core::slice::from_raw_parts(src, take) });
+            vec.extend_from_slice(unsafe {
+                core::slice::from_raw_parts(arena.chunk_ptr(idx), take)
+            });
         }
     }
 
@@ -208,12 +225,13 @@ impl ChunkedString {
         let fname_offset = self.filename_offset as usize;
         let fname_len = self.byte_len as usize - fname_offset;
         out.reserve(fname_len);
+        let indices = self.indices(arena);
         let start_chunk = fname_offset / SIMD_CHUNK_BYTES;
         let offset_in_chunk = fname_offset % SIMD_CHUNK_BYTES;
         let needed_chunks = chunks_needed(offset_in_chunk + fname_len);
         Self::write_slice_to_vec(
-            &self.indices[start_chunk..start_chunk + needed_chunks],
-            arena.as_ptr(),
+            &indices[start_chunk..start_chunk + needed_chunks],
+            arena,
             offset_in_chunk,
             fname_len,
             unsafe { out.as_mut_vec() },
@@ -229,12 +247,12 @@ impl ChunkedString {
             return;
         }
         out.reserve(total);
-        let base = arena.as_ptr();
         let vec = unsafe { out.as_mut_vec() };
-        for (i, &idx) in self.indices.iter().enumerate() {
-            let src = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
+        for (i, &idx) in self.indices(arena).iter().enumerate() {
             let take = SIMD_CHUNK_BYTES.min(total - i * SIMD_CHUNK_BYTES);
-            vec.extend_from_slice(unsafe { core::slice::from_raw_parts(src, take) });
+            vec.extend_from_slice(unsafe {
+                core::slice::from_raw_parts(arena.chunk_ptr(idx), take)
+            });
         }
     }
 }
@@ -242,8 +260,8 @@ impl ChunkedString {
 impl std::fmt::Debug for ChunkedString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChunkedString")
-            .field("indices", &self.indices.as_slice())
-            .field("chunks", &self.indices.len())
+            .field("index_offset", &self.index_offset)
+            .field("chunks", &self.chunk_count())
             .field("byte_len", &self.byte_len)
             .field("filename_offset", &self.filename_offset)
             .finish()
@@ -262,6 +280,7 @@ const fn chunks_needed(byte_len: usize) -> usize {
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkedPathStore {
     arena: Vec<SimdChunk>,
+    indices: Vec<u32>,
 }
 
 // SAFETY: arena is immutable after construction. Pointers derived from it are
@@ -271,7 +290,7 @@ unsafe impl Sync for ChunkedPathStore {}
 
 impl ChunkedPathStore {
     pub fn heap_bytes(&self) -> usize {
-        self.arena.len() * SIMD_CHUNK_BYTES
+        self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
     }
 
     #[cfg(test)]
@@ -281,7 +300,7 @@ impl ChunkedPathStore {
 
     #[inline]
     pub fn as_arena_ptr(&self) -> ArenaPtr {
-        ArenaPtr::new(self.arena.as_ptr() as *const u8)
+        ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
     }
 }
 
@@ -289,25 +308,34 @@ impl ChunkedPathStore {
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkedPathStoreBuilder {
     arena: Vec<SimdChunk>,
+    indices: Vec<u32>,
     chunk_dedup: AHashMap<[u8; SIMD_CHUNK_BYTES], u32>,
 }
 
 impl ChunkedPathStoreBuilder {
     pub fn new(estimated_files: usize) -> Self {
-        let est_chunks = estimated_files * INLINE_CHUNKS; // we know that most of repos will fit
-        // most paths into 64 = 16 * INLINE_CHUNKS
+        // most paths fit into 64 bytes = 4 chunks; dedup keeps the arena well below that
+        let est_indices = estimated_files * 4;
         Self {
-            arena: Vec::with_capacity(est_chunks),
-            chunk_dedup: AHashMap::with_capacity(est_chunks),
+            arena: Vec::with_capacity(est_indices / 2),
+            indices: Vec::with_capacity(est_indices),
+            chunk_dedup: AHashMap::with_capacity(est_indices / 2),
         }
     }
 
     pub fn finish(self) -> ChunkedPathStore {
-        ChunkedPathStore { arena: self.arena }
+        let Self {
+            mut arena,
+            mut indices,
+            ..
+        } = self;
+        arena.shrink_to_fit();
+        indices.shrink_to_fit();
+        ChunkedPathStore { arena, indices }
     }
 
     pub fn as_arena_ptr(&self) -> ArenaPtr {
-        ArenaPtr::new(self.arena.as_ptr() as *const u8)
+        ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
     }
 
     /// Like [`add_file_immediate`] but for directory paths where the entire
@@ -318,8 +346,7 @@ impl ChunkedPathStoreBuilder {
 
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
-        let byte_len = rel_path.len();
-        let mut indices = ChunkIndices::with_capacity(chunks_needed(byte_len));
+        let index_offset = self.indices.len() as u32;
 
         for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
@@ -335,10 +362,10 @@ impl ChunkedPathStoreBuilder {
                 }
             };
 
-            indices.push(arena_idx);
+            self.indices.push(arena_idx);
         }
 
-        ChunkedString::new(indices, byte_len as u16, filename_offset)
+        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
     }
 }
 
@@ -571,11 +598,7 @@ mod tests {
 
         let mut buf = [0u8; 512];
         assert_eq!(cs.read_to_buf(arena, &mut buf), path);
-        assert!(
-            cs.chunk_count() <= 6,
-            "should fit inline in ChunkIndices (INLINE_CHUNKS={})",
-            INLINE_CHUNKS
-        );
+        assert_eq!(cs.chunk_count(), path.len().div_ceil(SIMD_CHUNK_BYTES));
     }
 
     #[test]

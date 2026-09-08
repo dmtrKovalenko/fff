@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_apply_constraints_file_path_with_unicode_suffix() {
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
 
         let item = TestItem {
             relative_path: "data/유니코드_파일_테스트.csv",
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_negated_glob_excludes_matching_files() {
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
 
         let items = vec![
             TestItem {
@@ -882,7 +882,7 @@ mod tests {
     fn test_inline_glob_path_matches_prepass() {
         // Mixed (extensions + glob) takes the inline-compiled path.
         // Pure glob takes the prepass bitmap path. Both must give identical results.
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
         let items = vec![
             TestItem {
                 relative_path: "src/main.rs",
@@ -925,7 +925,7 @@ mod tests {
     fn test_inline_negated_glob_with_extension() {
         // Mixed Not(Glob) on inline path — exercise the negate=true branch in
         // glob_matches_inline through the Not->Glob recursion.
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
         let items = vec![
             TestItem {
                 relative_path: "src/main.rs",
