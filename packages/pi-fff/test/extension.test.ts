@@ -251,9 +251,12 @@ describe("pi-fff global config", () => {
     const setup = await start();
     const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
 
-    expect(toolNames).toContain("grep");
-    expect(toolNames).toContain("find");
-    expect(toolNames).not.toContain("ffgrep");
+    expect(toolNames).toEqual(
+      expect.arrayContaining(["ffgrep", "fffind", "grep", "find"]),
+    );
+    expect(setup.pi.setActiveTools).toHaveBeenLastCalledWith(
+      expect.not.arrayContaining(["ffgrep", "fffind"]),
+    );
     expect(createCalls[0]).toEqual({
       basePath: "/tmp/workspace",
       frecencyDbPath: "/config/frecency",
@@ -320,9 +323,12 @@ describe("pi-fff global config", () => {
     const setup = await start("invalid-flag-mode");
     const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
 
-    expect(toolNames).toContain("grep");
-    expect(toolNames).toContain("find");
-    expect(toolNames).not.toContain("ffgrep");
+    expect(toolNames).toEqual(
+      expect.arrayContaining(["ffgrep", "fffind", "grep", "find"]),
+    );
+    expect(setup.pi.setActiveTools).toHaveBeenLastCalledWith(
+      expect.not.arrayContaining(["ffgrep", "fffind"]),
+    );
     await shutdown(setup);
   });
 });
@@ -332,7 +338,7 @@ function writeConfig(config: Record<string, unknown>): void {
 }
 
 describe("pi-fff session mode", () => {
-  test("registers tools only after restoring the saved mode", async () => {
+  test("pre-registers FFF renderers before restoring the saved mode", async () => {
     const setup = createPi("tools-and-ui");
     const ctx = createContext();
     ctx.sessionManager.getEntries.mockReturnValue([
@@ -340,19 +346,42 @@ describe("pi-fff session mode", () => {
     ]);
     fffExtension(setup.pi as any);
 
-    expect(setup.pi.registerTool).not.toHaveBeenCalled();
+    expect(setup.pi.registerTool.mock.calls.map(([tool]) => tool.name)).toEqual([
+      "ffgrep",
+      "fffind",
+    ]);
+    expect(setup.pi.setActiveTools).not.toHaveBeenCalled();
     await setup.events.get("session_start")?.({ reason: "startup" }, ctx);
 
     const tools = setup.pi.registerTool.mock.calls.map(([tool]) => tool);
     const toolNames = tools.map((tool) => tool.name);
-    expect(toolNames).toContain("grep");
-    expect(toolNames).toContain("find");
-    expect(toolNames).not.toContain("ffgrep");
-    expect(toolNames).not.toContain("fffind");
-    const grepTool = tools.find((tool) => tool.name === "grep");
-    expect(grepTool.promptGuidelines[0].startsWith("grep:")).toBe(true);
+    expect(toolNames).toEqual(
+      expect.arrayContaining(["ffgrep", "fffind", "grep", "find"]),
+    );
+    const historicalGrep = tools.find((tool) => tool.name === "ffgrep");
+    const activeGrep = tools.find((tool) => tool.name === "grep");
+    const theme = {
+      bold: (text: string) => text,
+      fg: (_color: string, text: string) => text,
+    };
+    const historicalCall = historicalGrep.renderCall(
+      { pattern: "TODO", path: "." },
+      theme,
+      { state: {}, invalidate: mock(() => undefined), isError: false },
+    );
+    const activeCall = activeGrep.renderCall({ pattern: "TODO", path: "." }, theme, {
+      state: {},
+      invalidate: mock(() => undefined),
+      isError: false,
+    });
+    expect(historicalCall.text).toBe("ffgrep /TODO/ in .");
+    expect(activeCall.text).toBe("grep /TODO/ in .");
+    expect(activeGrep.promptGuidelines[0].startsWith("grep:")).toBe(true);
     expect(setup.pi.setActiveTools).toHaveBeenCalledWith(
       expect.arrayContaining(["read", "grep", "find"]),
+    );
+    expect(setup.pi.setActiveTools).toHaveBeenLastCalledWith(
+      expect.not.arrayContaining(["ffgrep", "fffind"]),
     );
 
     await setup.commands.get("fff-mode").handler("", ctx);
@@ -363,17 +392,47 @@ describe("pi-fff session mode", () => {
     await shutdown(setup);
   });
 
+  test("prunes auto-activated FFF names when override is the final mode", async () => {
+    const setup = createPi("tools-and-ui");
+    const ctx = createContext();
+    ctx.sessionManager.getEntries.mockReturnValue([
+      { type: "custom", customType: "fff-mode", data: { mode: "override" } },
+    ]);
+    fffExtension(setup.pi as any);
+
+    // Pi core activates every newly registered tool, so the early FFF
+    // registrations are active by the time session_start runs.
+    setup.pi.getActiveTools.mockReturnValue(["read", "ffgrep", "fffind"]);
+    await setup.events.get("session_start")?.({ reason: "startup" }, ctx);
+
+    expect(setup.pi.setActiveTools).toHaveBeenLastCalledWith(
+      expect.arrayContaining(["read", "grep", "find"]),
+    );
+    expect(setup.pi.setActiveTools).toHaveBeenLastCalledWith(
+      expect.not.arrayContaining(["ffgrep", "fffind"]),
+    );
+    await shutdown(setup);
+  });
+
   test("registers tools before an unbound SDK session's first agent turn", async () => {
     const setup = createPi("override");
     const ctx = createContext();
     fffExtension(setup.pi as any);
 
-    expect(setup.pi.registerTool).not.toHaveBeenCalled();
+    expect(setup.pi.registerTool.mock.calls.map(([tool]) => tool.name)).toEqual([
+      "ffgrep",
+      "fffind",
+    ]);
+    expect(setup.pi.setActiveTools).not.toHaveBeenCalled();
     await setup.events.get("before_agent_start")?.({}, ctx);
 
     const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
-    expect(toolNames).toContain("grep");
-    expect(toolNames).toContain("find");
+    expect(toolNames).toEqual(
+      expect.arrayContaining(["ffgrep", "fffind", "grep", "find"]),
+    );
+    expect(setup.pi.setActiveTools).toHaveBeenLastCalledWith(
+      expect.not.arrayContaining(["ffgrep", "fffind"]),
+    );
     expect(createCalls).toHaveLength(0);
     await shutdown(setup);
   });
