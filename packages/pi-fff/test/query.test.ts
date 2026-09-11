@@ -2,12 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { buildQuery, normalizePathConstraint } from "../src/query";
 
 const cwd = "/tmp/workspace";
+const defaultExcludes = [".worktrees/", ".claude/worktrees/"];
 
 describe("path constraint normalization", () => {
   test("converts absolute in-workspace paths to repo-relative constraints", () => {
-    expect(normalizePathConstraint("/tmp/workspace/.agents/**", cwd)).toBe(".agents/");
+    expect(normalizePathConstraint("/tmp/workspace/.agents/**", cwd)).toBe(".agents/**");
     expect(normalizePathConstraint("/tmp/workspace/.agents/plans/**", cwd)).toBe(
-      ".agents/plans/",
+      ".agents/plans/**",
     );
   });
 
@@ -17,9 +18,9 @@ describe("path constraint normalization", () => {
     );
   });
 
-  test("collapses only simple trailing recursive directory globs", () => {
-    expect(normalizePathConstraint(".agents/**", cwd)).toBe(".agents/");
-    expect(normalizePathConstraint("src/**/*", cwd)).toBe("src/");
+  test("preserves recursive directory globs as root-relative constraints", () => {
+    expect(normalizePathConstraint(".agents/**", cwd)).toBe(".agents/**");
+    expect(normalizePathConstraint("src/**/*", cwd)).toBe("src/**/*");
     expect(normalizePathConstraint("src/**/*.ts", cwd)).toBe("src/**/*.ts");
     expect(normalizePathConstraint("{src,lib}/**", cwd)).toBe("{src,lib}/**");
   });
@@ -27,7 +28,7 @@ describe("path constraint normalization", () => {
   test("builds find queries with normalized include and exclude constraints", () => {
     expect(
       buildQuery("/tmp/workspace/.agents/**", "*", "/tmp/workspace/test/**", cwd),
-    ).toBe(".agents/ !test/ *");
+    ).toBe(".agents/** !test/** *");
   });
 
   test("treats path='.' as workspace root (no constraint)", () => {
@@ -75,5 +76,28 @@ describe("path constraint normalization", () => {
     expect(normalizePathConstraint("**/*", cwd)).toBeNull();
     expect(normalizePathConstraint("./**", cwd)).toBeNull();
     expect(buildQuery("**", "needle", undefined, cwd)).toBe("needle");
+  });
+});
+
+describe("default excludes", () => {
+  test("adds configured excludes to ordinary queries", () => {
+    expect(buildQuery("src/**", "needle", undefined, cwd, defaultExcludes)).toBe(
+      "src/** !.worktrees/ !.claude/worktrees/ needle",
+    );
+  });
+
+  test("combines configured and caller excludes", () => {
+    expect(buildQuery("src/**", "needle", "test/", cwd, defaultExcludes)).toBe(
+      "src/** !.worktrees/ !.claude/worktrees/ !test/ needle",
+    );
+  });
+
+  test("does not apply an exclude when path explicitly targets it", () => {
+    expect(
+      buildQuery(".worktrees/demo/**", "needle", undefined, cwd, defaultExcludes),
+    ).toBe(".worktrees/demo/** needle");
+    expect(
+      buildQuery(".claude/worktrees/demo/**", "needle", undefined, cwd, defaultExcludes),
+    ).toBe(".claude/worktrees/demo/** needle");
   });
 });

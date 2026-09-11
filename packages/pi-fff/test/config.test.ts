@@ -33,6 +33,7 @@ describe("loadConfig", () => {
       enableHomeDirScanning: false,
       warnOnHomeDirScan: false,
       followSymlinks: true,
+      defaultExcludes: [".worktrees/", ".claude/worktrees/"],
     };
     writeConfig(config);
 
@@ -70,6 +71,14 @@ describe("loadConfig", () => {
       [{ enableHomeDirScanning: "false" }, '"enableHomeDirScanning" must be a boolean'],
       [{ warnOnHomeDirScan: "false" }, '"warnOnHomeDirScan" must be a boolean'],
       [{ followSymlinks: "true" }, '"followSymlinks" must be a boolean'],
+      [
+        { defaultExcludes: "test/" },
+        '"defaultExcludes" must be an array of non-empty strings',
+      ],
+      [
+        { defaultExcludes: ["test/", ""] },
+        '"defaultExcludes" must be an array of non-empty strings',
+      ],
     ];
 
     for (const [config, message] of cases) {

@@ -25,17 +25,6 @@ export function normalizePathConstraint(
   // wif we left with the ** it means anything so treat it as a cwd path
   if (trimmed === "**" || trimmed === "**/" || trimmed === "**/*") return null;
 
-  // FFF's glob matcher can treat a hidden directory root glob such as
-  // `.agents/**` as empty, while the tool contract says this means "inside
-  // this directory". Collapse simple trailing recursive directory globs to the
-  // directory-prefix constraint understood by the parser. Keep real file globs
-  // such as `src/**/*.ts` unchanged.
-  const recursiveDir = trimmed.match(/^(.*)\/\*\*(?:\/\*)?$/);
-  if (recursiveDir) {
-    const dir = recursiveDir[1];
-    if (dir && !/[*?[{]/.test(dir)) return `${dir}/`;
-  }
-
   // Already signals path-constraint syntax to the parser.
   if (trimmed.startsWith("/") || trimmed.endsWith("/")) return trimmed;
   // Globs (`*.ts`, `src/**/*.cc`, `{src,lib}`) are handled by the parser.
@@ -73,18 +62,36 @@ export function normalizeExcludes(
   return out;
 }
 
+function pathTargetsExcludedRoot(
+  pathConstraint: string | undefined,
+  excludes: string[],
+  cwd: string,
+): boolean {
+  if (!pathConstraint || excludes.length === 0) return false;
+  const normalized = normalizePathConstraint(pathConstraint, cwd);
+  if (!normalized) return false;
+  return excludes.some(
+    (exclude) => normalized === exclude || normalized.startsWith(exclude),
+  );
+}
+
 export function buildQuery(
   path: string | undefined,
   pattern: string,
   exclude?: string | string[],
   cwd = process.cwd(),
+  defaultExcludes: string[] = [],
 ): string {
   const parts: string[] = [];
   if (path) {
     const pathConstraint = normalizePathConstraint(path, cwd);
     if (pathConstraint) parts.push(pathConstraint);
   }
-  parts.push(...normalizeExcludes(exclude, cwd));
+  const activeDefaultExcludes = pathTargetsExcludedRoot(path, defaultExcludes, cwd)
+    ? []
+    : defaultExcludes;
+  const callerExcludes = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
+  parts.push(...normalizeExcludes([...activeDefaultExcludes, ...callerExcludes], cwd));
   parts.push(pattern);
   return parts.join(" ");
 }

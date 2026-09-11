@@ -46,6 +46,12 @@
       "type": "boolean",
       "default": true,
       "description": "Indexes through directory symlinks, e.g. a git worktree or stow layout whose files live behind links. Set to false to keep the walk inside the real tree."
+    },
+    "defaultExcludes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "default": [],
+      "description": "Path constraints to exclude from every find and grep query unless the query path explicitly targets one of them."
     }
   }
 }

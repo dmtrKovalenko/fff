@@ -350,6 +350,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   let enableHomeDirScanning = true;
   let warnOnHomeDirScan = true;
   let followSymlinks = true;
+  let defaultExcludes: string[] = [];
 
   function setMode(mode: FffMode): void {
     currentMode = mode;
@@ -408,6 +409,7 @@ export default function fffExtension(pi: ExtensionAPI) {
       true,
       parseBoolean,
     );
+    defaultExcludes = config.defaultExcludes ?? [];
   }
 
   function getMode(): FffMode {
@@ -550,7 +552,13 @@ export default function fffExtension(pi: ExtensionAPI) {
     // constraint stays relative to the picker's actual root.
     const rebase = nodePath.relative(aux.root, route.root).replaceAll(nodePath.sep, "/");
     const suffix = [rebase, route.suffix].filter(Boolean).join("/");
-    const query = buildQuery(suffix || undefined, pattern, exclude, aux.root);
+    const query = buildQuery(
+      suffix || undefined,
+      pattern,
+      exclude,
+      aux.root,
+      defaultExcludes,
+    );
     return { finder: aux.finder, query, root: aux.root };
   }
 
@@ -878,7 +886,7 @@ export default function fffExtension(pi: ExtensionAPI) {
       const context = clampContext(params.context);
       const query = aux
         ? aux.query
-        : buildQuery(params.path, pattern, params.exclude, activeCwd);
+        : buildQuery(params.path, pattern, params.exclude, activeCwd, defaultExcludes);
 
       // Auto-detect: regex if the pattern has regex metacharacters AND parses
       // as a valid regex, otherwise plain literal. The fuzzy fallback below
@@ -1080,7 +1088,13 @@ export default function fffExtension(pi: ExtensionAPI) {
         ? resumed.query
         : aux && "query" in aux
           ? (aux as { query: string }).query
-          : buildQuery(params.path, params.pattern, params.exclude, activeCwd);
+          : buildQuery(
+              params.path,
+              params.pattern,
+              params.exclude,
+              activeCwd,
+              defaultExcludes,
+            );
 
       const pattern = resumed ? resumed.pattern : params.pattern;
       const pageIndex = resumed?.nextPageIndex ?? 0;

@@ -16,6 +16,7 @@ export interface FffConfig {
   enableHomeDirScanning?: boolean;
   warnOnHomeDirScan?: boolean;
   followSymlinks?: boolean;
+  defaultExcludes?: string[];
 }
 
 const CONFIG_KEYS = new Set<keyof FffConfig>([
@@ -27,6 +28,7 @@ const CONFIG_KEYS = new Set<keyof FffConfig>([
   "enableHomeDirScanning",
   "warnOnHomeDirScan",
   "followSymlinks",
+  "defaultExcludes",
 ]);
 
 export function loadConfig(agentDir = piDataDir()): FffConfig {
@@ -70,6 +72,7 @@ export function loadConfig(agentDir = piDataDir()): FffConfig {
   validateBoolean(configPath, parsed, "enableHomeDirScanning");
   validateBoolean(configPath, parsed, "warnOnHomeDirScan");
   validateBoolean(configPath, parsed, "followSymlinks");
+  validateStringArray(configPath, parsed, "defaultExcludes");
 
   return parsed as FffConfig;
 }
@@ -109,5 +112,20 @@ function validateBoolean(
   const value = config[key];
   if (value !== undefined && typeof value !== "boolean") {
     throw invalidConfig(configPath, `"${key}" must be a boolean`);
+  }
+}
+
+function validateStringArray(
+  configPath: string,
+  config: Record<string, unknown>,
+  key: "defaultExcludes",
+): void {
+  const value = config[key];
+  if (value === undefined) return;
+  if (
+    !Array.isArray(value) ||
+    value.some((item) => typeof item !== "string" || item.length === 0)
+  ) {
+    throw invalidConfig(configPath, `"${key}" must be an array of non-empty strings`);
   }
 }
