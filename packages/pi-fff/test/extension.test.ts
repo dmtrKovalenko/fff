@@ -147,7 +147,7 @@ function createPi(mode?: string, flags: Record<string, unknown> = {}) {
     registerTool: mock((_tool: any) => undefined),
     getActiveTools: mock(() => ["read"] as string[]),
     setActiveTools: mock((_names: string[]) => undefined),
-    appendEntry: mock(() => undefined),
+    appendEntry: mock((_customType: string, _data: unknown) => undefined),
   };
 
   return { pi, events, commands };
@@ -396,6 +396,83 @@ describe("pi-fff session mode", () => {
       "Current mode: 'tools-and-ui' (flag: unset)",
       "info",
     );
+    await shutdown(setup);
+  });
+});
+
+// Regression for #855: pi carries the active tool list and the session entries across
+// /reload, but drops the extension instance, so a mode switch must not leave the
+// previous mode's tool names active.
+describe("pi-fff mode switch across /reload", () => {
+  // Pi's own default active set: builtin grep/find ship inactive (dist/core/sdk.js).
+  const PI_DEFAULT_ACTIVE = ["read", "bash", "edit", "write"];
+
+  function createReloadableSession(startupMode?: string, active = PI_DEFAULT_ACTIVE) {
+    let activeTools = [...active];
+    const entries: unknown[] = [];
+
+    async function load() {
+      const setup = createPi(startupMode);
+      setup.pi.getActiveTools.mockImplementation(() => [...activeTools]);
+      setup.pi.setActiveTools.mockImplementation((names: string[]) => {
+        activeTools = [...names];
+      });
+      setup.pi.appendEntry.mockImplementation((customType: string, data: unknown) => {
+        entries.push({ type: "custom", customType, data });
+      });
+
+      const ctx = createContext();
+      ctx.sessionManager.getEntries.mockReturnValue(entries as any[]);
+      fffExtension(setup.pi as any);
+      await setup.events.get("session_start")?.({ reason: "startup" }, ctx);
+      return { ...setup, ctx };
+    }
+
+    return { load, getActiveTools: () => activeTools };
+  }
+
+  test("drops override tool names when switching back to a FFF-named mode", async () => {
+    const session = createReloadableSession("override");
+
+    const first = await session.load();
+    expect(session.getActiveTools()).toEqual([...PI_DEFAULT_ACTIVE, "grep", "find"]);
+    await first.commands.get("fff-mode").handler("tools-and-ui", first.ctx);
+    await shutdown(first);
+
+    const second = await session.load();
+    expect(session.getActiveTools()).toEqual([...PI_DEFAULT_ACTIVE, "ffgrep", "fffind"]);
+    await shutdown(second);
+  });
+
+  test("drops FFF tool names when switching to override", async () => {
+    const session = createReloadableSession("tools-and-ui");
+
+    const first = await session.load();
+    expect(session.getActiveTools()).toEqual([...PI_DEFAULT_ACTIVE, "ffgrep", "fffind"]);
+    await first.commands.get("fff-mode").handler("override", first.ctx);
+    await shutdown(first);
+
+    const second = await session.load();
+    expect(session.getActiveTools()).toEqual([...PI_DEFAULT_ACTIVE, "grep", "find"]);
+    await shutdown(second);
+  });
+
+  test("keeps user-enabled builtin grep and find when override was never used", async () => {
+    const session = createReloadableSession("tools-and-ui", [
+      ...PI_DEFAULT_ACTIVE,
+      "grep",
+      "find",
+    ]);
+
+    const setup = await session.load();
+
+    expect(session.getActiveTools()).toEqual([
+      ...PI_DEFAULT_ACTIVE,
+      "grep",
+      "find",
+      "ffgrep",
+      "fffind",
+    ]);
     await shutdown(setup);
   });
 });
