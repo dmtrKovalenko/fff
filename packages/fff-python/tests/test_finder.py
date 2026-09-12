@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata as metadata
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,15 @@ from fff import FFFException, FileFinder, GrepCursor, MixedDirItem, MixedFileIte
 
 def rel(path: str) -> str:
     return path.replace("\\", "/")
+
+
+def wait_for_content_index(finder: FileFinder, timeout: float = 10.0) -> None:
+    # wait_for_scan only covers the file walk; the bigram index lands a bit later
+    # and changes which files a grep page spans, so cursors must not straddle it.
+    deadline = time.monotonic() + timeout
+    while not finder.scan_progress.is_warmup_complete:
+        assert time.monotonic() < deadline, "content index did not finish"
+        time.sleep(0.01)
 
 
 @pytest.fixture
@@ -289,6 +299,7 @@ def test_grep_invalid_mode_raises(sample_dir: str) -> None:
 def test_grep_cursor_paginates_by_file(sample_dir: str) -> None:
     with FileFinder(sample_dir, watch=False, enable_content_indexing=True) as finder:
         assert finder.wait_for_scan_blocking(timeout_ms=5000)
+        wait_for_content_index(finder)
 
         first = finder.grep("def", page_limit=1)
         assert first.total_matched >= 1

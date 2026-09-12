@@ -19,7 +19,7 @@ ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
 zlob = ["fff/zlob", "fff-query-parser/zlob"]
 
 [dependencies]
-fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.10.6", features = ["definitions"] }
+fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.10.6", features = ["definitions", "mimalloc-collect"] }
 fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.10.6" }
 mimalloc = { workspace = true }
 rmcp = { version = "1.7.0", features = ["server", "transport-io"] }

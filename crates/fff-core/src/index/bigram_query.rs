@@ -92,34 +92,9 @@ impl BigramQuery {
         match self {
             BigramQuery::Any => None,
 
-            BigramQuery::Consec(key) => {
-                let col = index.lookup()[*key as usize];
-                if col == u16::MAX {
-                    return None;
-                }
-                let words = index.words();
-                let offset = col as usize * words;
-                let data = index.dense_data();
-                if offset + words > data.len() {
-                    return None;
-                }
-                Some(Cow::Borrowed(&data[offset..offset + words]))
-            }
+            BigramQuery::Consec(key) => index.column_bitset(*key),
 
-            BigramQuery::Skip1(key) => {
-                let skip = index.skip_index()?;
-                let col = skip.lookup()[*key as usize];
-                if col == u16::MAX {
-                    return None;
-                }
-                let words = skip.words();
-                let offset = col as usize * words;
-                let data = skip.dense_data();
-                if offset + words > data.len() {
-                    return None;
-                }
-                Some(Cow::Borrowed(&data[offset..offset + words]))
-            }
+            BigramQuery::Skip1(key) => index.skip_index()?.column_bitset(*key),
 
             BigramQuery::And(children) => {
                 let mut result: Option<Vec<u64>> = None;

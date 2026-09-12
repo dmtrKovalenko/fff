@@ -577,6 +577,7 @@ Run `:FFFScan` to force a rescan.
 - `:FFFOpenLog` opens the current session's log file.
 - Historical log files are stored near the main log file `<state>/log/fff+<UTC-timestamp>+<pid>.log` (up to 20 files)
 - For a crash backtrace, run `lldb -- nvim` or `gdb -- nvim` and reproduce
+- fff keeps its allocator off transparent huge pages to keep the index RSS low (~15-20% on large repos); set `MIMALLOC_ALLOW_LARGE_OS_PAGES=2` before starting Neovim to trade that memory back for a slightly faster initial index build
 
 </details>
 

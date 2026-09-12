@@ -329,6 +329,7 @@ impl ScanJob {
             {
                 picker.set_bigram_index(index);
             }
+            crate::index::release_thread_buffers();
 
             // Bigram only sniffs files <= MAX_INDEXABLE_FILE_SIZE; large
             // unknown-extension binaries slip past it and would otherwise be
