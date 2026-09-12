@@ -518,3 +518,78 @@ fn regex_fallback_keeps_file_path_scope_issue_756() {
         "regex fallback must not leak outside the FilePath scope"
     );
 }
+
+/// Candidate bitsets are OR-ed across the patterns of a multi-pattern grep. A
+/// pattern the bigram index cannot prefilter (no printable-ASCII bigram, e.g. a
+/// CJK needle) matches any file, so leaving it out of the union hides every file
+/// that only it matches.
+#[test]
+fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // Only a/b/c carry the ASCII needle, so its bigrams stay below the
+    // ubiquity threshold that `compress` drops.
+    let base_contents: &[(&str, &str)] = &[
+        ("a.txt", "hello unicorn world"),
+        ("b.txt", "another unicorn line"),
+        ("c.txt", "one more unicorn here"),
+        ("d.txt", "nothing special in here"),
+        ("e.txt", "日本語のテキスト"),
+        ("f.txt", "rainbow sky above"),
+    ];
+    for (name, content) in base_contents {
+        let mut f = std::fs::File::create(base.join(name)).unwrap();
+        writeln!(f, "{}", content).unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    assert_eq!(picker.get_files().len(), base_contents.len());
+
+    let consec_builder = BigramIndexBuilder::new(base_contents.len());
+    let skip_builder = BigramIndexBuilder::new(base_contents.len());
+    for (i, (_, content)) in base_contents.iter().enumerate() {
+        consec_builder.add_file_content(&skip_builder, i, content.as_bytes());
+    }
+    let mut index = consec_builder.compress(Some(0));
+    index.set_skip_index(skip_builder.compress(Some(0)));
+    picker.set_bigram_index(index);
+
+    let options = crate::GrepSearchOptions {
+        mode: super::GrepMode::PlainText,
+        smart_case: true,
+        page_limit: 100,
+        ..Default::default()
+    };
+
+    let matched_paths = |patterns: &[&str]| -> Vec<String> {
+        let result = picker.multi_grep(patterns, &[], &options);
+        let mut paths: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path(&picker))
+            .collect();
+        paths.sort();
+        paths
+    };
+
+    assert_eq!(
+        matched_paths(&["unicorn", "日本語"]),
+        vec!["a.txt", "b.txt", "c.txt", "e.txt"],
+        "the CJK needle has no usable bigram, so its file must still be searched"
+    );
+
+    // Pins that the prefilter still narrows (both hold before and after):
+    // every pattern indexable => files matching none of them stay out.
+    assert_eq!(
+        matched_paths(&["unicorn", "rainbow"]),
+        vec!["a.txt", "b.txt", "c.txt", "f.txt"]
+    );
+    assert_eq!(matched_paths(&["unicorn"]), vec!["a.txt", "b.txt", "c.txt"]);
+}
