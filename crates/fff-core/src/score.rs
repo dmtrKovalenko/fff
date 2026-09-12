@@ -516,6 +516,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
                 special_filename_bonus: 0,
                 frecency_boost,
                 git_status_boost: 0,
+                git_recency_boost: 0,
                 distance_penalty,
                 current_file_penalty: 0,
                 combo_match_boost: 0,
@@ -721,6 +722,7 @@ fn match_and_score_in_arena<'a>(
             } else {
                 0
             };
+            let git_recency_boost = file.git_recency_score as i32;
 
             if context.current_file.is_some() || context.last_same_query_match.is_some() {
                 file.write_dir_str(arena, &mut dir_buf);
@@ -847,6 +849,7 @@ fn match_and_score_in_arena<'a>(
             let total = base_score
                 .saturating_add(frecency_boost)
                 .saturating_add(git_status_boost)
+                .saturating_add(git_recency_boost)
                 .saturating_add(distance_penalty)
                 .saturating_add(filename_bonus)
                 .saturating_add(current_file_penalty)
@@ -865,6 +868,7 @@ fn match_and_score_in_arena<'a>(
                 },
                 frecency_boost,
                 git_status_boost,
+                git_recency_boost,
                 distance_penalty,
                 combo_match_boost,
                 path_alignment_bonus,
@@ -925,11 +929,13 @@ fn score_filtered_by_frecency<'a>(
         } else {
             0
         };
+        let git_recency_boost = file.git_recency_score as i32;
 
         let current_file_penalty =
             calculate_current_file_penalty(file, total_frecency_score, context, arena);
         let total = total_frecency_score
             .saturating_add(git_status_boost)
+            .saturating_add(git_recency_boost)
             .saturating_add(current_file_penalty);
 
         let score = Score {
@@ -943,6 +949,7 @@ fn score_filtered_by_frecency<'a>(
             current_file_penalty,
             frecency_boost: total_frecency_score,
             git_status_boost,
+            git_recency_boost,
             exact_match: false,
             match_type: "frecency",
         };
@@ -1090,6 +1097,7 @@ mod tests {
                     current_file_penalty: 0,
                     frecency_boost: 0,
                     git_status_boost: 0,
+                    git_recency_boost: 0,
                     exact_match: false,
                     match_type: "test",
                     combo_match_boost: 0,
@@ -1524,6 +1532,91 @@ mod filename_bonus_tests {
             !matches.is_empty(),
             "'core' should match the lowercase path"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_recency_scoring_tests {
+    use super::*;
+    use crate::types::PaginationArgs;
+    use fff_query_parser::QueryParser;
+
+    fn make_files(specs: &[(&str, i16)]) -> (Vec<FileItem>, ArenaPtr) {
+        let path_strings: Vec<String> = specs.iter().map(|(p, _)| p.to_string()).collect();
+        let items: Vec<FileItem> = specs
+            .iter()
+            .map(|(p, _)| {
+                let fname = p.rfind(std::path::is_separator).map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &items);
+        let arena = store.as_arena_ptr();
+        let mut result: Vec<FileItem> = items;
+        for (i, file) in result.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+            file.git_recency_score = specs[i].1;
+        }
+        std::mem::forget(store);
+        (result, arena)
+    }
+
+    fn search(files: &[FileItem], query: &str, arena: ArenaPtr) -> Vec<(String, Score)> {
+        let parser = QueryParser::default();
+        let parsed = parser.parse(query);
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos: 2,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 100,
+            },
+        };
+        let (items, scores, _) =
+            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+        items
+            .iter()
+            .zip(scores)
+            .map(|(f, s)| (f.relative_path(arena), s))
+            .collect()
+    }
+
+    #[test]
+    fn recency_boost_breaks_ties_between_equal_fuzzy_matches() {
+        // Dir names share no letters with the query so both paths fuzzy-match
+        // identically and only the recency boost separates them.
+        let (files, arena) = make_files(&[("src/xxx/handler.rs", 0), ("src/yyy/handler.rs", 5)]);
+
+        let results = search(&files, "handler", arena);
+
+        assert!(results.len() >= 2);
+        assert_eq!(results[0].0, "src/yyy/handler.rs");
+        assert_eq!(results[0].1.git_recency_boost, 5);
+        assert_eq!(results[1].1.git_recency_boost, 0);
+        assert_eq!(
+            results[0].1.total - results[1].1.total,
+            5,
+            "boost is additive: exactly +1 point per participating commit"
+        );
+    }
+
+    #[test]
+    fn recency_boost_ranks_files_in_frecency_only_mode() {
+        let (files, arena) = make_files(&[("cold.rs", 0), ("committed.rs", 7)]);
+
+        let results = search(&files, "", arena);
+
+        assert_eq!(results[0].0, "committed.rs");
+        assert_eq!(results[0].1.git_recency_boost, 7);
+        assert_eq!(results[0].1.total, 7);
+        assert_eq!(results[0].1.match_type, "frecency");
     }
 }
 

@@ -33,6 +33,7 @@ use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
+use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
@@ -47,6 +48,7 @@ use crate::types::{
 };
 use crate::walk::WalkOutput;
 use crate::watch::BackgroundWatcher;
+use ahash::AHashMap;
 use fff_query_parser::FFFQuery;
 use git2::{Repository, Status};
 use rayon::prelude::*;
@@ -195,8 +197,6 @@ impl FileSync {
 
     #[inline]
     fn find_file_index(&self, path: &Path, base_path: &Path) -> Option<usize> {
-        let arena = self.arena_base_ptr();
-
         // Strip base_path prefix to get the relative path. On Windows this
         // can fail for 8.3 short names or a different casing; fall back to
         // canonicalize-then-strip so watcher events still land on the right
@@ -216,8 +216,13 @@ impl FileSync {
         };
         // The dir table and stored file paths are '/'-canonical; fold the
         // native relative path so the byte-wise comparisons below match.
-        let rel_path_owned = crate::path_utils::to_canonical_slashes(&rel_path_owned).into_owned();
-        let rel_path: &str = &rel_path_owned;
+        self.find_by_relative_path(&crate::path_utils::to_canonical_slashes(&rel_path_owned))
+    }
+
+    // Lookup for a base-relative, '/'-canonical path — the form paths are
+    // stored in, so no normalization is needed.
+    fn find_by_relative_path(&self, rel_path: &str) -> Option<usize> {
+        let arena = self.arena_base_ptr();
 
         // Split into directory (with trailing '/') and filename.
         let parent_end = rel_path
@@ -559,6 +564,9 @@ pub struct FilePickerOptions {
     /// Allow indexing the user's home directory. Off by default for the same
     /// reason as `enable_fs_root_scanning`
     pub enable_home_dir_scanning: bool,
+    /// Ranking boost for files that participated in recent commits of the
+    /// current branch. Enabled with default limits unless overridden.
+    pub git_recency: GitRecencyConfig,
 }
 
 impl Default for FilePickerOptions {
@@ -573,6 +581,7 @@ impl Default for FilePickerOptions {
             follow_symlinks: false,
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
+            git_recency: GitRecencyConfig::default(),
         }
     }
 }
@@ -596,6 +605,7 @@ pub struct FilePicker {
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
+    git_recency_config: GitRecencyConfig,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -677,6 +687,10 @@ impl FilePicker {
 
     pub fn home_dir_scanning_enabled(&self) -> bool {
         self.enable_home_dir_scanning
+    }
+
+    pub fn git_recency_config(&self) -> GitRecencyConfig {
+        self.git_recency_config
     }
 
     pub fn trace_id(&self) -> &str {
@@ -858,6 +872,8 @@ impl FilePicker {
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
+        crate::git::tune_libgit2_for_local_reads();
+
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
             error!("Base path does not exist: {}", options.base_path);
@@ -913,6 +929,7 @@ impl FilePicker {
             follow_symlinks: options.follow_symlinks,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
+            git_recency_config: options.git_recency,
             trace_span,
             trace_id,
         })
@@ -1038,6 +1055,15 @@ impl FilePicker {
                     &mut path_buf,
                 ));
             }
+        }
+
+        if let Some(workdir) = self.sync_data.git_workdir.clone()
+            && let Ok(repo) = Repository::open(&workdir)
+                .inspect_err(|e| debug!(?e, ?workdir, "git recency: failed to open repo"))
+        {
+            let recency =
+                git_recency::compute_git_recency(&repo, &self.git_recency_config, &self.base_path);
+            self.apply_git_recency(recency.as_ref());
         }
 
         self.signals.scanning.store(false, Ordering::Relaxed);
@@ -1543,6 +1569,32 @@ impl FilePicker {
             })?;
 
         Ok(())
+    }
+
+    // Replaces every recency score with a freshly computed set. `None` zeroes
+    // them, so a vanished window (orphan HEAD, repo gone) leaves no stale boost.
+    pub(crate) fn apply_git_recency(&mut self, scores: Option<&AHashMap<String, i16>>) {
+        if !self.git_recency_config.enabled {
+            return;
+        }
+
+        for file in self.sync_data.files.iter_mut() {
+            file.git_recency_score = 0;
+        }
+
+        let Some(scores) = scores else { return };
+
+        let mut applied = 0usize;
+        for (relative_path, score) in scores {
+            if let Some(index) = self.sync_data.find_by_relative_path(relative_path)
+                && let Some((_, file)) = self.sync_data.get_file_mut(index)
+            {
+                file.git_recency_score = *score;
+                applied += 1;
+            }
+        }
+
+        debug!(files_scored = applied, "Git recency scores applied");
     }
 
     pub fn update_single_file_frecency(

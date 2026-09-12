@@ -119,6 +119,9 @@ pub use dbs::*;
 /// Git status caching and repository detection utilities.
 pub mod git;
 
+pub mod git_recency;
+pub use git_recency::GitRecencyConfig;
+
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;
 pub use grep::*;

@@ -36,6 +36,8 @@ local M = {}
 ---@field filename_bonus integer
 ---@field special_filename_bonus integer
 ---@field frecency_boost integer
+---@field git_status_boost integer
+---@field git_recency_boost integer
 ---@field combo_match_boost integer
 ---@field distance_penalty integer
 ---@field current_file_penalty integer
@@ -246,6 +248,7 @@ local function render_score_section(b, score, file, hls, width)
     { '  +name ' .. (score.filename_bonus or 0), bonus_hl(score.filename_bonus) },
     { '  +special ' .. (score.special_filename_bonus or 0), bonus_hl(score.special_filename_bonus) },
     { '  +frec ' .. signed(score.frecency_boost or 0), mod_hl(score.frecency_boost) },
+    { '  +recent ' .. signed(score.git_recency_boost or 0), bonus_hl(score.git_recency_boost) },
     { '  +combo ' .. signed(score.combo_match_boost or 0), bonus_hl(score.combo_match_boost) },
     { '  penalty ' .. total_pen, total_pen > 0 and neg_hl or val_hl },
   }
