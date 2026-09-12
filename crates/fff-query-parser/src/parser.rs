@@ -1491,6 +1491,40 @@ mod tests {
     }
 
     #[test]
+    fn test_dotted_numbers_are_not_filename_constraints() {
+        fn assert_dotted_numbers_stay_text<C: ParserConfig>(config: C, label: &str) {
+            let parser = QueryParser::new(config);
+
+            for query in ["192.168.1.1 timeout", "v2.0 release", "python 3.11"] {
+                let result = parser.parse(query);
+                assert!(
+                    result.constraints.is_empty(),
+                    "{label}: {query:?} must stay search text, got {:?}",
+                    result.constraints
+                );
+            }
+
+            // Real filenames still scope the search (passes before and after).
+            assert_eq!(
+                parser.parse("schema.rs users").constraints.as_slice(),
+                [Constraint::FilePath("schema.rs")],
+                "{label}: a bare filename must still be a constraint"
+            );
+            assert_eq!(
+                parser
+                    .parse("libswscale/input.c avframe")
+                    .constraints
+                    .as_slice(),
+                [Constraint::FilePath("libswscale/input.c")],
+                "{label}: a path-prefixed filename must still be a constraint"
+            );
+        }
+
+        assert_dotted_numbers_stay_text(AiGrepConfig, "ai-grep");
+        assert_dotted_numbers_stay_text(FilenameConstraintConfig, "filename-constraint");
+    }
+
+    #[test]
     fn test_file_picker_only_one_filepath_constraint() {
         let parser = QueryParser::new(FilenameConstraintConfig);
         let result = parser.parse("main.rs score.rs");

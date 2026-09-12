@@ -63,7 +63,7 @@ impl Constraint<'_> {
             Some(dot_idx) => {
                 let extension = &filename[dot_idx + 1..];
 
-                !extension.is_empty()
+                extension.starts_with(|c: char| c.is_ascii_alphabetic())
                     && extension.len() <= 10 // just an sassumption
                     && extension.bytes().all(|b| b.is_ascii_alphanumeric())
             }
