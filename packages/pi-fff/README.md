@@ -162,6 +162,8 @@ All fields are optional:
 | `warnOnHomeDirScan` | boolean | `true` |
 | `followSymlinks` | boolean | `true` |
 
+Starting a session in a directory the config opts out of indexing (`$HOME` with `enableHomeDirScanning: false`, `/` with `enableFsRootScanning: false`) disables FFF workspace search for that session: the extension reports it once as a warning and keeps the `ffgrep`/`fffind` names even in `override` mode, so pi's built-in `grep`/`find` stay reachable.
+
 CLI flags take precedence over environment variables, which take precedence over this file. A missing file is ignored. Malformed JSON, unknown fields, and invalid values stop the extension from loading and report the file path and error. `/fff-mode` changes the current session; it does not edit this file.
 
 The file is global only. Project-level config cannot safely control tool names because pi decides which tools an extension registers before project configuration can be trusted.

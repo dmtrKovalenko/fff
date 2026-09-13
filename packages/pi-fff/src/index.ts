@@ -28,7 +28,7 @@ import { Type, type TSchema } from "@sinclair/typebox";
 import { AuxFinderPool, routePathConstraint } from "./aux-finders";
 import { type FffMode, loadConfig, VALID_MODES } from "./config";
 import { FilePickerFactory } from "./file-picker";
-import { isHomeDir, resolveDbPaths } from "./paths";
+import { isFsRoot, isHomeDir, resolveDbPaths } from "./paths";
 import { buildQuery } from "./query";
 
 export { SCAN_TIMEOUT_MS } from "./sdk";
@@ -460,8 +460,22 @@ export default function fffExtension(pi: ExtensionAPI) {
     });
   }
 
+  // The native layer refuses a picker rooted at $HOME / the fs root unless the
+  // matching opt-in is set (crates/fff-core/src/file_picker.rs). Detect that here
+  // so the opt-out reads as "search off" instead of an init failure (issue #857).
+  function scanOptOutReason(cwd: string): string | null {
+    if (!enableHomeDirScanning && isHomeDir(cwd))
+      return `(fff): cwd is $HOME and "enableHomeDirScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableHomeDirScanning": true / --fff-enable-home-scan=true to index $HOME.`;
+    if (!enableFsRootScanning && isFsRoot(cwd))
+      return `(fff): cwd is the filesystem root and "enableFsRootScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableFsRootScanning": true / --fff-enable-root-scan=true to index it.`;
+    return null;
+  }
+
   // in case cwd changes we need to figure this out
   function ensureFinder(cwd: string): Promise<FileFinderApi> {
+    const optOut = scanOptOutReason(cwd);
+    if (optOut) return Promise.reject(new Error(optOut));
+
     if (mainFinder && !mainFinder.isDestroyed && finderCwd === cwd)
       return Promise.resolve(mainFinder);
 
@@ -741,6 +755,13 @@ export default function fffExtension(pi: ExtensionAPI) {
     }
 
     initializeFinderFactories();
+
+    // `override` replaces pi's built-in grep/find. With the cwd opted out of
+    // indexing that would leave the session without any working workspace
+    // search, so keep the FFF names and let the built-ins stand (issue #857).
+    if (currentMode === "override" && scanOptOutReason(activeCwd))
+      toolNames = FFF_TOOL_NAMES;
+
     registerPendingTools();
   }
 
@@ -748,6 +769,15 @@ export default function fffExtension(pi: ExtensionAPI) {
     try {
       prepareSession(ctx);
       registerAutocompleteProvider(ctx);
+
+      // The user opted out of indexing this cwd, so skip the picker entirely
+      // instead of letting the native refusal surface as an error (issue #857).
+      const optOut = scanOptOutReason(activeCwd);
+      if (optOut) {
+        ctx.ui.notify(optOut, "warning");
+        return;
+      }
+
       await ensureFinder(activeCwd);
 
       // Warn when launched from $HOME with home scanning on: indexing a large

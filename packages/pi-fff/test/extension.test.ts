@@ -67,10 +67,27 @@ function createMockFinder(): MockFinder {
   };
 }
 
+const NATIVE_ROOT_REFUSAL =
+  "Failed to init file picker: Can not run certain FFF features in a file system root or home directories. Consider smaller per-project directories.";
+
+// Mirrors the native guard in crates/fff-core/src/file_picker.rs: a picker rooted
+// at $HOME or `/` is refused unless the matching opt-in is set.
+function nativeRefusal(options: {
+  basePath: string;
+  enableHomeDirScanning?: boolean;
+  enableFsRootScanning?: boolean;
+}): boolean {
+  const base = path.resolve(options.basePath);
+  if (options.enableHomeDirScanning === false && base === path.resolve(os.homedir()))
+    return true;
+  return options.enableFsRootScanning === false && path.dirname(base) === base;
+}
+
 const finderModule = {
   FileFinder: {
-    create: mock((options: unknown) => {
+    create: mock((options: any) => {
       createCalls.push(options);
+      if (nativeRefusal(options)) return { ok: false, error: NATIVE_ROOT_REFUSAL };
       const finder = createMockFinder();
       finders.push(finder);
       return { ok: true, value: finder };
@@ -452,12 +469,41 @@ describe("pi-fff $HOME scan warning", () => {
     expect(setup.ctx.ui.setStatus).toHaveBeenLastCalledWith("fff", undefined);
   });
 
-  test("no warning when home scanning is disabled", async () => {
+  // #857: the opt-out must skip the picker, not surface the native refusal as an
+  // init error, and must not shadow pi's built-in search tools in override mode.
+  test("skips the picker and stays out of the way when home scanning is off", async () => {
     process.env.FFF_ENABLE_HOME_SCAN = "0";
+    const setup = await start("override", os.homedir());
+
+    expect(createCalls).toHaveLength(0);
+    expect(setup.ctx.ui.setStatus).not.toHaveBeenCalled();
+
+    const [message, level] = setup.ctx.ui.notify.mock.calls[0];
+    expect(setup.ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(level).toBe("warning");
+    expect(message).not.toContain("FFF init failed");
+    expect(message).toContain("enableHomeDirScanning");
+
+    const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
+    expect(toolNames).toEqual(["ffgrep", "fffind"]);
+    await shutdown(setup);
+  });
+
+  test("skips the picker at the filesystem root without root scanning", async () => {
+    const setup = await start(undefined, path.parse(process.cwd()).root);
+
+    expect(createCalls).toHaveLength(0);
+    const [message, level] = setup.ctx.ui.notify.mock.calls[0];
+    expect(level).toBe("warning");
+    expect(message).toContain("enableFsRootScanning");
+    await shutdown(setup);
+  });
+
+  test("still indexes $HOME when the opt-out is not set", async () => {
     const setup = await start(undefined, os.homedir());
 
-    expect(setup.ctx.ui.notify).not.toHaveBeenCalled();
-    expect(setup.ctx.ui.setStatus).not.toHaveBeenCalled();
+    expect(createCalls).toHaveLength(1);
+    expect((createCalls[0] as { basePath: string }).basePath).toBe(os.homedir());
     await shutdown(setup);
   });
 
