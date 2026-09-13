@@ -100,6 +100,11 @@ export interface InitOptions {
   enableHomeDirScanning?: boolean;
   /** Follow symlinks for directories */
   followSymlinks?: boolean;
+  /**
+   * Apply the grep time budget even before anything matched. Off by default:
+   * plain/regex grep only starts counting once matches exist.
+   */
+  enforceGrepTimeBudget?: boolean;
 }
 
 /**
@@ -432,11 +437,6 @@ export interface GrepOptions {
    * partial results. 0 = unlimited. (default: 0)
    */
   timeBudgetMs?: number;
-  /**
-   * Apply `timeBudgetMs` even before anything matched. Off by default, so a
-   * zero-match query scans every candidate file. (default: false)
-   */
-  enforceTimeBudget?: boolean;
   /** Number of context lines to include before each match (default: 0) */
   beforeContext?: number;
   /** Number of context lines to include after each match (default: 0) */
@@ -543,11 +543,6 @@ export interface MultiGrepOptions {
    * partial results. 0 = unlimited. (default: 0)
    */
   timeBudgetMs?: number;
-  /**
-   * Apply `timeBudgetMs` even before anything matched. Off by default, so a
-   * zero-match query scans every candidate file. (default: false)
-   */
-  enforceTimeBudget?: boolean;
   /** Number of context lines to include before each match (default: 0) */
   beforeContext?: number;
   /** Number of context lines to include after each match (default: 0) */

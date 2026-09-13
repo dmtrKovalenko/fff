@@ -9,15 +9,15 @@ use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 const FILE_COUNT: usize = 10_000;
 const NEEDLE: &str = "needle-in-a-haystack";
 
-// With `enforce_time_budget` a zero-match search must stop at the budget and
+// With `enforce_grep_time_budget` a zero-match search must stop at the budget and
 // hand back a resume cursor instead of scanning every candidate. Issue #826.
 #[test]
 fn zero_match_search_stops_at_enforced_time_budget() {
     let tmp = TempDir::new().unwrap();
-    let picker = create_picker(tmp.path(), None);
+    let picker = create_picker(tmp.path(), None, true);
 
     let parsed = parse_grep_query("zzz-absent-literal");
-    let result = picker.grep(&parsed, &budget_opts(GrepMode::PlainText, true));
+    let result = picker.grep(&parsed, &budget_opts(GrepMode::PlainText));
 
     assert_eq!(result.matches.len(), 0, "sanity: query must not match");
     assert_eq!(result.filtered_file_count, FILE_COUNT);
@@ -37,10 +37,10 @@ fn zero_match_search_stops_at_enforced_time_budget() {
 #[test]
 fn zero_match_search_ignores_unenforced_time_budget() {
     let tmp = TempDir::new().unwrap();
-    let picker = create_picker(tmp.path(), None);
+    let picker = create_picker(tmp.path(), None, false);
 
     let parsed = parse_grep_query("zzz-absent-literal");
-    let result = picker.grep(&parsed, &budget_opts(GrepMode::PlainText, false));
+    let result = picker.grep(&parsed, &budget_opts(GrepMode::PlainText));
 
     assert_eq!(result.matches.len(), 0, "sanity: query must not match");
     assert_eq!(result.total_files_searched, result.filtered_file_count);
@@ -50,10 +50,10 @@ fn zero_match_search_ignores_unenforced_time_budget() {
 #[test]
 fn zero_match_fuzzy_search_stops_at_time_budget() {
     let tmp = TempDir::new().unwrap();
-    let picker = create_picker(tmp.path(), None);
+    let picker = create_picker(tmp.path(), None, false);
 
     let parsed = parse_grep_query("zzzabsentfuzzy");
-    let result = picker.grep(&parsed, &budget_opts(GrepMode::Fuzzy, false));
+    let result = picker.grep(&parsed, &budget_opts(GrepMode::Fuzzy));
 
     assert_eq!(result.matches.len(), 0, "sanity: query must not match");
     assert!(
@@ -72,10 +72,10 @@ fn zero_match_fuzzy_search_stops_at_time_budget() {
 #[test]
 fn budget_resume_cursor_does_not_skip_files() {
     let tmp = TempDir::new().unwrap();
-    let picker = create_picker(tmp.path(), Some(FILE_COUNT - 1));
+    let picker = create_picker(tmp.path(), Some(FILE_COUNT - 1), true);
 
     let parsed = parse_grep_query(NEEDLE);
-    let mut opts = budget_opts(GrepMode::PlainText, true);
+    let mut opts = budget_opts(GrepMode::PlainText);
     let mut found = 0usize;
     let mut pages = 0usize;
 
@@ -105,7 +105,11 @@ fn budget_resume_cursor_does_not_skip_files() {
 
 // 10k files of 4KiB filler. `needle_at` gets NEEDLE appended so paging can be
 // checked for skipped files.
-fn create_picker(base: &Path, needle_at: Option<usize>) -> FilePicker {
+fn create_picker(
+    base: &Path,
+    needle_at: Option<usize>,
+    enforce_grep_time_budget: bool,
+) -> FilePicker {
     let filler = format!("{}\n", "x".repeat(4 * 1024));
     for i in 0..FILE_COUNT {
         let path = base.join(format!("file-{i}.txt"));
@@ -119,6 +123,7 @@ fn create_picker(base: &Path, needle_at: Option<usize>) -> FilePicker {
         base_path: base.to_string_lossy().to_string(),
         enable_mmap_cache: false,
         watch: false,
+        enforce_grep_time_budget,
         ..Default::default()
     })
     .expect("Failed to create FilePicker");
@@ -126,7 +131,7 @@ fn create_picker(base: &Path, needle_at: Option<usize>) -> FilePicker {
     picker
 }
 
-fn budget_opts(mode: GrepMode, enforce_time_budget: bool) -> GrepSearchOptions {
+fn budget_opts(mode: GrepMode) -> GrepSearchOptions {
     GrepSearchOptions {
         max_file_size: 1024 * 1024,
         max_matches_per_file: 200,
@@ -135,7 +140,6 @@ fn budget_opts(mode: GrepMode, enforce_time_budget: bool) -> GrepSearchOptions {
         page_limit: 500,
         mode,
         time_budget_ms: 5,
-        enforce_time_budget,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,

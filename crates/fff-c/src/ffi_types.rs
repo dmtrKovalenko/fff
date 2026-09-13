@@ -12,7 +12,7 @@ use fff::{
 };
 
 /// Current used version of [`FffCreateOptions`].
-pub const FFF_CREATE_OPTIONS_VERSION: u32 = 2;
+pub const FFF_CREATE_OPTIONS_VERSION: u32 = 3;
 
 /// Options for `fff_create_instance_with`.
 ///
@@ -57,7 +57,11 @@ pub struct FffCreateOptions {
     /// Follow symlinks during scan and watcher walks. Off by default: without
     /// external loop protection cyclic symlinks can wedge the watcher.
     pub follow_symlinks: bool,
-    // ----- new version 3+ fields go here, ALWAYS appended -----
+    // ----- v3 fields -----
+    /// Apply the grep time budget even before anything matched. Off by default:
+    /// plain/regex grep only starts counting once matches exist.
+    pub enforce_grep_time_budget: bool,
+    // ----- new version 4+ fields go here, ALWAYS appended -----
 }
 
 impl FffCreateOptions {
@@ -80,6 +84,7 @@ impl FffCreateOptions {
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
             follow_symlinks: false,
+            enforce_grep_time_budget: false,
         }
     }
 }
@@ -805,5 +810,6 @@ mod options_layout_tests {
         assert_eq!(offset_of!(FffCreateOptions, enable_fs_root_scanning), 80);
         assert_eq!(offset_of!(FffCreateOptions, enable_home_dir_scanning), 81);
         assert_eq!(offset_of!(FffCreateOptions, follow_symlinks), 82);
+        assert_eq!(offset_of!(FffCreateOptions, enforce_grep_time_budget), 83);
     }
 }

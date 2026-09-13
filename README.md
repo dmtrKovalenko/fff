@@ -278,7 +278,6 @@ local r = require('fff').content_search('TODO', {
   page_size             = 50,
   file_offset           = 0,
   time_budget_ms        = 0,
-  enforce_time_budget   = false,    -- true also bounds zero-match searches
   trim_whitespace       = false,
   cwd                   = nil,      -- switch indexed root if different
   wait_for_index_ms     = nil,      -- override the default scan wait timeout

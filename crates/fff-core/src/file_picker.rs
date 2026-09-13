@@ -559,6 +559,9 @@ pub struct FilePickerOptions {
     /// Allow indexing the user's home directory. Off by default for the same
     /// reason as `enable_fs_root_scanning`
     pub enable_home_dir_scanning: bool,
+    /// Apply the grep time budget even before anything matched. Off by default:
+    /// plain/regex grep only starts counting once matches exist.
+    pub enforce_grep_time_budget: bool,
 }
 
 impl Default for FilePickerOptions {
@@ -573,6 +576,7 @@ impl Default for FilePickerOptions {
             follow_symlinks: false,
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
+            enforce_grep_time_budget: false,
         }
     }
 }
@@ -596,6 +600,7 @@ pub struct FilePicker {
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
+    enforce_grep_time_budget: bool,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -677,6 +682,10 @@ impl FilePicker {
 
     pub fn home_dir_scanning_enabled(&self) -> bool {
         self.enable_home_dir_scanning
+    }
+
+    pub fn enforces_grep_time_budget(&self) -> bool {
+        self.enforce_grep_time_budget
     }
 
     pub fn trace_id(&self) -> &str {
@@ -913,6 +922,7 @@ impl FilePicker {
             follow_symlinks: options.follow_symlinks,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
+            enforce_grep_time_budget: options.enforce_grep_time_budget,
             trace_span,
             trace_id,
         })
@@ -1382,6 +1392,7 @@ impl FilePicker {
                 self.sync_data.bigram_index.as_deref(),
                 overlay_guard.as_deref(),
                 cancel,
+                self.enforce_grep_time_budget,
                 &self.base_path,
                 arena,
                 overflow_arena,
@@ -1414,6 +1425,7 @@ impl FilePicker {
                 self.sync_data.bigram_index.as_deref(),
                 overlay_guard.as_deref(),
                 cancel,
+                self.enforce_grep_time_budget,
                 &self.base_path,
                 arena,
                 overflow_arena,

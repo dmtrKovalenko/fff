@@ -86,7 +86,6 @@ fn grep_options(
     smart_case: bool,
     page_limit: u32,
     time_budget_ms: u64,
-    enforce_time_budget: bool,
     before_context: u32,
     after_context: u32,
     classify_definitions: bool,
@@ -100,7 +99,6 @@ fn grep_options(
         page_limit: defaulted_usize(page_limit, defaults.page_limit),
         mode,
         time_budget_ms,
-        enforce_time_budget,
         before_context: before_context as usize,
         after_context: after_context as usize,
         classify_definitions,
@@ -183,6 +181,7 @@ impl FileFinder {
         enable_fs_root_scanning=false,
         enable_home_dir_scanning=false,
         follow_symlinks=false,
+        enforce_grep_time_budget=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -202,6 +201,7 @@ impl FileFinder {
         enable_fs_root_scanning: bool,
         enable_home_dir_scanning: bool,
         follow_symlinks: bool,
+        enforce_grep_time_budget: bool,
     ) -> PyResult<Self> {
         let shared_picker = SharedFilePicker::default();
         let shared_frecency = SharedFrecency::default();
@@ -254,6 +254,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
+                    enforce_grep_time_budget,
                 },
             )
             .map_err(py_err)
@@ -596,7 +597,6 @@ impl FileFinder {
         cursor=None,
         page_limit=0,
         time_budget_ms=0,
-        enforce_time_budget=false,
         before_context=0,
         after_context=0,
         classify_definitions=false,
@@ -612,7 +612,6 @@ impl FileFinder {
         cursor: Option<&GrepCursor>,
         page_limit: u32,
         time_budget_ms: u64,
-        enforce_time_budget: bool,
         before_context: u32,
         after_context: u32,
         classify_definitions: bool,
@@ -641,7 +640,6 @@ impl FileFinder {
                 smart_case,
                 page_limit,
                 time_budget_ms,
-                enforce_time_budget,
                 before_context,
                 after_context,
                 classify_definitions,
@@ -663,7 +661,6 @@ impl FileFinder {
         cursor=None,
         page_limit=0,
         time_budget_ms=0,
-        enforce_time_budget=false,
         before_context=0,
         after_context=0,
         classify_definitions=false,
@@ -680,7 +677,6 @@ impl FileFinder {
         cursor: Option<&GrepCursor>,
         page_limit: u32,
         time_budget_ms: u64,
-        enforce_time_budget: bool,
         before_context: u32,
         after_context: u32,
         classify_definitions: bool,
@@ -715,7 +711,6 @@ impl FileFinder {
                 smart_case,
                 page_limit,
                 time_budget_ms,
-                enforce_time_budget,
                 before_context,
                 after_context,
                 classify_definitions,
@@ -817,7 +812,16 @@ impl FileFinder {
             }
             let canonical = fff::path_utils::canonicalize(&new_path).map_err(py_err)?;
 
-            let (warmup_caches, content_indexing, watch, mode, fs_root, home_dir, follow_symlinks) = {
+            let (
+                warmup_caches,
+                content_indexing,
+                watch,
+                mode,
+                fs_root,
+                home_dir,
+                follow_symlinks,
+                enforce_grep_time_budget,
+            ) = {
                 let guard = picker.read().map_err(py_err)?;
                 if let Some(ref picker) = *guard {
                     (
@@ -828,9 +832,19 @@ impl FileFinder {
                         picker.fs_root_scanning_enabled(),
                         picker.home_dir_scanning_enabled(),
                         picker.follows_symlinks(),
+                        picker.enforces_grep_time_budget(),
                     )
                 } else {
-                    (false, true, true, FFFMode::default(), false, false, false)
+                    (
+                        false,
+                        true,
+                        true,
+                        FFFMode::default(),
+                        false,
+                        false,
+                        false,
+                        false,
+                    )
                 }
             };
 
@@ -851,6 +865,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
+                    enforce_grep_time_budget,
                 },
             )
             .map_err(py_err)

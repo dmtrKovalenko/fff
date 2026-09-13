@@ -68,6 +68,7 @@ struct PickerInitOpts {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     enable_filename_constraint: bool,
+    enforce_grep_time_budget: bool,
 }
 
 impl PickerInitOpts {
@@ -91,6 +92,9 @@ impl PickerInitOpts {
                     .unwrap_or(false),
                 enable_filename_constraint: t
                     .get::<Option<bool>>("enable_filename_constraint")?
+                    .unwrap_or(false),
+                enforce_grep_time_budget: t
+                    .get::<Option<bool>>("enforce_grep_time_budget")?
                     .unwrap_or(false),
             }),
             other => Err(LuaError::RuntimeError(format!(
@@ -128,6 +132,7 @@ pub fn init_file_picker(
             follow_symlinks: opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            enforce_grep_time_budget: opts.enforce_grep_time_budget,
             ..Default::default()
         },
     )
@@ -175,7 +180,7 @@ pub fn restart_index_in_path(
         // Inherit current picker's scanning flags when caller didn't pass
         // explicit opts — otherwise a `:cd ~` after init would silently lose
         // the user's `enable_home_dir_scanning = true` setting.
-        let (follow_symlinks, fs_root, home_dir) = {
+        let (follow_symlinks, fs_root, home_dir, enforce_grep_budget) = {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -193,11 +198,13 @@ pub fn restart_index_in_path(
                     p.follows_symlinks() || opts.follow_symlinks,
                     p.fs_root_scanning_enabled() || opts.enable_fs_root_scanning,
                     p.home_dir_scanning_enabled() || opts.enable_home_dir_scanning,
+                    p.enforces_grep_time_budget() || opts.enforce_grep_time_budget,
                 ),
                 None => (
                     opts.follow_symlinks,
                     opts.enable_fs_root_scanning,
                     opts.enable_home_dir_scanning,
+                    opts.enforce_grep_time_budget,
                 ),
             }
         };
@@ -220,6 +227,7 @@ pub fn restart_index_in_path(
                 follow_symlinks,
                 enable_fs_root_scanning: fs_root,
                 enable_home_dir_scanning: home_dir,
+                enforce_grep_time_budget: enforce_grep_budget,
                 ..Default::default()
             },
         ) {
@@ -437,7 +445,6 @@ pub fn live_grep(
         grep_mode,
         time_budget_ms,
         trim_whitespace,
-        enforce_time_budget,
     ): (
         String,
         Option<usize>,
@@ -447,7 +454,6 @@ pub fn live_grep(
         Option<bool>,
         Option<String>,
         Option<u64>,
-        Option<bool>,
         Option<bool>,
     ),
 ) -> LuaResult<LuaValue> {
@@ -471,7 +477,6 @@ pub fn live_grep(
         page_limit: page_size.unwrap_or(50),
         mode,
         time_budget_ms: time_budget_ms.unwrap_or(0),
-        enforce_time_budget: enforce_time_budget.unwrap_or(false),
         before_context: 0,
         after_context: 0,
         classify_definitions: false,

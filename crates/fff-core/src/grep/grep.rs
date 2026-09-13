@@ -197,6 +197,7 @@ pub(crate) fn grep_search<'a>(
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
+    enforce_time_budget: bool,
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
@@ -209,6 +210,7 @@ pub(crate) fn grep_search<'a>(
         bigram_index,
         bigram_overlay,
         abort_signal,
+        enforce_time_budget,
         base_path,
         arena,
         overflow_arena,
@@ -254,6 +256,7 @@ pub(crate) fn grep_search<'a>(
         bigram_index,
         bigram_overlay,
         abort_signal,
+        enforce_time_budget,
         base_path,
         arena,
         overflow_arena,
@@ -276,6 +279,7 @@ fn grep_search_parsed<'a>(
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
+    enforce_time_budget: bool,
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
@@ -407,6 +411,7 @@ fn grep_search_parsed<'a>(
             overflow_arena,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
+            enforce_time_budget,
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
@@ -526,6 +531,7 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) overflow_arena: crate::simd_path::ArenaPtr,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
+    pub(super) enforce_time_budget: bool,
 }
 
 impl GrepContext<'_, '_> {
@@ -597,7 +603,7 @@ where
         let chunk_offset = files_consumed;
 
         // Unless enforced, the budget stays dormant until something matched.
-        let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
+        let budget = time_budget.filter(|_| ctx.enforce_time_budget || all_matches.len() > 1);
 
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
             .par_iter()

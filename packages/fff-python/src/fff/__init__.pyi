@@ -179,6 +179,7 @@ class FileFinder:
         enable_fs_root_scanning: bool = False,
         enable_home_dir_scanning: bool = False,
         follow_symlinks: bool = False,
+        enforce_grep_time_budget: bool = False,
     ) -> None: ...
     def __enter__(self) -> FileFinder: ...
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None: ...
@@ -241,7 +242,6 @@ class FileFinder:
         cursor: GrepCursor | None = None,
         page_limit: int = 0,
         time_budget_ms: int = 0,
-        enforce_time_budget: bool = False,
         before_context: int = 0,
         after_context: int = 0,
         classify_definitions: bool = False,
@@ -258,7 +258,6 @@ class FileFinder:
         cursor: GrepCursor | None = None,
         page_limit: int = 0,
         time_budget_ms: int = 0,
-        enforce_time_budget: bool = False,
         before_context: int = 0,
         after_context: int = 0,
         classify_definitions: bool = False,

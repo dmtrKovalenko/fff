@@ -136,6 +136,7 @@ export class FileFinder implements FileFinderApi {
       options.enableFsRootScanning ?? false,
       options.enableHomeDirScanning ?? false,
       options.followSymlinks ?? false,
+      options.enforceGrepTimeBudget ?? false,
     );
 
     if (!result.ok) {
@@ -379,7 +380,6 @@ export class FileFinder implements FileFinderApi {
       options?.cursor?._offset ?? 0,
       options?.pageSize ?? 0,
       options?.timeBudgetMs ?? 0,
-      options?.enforceTimeBudget ?? false,
       options?.beforeContext ?? 0,
       options?.afterContext ?? 0,
       options?.classifyDefinitions ?? false,
@@ -429,7 +429,6 @@ export class FileFinder implements FileFinderApi {
       options.cursor?._offset ?? 0,
       options.pageSize ?? 0,
       options.timeBudgetMs ?? 0,
-      options.enforceTimeBudget ?? false,
       options.beforeContext ?? 0,
       options.afterContext ?? 0,
       options.classifyDefinitions ?? false,

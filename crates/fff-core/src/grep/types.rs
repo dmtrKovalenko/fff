@@ -94,9 +94,6 @@ pub struct GrepSearchOptions {
     /// Maximum time in milliseconds to spend searching before returning partial
     /// results. Prevents UI freezes on pathological queries. 0 = no limit.
     pub time_budget_ms: u64,
-    /// Apply `time_budget_ms` even before anything matched. Off by default: plain/regex
-    /// grep only starts counting once matches exist, so a zero-match query scans everything.
-    pub enforce_time_budget: bool,
     /// Number of context lines to include before each match. 0 = disabled.
     pub before_context: usize,
     /// Number of context lines to include after each match. 0 = disabled.
@@ -125,7 +122,6 @@ impl Default for GrepSearchOptions {
             page_limit: 50,
             mode: GrepMode::default(),
             time_budget_ms: 0,
-            enforce_time_budget: false,
             before_context: 0,
             after_context: 0,
             classify_definitions: false,

@@ -108,6 +108,7 @@ pub(crate) fn multi_grep_search<'a>(
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
+    enforce_time_budget: bool,
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
@@ -168,6 +169,7 @@ pub(crate) fn multi_grep_search<'a>(
             overflow_arena,
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
+            enforce_time_budget,
         },
         |file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {

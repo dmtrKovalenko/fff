@@ -139,7 +139,7 @@ const ffiDefinition = {
   },
 
   // Live grep (content search)
-  fff_live_grep_ex: {
+  fff_live_grep: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // query
@@ -150,7 +150,6 @@ const ffiDefinition = {
       FFIType.u32, // file_offset
       FFIType.u32, // page_limit
       FFIType.u64, // time_budget_ms
-      FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
       FFIType.bool, // classify_definitions
@@ -159,7 +158,7 @@ const ffiDefinition = {
   },
 
   // Multi-pattern grep (Aho-Corasick)
-  fff_multi_grep_ex: {
+  fff_multi_grep: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // patterns_joined (\n-separated)
@@ -170,7 +169,6 @@ const ffiDefinition = {
       FFIType.u32, // file_offset
       FFIType.u32, // page_limit
       FFIType.u64, // time_budget_ms
-      FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
       FFIType.bool, // classify_definitions
@@ -413,7 +411,7 @@ const RES_HANDLE = 16; // *mut c_void (8)
 const RES_INT_VALUE = 24; // i64         (8)
 
 // MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
-const FFF_CREATE_OPTIONS_VERSION = 1;
+const FFF_CREATE_OPTIONS_VERSION = 3;
 const FFF_CREATE_OPTIONS_SIZE = 88;
 const FCO_VERSION = 0;
 const FCO_BASE_PATH = 8;
@@ -430,6 +428,8 @@ const FCO_CACHE_BUDGET_MAX_BYTES = 64;
 const FCO_CACHE_BUDGET_MAX_FILE_SIZE = 72;
 const FCO_ENABLE_FS_ROOT_SCANNING = 80;
 const FCO_ENABLE_HOME_DIR_SCANNING = 81;
+const FCO_FOLLOW_SYMLINKS = 82;
+const FCO_ENFORCE_GREP_TIME_BUDGET = 83;
 
 function readResultEnvelope(
   resultPtr: Pointer | null,
@@ -543,6 +543,8 @@ export function ffiCreate(
   cacheBudgetMaxFileSize: bigint,
   enableFsRootScanning: boolean,
   enableHomeDirScanning: boolean,
+  followSymlinks: boolean,
+  enforceGrepTimeBudget: boolean,
 ): Result<NativeHandle> {
   const library = loadLibrary();
 
@@ -570,6 +572,8 @@ export function ffiCreate(
   opts.writeBigUInt64LE(cacheBudgetMaxFileSize, FCO_CACHE_BUDGET_MAX_FILE_SIZE);
   opts.writeUInt8(enableFsRootScanning ? 1 : 0, FCO_ENABLE_FS_ROOT_SCANNING);
   opts.writeUInt8(enableHomeDirScanning ? 1 : 0, FCO_ENABLE_HOME_DIR_SCANNING);
+  opts.writeUInt8(followSymlinks ? 1 : 0, FCO_FOLLOW_SYMLINKS);
+  opts.writeUInt8(enforceGrepTimeBudget ? 1 : 0, FCO_ENFORCE_GREP_TIME_BUDGET);
 
   const resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
 
@@ -1246,13 +1250,12 @@ export function ffiLiveGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
-  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
   classifyDefinitions: boolean,
 ): Result<GrepResult> {
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_live_grep_ex(
+  const resultPtr = library.symbols.fff_live_grep(
     handle,
     ptr(encodeString(query)),
     grepModeToU8(mode),
@@ -1262,7 +1265,6 @@ export function ffiLiveGrep(
     fileOffset,
     pageLimit,
     BigInt(timeBudgetMs),
-    enforceTimeBudget,
     beforeContext,
     afterContext,
     classifyDefinitions,
@@ -1283,13 +1285,12 @@ export function ffiMultiGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
-  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
   classifyDefinitions: boolean,
 ): Result<GrepResult> {
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_multi_grep_ex(
+  const resultPtr = library.symbols.fff_multi_grep(
     handle,
     ptr(encodeString(patternsJoined)),
     ptr(encodeString(constraints)),
@@ -1299,7 +1300,6 @@ export function ffiMultiGrep(
     fileOffset,
     pageLimit,
     BigInt(timeBudgetMs),
-    enforceTimeBudget,
     beforeContext,
     afterContext,
     classifyDefinitions,
