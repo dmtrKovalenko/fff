@@ -58,7 +58,8 @@ fn test_fuzzy_typo_scoring() {
 
     // Helper: check if a match would pass our post-filters
     let passes = |n: &str, h: &str| -> bool {
-        let Some(mut mi) = neo_frizbee::Matcher::new(n, &config).match_list_indices(&[h])
+        let Some(mut mi) = neo_frizbee::Matcher::new(n, &config)
+            .match_list_indices(&[h])
             .into_iter()
             .next()
         else {

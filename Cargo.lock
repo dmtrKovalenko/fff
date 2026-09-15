@@ -1508,9 +1508,9 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15569f06e7e88f579edc822d040986c0128f89342b9b98aa3d08929ebd378278"
+checksum = "31d299e4377053f9a1c6ce6405a5d9f930d4fe6be96d938abeecdd199d2ccca8"
 dependencies = [
  "serde",
 ]

@@ -19,6 +19,14 @@ enum FileItems<'a> {
 
 impl<'a> FileItems<'a> {
     #[inline]
+    fn len(&self) -> usize {
+        match self {
+            FileItems::All(s) => s.len(),
+            FileItems::Filtered(v) => v.len(),
+        }
+    }
+
+    #[inline]
     fn index(&self, index: usize) -> &'a FileItem {
         match self {
             FileItems::All(s) => &s[index],
@@ -61,25 +69,14 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // A single `&FileItem` resolver keeps frizbee to one monomorphized hot loop
-    // instead of separate `FileItem` and `&FileItem` copies (~1MB of code each).
-    let resolve_ref = |file: &&FileItem,
-                       buf: &mut [*const u8; MAX_PATH_CHUNKS]|
-     -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
-
-    let all_refs: Vec<&FileItem>;
-    let candidates: &[&FileItem] = match working_files {
-        FileItems::All(files) => {
-            all_refs = files.iter().collect();
-            &all_refs
-        }
-        FileItems::Filtered(files) => files,
-    };
-
-    let first_part_matches = neo_frizbee::match_list_parallel_resolved(
+    // Index-based resolver: no `Vec<&FileItem>` materialization for either the
+    // full list or the per-part subsets, and a single monomorphized hot loop.
+    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
         valid_parts[0],
-        candidates,
-        &resolve_ref,
+        working_files.len(),
+        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+            resolve_file_chunks(working_files.index(index as usize), arena, buf)
+        },
         options,
         max_threads,
     );
@@ -94,16 +91,16 @@ fn match_fuzzy_parts(
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        // Collect the subset of files that survived the previous round.
-        let subset: Vec<&FileItem> = matches
-            .iter()
-            .map(|m| working_files.index(m.index as usize))
-            .collect();
-
-        let sub_matches = neo_frizbee::match_list_parallel_resolved(
+        // Match only the files that survived the previous round, addressed
+        // through the previous matches without collecting a subset.
+        let survivors = &matches;
+        let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
-            subset.as_slice(),
-            &resolve_ref,
+            survivors.len(),
+            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                let file = working_files.index(survivors[index as usize].index as usize);
+                resolve_file_chunks(file, arena, buf)
+            },
             &part_options,
             max_threads,
         );
@@ -326,15 +323,12 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
-    let resolve_chunks_for_frizbee =
-        |dir: &&DirItem, buf: &mut [*const u8; MAX_PATH_CHUNKS]| -> Option<(usize, u16)> {
-            resolve_dir_chunks(dir, arena, overflow_arena, buf)
-        };
-
-    let first_part_matches = neo_frizbee::match_list_parallel_resolved(
+    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
         valid_parts[0],
-        working_dirs,
-        &resolve_chunks_for_frizbee,
+        working_dirs.len(),
+        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+            resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
+        },
         options,
         max_threads,
     );
@@ -349,16 +343,16 @@ fn match_fuzzy_parts_dirs(
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        // Collect the subset of dirs that survived the previous round.
-        let subset: Vec<&DirItem> = matches
-            .iter()
-            .map(|m| working_dirs[m.index as usize])
-            .collect();
-
-        let sub_matches = neo_frizbee::match_list_parallel_resolved(
+        // Match only the dirs that survived the previous round, addressed
+        // through the previous matches without collecting a subset.
+        let survivors = &matches;
+        let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
-            subset.as_slice(),
-            &resolve_chunks_for_frizbee,
+            survivors.len(),
+            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                let dir = working_dirs[survivors[index as usize].index as usize];
+                resolve_dir_chunks(dir, arena, overflow_arena, buf)
+            },
             &part_options,
             max_threads,
         );
