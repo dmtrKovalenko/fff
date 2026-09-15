@@ -201,7 +201,7 @@ pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>)
 /// Adjacent characters are merged into a single contiguous range.
 pub(super) fn char_indices_to_byte_offsets(
     line: &str,
-    char_indices: &[usize],
+    char_indices: &[u32],
 ) -> SmallVec<[(u32, u32); 4]> {
     if char_indices.is_empty() {
         return SmallVec::new();
@@ -218,6 +218,7 @@ pub(super) fn char_indices_to_byte_offsets(
     let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
 
     for &ci in char_indices {
+        let ci = ci as usize;
         if ci >= char_byte_ranges.len() {
             continue; // out of bounds (shouldn't happen with valid data)
         }

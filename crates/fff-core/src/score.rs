@@ -202,7 +202,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         .any(|part| part.chars().any(|ch| ch.is_uppercase()));
     let config = neo_frizbee::Config {
         max_typos: Some(max_typos),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: Scoring {
             capitalization_bonus: if has_uppercase { 8 } else { 0 },
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
@@ -238,7 +238,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     ranges_by_item
 }
 
-fn char_indices_to_byte_offsets(line: &str, char_indices: &[usize]) -> SmallVec<[(u32, u32); 4]> {
+fn char_indices_to_byte_offsets(line: &str, char_indices: &[u32]) -> SmallVec<[(u32, u32); 4]> {
     let char_byte_ranges: Vec<(usize, usize)> = line
         .char_indices()
         .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
@@ -246,7 +246,7 @@ fn char_indices_to_byte_offsets(line: &str, char_indices: &[usize]) -> SmallVec<
     let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
 
     for &char_idx in char_indices {
-        let Some(&(start, end)) = char_byte_ranges.get(char_idx) else {
+        let Some(&(start, end)) = char_byte_ranges.get(char_idx as usize) else {
             continue;
         };
 
@@ -439,7 +439,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
 
     let options = neo_frizbee::Config {
         max_typos: Some(context.max_typos),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: Scoring {
             capitalization_bonus: if has_uppercase { 8 } else { 0 },
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
@@ -643,7 +643,7 @@ fn match_and_score_in_arena<'a>(
 
     let options = neo_frizbee::Config {
         max_typos: Some(context.max_typos),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: Scoring {
             capitalization_bonus: if has_uppercase { 8 } else { 0 },
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
@@ -684,16 +684,15 @@ fn match_and_score_in_arena<'a>(
         if fallback_filenames.is_empty() {
             vec![]
         } else {
-            let mut matches = neo_frizbee::match_list_parallel(
-                fuzzy_parts[0],
-                &fallback_filenames,
-                &options,
-                if path_matches.len() > 4096 {
-                    context.max_threads.div_ceil(2048)
-                } else {
-                    1
-                },
-            );
+            let mut matches = neo_frizbee::Matcher::new(fuzzy_parts[0], &options)
+                .match_list_parallel(
+                    &fallback_filenames,
+                    if path_matches.len() > 4096 {
+                        context.max_threads.div_ceil(2048)
+                    } else {
+                        1
+                    },
+                );
 
             sort_by_key_with_buffer(&mut matches, |m| fallback_indices[m.index as usize]);
             matches
@@ -1494,21 +1493,21 @@ mod filename_bonus_tests {
 
         let options = neo_frizbee::Config {
             max_typos: Some(2),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             ..Default::default()
         };
 
-        let matches = neo_frizbee::match_list("aipart", &[path], &options);
+        let matches = neo_frizbee::Matcher::new("aipart", &options).match_list(&[path]);
         assert!(!matches.is_empty(), "'aipart' should match the path");
 
-        let matches = neo_frizbee::match_list("core", &[path], &options);
+        let matches = neo_frizbee::Matcher::new("core", &options).match_list(&[path]);
         assert!(!matches.is_empty(), "'core' should match the path");
 
         let co_options = neo_frizbee::Config {
             max_typos: Some(2),
             ..options
         };
-        let matches = neo_frizbee::match_list("co", &[path], &co_options);
+        let matches = neo_frizbee::Matcher::new("co", &co_options).match_list(&[path]);
         assert!(!matches.is_empty(), "'co' should match the path");
     }
 
@@ -1518,14 +1517,14 @@ mod filename_bonus_tests {
 
         let options = neo_frizbee::Config {
             max_typos: Some(2),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             ..Default::default()
         };
 
-        let matches = neo_frizbee::match_list("co", &[path.as_str()], &options);
+        let matches = neo_frizbee::Matcher::new("co", &options).match_list(&[path.as_str()]);
         assert!(!matches.is_empty(), "'co' should match the lowercase path");
 
-        let matches = neo_frizbee::match_list("core", &[path.as_str()], &options);
+        let matches = neo_frizbee::Matcher::new("core", &options).match_list(&[path.as_str()]);
         assert!(
             !matches.is_empty(),
             "'core' should match the lowercase path"

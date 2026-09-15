@@ -53,7 +53,7 @@ pub(super) fn fuzzy_grep_search<'a>(
         &neo_frizbee::Config {
             // Use the real max_typos so frizbee's SIMD prefilter actually rejects non-matching lines (~2 SIMD instructions per line vs full SW scoring).
             max_typos: Some(max_typos as u16),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             scoring,
             ..Default::default()
         },
@@ -271,7 +271,7 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                         if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
                             // reject widely scattered matches
-                            let span = last - first + 1;
+                            let span = (last - first + 1) as usize;
                             if span > max_match_span {
                                 continue;
                             }
