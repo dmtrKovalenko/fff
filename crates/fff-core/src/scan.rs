@@ -7,6 +7,7 @@ use tracing::{error, info};
 use crate::FileSync;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
+use crate::index::snapshot::LayerSnapshot;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::shared::{SharedFilePicker, SharedFrecency};
@@ -59,6 +60,9 @@ pub(crate) struct ScanJob {
     /// walker. Shared `Arc` so the UI polls the same atomic.
     scanned_files_counter: Arc<AtomicUsize>,
     trace_span: tracing::Span,
+    // A saved base scan replaces the filesystem walk; every later phase
+    // (git, post-scan indexing, watcher) runs the same way.
+    source: Option<LayerSnapshot>,
 }
 
 impl ScanJob {
@@ -106,7 +110,13 @@ impl ScanJob {
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
             trace_span,
+            source: None,
         }))
+    }
+
+    pub fn with_source(mut self, snapshot: LayerSnapshot) -> Self {
+        self.source = Some(snapshot);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -129,6 +139,7 @@ impl ScanJob {
             scanned_files_counter,
             config,
             trace_span,
+            source: None,
         }
     }
 
@@ -159,26 +170,40 @@ impl ScanJob {
             scanned_files_counter,
             config,
             trace_span: _,
+            source,
         } = self;
 
         let _scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
 
-        // 1. Walk the file system and collect the list of files
+        // 1. Walk the file system (or unpack the saved base) into a file list
         let git_workdir = FileSync::discover_git_workdir(&base_path);
-        let sync = match FileSync::walk_filesystem(
-            &base_path,
-            git_workdir.clone(),
-            &scanned_files_counter,
-            &shared_frecency,
-            mode,
-            config.follow_symlinks,
-        ) {
-            Ok(sync) => sync,
-            Err(e) => {
-                error!(?e, "scan walk failed");
-                return;
+        let sync = match source {
+            Some(snapshot) => {
+                let frecency = shared_frecency.read().ok();
+                let sync = FileSync::from_snapshot(
+                    snapshot,
+                    &base_path,
+                    frecency.as_deref().and_then(Option::as_ref),
+                    mode,
+                );
+                scanned_files_counter.store(sync.live_count, Ordering::Relaxed);
+                sync
             }
+            None => match FileSync::walk_filesystem(
+                &base_path,
+                git_workdir.clone(),
+                &scanned_files_counter,
+                &shared_frecency,
+                mode,
+                config.follow_symlinks,
+            ) {
+                Ok(sync) => sync,
+                Err(e) => {
+                    error!(?e, "scan walk failed");
+                    return;
+                }
+            },
         };
 
         // 2. Populate the file list

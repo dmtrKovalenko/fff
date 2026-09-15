@@ -57,6 +57,8 @@ import type {
   FileItem,
   GrepMatch,
   GrepResult,
+  LayerEntry,
+  LayerInfo,
   Location,
   MixedItem,
   MixedSearchResult,
@@ -1824,6 +1826,177 @@ export function ffiWatchCleanupAfterDestroy(
   }
   watchInstances.delete(handle as unknown);
   releaseWatchTrampolineIfIdle();
+}
+
+/**
+ * Seal the writable index layer and open a new one. Returns the new id.
+ */
+export function ffiLayerCreate(handle: NativeHandle, label?: string): Result<number> {
+  // ffi-rs rejects null for String params: U64(0) stands in for a null char*.
+  const labelType = label === undefined ? DataType.U64 : DataType.String;
+  return callIntResult(
+    "fff_layer_create",
+    [DataType.External, labelType],
+    [handle, label === undefined ? 0 : label],
+  );
+}
+
+/**
+ * Id of the layer new files are written into.
+ */
+export function ffiLayerCurrent(handle: NativeHandle): Result<number> {
+  return callIntResult("fff_layer_current", [DataType.External], [handle]);
+}
+
+/**
+ * Live file count of `layer` (0 = base scan).
+ */
+export function ffiLayerFileCount(handle: NativeHandle, layer: number): Result<number> {
+  return callIntResult(
+    "fff_layer_file_count",
+    [DataType.External, DataType.U8],
+    [handle, layer],
+  );
+}
+
+/**
+ * Every overlay layer, oldest first.
+ */
+export function ffiLayerList(handle: NativeHandle): Result<LayerInfo[]> {
+  const parsed = callJsonResult<LayerInfo[] | undefined>(
+    "fff_layer_list",
+    [DataType.External],
+    [handle],
+  );
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: parsed.value ?? [] };
+}
+
+/**
+ * Append paths to the writable layer. One FFI call per batch: paths travel
+ * as a single newline-joined buffer, metadata as two little-endian u64 arrays.
+ */
+export function ffiLayerAddPaths(
+  handle: NativeHandle,
+  entries: Array<string | LayerEntry>,
+): Result<number> {
+  const batch = encodeLayerBatch(entries);
+  const [types, values] = layerBatchParams(batch);
+  return callIntResult(
+    "fff_layer_add_paths",
+    [DataType.External, ...types],
+    [handle, ...values],
+  );
+}
+
+/**
+ * Build a layer file from `entries` without an instance. Returns bytes written.
+ */
+export function ffiLayerBuild(
+  label: string | undefined,
+  entries: Array<string | LayerEntry>,
+  outPath: string,
+): Result<number> {
+  const batch = encodeLayerBatch(entries);
+  const [types, values] = layerBatchParams(batch);
+  const labelType = label === undefined ? DataType.U64 : DataType.String;
+  return callIntResult(
+    "fff_layer_build",
+    [labelType, ...types, DataType.String],
+    [label === undefined ? 0 : label, ...values, outPath],
+  );
+}
+
+/**
+ * Write `layer` (0 = base scan) to `filePath`. Returns bytes written.
+ */
+export function ffiLayerSave(
+  handle: NativeHandle,
+  layer: number,
+  filePath: string,
+): Result<number> {
+  return callIntResult(
+    "fff_layer_save",
+    [DataType.External, DataType.U8, DataType.String],
+    [handle, layer, filePath],
+  );
+}
+
+/**
+ * Load a layer file as a new sealed overlay. Returns its id.
+ */
+export function ffiLayerLoad(handle: NativeHandle, filePath: string): Result<number> {
+  return callIntResult(
+    "fff_layer_load",
+    [DataType.External, DataType.String],
+    [handle, filePath],
+  );
+}
+
+/**
+ * Load a layer file as the base scan. Returns the file count.
+ */
+export function ffiBaseLoad(handle: NativeHandle, filePath: string): Result<number> {
+  return callIntResult(
+    "fff_base_load",
+    [DataType.External, DataType.String],
+    [handle, filePath],
+  );
+}
+
+interface LayerBatch {
+  paths: Buffer;
+  sizes: Buffer | null;
+  modified: Buffer | null;
+  count: number;
+}
+
+/** Packs entries into the buffers `fff_layer_add_paths` / `fff_layer_build` take. */
+function encodeLayerBatch(entries: Array<string | LayerEntry>): LayerBatch {
+  const count = entries.length;
+  let hasMeta = false;
+  const lines: string[] = Array.from({ length: count }, () => "");
+  for (let i = 0; i < count; i++) {
+    const entry = entries[i];
+    if (typeof entry === "string") {
+      lines[i] = entry;
+    } else {
+      lines[i] = entry.path;
+      if (entry.size !== undefined || entry.modified !== undefined) hasMeta = true;
+    }
+  }
+
+  const paths = Buffer.from(lines.join("\n"), "utf8");
+  if (!hasMeta) return { paths, sizes: null, modified: null, count };
+
+  const sizes = Buffer.alloc(count * 8);
+  const modified = Buffer.alloc(count * 8);
+  for (let i = 0; i < count; i++) {
+    const entry = entries[i];
+    if (typeof entry === "string") continue;
+    sizes.writeBigUInt64LE(BigInt(entry.size ?? 0), i * 8);
+    modified.writeBigUInt64LE(BigInt(entry.modified ?? 0), i * 8);
+  }
+  return { paths, sizes, modified, count };
+}
+
+/** `(paths, paths_len, sizes, modified, count)` params; U64(0) stands in for null. */
+function layerBatchParams(batch: LayerBatch): [FieldType[], unknown[]] {
+  const types: FieldType[] = [];
+  const values: unknown[] = [];
+  const optional = (buf: Buffer | null) => {
+    types.push(buf === null ? DataType.U64 : DataType.U8Array);
+    values.push(buf === null ? 0 : buf);
+  };
+
+  optional(batch.count === 0 ? null : batch.paths);
+  types.push(DataType.U64);
+  values.push(batch.paths.byteLength);
+  optional(batch.sizes);
+  optional(batch.modified);
+  types.push(DataType.U64);
+  values.push(batch.count);
+  return [types, values];
 }
 
 /**

@@ -25,6 +25,8 @@ import type {
   FileItem,
   GrepMatch,
   GrepResult,
+  LayerEntry,
+  LayerInfo,
   Location,
   MixedItem,
   MixedSearchResult,
@@ -255,6 +257,54 @@ const ffiDefinition = {
   },
   fff_get_historical_query: {
     args: [FFIType.ptr, FFIType.u64],
+    returns: FFIType.ptr,
+  },
+
+  // Index layers
+  fff_layer_create: {
+    args: [FFIType.ptr, FFIType.ptr],
+    returns: FFIType.ptr,
+  },
+  fff_layer_current: {
+    args: [FFIType.ptr],
+    returns: FFIType.ptr,
+  },
+  fff_layer_file_count: {
+    args: [FFIType.ptr, FFIType.u8],
+    returns: FFIType.ptr,
+  },
+  fff_layer_list: {
+    args: [FFIType.ptr],
+    returns: FFIType.ptr,
+  },
+  fff_layer_add_paths: {
+    // handle, paths, paths_len, sizes, modified, count
+    args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.u64],
+    returns: FFIType.ptr,
+  },
+  fff_layer_build: {
+    // label, paths, paths_len, sizes, modified, count, out_path
+    args: [
+      FFIType.ptr,
+      FFIType.ptr,
+      FFIType.u64,
+      FFIType.ptr,
+      FFIType.ptr,
+      FFIType.u64,
+      FFIType.cstring,
+    ],
+    returns: FFIType.ptr,
+  },
+  fff_layer_save: {
+    args: [FFIType.ptr, FFIType.u8, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  fff_layer_load: {
+    args: [FFIType.ptr, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  fff_base_load: {
+    args: [FFIType.ptr, FFIType.cstring],
     returns: FFIType.ptr,
   },
 
@@ -1549,6 +1599,122 @@ export function ffiHealthCheck(
 }
 
 /**
+ * Seal the writable index layer and open a new one. Returns the new id.
+ */
+export function ffiLayerCreate(handle: NativeHandle, label?: string): Result<number> {
+  const library = loadLibrary();
+  const labelPtr = label === undefined ? null : ptr(encodeString(label));
+  const resultPtr = library.symbols.fff_layer_create(handle, labelPtr);
+  return parseIntResult(resultPtr);
+}
+
+/**
+ * Id of the layer new files are written into.
+ */
+export function ffiLayerCurrent(handle: NativeHandle): Result<number> {
+  const library = loadLibrary();
+  return parseIntResult(library.symbols.fff_layer_current(handle));
+}
+
+/**
+ * Live file count of `layer` (0 = base scan).
+ */
+export function ffiLayerFileCount(handle: NativeHandle, layer: number): Result<number> {
+  const library = loadLibrary();
+  return parseIntResult(library.symbols.fff_layer_file_count(handle, layer));
+}
+
+/**
+ * Every overlay layer, oldest first.
+ */
+export function ffiLayerList(handle: NativeHandle): Result<LayerInfo[]> {
+  const library = loadLibrary();
+  const parsed = parseJsonResult<LayerInfo[] | undefined>(
+    library.symbols.fff_layer_list(handle),
+  );
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: parsed.value ?? [] };
+}
+
+/**
+ * Append paths to the writable layer. One FFI call per batch: paths travel
+ * as a single newline-joined buffer, metadata as two u64 arrays.
+ */
+export function ffiLayerAddPaths(
+  handle: NativeHandle,
+  entries: Array<string | LayerEntry>,
+): Result<number> {
+  const library = loadLibrary();
+  const batch = encodeLayerBatch(entries);
+  const resultPtr = library.symbols.fff_layer_add_paths(
+    handle,
+    batch.count === 0 ? null : ptr(batch.paths),
+    batch.paths.byteLength,
+    batch.sizes === null ? null : ptr(batch.sizes),
+    batch.modified === null ? null : ptr(batch.modified),
+    batch.count,
+  );
+  return parseIntResult(resultPtr);
+}
+
+/**
+ * Build a layer file from `entries` without an instance. Returns bytes written.
+ */
+export function ffiLayerBuild(
+  label: string | undefined,
+  entries: Array<string | LayerEntry>,
+  outPath: string,
+): Result<number> {
+  const library = loadLibrary();
+  const batch = encodeLayerBatch(entries);
+  const resultPtr = library.symbols.fff_layer_build(
+    label === undefined ? null : ptr(encodeString(label)),
+    batch.count === 0 ? null : ptr(batch.paths),
+    batch.paths.byteLength,
+    batch.sizes === null ? null : ptr(batch.sizes),
+    batch.modified === null ? null : ptr(batch.modified),
+    batch.count,
+    ptr(encodeString(outPath)),
+  );
+  return parseIntResult(resultPtr);
+}
+
+/**
+ * Write `layer` (0 = base scan) to `filePath`. Returns bytes written.
+ */
+export function ffiLayerSave(
+  handle: NativeHandle,
+  layer: number,
+  filePath: string,
+): Result<number> {
+  const library = loadLibrary();
+  const resultPtr = library.symbols.fff_layer_save(
+    handle,
+    layer,
+    ptr(encodeString(filePath)),
+  );
+  return parseIntResult(resultPtr);
+}
+
+/**
+ * Load a layer file as a new sealed overlay. Returns its id.
+ */
+export function ffiLayerLoad(handle: NativeHandle, filePath: string): Result<number> {
+  const library = loadLibrary();
+  const resultPtr = library.symbols.fff_layer_load(handle, ptr(encodeString(filePath)));
+  return parseIntResult(resultPtr);
+}
+
+/**
+ * Load a layer file as the base scan. Returns the file count.
+ */
+export function ffiBaseLoad(handle: NativeHandle, filePath: string): Result<number> {
+  const library = loadLibrary();
+  const resultPtr = library.symbols.fff_base_load(handle, ptr(encodeString(filePath)));
+  return parseIntResult(resultPtr);
+}
+
+/**
  * Ensure the library is loaded.
  *
  * Loads the native library from the platform-specific npm package
@@ -1568,4 +1734,38 @@ export function isAvailable(): boolean {
   } catch {
     return false;
   }
+}
+
+/** Packs entries into the buffers `fff_layer_add_paths` / `fff_layer_build` take. */
+function encodeLayerBatch(entries: Array<string | LayerEntry>): {
+  paths: Uint8Array;
+  sizes: BigUint64Array | null;
+  modified: BigUint64Array | null;
+  count: number;
+} {
+  const count = entries.length;
+  let hasMeta = false;
+  const lines: string[] = Array.from({ length: count }, () => "");
+  for (let i = 0; i < count; i++) {
+    const entry = entries[i];
+    if (typeof entry === "string") {
+      lines[i] = entry;
+    } else {
+      lines[i] = entry.path;
+      if (entry.size !== undefined || entry.modified !== undefined) hasMeta = true;
+    }
+  }
+
+  const paths = new TextEncoder().encode(lines.join("\n"));
+  if (!hasMeta) return { paths, sizes: null, modified: null, count };
+
+  const sizes = new BigUint64Array(count);
+  const modified = new BigUint64Array(count);
+  for (let i = 0; i < count; i++) {
+    const entry = entries[i];
+    if (typeof entry === "string") continue;
+    sizes[i] = BigInt(entry.size ?? 0);
+    modified[i] = BigInt(entry.modified ?? 0);
+  }
+  return { paths, sizes, modified, count };
 }

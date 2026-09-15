@@ -24,6 +24,17 @@
 //!   path, or directory subtree with normalized batch delivery
 //!   (see [`SharedFilePicker::watch`]).
 //!
+//! ## Index Layers
+//!
+//! The path index is a stack: layer 0 is the immutable base scan, above it up
+//! to [`MAX_OVERLAY_LAYERS`] append-only overlays with their own path arenas.
+//! [`SESSION_LAYER`] collects watcher additions; `FilePicker::create_layer`
+//! seals the top and opens a new one, compacting the two newest when full.
+//! [`LayerBuilder`] packs entries off-lock into a [`LayerSnapshot`], which can
+//! be imported as a sealed layer, saved to a file, or (for a base scan) fed to
+//! [`SharedFilePicker::import_base`] to replace the walk. Explicit layers survive
+//! a rescan; only the base and session layer are rebuilt.
+//!
 //! ## Shared State
 //!
 //! [`SharedFilePicker`], [`SharedFrecency`], and [`SharedQueryTracker`] are
@@ -134,6 +145,12 @@ pub mod types;
 pub use types::*;
 
 pub mod constants;
+
+/// Layered index arenas: the immutable base scan plus stacked overlays.
+pub use index::layers::{
+    LayerArenas, LayerId, LayerInfo, MAX_INDEX_LAYERS, MAX_OVERLAY_LAYERS, SESSION_LAYER,
+};
+pub use index::snapshot::{IndexEntry, LayerBuilder, LayerSnapshot, SnapshotLayout};
 
 /// Watcher rescan request accounting.
 pub mod rescan_stats;

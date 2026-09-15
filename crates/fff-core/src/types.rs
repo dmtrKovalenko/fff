@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
 use crate::constants::{MAX_CACHED_CONTENT_BYTES, MAX_FFFILE_SIZE, PATH_BUF_SIZE};
 use crate::index::constraints::Constrainable;
+use crate::index::layers::{LAYER_MASK, LAYER_SHIFT, LayerId};
 use crate::query_tracker::QueryMatchEntry;
 use crate::simd_path::ArenaPtr;
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
@@ -23,6 +24,16 @@ pub trait FFFStringStorage {
     fn base_arena(&self) -> ArenaPtr;
     /// The overflow arena (paths added after the last full scan).
     fn overflow_arena(&self) -> ArenaPtr;
+
+    /// Arena backing a specific index layer. The default collapses the layer
+    /// stack onto the legacy base/overflow split.
+    fn arena_for_layer(&self, layer: LayerId) -> ArenaPtr {
+        if layer == 0 {
+            self.base_arena()
+        } else {
+            self.overflow_arena()
+        }
+    }
 }
 
 impl FFFStringStorage for ArenaPtr {
@@ -61,8 +72,10 @@ impl FileItemFlags {
     /// bigram indices for other files stay valid.
     pub const DELETED: u8 = 1 << 1;
     /// File was added after the last full reindex; its indices point
-    /// into the overflow builder arena, not the base arena.
+    /// into an overlay layer arena, not the base arena.
     pub const OVERFLOW: u8 = 1 << 2;
+    /// Bits 3..5 hold the arena layer id (0 = base scan).
+    pub const LAYER: u8 = LAYER_MASK;
 }
 
 pub struct DirFlags;
@@ -70,6 +83,8 @@ pub struct DirFlags;
 impl DirFlags {
     pub const OVERFLOW: u8 = 1 << 0;
     pub const DELETED: u8 = 1 << 1;
+    /// Bits 3..5 hold the arena layer id (0 = base scan).
+    pub const LAYER: u8 = LAYER_MASK;
 }
 
 /// A directory in the file index. Shares chunk arena with file paths.
@@ -129,16 +144,33 @@ impl DirItem {
         }
     }
 
-    /// A dir appended after the initial scan; its path lives in the overflow arena.
-    pub(crate) fn new_overflow(
+    /// A dir appended after the initial scan; its path lives in the arena of
+    /// overlay layer `layer`.
+    pub(crate) fn new_in_layer(
         path: crate::simd_path::ChunkedString,
         last_segment_offset: u16,
+        layer: LayerId,
     ) -> Self {
         Self {
             path,
-            flags: DirFlags::OVERFLOW,
+            flags: DirFlags::OVERFLOW | ((layer << LAYER_SHIFT) & LAYER_MASK),
             last_segment_offset,
             max_access_frecency: AtomicI32::new(0),
+        }
+    }
+
+    /// Arena layer owning this dir's path. `0` is the base scan.
+    #[inline(always)]
+    pub fn layer_id(&self) -> LayerId {
+        (self.flags & LAYER_MASK) >> LAYER_SHIFT
+    }
+
+    pub(crate) fn set_layer(&mut self, layer: LayerId) {
+        self.flags = (self.flags & !LAYER_MASK) | ((layer << LAYER_SHIFT) & LAYER_MASK);
+        if layer == 0 {
+            self.flags &= !DirFlags::OVERFLOW;
+        } else {
+            self.flags |= DirFlags::OVERFLOW;
         }
     }
 
@@ -174,13 +206,8 @@ impl DirItem {
     /// Relative dir path as owned String (cold path).
     pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
-        let ptr = if self.is_overflow() {
-            arena.overflow_arena()
-        } else {
-            arena.base_arena()
-        };
-
-        self.path.write_to_string(ptr, &mut out);
+        self.path
+            .write_to_string(arena.arena_for_layer(self.layer_id()), &mut out);
         out
     }
 
@@ -201,12 +228,7 @@ impl DirItem {
     /// The dirname (last segment) as an owned String. Cold path.
     pub fn dir_name(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
-        let ptr = if self.is_overflow() {
-            arena.overflow_arena()
-        } else {
-            arena.base_arena()
-        };
-        self.write_dir_name(ptr, &mut out);
+        self.write_dir_name(arena.arena_for_layer(self.layer_id()), &mut out);
         out
     }
 
@@ -239,8 +261,8 @@ impl Constrainable for DirItem {
     }
 
     #[inline]
-    fn is_overflow(&self) -> bool {
-        DirItem::is_overflow(self)
+    fn layer_id(&self) -> LayerId {
+        DirItem::layer_id(self)
     }
 }
 
@@ -621,12 +643,42 @@ impl FileItem {
 
     #[inline]
     pub fn set_overflow(&self, val: bool) {
-        if val {
-            self.flags
-                .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
+        self.set_layer(if val {
+            crate::index::layers::SESSION_LAYER
         } else {
-            self.flags
-                .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
+            0
+        });
+    }
+
+    /// Arena layer owning this file's path. `0` is the base scan, higher ids
+    /// are overlay layers stacked in creation order.
+    #[inline(always)]
+    pub fn layer_id(&self) -> LayerId {
+        (self.flags.load(Ordering::Relaxed) & LAYER_MASK) >> LAYER_SHIFT
+    }
+
+    /// Moves the file onto `layer`. Only the picker may call this — the path
+    /// indices must already point into that layer's arena.
+    #[inline]
+    pub(crate) fn set_layer(&self, layer: LayerId) {
+        let bits = (layer << LAYER_SHIFT) & LAYER_MASK;
+        let overflow = if layer == 0 {
+            0
+        } else {
+            FileItemFlags::OVERFLOW
+        };
+        let mut current = self.flags.load(Ordering::Relaxed);
+        loop {
+            let next = (current & !(LAYER_MASK | FileItemFlags::OVERFLOW)) | bits | overflow;
+            match self.flags.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -831,8 +883,8 @@ impl Constrainable for FileItem {
     }
 
     #[inline]
-    fn is_overflow(&self) -> bool {
-        FileItem::is_overflow(self)
+    fn layer_id(&self) -> LayerId {
+        FileItem::layer_id(self)
     }
 }
 
