@@ -61,32 +61,28 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    let resolve = |file: &FileItem,
-                   buf: &mut [*const u8; MAX_PATH_CHUNKS]|
-     -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
-
-    // because we reassemble the vec of reference we have to use a different type
-    // to narrow down the [&FileItem] which would be resolved by frizbee as &&
+    // A single `&FileItem` resolver keeps frizbee to one monomorphized hot loop
+    // instead of separate `FileItem` and `&FileItem` copies (~1MB of code each).
     let resolve_ref = |file: &&FileItem,
                        buf: &mut [*const u8; MAX_PATH_CHUNKS]|
      -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
 
-    let first_part_matches = match working_files {
-        FileItems::All(files) => neo_frizbee::match_list_parallel_resolved(
-            valid_parts[0],
-            files,
-            &resolve,
-            options,
-            max_threads,
-        ),
-        FileItems::Filtered(files) => neo_frizbee::match_list_parallel_resolved(
-            valid_parts[0],
-            files.as_slice(),
-            &resolve_ref,
-            options,
-            max_threads,
-        ),
+    let all_refs: Vec<&FileItem>;
+    let candidates: &[&FileItem] = match working_files {
+        FileItems::All(files) => {
+            all_refs = files.iter().collect();
+            &all_refs
+        }
+        FileItems::Filtered(files) => files,
     };
+
+    let first_part_matches = neo_frizbee::match_list_parallel_resolved(
+        valid_parts[0],
+        candidates,
+        &resolve_ref,
+        options,
+        max_threads,
+    );
 
     if valid_parts.len() == 1 {
         return first_part_matches;
@@ -215,6 +211,8 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         ..Default::default()
     };
 
+    // Match on `&str` so this shares frizbee's instantiation with fuzzy grep.
+    let path_strs: Vec<&str> = paths.iter().map(String::as_str).collect();
     for (idx, part) in parts.iter().copied().enumerate() {
         let mut part_config = config;
         if idx > 0 {
@@ -222,7 +220,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         }
 
         let mut matcher = neo_frizbee::Matcher::new(part, &part_config);
-        for mut matched in matcher.match_list_indices(&paths) {
+        for mut matched in matcher.match_list_indices(&path_strs) {
             let item_idx = matched.index as usize;
             let Some(path) = paths.get(item_idx) else {
                 continue;
