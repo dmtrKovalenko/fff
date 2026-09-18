@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                        For Neovim >= 0.10.0    Last change: 2026 September 14
+                        For Neovim >= 0.10.0    Last change: 2026 September 18
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -62,7 +62,7 @@ VIM.PACK
 >lua
     -- Package name changed from `fff.nvim` to `fff`. If you installed fff.nvim before, clean with `:packdel fff.nvim`
     vim.pack.add({ 'https://github.com/dmtrKovalenko/fff' })
-    
+
     vim.api.nvim_create_autocmd('PackChanged', {
       callback = function(ev)
         local name, kind = ev.data.spec.name, ev.data.kind
@@ -72,12 +72,12 @@ VIM.PACK
         end
       end,
     })
-    
+
     vim.g.fff = {
       lazy_sync = true,
       debug = { enabled = true, show_scores = true },
     }
-    
+
     vim.keymap.set('n', 'ff', function() require('fff').find_files() end, { desc = 'FFFind files' })
 <
 
@@ -92,7 +92,7 @@ PUBLIC API ~
     require('fff').refresh_git_status()                -- refresh git status
     require('fff').find_files_in_dir(path)             -- find in a specific dir
     require('fff').change_indexing_directory(new_path) -- change root
-    
+
     -- Programmatic search (no UI). Useful for plugin integrations.
     require('fff').file_search(query, opts)            -- fuzzy search files / dirs / mixed
     require('fff').content_search(query, opts)         -- programmatic grep
@@ -221,7 +221,7 @@ Defaults are sensible. Override only what you care about.
         --   { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ' },
         --   { ' ', ' ', ' ', ' ', ' ' },
         -- },
-    
+
         flex = { size = 130, wrap = 'top' },
         min_list_height = 10, --  do not display anything except the list below this threshold
         show_scrollbar = true,
@@ -414,7 +414,7 @@ back to the default built from `hl.normal`, `hl.border`, and `hl.title`.
 >lua
     -- Apply the same winhighlight to all picker windows
     hl = { winhl = 'Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:Title' }
-    
+
     -- Or override specific windows only
     hl = {
       winhl = {
