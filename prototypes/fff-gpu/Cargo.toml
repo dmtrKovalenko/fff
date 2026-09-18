@@ -1,0 +1,19 @@
+[package]
+name = "fff-gpu"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+# Standalone prototype: keep wgpu out of the workspace lockfile.
+[workspace]
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+ignore = "0.4"
+neo_frizbee = "0.11.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
