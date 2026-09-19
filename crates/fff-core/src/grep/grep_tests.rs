@@ -170,8 +170,7 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
-        arena,
-        arena,
+        crate::index::layers::LayerArenas::uniform(arena),
     );
 
     assert!(
@@ -210,8 +209,7 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
-        arena,
-        arena,
+        crate::index::layers::LayerArenas::uniform(arena),
     );
     assert_eq!(
         result2.matches.len(),
@@ -230,8 +228,7 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
-        arena,
-        arena,
+        crate::index::layers::LayerArenas::uniform(arena),
     );
     assert_eq!(
         result3.matches.len(),

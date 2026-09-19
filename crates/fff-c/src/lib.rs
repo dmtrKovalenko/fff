@@ -18,6 +18,7 @@ use fff::shared::SharedQueryTracker;
 
 mod accessors;
 mod ffi_types;
+mod layers;
 mod watch;
 
 use fff::file_picker::FilePicker;
@@ -50,7 +51,7 @@ pub(crate) unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
 }
 
 /// Optional C string param: `None` if null, empty, or invalid UTF-8.
-unsafe fn optional_cstr<'a>(s: *const c_char) -> Option<&'a str> {
+pub(crate) unsafe fn optional_cstr<'a>(s: *const c_char) -> Option<&'a str> {
     unsafe { cstr_to_str(s) }.filter(|s| !s.is_empty())
 }
 

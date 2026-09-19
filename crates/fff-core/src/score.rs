@@ -1,6 +1,7 @@
 use crate::{
     git::is_modified_status,
     index::constraints::apply_constraints,
+    index::layers::{LayerArenas, LayerId},
     path_utils::calculate_distance_penalty,
     simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
@@ -143,28 +144,24 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     base_count: usize,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
+    overlay_ranges: &[(usize, usize, LayerId, ArenaPtr)],
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    // Process overflow files first: newly added files (created after the
-    // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search.
-    //
-    // putting them first in the list makes sorting more efficient and gives
-    // them tiebreaker advantage in case sorting is the same
-    let results = if files.len() > base_count {
-        let mut results = match_and_score_in_arena(&files[base_count..], context, overflow_arena);
+    // Newest overlay first: recently added files win ties, and each layer's
+    // contiguous range has one arena so the hot loop never resolves it per item.
+    let mut results = Vec::new();
+    for &(start, end, _, arena) in overlay_ranges.iter().rev() {
+        if start < end {
+            results.extend(match_and_score_in_arena(&files[start..end], context, arena));
+        }
+    }
 
-        results.extend(match_and_score_in_arena(
-            &files[..base_count],
-            context,
-            base_arena,
-        ));
-
-        results
-    } else {
-        match_and_score_in_arena(files, context, base_arena)
-    };
+    let base_end = base_count.min(files.len());
+    results.extend(match_and_score_in_arena(
+        &files[..base_end],
+        context,
+        arenas.base(),
+    ));
 
     sort_and_paginate(results, context)
 }
@@ -173,8 +170,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     query: &'q FFFQuery<'q>,
     items: &[&FileItem],
     max_typos: u16,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
 ) -> Vec<SmallVec<[(u32, u32); 4]>> {
     let parts: Vec<&str> = match &query.fuzzy_query {
         FuzzyQuery::Text(text) if text.len() >= 2 => vec![*text],
@@ -190,11 +186,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     let paths: Vec<String> = items
         .iter()
         .map(|item| {
-            let arena = if item.is_overflow() {
-                overflow_arena
-            } else {
-                base_arena
-            };
+            let arena = arenas.get(item.layer_id());
             let mut path = String::with_capacity(item.relative_path_len());
             item.write_relative_path_from_arena(arena, &mut path);
             path
@@ -295,16 +287,10 @@ fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, 
 #[inline]
 fn resolve_dir_chunks(
     dir: &DirItem,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
     buf: &mut [*const u8; MAX_PATH_CHUNKS],
 ) -> Option<(usize, u16)> {
-    let arena = if dir.is_overflow() {
-        overflow_arena
-    } else {
-        arena
-    };
-    let ptrs = dir.path.resolve_ptrs(arena, buf);
+    let ptrs = dir.path.resolve_ptrs(arenas.get(dir.layer_id()), buf);
     Some((ptrs.len(), dir.path.byte_len))
 }
 
@@ -315,8 +301,7 @@ fn match_fuzzy_parts_dirs(
     working_dirs: &[&DirItem],
     options: &neo_frizbee::Config,
     max_threads: usize,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -330,7 +315,7 @@ fn match_fuzzy_parts_dirs(
 
     let resolve_chunks_for_frizbee =
         |dir: &&DirItem, buf: &mut [*const u8; MAX_PATH_CHUNKS]| -> Option<(usize, u16)> {
-            resolve_dir_chunks(dir, arena, overflow_arena, buf)
+            resolve_dir_chunks(dir, arenas, buf)
         };
 
     let first_part_matches = neo_frizbee::match_list_parallel_resolved(
@@ -396,8 +381,7 @@ fn match_fuzzy_parts_dirs(
 pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     dirs: &'a [DirItem],
     context: &ScoringContext,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
     if dirs.is_empty() {
         return (vec![], vec![], 0);
@@ -408,7 +392,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     let working_dirs: Vec<&DirItem> = if parsed_query.constraints.is_empty() {
         dirs.iter().filter(|d| !d.is_deleted()).collect()
     } else {
-        match apply_constraints(dirs, &parsed_query.constraints, arena, overflow_arena) {
+        match apply_constraints(dirs, &parsed_query.constraints, arenas) {
             Some(filtered) if !filtered.is_empty() => {
                 filtered.into_iter().filter(|d| !d.is_deleted()).collect()
             }
@@ -455,8 +439,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         &working_dirs,
         &options,
         context.max_threads,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     let main_needle = valid_parts[0].as_bytes();
@@ -469,11 +452,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .into_iter()
         .map(|path_match| {
             let dir = working_dirs[path_match.index as usize];
-            let dir_arena = if dir.is_overflow() {
-                overflow_arena
-            } else {
-                arena
-            };
+            let dir_arena = arenas.get(dir.layer_id());
             let base_score = path_match.score as i32;
             let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
 
@@ -615,7 +594,7 @@ fn match_and_score_in_arena<'a>(
     let working_files: FileItems<'a> = if parsed.constraints.is_empty() {
         FileItems::All(files)
     } else {
-        match apply_constraints(files, &parsed.constraints, arena, arena) {
+        match apply_constraints(files, &parsed.constraints, LayerArenas::uniform(arena)) {
             Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
             Some(_) => {
                 return vec![];
@@ -1330,7 +1309,7 @@ mod filename_bonus_tests {
             },
         };
         let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+            fuzzy_match_and_score_files(files, &ctx, files.len(), LayerArenas::uniform(arena), &[]);
         items
             .iter()
             .zip(scores.iter())
@@ -1575,7 +1554,8 @@ mod typo_resistance_tests {
                 limit: 100,
             },
         };
-        let (items, _, _) = fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+        let (items, _, _) =
+            fuzzy_match_and_score_files(files, &ctx, files.len(), LayerArenas::uniform(arena), &[]);
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
@@ -1684,8 +1664,13 @@ mod constraint_only_query_tests {
             },
         };
 
-        let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
+        let (items, _scores, total_matched) = fuzzy_match_and_score_files(
+            &files,
+            &ctx,
+            files.len(),
+            LayerArenas::uniform(arena),
+            &[],
+        );
 
         assert_eq!(
             total_matched, 1,
@@ -1735,8 +1720,13 @@ mod constraint_only_query_tests {
             },
         };
 
-        let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
+        let (items, _scores, total_matched) = fuzzy_match_and_score_files(
+            &files,
+            &ctx,
+            files.len(),
+            LayerArenas::uniform(arena),
+            &[],
+        );
 
         assert_eq!(total_matched, 1);
         assert_eq!(items[0].relative_path(arena), "a.rs");

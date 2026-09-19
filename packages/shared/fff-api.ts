@@ -555,6 +555,30 @@ export interface MultiGrepOptions {
   classifyDefinitions?: boolean;
 }
 
+/** Metadata for a file added to an index layer without touching the filesystem. */
+export interface LayerEntry {
+  /** Path relative to the indexed root, `/` separated. */
+  path: string;
+  /** Size in bytes (default 0). */
+  size?: number;
+  /** Modification time as unix seconds (default 0). */
+  modified?: number;
+}
+
+/** One overlay layer of the index. */
+export interface LayerInfo {
+  id: number;
+  label: string | null;
+  /** Index slots owned by the layer, tombstones included. */
+  fileCount: number;
+  liveFileCount: number;
+  dirCount: number;
+  /** Bytes held by the layer's path arena. */
+  arenaBytes: number;
+  /** True for the single writable layer at the top of the stack. */
+  isOpen: boolean;
+}
+
 /**
  * The shared instance surface implemented by `FileFinder` in both
  * `@ff-labs/fff-node` and `@ff-labs/fff-bun`.
@@ -654,4 +678,39 @@ export interface FileFinderApi {
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;
+
+  /**
+   * Seal the writable index layer and open a new one. Returns its id.
+   * At most 4 overlays exist; past that the two newest are merged.
+   */
+  createLayer(label?: string): Result<number>;
+
+  /** Id of the layer new files are currently written into. */
+  currentLayer(): Result<number>;
+
+  /** Every overlay layer, oldest first. The base scan (layer 0) is not listed. */
+  listLayers(): Result<LayerInfo[]>;
+
+  /** Live file count of `layer` (0 = base scan). */
+  layerFileCount(layer: number): Result<number>;
+
+  /**
+   * Append paths to the writable layer without touching the filesystem.
+   * Paths already indexed are skipped. Returns the number added.
+   */
+  addPaths(entries: Array<string | LayerEntry>): Result<number>;
+
+  /** Write `layer` (0 = base scan) to a file. Returns bytes written. */
+  saveLayer(layer: number, filePath: string): Result<number>;
+
+  /** Load a layer file as a new sealed overlay. Returns its id. */
+  loadLayer(filePath: string): Result<number>;
+
+  /**
+   * Load a layer file as the base scan in the background, like a rescan:
+   * explicit overlays are kept, frecency and content indexing are applied.
+   * Returns the file count; wait with `waitForScan` before searching.
+   * Fails while another scan is active.
+   */
+  loadBase(filePath: string): Result<number>;
 }

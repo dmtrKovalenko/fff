@@ -23,7 +23,7 @@
     "build": "npm run build:bundle && npm run build:types",
     "build:bundle": "tsup src/index.ts --format esm,cjs --platform node --target node18 --external ffi-rs --sourcemap",
     "build:types": "tsc -p tsconfig.build.json",
-    "test": "node test/e2e.mjs && node test/watch.mjs",
+    "test": "node test/e2e.mjs && node test/watch.mjs && node test/layers.mjs",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

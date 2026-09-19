@@ -145,6 +145,48 @@ Notes:
 - Watching requires the instance to be created with watching enabled
   (the default).
 
+## Index layers
+
+The path index is a stack: layer 0 is the base scan, on top of it sit up to
+four append-only overlays. Layer 1 is opened automatically and collects
+everything the watcher indexes during the session. Layers only hold paths;
+file contents are never layered.
+
+Add paths that the scanner can't see (generated files, remote checkouts,
+virtual trees) and persist any layer — the base scan included — to a file:
+
+```typescript
+// Open a new layer and append to it. Duplicates of already indexed paths are skipped.
+const layer = finder.createLayer("generated");
+finder.addPaths(["build/out/a.js", { path: "build/out/b.js", size: 1024, modified: 1_700_000_000 }]);
+
+// Persist it, or the base scan (layer 0), to disk
+finder.saveLayer(layer.value, "/tmp/generated.fff");
+finder.saveLayer(0, "/tmp/base.fff");
+
+// Later: attach a saved layer, or restore the base without rescanning
+finder.loadLayer("/tmp/generated.fff");
+finder.loadBase("/tmp/base.fff"); // runs like a rescan; await finder.waitForScan()
+
+// Build a layer file without an instance (e.g. in a worker)
+FileFinder.buildLayerFile(paths, "/tmp/prebuilt.fff", "prebuilt");
+
+for (const l of finder.listLayers().value ?? []) {
+  console.log(l.id, l.label, l.liveFileCount, l.isOpen);
+}
+```
+
+Notes:
+
+- Batch `addPaths` calls: each call is one FFI crossing, so 100 paths per
+  call is already within a few percent of a single 100k batch.
+- Loading a layer that overlaps the index dedups per path (~350 ns each), so
+  loading 100k already-indexed paths costs ~35 ms.
+- Once the stack is full, the two newest overlays are compacted into one;
+  explicit layers survive a rescan, only the base and session layer rebuild.
+- Layer files are ~45 bytes per path; loading 100k paths takes ~10 ms vs a
+  fresh scan of the same tree.
+
 ## API Reference
 
 Verify the latest API in the local interface at [`./src/fff-api.ts`](./src/fff-api.ts). Every field and type is documented.

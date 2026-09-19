@@ -123,6 +123,20 @@ impl<T> StableVec<T> {
     }
 
     #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.cap
+    }
+
+    /// Fresh allocation holding a clone of every element plus `extra` slots.
+    /// The old buffer stays alive for any outstanding Arc clones.
+    pub fn reallocate_with_reserve(&self, extra: usize) -> Self
+    where
+        T: Clone,
+    {
+        Self::from_vec_with_reserve(self.to_vec(), extra)
+    }
+
+    #[inline]
     pub fn last(&self) -> Option<&T> {
         let len = self.len();
         if len == 0 {

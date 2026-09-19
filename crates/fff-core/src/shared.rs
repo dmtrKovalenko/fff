@@ -209,6 +209,26 @@ impl SharedFilePicker {
             .map(|_| ())
     }
 
+    /// Installs a saved base scan instead of walking the filesystem, then
+    /// runs the usual post-scan phases in the background. Fails with
+    /// [`Error::IndexBusy`] while another scan is active; wait with
+    /// [`wait_for_scan`](Self::wait_for_scan).
+    pub fn import_base(
+        &self,
+        snapshot: crate::LayerSnapshot,
+        shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        self.0.rescan_throttle.note_explicit_scan();
+        self.0.rescans.record(RescanReason::Explicit);
+        match ScanJob::new_rescan(self, shared_frecency)? {
+            Some(job) => {
+                job.with_source(snapshot).spawn();
+                Ok(())
+            }
+            None => Err(Error::IndexBusy),
+        }
+    }
+
     /// Returns admitted and throttled rescan requests by reason.
     /// Counters start at picker creation or the last reset.
     pub fn rescan_stats(&self) -> RescanStats {

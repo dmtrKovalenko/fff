@@ -15,8 +15,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
     bigram_candidates: Option<&[u64]>,
     base_count: usize,
     options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> (Vec<&'a FileItem>, usize) {
     let (files_to_search, filtered_file_count) = prefilter_files(
         files,
@@ -24,8 +23,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         bigram_candidates,
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     if !files_to_search.is_empty() {
@@ -42,8 +40,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         bigram_candidates,
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
     )
 }
 
@@ -56,19 +53,13 @@ pub(crate) fn prefilter_files<'a>(
     bigram_candidates: Option<&[u64]>,
     base_count: usize,
     options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> (Vec<&'a FileItem>, usize) {
     let max_file_size = options.max_file_size;
     let plan = if constraints.is_empty() {
         None
     } else {
-        Some(ConstraintPlan::build(
-            constraints,
-            files,
-            arena,
-            overflow_arena,
-        ))
+        Some(ConstraintPlan::build(constraints, files, arenas))
     };
 
     let mut scratch = ConstraintsBuffers::new();
@@ -105,7 +96,7 @@ pub(crate) fn prefilter_files<'a>(
                             continue;
                         }
                         if let Some(plan) = plan.as_ref()
-                            && !plan.matches(f, file_idx, arena, overflow_arena, &mut scratch)
+                            && !plan.matches(f, file_idx, arenas, &mut scratch)
                         {
                             continue;
                         }
@@ -137,7 +128,7 @@ pub(crate) fn prefilter_files<'a>(
                     continue;
                 }
                 if let Some(ref p) = plan
-                    && !p.matches(f, boundary + offset, arena, overflow_arena, &mut scratch)
+                    && !p.matches(f, boundary + offset, arenas, &mut scratch)
                 {
                     continue;
                 }
@@ -156,7 +147,7 @@ pub(crate) fn prefilter_files<'a>(
                     continue;
                 }
                 if let Some(ref p) = plan
-                    && !p.matches(f, idx, arena, overflow_arena, &mut scratch)
+                    && !p.matches(f, idx, arenas, &mut scratch)
                 {
                     continue;
                 }
