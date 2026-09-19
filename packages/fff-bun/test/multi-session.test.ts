@@ -198,6 +198,21 @@ function startSession(
 }
 
 describe("pi-fff: in-process double activation works (#760)", () => {
+  test("same-workspace sessions share a finder across one shutdown", async () => {
+    const dbs = makeDbPaths();
+    const workspace = makeWorkspace("shared-session");
+    const first = startSession(workspace, dbs);
+    const second = startSession(workspace, dbs);
+
+    await Promise.all([first.start(), second.start()]);
+    expect(first.errors()).toEqual([]);
+    expect(second.errors()).toEqual([]);
+
+    await first.shutdown();
+    expect(await second.find("gamma")).toContain("gamma.ts");
+    await second.shutdown();
+  }, 40_000);
+
   test("two sessions in one process both search against the same dbs", async () => {
     const dbs = makeDbPaths();
     const first = startSession(makeWorkspace("session1"), dbs);

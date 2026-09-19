@@ -468,23 +468,29 @@ export default function fffExtension(pi: ExtensionAPI) {
     if (finderPromise) return finderPromise;
 
     finderPromise = (async () => {
-      if (mainFinder && !mainFinder.isDestroyed) {
-        mainFinder.destroy();
+      if (mainFinder) {
+        pickers?.release(mainFinder);
         mainFinder = null;
         finderCwd = null;
       }
 
       // if the dbs can't be opened the factory falls back to a db-less picker,
       // e.g. when some other process corrupts the lock
-      if (!pickers) throw new Error("FFF picker factory is not initialized");
-      mainFinder = await pickers.create({
+      const factory = pickers;
+      if (!factory) throw new Error("FFF picker factory is not initialized");
+      const finder = await factory.create({
         basePath: cwd,
         enableHomeDirScanning,
         enableFsRootScanning,
         followSymlinks,
       });
+      if (pickers !== factory) {
+        factory.release(finder);
+        throw new Error("FFF session shut down during initialization");
+      }
+      mainFinder = finder;
       finderCwd = cwd;
-      return mainFinder;
+      return finder;
     })().finally(() => {
       finderPromise = null;
     });
@@ -526,8 +532,8 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   function destroyFinder() {
     stopHomeScanStatus();
-    if (mainFinder && !mainFinder.isDestroyed) {
-      mainFinder.destroy();
+    if (mainFinder) {
+      pickers?.release(mainFinder);
       mainFinder = null;
       finderCwd = null;
     }

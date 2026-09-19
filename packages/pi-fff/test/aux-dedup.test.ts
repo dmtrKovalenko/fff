@@ -45,6 +45,25 @@ function makePickers() {
   });
 }
 
+describe("process-wide finder sharing", () => {
+  test("one factory releases each acquisition independently", async () => {
+    created.length = 0;
+    const pickers = makePickers();
+    const [first, second] = await Promise.all([
+      pickers.create({ basePath: "/workspace" }),
+      pickers.create({ basePath: "/workspace" }),
+    ]);
+
+    expect(created).toHaveLength(1);
+    expect(first).toBe(second);
+
+    pickers.release(first);
+    expect(created[0].isDestroyed).toBe(false);
+    pickers.release(second);
+    expect(created[0].isDestroyed).toBe(true);
+  });
+});
+
 describe("AuxFinderPool concurrent dedup (#746)", () => {
   test("two concurrent acquires for same root share one finder", async () => {
     created.length = 0;
@@ -58,6 +77,21 @@ describe("AuxFinderPool concurrent dedup (#746)", () => {
     ]);
     expect(created.length).toBe(1);
     expect(a.finder).toBe(b.finder);
+    pool.destroy();
+  });
+
+  test("destroying a pool releases a finder whose scan is still starting", async () => {
+    created.length = 0;
+    const pool = new AuxFinderPool({
+      enableFsRootScanning: false,
+      pickers: makePickers(),
+    });
+    const pending = pool.acquire("/Users/pending");
+
+    pool.destroy();
+    expect(pending).rejects.toThrow("destroyed during initialization");
+    await pending.catch(() => undefined);
+    expect(created[0].isDestroyed).toBe(true);
   });
 
   test("sequential acquire after in-flight one resolves still reuses", async () => {
@@ -72,5 +106,6 @@ describe("AuxFinderPool concurrent dedup (#746)", () => {
     const third = await pool.acquire("/Users/x");
     expect(created.length).toBe(1);
     expect(third.root).toBe("/Users/x");
+    pool.destroy();
   });
 });
