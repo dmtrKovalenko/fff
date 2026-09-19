@@ -30,6 +30,11 @@ fff is MIT and open source forever. Development is supported by these companies:
     <td align="center"><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github"><img alt="Mango Proxy" src="./assets/sponsors/mango-proxy.png" width="280"></a></td>
     <td><b><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github">Mango Proxy</a></b><br><sub>Fast, secure proxies for all the needs.</sub></td>
   </tr>
+  <tr>
+    <td align="center"><sub><b>🥈<br>SILVER</b></sub></td>
+    <td align="center"><a href="https://www.rapidproxy.io/?ref=fff"><img alt="RapidProxy" src="./assets/sponsors/rapidproxy.png" width="200"></a></td>
+    <td><b><a href="https://www.rapidproxy.io/?ref=fff">RapidProxy</a></b><br><sub>Residential proxies built for scraping at scale.</sub></td>
+  </tr>
 </table>
 
 <sub>Use and enjoy fff? <a href="mailto:dmitriy@iusevimbtw.com">Become a sponsor to get your features/fixes the highest priority</a>.</sub>
