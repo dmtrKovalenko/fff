@@ -68,6 +68,10 @@ local M = {}
 --- @field trim_whitespace boolean
 --- @field location_format string
 
+--- @class FffSuggestionsConfig
+--- @field enabled boolean
+--- @field grep_time_budget_ms number
+
 --- @alias FffSelectAction 'edit' | 'split' | 'vsplit' | 'tab'
 
 --- @class FffSelectConfig
@@ -98,6 +102,7 @@ local M = {}
 --- @field wrap_around boolean
 --- @field file_picker table
 --- @field grep FffGrepConfig
+--- @field suggestions FffSuggestionsConfig
 
 ---@class fff.conf.State
 local state = {
@@ -457,6 +462,11 @@ local function init()
     file_picker = {
       current_file_label = '(current)',
       fuzzy_query_highlighting = false,
+    },
+    -- Cross-mode suggestions shown when a query has no results
+    suggestions = {
+      enabled = true,
+      grep_time_budget_ms = 50, -- Hard cap for the grep hint in file mode (it never runs before content indexing finishes)
     },
     -- grep settings
     grep = {

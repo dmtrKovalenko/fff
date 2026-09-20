@@ -150,14 +150,22 @@ end
 function M.is_initialized() return M.state.initialized end
 
 --- Get scan progress information
---- @return table Progress information with scanned_files_count, is_scanning
+--- @return table Progress information with scanned_files_count, is_scanning, is_warmup_complete, is_index_ready
 function M.get_scan_progress()
-  if not M.state.initialized then return { total_files = 0, scanned_files_count = 0, is_scanning = false } end
+  if not M.state.initialized then
+    return {
+      total_files = 0,
+      scanned_files_count = 0,
+      is_scanning = false,
+      is_warmup_complete = false,
+      is_index_ready = false,
+    }
+  end
 
   local ok, result = pcall(fuzzy.get_scan_progress)
   if not ok then
     vim.notify('Failed to get scan progress: ' .. tostring(result), vim.log.levels.WARN)
-    return { scanned_files_count = 0, is_scanning = false }
+    return { scanned_files_count = 0, is_scanning = false, is_warmup_complete = false, is_index_ready = false }
   end
 
   return result

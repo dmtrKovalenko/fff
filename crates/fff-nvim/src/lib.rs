@@ -612,6 +612,11 @@ pub fn get_scan_progress(lua: &Lua, _: ()) -> LuaResult<LuaValue> {
     let table = lua.create_table()?;
     table.set("scanned_files_count", progress.scanned_files_count)?;
     table.set("is_scanning", progress.is_scanning)?;
+    table.set("is_warmup_complete", progress.is_warmup_complete)?;
+    let is_index_ready =
+        picker.has_content_indexing() && picker.bigram_index().is_some() && !progress.is_scanning;
+
+    table.set("is_index_ready", is_index_ready)?;
     Ok(LuaValue::Table(table))
 }
 

@@ -81,7 +81,8 @@ function M.update_results_sync()
 
   S.suggestion_items = nil
   S.suggestion_source = nil
-  if #results == 0 and S.query ~= '' then
+  local suggestions_enabled = (S.config.suggestions or {}).enabled ~= false
+  if #results == 0 and S.query ~= '' and suggestions_enabled then
     if S.mode == 'grep' then
       local suggestion_results =
         file_picker.search_files_paginated(S.query, S.current_file_cache, S.config.max_threads, nil, 0, page_size)
@@ -90,8 +91,7 @@ function M.update_results_sync()
         S.suggestion_source = 'files'
       end
     else
-      local grep_result = grep.search(S.query, 0, page_size, S.grep_config, 'plain')
-      local grep_items = grep_result and grep_result.items or {}
+      local grep_items = M.suggestion_grep(page_size)
       if #grep_items > 0 then
         S.suggestion_items = grep_items
         S.suggestion_source = 'grep'
@@ -111,6 +111,23 @@ function M.update_results_sync()
   end
 
   P.render_debounced()
+end
+
+-- Hint only: hard time budget (a zero-hit query would otherwise scan every file)
+-- and skipped unless the bigram index is built, since without it grep is a cold disk scan.
+---@param page_size number
+---@return table[]
+function M.suggestion_grep(page_size)
+  if not file_picker.get_scan_progress().is_index_ready then return {} end
+  local suggest_config = S.config.suggestions or {}
+
+  local grep_config = vim.tbl_extend('force', S.grep_config or S.config.grep or {}, {
+    enforce_time_budget = true,
+    time_budget_ms = suggest_config.grep_time_budget_ms or 50,
+  })
+  local ok, grep_result = pcall(grep.search, S.query, 0, page_size, grep_config, 'plain')
+  if not ok or not grep_result then return {} end
+  return grep_result.items or {}
 end
 
 function M.load_page_at_index(new_page_index, adjust_cursor_fn)

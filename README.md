@@ -438,6 +438,10 @@ require('fff').setup({
     enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
+  suggestions = {
+    enabled = true, -- when a query has no results, look them up in the other mode (files <-> grep) and show as a hint
+    grep_time_budget_ms = 50, -- hard cap for the grep hint in file mode; it is skipped until content indexing finishes
+  },
   debug = {
     enabled = false, -- show the file info panel next to the preview
     show_scores = false, -- inline scores in the file list
