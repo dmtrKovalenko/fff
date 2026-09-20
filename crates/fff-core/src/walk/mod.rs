@@ -145,4 +145,56 @@ mod tests {
         assert!(rules.is_ignored(Path::new("debug.log")));
         assert!(!rules.is_ignored(Path::new("Cargo.toml")));
     }
+
+    // Both backends must honor git's core.excludesFile, not just repo-local
+    // .gitignore/.ignore (#874).
+    #[test]
+    fn honors_git_excludes_file() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".worktrees/wt1")).unwrap();
+        fs::write(root.join("src/hit.ts"), "x").unwrap();
+        fs::write(root.join(".worktrees/wt1/hit.ts"), "x").unwrap();
+
+        let excludes = root.join("global_ignore");
+        fs::write(&excludes, "# comment\n\n.worktrees/\n").unwrap();
+        let git = |args: &[&std::ffi::OsStr]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init".as_ref(), "-q".as_ref()]);
+        git(&[
+            "config".as_ref(),
+            "core.excludesFile".as_ref(),
+            excludes.as_ref(),
+        ]);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("src/hit.ts")), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains(".worktrees")),
+            "core.excludesFile not honored: {names:?}"
+        );
+
+        // The watcher reuses these rules, so excluded dirs must stay excluded
+        // on incremental updates too.
+        #[cfg(feature = "zlob")]
+        {
+            let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+            assert!(rules.is_ignored(std::path::Path::new(".worktrees/")));
+            assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts")));
+        }
+    }
 }

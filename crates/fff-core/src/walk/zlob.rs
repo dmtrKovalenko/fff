@@ -36,9 +36,21 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
+    // zlob reads nested .gitignore/.ignore itself but never git's
+    // core.excludesFile, so layer that in as root-level extra rules (#874).
+    let global_excludes = if is_git_repo {
+        crate::ignore::git_excludes_patterns(base_path)
+    } else {
+        Vec::new()
+    };
+    let extra_ignore: Vec<&str> = if is_git_repo {
+        global_excludes.iter().map(String::as_str).collect()
+    } else {
+        IGNORED_DIRS.to_vec()
+    };
+
+    if !extra_ignore.is_empty()
+        && let Err(e) = builder.extra_ignore(&extra_ignore)
     {
         // Interior NUL in one of the extra_ignore patterns would fail
         // here — treat as if no extras were supplied rather than
