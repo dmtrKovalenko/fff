@@ -2,8 +2,10 @@ PLENARY_DIR ?= ../plenary.nvim
 MINI_DIR ?= ../mini.nvim
 
 PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
+PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
 
 # Compile-time cfg that gates the watcher + git-status fuzz stress test.
 STRESS_RUSTFLAGS := --cfg stress
@@ -50,38 +52,25 @@ build:
 build-e2e:
 	cargo build --release -p fff-nvim -p fff-c --no-default-features --features zlob
 
+# Build the C library, header, and pkg-config file via cargo-c.
 build-c-lib:
-	cargo build --release -p fff-c --no-default-features --features zlob
+	@command -v cargo-cbuild >/dev/null 2>&1 || { echo "error: cargo-c is required to build the C library. Install it with: cargo install cargo-c" >&2; exit 1; }
+	cargo cbuild -p fff-c --release --no-default-features --features zlob --prefix=$(PREFIX) --bindir=$(BINDIR) --libdir=$(LIBDIR) --includedir=$(INCLUDEDIR) --pkgconfigdir=$(PKGCONFIGDIR)
 
 header:
 	cbindgen --config crates/fff-c/cbindgen.toml --crate fff-c --output crates/fff-c/include/fff.h
 
-# Install the C library and header under $(PREFIX) (default /usr/local).
-# Override PREFIX for user-local installs, e.g. `make install PREFIX=$$HOME/.local`.
-# DESTDIR is honoured for packagers.
+# Install the C library, header, and pkg-config file via cargo-c.
 install: build-c-lib
-	install -d $(DESTDIR)$(LIBDIR)
-	install -d $(DESTDIR)$(INCLUDEDIR)
-	install -m 0644 crates/fff-c/include/fff.h $(DESTDIR)$(INCLUDEDIR)/fff.h
-	@if [ -f target/release/libfff_c.dylib ]; then \
-		install -m 0755 target/release/libfff_c.dylib $(DESTDIR)$(LIBDIR)/libfff_c.dylib; \
-		echo "Installed $(DESTDIR)$(LIBDIR)/libfff_c.dylib"; \
-	fi
-	@if [ -f target/release/libfff_c.so ]; then \
-		install -m 0755 target/release/libfff_c.so $(DESTDIR)$(LIBDIR)/libfff_c.so; \
-		echo "Installed $(DESTDIR)$(LIBDIR)/libfff_c.so"; \
-	fi
-	@if [ -f target/release/fff_c.dll ]; then \
-		install -m 0755 target/release/fff_c.dll $(DESTDIR)$(LIBDIR)/fff_c.dll; \
-		echo "Installed $(DESTDIR)$(LIBDIR)/fff_c.dll"; \
-	fi
-	@echo "Installed header $(DESTDIR)$(INCLUDEDIR)/fff.h"
+	@command -v cargo-cinstall >/dev/null 2>&1 || { echo "error: cargo-c is required to install the C library. Install it with: cargo install cargo-c" >&2; exit 1; }
+	cargo cinstall -p fff-c --release --no-default-features --features zlob --prefix=$(PREFIX) --bindir=$(BINDIR) --libdir=$(LIBDIR) --includedir=$(INCLUDEDIR) --pkgconfigdir=$(PKGCONFIGDIR) $(if $(DESTDIR),--destdir=$(DESTDIR),)
 
 uninstall:
-	rm -f $(DESTDIR)$(LIBDIR)/libfff_c.dylib
-	rm -f $(DESTDIR)$(LIBDIR)/libfff_c.so
-	rm -f $(DESTDIR)$(LIBDIR)/fff_c.dll
+	rm -f $(DESTDIR)$(LIBDIR)/libfff_c.*
+	rm -f $(DESTDIR)$(LIBDIR)/fff_c.*
+	rm -f $(DESTDIR)$(BINDIR)/fff_c.dll
 	rm -f $(DESTDIR)$(INCLUDEDIR)/fff.h
+	rm -f $(DESTDIR)$(PKGCONFIGDIR)/fff_c.pc
 	@echo "Removed fff-c from $(DESTDIR)$(PREFIX)"
 
 test-setup:

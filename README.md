@@ -664,12 +664,18 @@ Native rust crate that is performing all the search. Stable and well documented.
 
 ### Build
 
+Building and installing the C library requires [cargo-c](https://crates.io/crates/cargo-c):
+
 ```bash
-# Builds only the C cdylib (fastest):
+cargo install cargo-c
+```
+
+```bash
+# Builds the C library, header, and pkg-config file:
 make build-c-lib
 
-# or directly with cargo:
-cargo build --release -p fff-c --features zlob
+# or directly with cargo-c:
+cargo cbuild -p fff-c --release --no-default-features --features zlob
 ```
 
 > The `zlob` feature (requires the [Zig](https://ziglang.org) toolchain) switches both
@@ -677,11 +683,13 @@ cargo build --release -p fff-c --features zlob
 > native parallel walker. Without it, the default build uses the pure-Rust
 > [`ignore`](https://crates.io/crates/ignore) (ripgrep) walker and `globset`.
 
-The output is a `cdylib` (`libfff_c.so` / `libfff_c.dylib` / `fff_c.dll`). The header lives at [`crates/fff-c/include/fff.h`](./crates/fff-c/include/fff.h).
+The output includes dynamic libraries (`libfff_c.so` / `libfff_c.dylib` / `fff_c.dll`) and a static library (`libfff_c.a` / `fff_c.lib`). The header lives at [`crates/fff-c/include/fff.h`](./crates/fff-c/include/fff.h).
 
 Prebuilt binaries for every version, including every commit on main, are on the [releases page](https://github.com/dmtrKovalenko/fff/releases). The same binaries also ship inside the `@ff-labs/fff-bin-*` npm packages.
 
 ### Install
+
+Then install via `make install`:
 
 ```bash
 # System-wide (needs sudo):
@@ -694,11 +702,21 @@ make install PREFIX=$HOME/.local
 make install DESTDIR=/tmp/pkgroot PREFIX=/usr
 ```
 
-Drops `libfff_c.{so,dylib,dll}` into `$(PREFIX)/lib` and the header into `$(PREFIX)/include/fff.h`. Remove with `make uninstall`, which honours the same `PREFIX` and `DESTDIR`.
+Or directly with `cargo-c`:
+
+```bash
+cargo cinstall -p fff-c --release --no-default-features --features zlob --prefix=/usr/local
+```
+
+Installs `libfff_c.{so,dylib}` and `libfff_c.a` into `$(PREFIX)/lib` on Unix. On Windows, it installs `fff_c.dll` into `$(BINDIR)` and `fff_c.lib` into `$(PREFIX)/lib`. It also installs the header into `$(PREFIX)/include/fff.h` and `fff_c.pc` into `$(PKGCONFIGDIR)`. Remove with `make uninstall`, which honours the same `PREFIX` and `DESTDIR`.
 
 Link against it after install:
 
 ```bash
+# Using pkg-config:
+cc my_app.c $(pkg-config --cflags --libs fff_c) -o my_app
+
+# Or directly:
 cc my_app.c -lfff_c -o my_app
 ```
 

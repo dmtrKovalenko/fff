@@ -9,10 +9,15 @@ license = "MIT"
 workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "staticlib"]
+
+[package.metadata.capi.header]
+name = "fff"
+subdirectory = false
 
 [features]
 default = ["ripgrep"] # use ripgrep base crates to avoid requiring zig for rust crate
+capi = []
 ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
 zlob = ["fff/zlob", "fff-query-parser/zlob"]
 
