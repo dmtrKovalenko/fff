@@ -498,7 +498,7 @@ pub fn live_grep(
         time_budget_ms,
         trim_whitespace,
         enforce_time_budget,
-        case_mode,
+        casing,
     ): (
         String,
         Option<usize>,
@@ -525,7 +525,7 @@ pub fn live_grep(
         _ => fff::GrepMode::PlainText, // "plain" or nil or unknown
     };
     // nil/unknown falls back to the legacy smart_case toggle
-    let case_mode = match case_mode.as_deref() {
+    let casing = match casing.as_deref() {
         Some("smart") => Some(fff::Casing::Smart),
         Some("sensitive") => Some(fff::Casing::Sensitive),
         Some("insensitive") => Some(fff::Casing::Insensitive),
@@ -536,7 +536,7 @@ pub fn live_grep(
         max_file_size: max_file_size.unwrap_or(10 * 1024 * 1024),
         max_matches_per_file: max_matches_per_file.unwrap_or(200),
         smart_case: smart_case.unwrap_or(true),
-        case_mode,
+        casing,
         file_offset: file_offset.unwrap_or(0),
         page_limit: page_size.unwrap_or(50),
         mode,

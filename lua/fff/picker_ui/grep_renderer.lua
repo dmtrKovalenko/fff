@@ -40,7 +40,7 @@ function M.search(query, file_offset, page_size, config, grep_mode)
     conf.time_budget_ms,
     conf.trim_whitespace,
     conf.enforce_time_budget,
-    conf.case_mode
+    conf.casing
   )
   return last_result
 end

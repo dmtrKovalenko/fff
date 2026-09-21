@@ -10,7 +10,7 @@ pub fn has_regex_metacharacters(text: &str) -> bool {
     regex::escape(text) != text
 }
 
-pub(super) fn build_regex(pattern: &str, case_mode: Casing) -> Result<regex::bytes::Regex, String> {
+pub(super) fn build_regex(pattern: &str, casing: Casing) -> Result<regex::bytes::Regex, String> {
     if pattern.is_empty() {
         return Err("empty pattern".to_string());
     }
@@ -21,7 +21,7 @@ pub(super) fn build_regex(pattern: &str, case_mode: Casing) -> Result<regex::byt
         pattern.to_string()
     };
 
-    let case_insensitive = case_mode.is_insensitive_for(pattern);
+    let case_insensitive = casing.is_insensitive_for(pattern);
 
     regex::bytes::RegexBuilder::new(&regex_pattern)
         .case_insensitive(case_insensitive)

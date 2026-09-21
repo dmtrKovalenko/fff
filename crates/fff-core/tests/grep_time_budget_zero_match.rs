@@ -131,7 +131,7 @@ fn budget_opts(mode: GrepMode, enforce_time_budget: bool) -> GrepSearchOptions {
         max_file_size: 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
-        case_mode: None,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode,

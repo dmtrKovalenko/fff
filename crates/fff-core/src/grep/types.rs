@@ -103,10 +103,10 @@ pub struct GrepSearchOptions {
     pub max_file_size: u64,
     pub max_matches_per_file: usize,
     /// Legacy toggle: `true` => `Casing::Smart`, `false` => `Casing::Sensitive`.
-    /// Ignored when `case_mode` is `Some`.
+    /// Ignored when `casing` is `Some`.
     pub smart_case: bool,
     /// Explicit case mode; overrides `smart_case` when set.
-    pub case_mode: Option<Casing>,
+    pub casing: Option<Casing>,
     /// File-based pagination offset: index into the sorted/filtered file list
     /// to start searching from. Pass 0 for the first page, then use
     /// `GrepResult::next_file_offset` for subsequent pages.
@@ -140,8 +140,8 @@ pub struct GrepSearchOptions {
 }
 
 impl GrepSearchOptions {
-    pub fn effective_case_mode(&self) -> Casing {
-        match self.case_mode {
+    pub fn effective_casing(&self) -> Casing {
+        match self.casing {
             Some(mode) => mode,
             None if self.smart_case => Casing::Smart,
             None => Casing::Sensitive,
@@ -155,7 +155,7 @@ impl Default for GrepSearchOptions {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 200,
             smart_case: true,
-            case_mode: None,
+            casing: None,
             file_offset: 0,
             page_limit: 50,
             mode: GrepMode::default(),

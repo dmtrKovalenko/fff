@@ -136,8 +136,8 @@ pub(crate) fn multi_grep_search<'a>(
         return GrepResult::empty(total_files, filtered_file_count);
     }
 
-    let case_mode = options.effective_case_mode();
-    let case_insensitive = patterns.iter().all(|p| case_mode.is_insensitive_for(p));
+    let casing = options.effective_casing();
+    let case_insensitive = patterns.iter().all(|p| casing.is_insensitive_for(p));
 
     let ac = aho_corasick::AhoCorasickBuilder::new()
         .ascii_case_insensitive(case_insensitive)

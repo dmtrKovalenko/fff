@@ -280,7 +280,7 @@ local r = require('fff').content_search('TODO', {
   max_file_size         = 10 * 1024 * 1024,
   max_matches_per_file  = 100,
   smart_case            = true,
-  case_mode             = nil,      -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case
+  casing             = nil,      -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case
   page_size             = 50,
   file_offset           = 0,
   time_budget_ms        = 0,
@@ -443,7 +443,7 @@ require('fff').setup({
     max_file_size = 10 * 1024 * 1024,
     max_matches_per_file = 100,
     smart_case = true,
-    case_mode = nil, -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case when set
+    casing = nil, -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case when set
     time_budget_ms = 150,
     enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
     modes = { 'plain', 'regex', 'fuzzy' },

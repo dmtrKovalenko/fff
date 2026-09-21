@@ -32,7 +32,7 @@ fn plain_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
-        case_mode: None,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::PlainText,
@@ -52,7 +52,7 @@ fn regex_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
-        case_mode: None,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::Regex,
@@ -72,7 +72,7 @@ fn fuzzy_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
-        case_mode: None,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::Fuzzy,
@@ -1903,55 +1903,55 @@ fn literal_fallback_not_triggered_when_constraints_match() {
     assert!(!result.literal_fallback);
 }
 
-fn case_mode_picker(tmp: &TempDir) -> FilePicker {
+fn casing_picker(tmp: &TempDir) -> FilePicker {
     create_picker(
         tmp.path(),
         &[("a.txt", "Hello World\nhello world\nHELLO WORLD\n")],
     )
 }
 
-fn with_case_mode(mut opts: GrepSearchOptions, mode: Casing) -> GrepSearchOptions {
-    opts.case_mode = Some(mode);
+fn with_casing(mut opts: GrepSearchOptions, mode: Casing) -> GrepSearchOptions {
+    opts.casing = Some(mode);
     opts
 }
 
 #[test]
-fn case_mode_overrides_legacy_smart_case() {
+fn casing_overrides_legacy_smart_case() {
     let smart = GrepSearchOptions {
         smart_case: true,
-        case_mode: None,
+        casing: None,
         ..Default::default()
     };
     let sensitive = GrepSearchOptions {
         smart_case: false,
-        case_mode: None,
+        casing: None,
         ..Default::default()
     };
     let explicit = GrepSearchOptions {
         smart_case: true,
-        case_mode: Some(Casing::Insensitive),
+        casing: Some(Casing::Insensitive),
         ..Default::default()
     };
-    assert_eq!(smart.effective_case_mode(), Casing::Smart);
-    assert_eq!(sensitive.effective_case_mode(), Casing::Sensitive);
-    assert_eq!(explicit.effective_case_mode(), Casing::Insensitive);
+    assert_eq!(smart.effective_casing(), Casing::Smart);
+    assert_eq!(sensitive.effective_casing(), Casing::Sensitive);
+    assert_eq!(explicit.effective_casing(), Casing::Insensitive);
 }
 
 #[test]
-fn plain_text_case_mode_insensitive_matches_all_with_uppercase_query() {
+fn plain_text_casing_insensitive_matches_all_with_uppercase_query() {
     let tmp = TempDir::new().unwrap();
-    let picker = case_mode_picker(&tmp);
+    let picker = casing_picker(&tmp);
     let parsed = parse_grep_query("Hello");
-    let opts = with_case_mode(plain_opts(), Casing::Insensitive);
+    let opts = with_casing(plain_opts(), Casing::Insensitive);
     assert_eq!(picker.grep(&parsed, &opts).matches.len(), 3);
 }
 
 #[test]
-fn plain_text_case_mode_sensitive_with_lowercase_query() {
+fn plain_text_casing_sensitive_with_lowercase_query() {
     let tmp = TempDir::new().unwrap();
-    let picker = case_mode_picker(&tmp);
+    let picker = casing_picker(&tmp);
     let parsed = parse_grep_query("hello");
-    let opts = with_case_mode(plain_opts(), Casing::Sensitive);
+    let opts = with_casing(plain_opts(), Casing::Sensitive);
     let result = picker.grep(&parsed, &opts);
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 2);
@@ -1960,7 +1960,7 @@ fn plain_text_case_mode_sensitive_with_lowercase_query() {
 #[test]
 fn plain_text_legacy_smart_case_false_is_sensitive() {
     let tmp = TempDir::new().unwrap();
-    let picker = case_mode_picker(&tmp);
+    let picker = casing_picker(&tmp);
     let parsed = parse_grep_query("hello");
     let mut opts = plain_opts();
     opts.smart_case = false;
@@ -1968,37 +1968,37 @@ fn plain_text_legacy_smart_case_false_is_sensitive() {
 }
 
 #[test]
-fn regex_case_mode_insensitive_and_sensitive() {
+fn regex_casing_insensitive_and_sensitive() {
     let tmp = TempDir::new().unwrap();
-    let picker = case_mode_picker(&tmp);
+    let picker = casing_picker(&tmp);
 
-    let parsed = parse_grep_query("Hel+o");
-    let opts = with_case_mode(regex_opts(), Casing::Insensitive);
+    let parsed = parse_grep_query("H.llo");
+    let opts = with_casing(regex_opts(), Casing::Insensitive);
     assert_eq!(picker.grep(&parsed, &opts).matches.len(), 3);
 
-    let parsed = parse_grep_query("hel+o");
-    let opts = with_case_mode(regex_opts(), Casing::Sensitive);
+    let parsed = parse_grep_query("h.llo");
+    let opts = with_casing(regex_opts(), Casing::Sensitive);
     let result = picker.grep(&parsed, &opts);
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 2);
 }
 
 #[test]
-fn multi_grep_case_mode_insensitive_and_sensitive() {
+fn multi_grep_casing_insensitive_and_sensitive() {
     let tmp = TempDir::new().unwrap();
-    let picker = case_mode_picker(&tmp);
+    let picker = casing_picker(&tmp);
     let patterns = ["Hello", "WORLD"];
 
-    let opts = with_case_mode(plain_opts(), Casing::Insensitive);
+    let opts = with_casing(plain_opts(), Casing::Insensitive);
     assert_eq!(picker.multi_grep(&patterns, &[], &opts).matches.len(), 3);
 
-    let opts = with_case_mode(plain_opts(), Casing::Sensitive);
+    let opts = with_casing(plain_opts(), Casing::Sensitive);
     let result = picker.multi_grep(&["hello"], &[], &opts);
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 2);
 
     // Smart: any uppercase in any pattern makes the whole set sensitive
-    let opts = with_case_mode(plain_opts(), Casing::Smart);
+    let opts = with_casing(plain_opts(), Casing::Smart);
     assert_eq!(
         picker
             .multi_grep(&["hello", "WORLD"], &[], &opts)

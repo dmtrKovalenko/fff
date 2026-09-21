@@ -28,7 +28,7 @@ end
 
 --- Live grep: search file contents in the current directory.
 --- When opts.resume is true, resumes the last live_grep picker (or opens a new one if none saved).
---- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, case_mode?: "smart"|"sensitive"|"insensitive", max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
+--- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, casing?: "smart"|"sensitive"|"insensitive", max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
 function M.live_grep(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
   if not picker_ok then
@@ -329,7 +329,7 @@ end
 --- @field max_file_size? number Skip files larger than N bytes (default: config.grep.max_file_size).
 --- @field max_matches_per_file? number Cap matches per file, 0 = unlimited (default: config.grep.max_matches_per_file).
 --- @field smart_case? boolean Case-insensitive when query is all lowercase (default: config.grep.smart_case).
---- @field case_mode? "smart"|"sensitive"|"insensitive" Explicit case mode, overrides smart_case (default: config.grep.case_mode).
+--- @field casing? "smart"|"sensitive"|"insensitive" Explicit case mode, overrides smart_case (default: config.grep.casing).
 --- @field page_size? number Max matches returned (default: 50).
 --- @field file_offset? number File-based pagination offset (default: 0).
 --- @field time_budget_ms? number Max wall-clock time, 0 = unlimited (default: config.grep.time_budget_ms).
@@ -377,7 +377,7 @@ function M.content_search(query, opts)
     max_file_size = opts.max_file_size or grep_cfg.max_file_size,
     max_matches_per_file = opts.max_matches_per_file or grep_cfg.max_matches_per_file,
     smart_case = opts.smart_case == nil and grep_cfg.smart_case or opts.smart_case,
-    case_mode = opts.case_mode == nil and grep_cfg.case_mode or opts.case_mode,
+    casing = opts.casing == nil and grep_cfg.casing or opts.casing,
     time_budget_ms = opts.time_budget_ms or grep_cfg.time_budget_ms,
     enforce_time_budget = opts.enforce_time_budget == nil and grep_cfg.enforce_time_budget or opts.enforce_time_budget,
     trim_whitespace = opts.trim_whitespace == nil and grep_cfg.trim_whitespace or opts.trim_whitespace,

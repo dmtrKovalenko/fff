@@ -62,7 +62,7 @@ local M = {}
 --- @field max_file_size number
 --- @field max_matches_per_file number
 --- @field smart_case boolean
---- @field case_mode? "smart"|"sensitive"|"insensitive"
+--- @field casing? "smart"|"sensitive"|"insensitive"
 --- @field time_budget_ms number
 --- @field enforce_time_budget boolean
 --- @field modes string[]
@@ -482,7 +482,7 @@ local function init()
       max_file_size = 10 * 1024 * 1024, -- Skip files larger than 10MB
       max_matches_per_file = 100, -- Maximum matches per file (set 0 to unlimited)
       smart_case = true, -- Case-insensitive unless query has uppercase
-      case_mode = nil, -- "smart" | "sensitive" | "insensitive"; overrides smart_case when set
+      casing = nil, -- "smart" | "sensitive" | "insensitive"; overrides smart_case when set
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order

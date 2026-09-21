@@ -288,8 +288,8 @@ fn grep_search_parsed<'a>(
         return GrepResult::empty(total_files, total_files);
     }
 
-    let case_mode = options.effective_case_mode();
-    let case_insensitive = case_mode.is_insensitive_for(&grep_text);
+    let casing = options.effective_casing();
+    let case_insensitive = casing.is_insensitive_for(&grep_text);
 
     let base_count = bigram_boundary(bigram_overlay, files.len());
 
@@ -327,7 +327,7 @@ fn grep_search_parsed<'a>(
                 overflow_arena,
             );
         }
-        GrepMode::Regex => build_regex(&grep_text, case_mode)
+        GrepMode::Regex => build_regex(&grep_text, casing)
             .inspect_err(|err| {
                 tracing::warn!("Regex compilation failed for {}. Error {}", grep_text, err);
 
