@@ -19,6 +19,8 @@ QUIET_PERIOD_SECONDS = 0.7
 
 @pytest.fixture
 def watch_dir() -> str:
+    # resolve(): expands Windows 8.3 short paths (RUNNER~1) so strict path
+    # comparisons against the core's canonicalized event paths hold
     root = Path(tempfile.mkdtemp(prefix="fff-watch-test-")).resolve()
     (root / "docs").mkdir()
     (root / "docs" / "seed.txt").write_text("seed\n")
@@ -125,9 +127,9 @@ def test_watch_reports_renames_with_both_paths(finder: FileFinder, watch_dir: st
         with lock:
             events.extend(batch)
 
-    source = Path(watch_dir) / "docs" / "move-me.txt"
-    target = Path(watch_dir) / "docs" / "moved.txt"
-    with finder.watch("**/*.txt", on_events):
+    source = Path(watch_dir) / "move-me.txt"
+    target = Path(watch_dir) / "moved.txt"
+    with finder.watch(None, on_events):
         source.write_text("move me\n")
         wait_for_event(events, lock, "move-me.txt")
         with lock:
@@ -138,11 +140,16 @@ def test_watch_reports_renames_with_both_paths(finder: FileFinder, watch_dir: st
         assert ev.kind == "renamed"
         assert ev.path == str(target)
         assert ev.from_path == str(source)
-        # The move is one event, not a removal plus a creation.
+        # Let any stray removed/created for the pair surface, then assert absence
+        time.sleep(QUIET_PERIOD_SECONDS)
         with lock:
-            assert not [
-                e for e in events if e.kind == "removed" and e.path == str(source)
-            ]
+            snapshot = list(events)
+        renamed = [e for e in snapshot if e.kind == "renamed" and e.path == str(target)]
+        assert len(renamed) == 1, snapshot
+        # The move is one event, not a removal plus a creation.
+        assert not [e for e in snapshot if e.kind == "removed" and e.path == str(source)], snapshot
+        assert not [e for e in snapshot if e.kind == "created" and e.path == str(target)], snapshot
+        assert all(e.kind == "renamed" or e.from_path is None for e in snapshot), snapshot
 
 
 def test_multiple_subscriptions_are_filtered_independently(

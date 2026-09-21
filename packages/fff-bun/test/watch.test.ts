@@ -62,7 +62,9 @@ describe("FileFinder - Watch Subscriptions", () => {
   let finder: FileFinder;
 
   beforeAll(async () => {
-    baseDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
+    // realpath.native: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
+    // won't match the core's canonicalized paths; only the native variant expands it
+    baseDir = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
     writeFileSync(join(baseDir, "seed-one.txt"), "seed one\n");
     writeFileSync(join(baseDir, "seed-two.js"), "// seed two\n");
 
@@ -127,10 +129,17 @@ describe("FileFinder - Watch Subscriptions", () => {
     );
     expect(gotRename).toBe(true);
 
-    const renamed = received.find((e) => e.kind === "renamed");
+    const renamed = received.find((e) => e.kind === "renamed" && e.path === to);
     expect(renamed?.from).toBe(from);
+    // Let any stray removed/created for the pair surface, then assert absence
+    await sleep(700);
+    expect(received.filter((e) => e.kind === "renamed" && e.path === to).length).toBe(1);
     // The move is one event, not a removal plus a creation.
     expect(received.some((e) => e.kind === "removed" && e.path === from)).toBe(false);
+    expect(received.some((e) => e.kind === "created" && e.path === to)).toBe(false);
+    expect(received.every((e) => e.kind === "renamed" || e.from === undefined)).toBe(
+      true,
+    );
 
     sub.value();
   }, 20_000);
@@ -237,7 +246,9 @@ describe("FileFinder - Watch Subscriptions", () => {
   }, 20_000);
 
   test("destroy with an active watcher does not crash", async () => {
-    const otherDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-destroy-")));
+    const otherDir = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "fff-watch-destroy-")),
+    );
     try {
       writeFileSync(join(otherDir, "seed.txt"), "seed\n");
       const other = await createReadyFinder(otherDir);

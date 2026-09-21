@@ -40,9 +40,9 @@ let baseDir = "";
 
 describe("fff-node watch", { concurrency: 1 }, () => {
   before(async () => {
-    // realpath: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
-    // won't prefix-match the core's canonicalized base when used as a pattern
-    baseDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
+    // realpath.native: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
+    // won't match the core's canonicalized paths; only the native variant expands it
+    baseDir = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
     const dbDir = mkdtempSync(join(tmpdir(), "fff-watch-db-"));
 
     // Seed files so the initial scan has content
@@ -155,12 +155,26 @@ describe("fff-node watch", { concurrency: 1 }, () => {
       `expected a renamed event, got: ${JSON.stringify(deliveredEvents(callback))}`,
     );
     assert.equal(renamed.from, from);
+    // Let any stray removed/created for the pair surface, then assert absence
+    await sleep(700);
+    const events = deliveredEvents(callback);
+    assert.equal(
+      events.filter((e) => e.kind === "renamed" && e.path === to).length,
+      1,
+      `rename must be reported exactly once: ${JSON.stringify(events)}`,
+    );
     // The move is one event, not a removal plus a creation.
     assert.ok(
-      deliveredEvents(callback).every(
-        (e) => !(e.kind === "removed" && e.path === from),
-      ),
-      "a recognised rename must not also report the source as removed",
+      events.every((e) => !(e.kind === "removed" && e.path === from)),
+      `rename must not also report the source as removed: ${JSON.stringify(events)}`,
+    );
+    assert.ok(
+      events.every((e) => !(e.kind === "created" && e.path === to)),
+      `rename must not also report the destination as created: ${JSON.stringify(events)}`,
+    );
+    assert.ok(
+      events.every((e) => e.kind === "renamed" || e.from === undefined),
+      `from must only be set on renamed events: ${JSON.stringify(events)}`,
     );
 
     sub.value();

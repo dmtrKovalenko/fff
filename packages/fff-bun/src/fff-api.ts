@@ -300,18 +300,16 @@ export interface ScanProgress {
  * rescan = internal OS buffers were overloaded, some events might be missing.
  * The `path` is going to be a folder needs to be rescanned
  *
- * renamed = the file moved and kept its identity. `path` is the destination
- * and `from` the source; no separate removed/created pair is emitted. A move
- * in or out of the indexed tree stays a plain created/removed instead.
+ * renamed = the file was moved to the other path without changing the content
  */
 export type WatchEventKind = "created" | "modified" | "removed" | "rescan" | "renamed";
 
 /** A single filesystem change notification. */
 export interface WatchEvent {
-  /** Absolute path of the affected file (base path to rescan if `kind ==rescan`) */
+  /** Absolute path of the affected file (base path to rescan if `kind == rescan`) */
   path: string;
   kind: WatchEventKind;
-  /** Absolute path the file moved from. Only set when `kind === "renamed"`. */
+  /** Absolute path the file moved from. Only set when `kind == "renamed"`. */
   from?: string;
 }
 
