@@ -5,6 +5,26 @@ use std::sync::atomic::AtomicBool;
 
 pub use crate::constants::MAX_FFFILE_SIZE;
 
+/// Controls case sensitivity of the grep pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaseMode {
+    /// Case-insensitive unless the pattern contains an uppercase char.
+    #[default]
+    Smart,
+    Sensitive,
+    Insensitive,
+}
+
+impl CaseMode {
+    pub fn is_insensitive_for(self, pattern: &str) -> bool {
+        match self {
+            CaseMode::Smart => !pattern.chars().any(|c| c.is_uppercase()),
+            CaseMode::Insensitive => true,
+            CaseMode::Sensitive => false,
+        }
+    }
+}
+
 /// Controls how the grep pattern is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrepMode {
@@ -82,7 +102,11 @@ impl GrepMatch {
 pub struct GrepSearchOptions {
     pub max_file_size: u64,
     pub max_matches_per_file: usize,
+    /// Legacy toggle: `true` => `CaseMode::Smart`, `false` => `CaseMode::Sensitive`.
+    /// Ignored when `case_mode` is `Some`.
     pub smart_case: bool,
+    /// Explicit case mode; overrides `smart_case` when set.
+    pub case_mode: Option<CaseMode>,
     /// File-based pagination offset: index into the sorted/filtered file list
     /// to start searching from. Pass 0 for the first page, then use
     /// `GrepResult::next_file_offset` for subsequent pages.
@@ -115,12 +139,23 @@ pub struct GrepSearchOptions {
     pub abort_signal: Option<Arc<AtomicBool>>,
 }
 
+impl GrepSearchOptions {
+    pub fn effective_case_mode(&self) -> CaseMode {
+        match self.case_mode {
+            Some(mode) => mode,
+            None if self.smart_case => CaseMode::Smart,
+            None => CaseMode::Sensitive,
+        }
+    }
+}
+
 impl Default for GrepSearchOptions {
     fn default() -> Self {
         Self {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 200,
             smart_case: true,
+            case_mode: None,
             file_offset: 0,
             page_limit: 50,
             mode: GrepMode::default(),

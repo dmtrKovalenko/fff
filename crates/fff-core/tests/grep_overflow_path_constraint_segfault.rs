@@ -43,6 +43,7 @@ fn grep_path_constraint_on_overflow_file_does_not_segfault() {
         mode: GrepMode::PlainText,
         page_limit: 20,
         smart_case: true,
+        case_mode: None,
         ..Default::default()
     };
 

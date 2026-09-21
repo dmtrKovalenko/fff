@@ -1,4 +1,5 @@
 use super::sink::{SinkState, debug_assert_newline_terminator, split_multiline_blob};
+use super::types::CaseMode;
 use fff_grep::{
     Searcher, Sink, SinkMatch,
     matcher::{Match, Matcher, NoError},
@@ -9,7 +10,10 @@ pub fn has_regex_metacharacters(text: &str) -> bool {
     regex::escape(text) != text
 }
 
-pub(super) fn build_regex(pattern: &str, smart_case: bool) -> Result<regex::bytes::Regex, String> {
+pub(super) fn build_regex(
+    pattern: &str,
+    case_mode: CaseMode,
+) -> Result<regex::bytes::Regex, String> {
     if pattern.is_empty() {
         return Err("empty pattern".to_string());
     }
@@ -20,11 +24,7 @@ pub(super) fn build_regex(pattern: &str, smart_case: bool) -> Result<regex::byte
         pattern.to_string()
     };
 
-    let case_insensitive = if smart_case {
-        !pattern.chars().any(|c| c.is_uppercase())
-    } else {
-        false
-    };
+    let case_insensitive = case_mode.is_insensitive_for(pattern);
 
     regex::bytes::RegexBuilder::new(&regex_pattern)
         .case_insensitive(case_insensitive)

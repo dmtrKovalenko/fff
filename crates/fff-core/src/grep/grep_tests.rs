@@ -146,6 +146,7 @@ fn test_multi_grep_search() {
         max_file_size: MAX_FFFILE_SIZE,
         max_matches_per_file: 0,
         smart_case: true,
+        case_mode: None,
         file_offset: 0,
         page_limit: 100,
         mode: super::GrepMode::PlainText,
@@ -419,6 +420,7 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
         max_file_size: MAX_FFFILE_SIZE,
         max_matches_per_file: 0,
         smart_case: true,
+        case_mode: None,
         file_offset: 0,
         page_limit: 100,
         mode: super::GrepMode::PlainText,
@@ -497,6 +499,7 @@ fn regex_fallback_keeps_file_path_scope_issue_756() {
     let options = crate::GrepSearchOptions {
         mode: super::GrepMode::Regex,
         smart_case: true,
+        case_mode: None,
         max_matches_per_file: 80,
         page_limit: 100,
         ..Default::default()

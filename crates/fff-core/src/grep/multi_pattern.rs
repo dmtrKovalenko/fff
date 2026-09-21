@@ -136,12 +136,8 @@ pub(crate) fn multi_grep_search<'a>(
         return GrepResult::empty(total_files, filtered_file_count);
     }
 
-    // Smart case: case-insensitive when all patterns are lowercase
-    let case_insensitive = if options.smart_case {
-        !patterns.iter().any(|p| p.chars().any(|c| c.is_uppercase()))
-    } else {
-        false
-    };
+    let case_mode = options.effective_case_mode();
+    let case_insensitive = patterns.iter().all(|p| case_mode.is_insensitive_for(p));
 
     let ac = aho_corasick::AhoCorasickBuilder::new()
         .ascii_case_insensitive(case_insensitive)

@@ -67,6 +67,7 @@ fn make_grep_options(
             max_file_size: 10 * 1024 * 1024,
             max_matches_per_file: matches_per_file,
             smart_case: true,
+            case_mode: None,
             file_offset,
             page_limit: 50,
             mode,

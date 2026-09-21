@@ -96,6 +96,7 @@ fn grep_options(
         max_file_size: defaulted_u64(max_file_size, defaults.max_file_size),
         max_matches_per_file: max_matches_per_file as usize,
         smart_case,
+        case_mode: None,
         file_offset: cursor_offset,
         page_limit: defaulted_usize(page_limit, defaults.page_limit),
         mode,
