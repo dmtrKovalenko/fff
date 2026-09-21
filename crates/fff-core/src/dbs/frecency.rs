@@ -74,9 +74,9 @@ impl LmdbStore for FrecencyTracker {
     // leaves ~18× headroom while capping runaway growth (see GH issue #437).
     const MAP_SIZE: usize = 10 * 1024 * 1024;
     const MAX_DBS: u32 = 0;
-    // Nuke the db when it exceeds 8 MiB on disk — leaves a small margin under
-    // MAP_SIZE so we don't hit MDB_MAP_FULL before the open-time erase fires.
-    const SIZE_CAP_BYTES: u64 = 12 * 1024 * 1024;
+    // Nuke the db when it exceeds 8 MiB on disk — must stay below MAP_SIZE,
+    // otherwise data.mdb never reaches the cap and MDB_MAP_FULL is permanent.
+    const SIZE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
     fn shared_env(&self) -> &SharedEnv {
         &self.env
@@ -466,6 +466,56 @@ impl FrecencyTracker {
 mod tests {
     use super::*;
     use crate::file_picker::FFFMode;
+
+    // data.mdb can never grow past MAP_SIZE, so a cap at or above it makes
+    // erase_if_oversized unreachable and MDB_MAP_FULL permanent (#883).
+    #[test]
+    fn size_cap_is_reachable_under_map_size() {
+        assert!(
+            FrecencyTracker::SIZE_CAP_BYTES < FrecencyTracker::MAP_SIZE as u64,
+            "SIZE_CAP_BYTES {} must be below MAP_SIZE {}",
+            FrecencyTracker::SIZE_CAP_BYTES,
+            FrecencyTracker::MAP_SIZE
+        );
+    }
+
+    // Fills the db until MDB_MAP_FULL, then reopens: the size cap must fire and
+    // wipe data.mdb so writes recover instead of failing forever (#883).
+    #[test]
+    fn map_full_db_is_erased_on_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("frecency");
+
+        {
+            let tracker = FrecencyTracker::open(&db_path).unwrap();
+            let mut filled = false;
+            'fill: for batch in 0..4096u64 {
+                let mut wtxn = tracker.env.write_txn().unwrap();
+                for i in 0..2048u64 {
+                    let key = (batch * 2048 + i).to_le_bytes();
+                    let mut accesses = VecDeque::new();
+                    accesses.push_back(i);
+                    if tracker.db.put(&mut wtxn, &key, &accesses).is_err() {
+                        filled = true;
+                        break 'fill;
+                    }
+                }
+                if wtxn.commit().is_err() {
+                    filled = true;
+                    break;
+                }
+            }
+            assert!(filled, "db never reached MDB_MAP_FULL");
+        }
+
+        let on_disk = std::fs::metadata(db_path.join("data.mdb")).unwrap().len();
+        let reopened = FrecencyTracker::open(&db_path).unwrap();
+        let entries = reopened.count_entries().unwrap()[0].1;
+        assert_eq!(
+            entries, 0,
+            "map-full db ({on_disk} bytes on disk) was not erased on reopen"
+        );
+    }
 
     // A path that doesn't exist on disk must still hash (canonicalize fails on
     // Windows → falls back to the raw string), so watcher delete events and
