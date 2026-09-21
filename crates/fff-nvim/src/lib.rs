@@ -526,9 +526,9 @@ pub fn live_grep(
     };
     // nil/unknown falls back to the legacy smart_case toggle
     let case_mode = match case_mode.as_deref() {
-        Some("smart") => Some(fff::CaseMode::Smart),
-        Some("sensitive") => Some(fff::CaseMode::Sensitive),
-        Some("insensitive") => Some(fff::CaseMode::Insensitive),
+        Some("smart") => Some(fff::Casing::Smart),
+        Some("sensitive") => Some(fff::Casing::Sensitive),
+        Some("insensitive") => Some(fff::Casing::Insensitive),
         _ => None,
     };
 

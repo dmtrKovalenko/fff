@@ -1,5 +1,5 @@
 use super::sink::{SinkState, debug_assert_newline_terminator, split_multiline_blob};
-use super::types::CaseMode;
+use super::types::Casing;
 use fff_grep::{
     Searcher, Sink, SinkMatch,
     matcher::{Match, Matcher, NoError},
@@ -10,10 +10,7 @@ pub fn has_regex_metacharacters(text: &str) -> bool {
     regex::escape(text) != text
 }
 
-pub(super) fn build_regex(
-    pattern: &str,
-    case_mode: CaseMode,
-) -> Result<regex::bytes::Regex, String> {
+pub(super) fn build_regex(pattern: &str, case_mode: Casing) -> Result<regex::bytes::Regex, String> {
     if pattern.is_empty() {
         return Err("empty pattern".to_string());
     }

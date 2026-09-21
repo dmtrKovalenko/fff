@@ -7,7 +7,7 @@ pub use crate::constants::MAX_FFFILE_SIZE;
 
 /// Controls case sensitivity of the grep pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CaseMode {
+pub enum Casing {
     /// Case-insensitive unless the pattern contains an uppercase char.
     #[default]
     Smart,
@@ -15,12 +15,12 @@ pub enum CaseMode {
     Insensitive,
 }
 
-impl CaseMode {
+impl Casing {
     pub fn is_insensitive_for(self, pattern: &str) -> bool {
         match self {
-            CaseMode::Smart => !pattern.chars().any(|c| c.is_uppercase()),
-            CaseMode::Insensitive => true,
-            CaseMode::Sensitive => false,
+            Casing::Smart => !pattern.chars().any(|c| c.is_uppercase()),
+            Casing::Insensitive => true,
+            Casing::Sensitive => false,
         }
     }
 }
@@ -102,11 +102,11 @@ impl GrepMatch {
 pub struct GrepSearchOptions {
     pub max_file_size: u64,
     pub max_matches_per_file: usize,
-    /// Legacy toggle: `true` => `CaseMode::Smart`, `false` => `CaseMode::Sensitive`.
+    /// Legacy toggle: `true` => `Casing::Smart`, `false` => `Casing::Sensitive`.
     /// Ignored when `case_mode` is `Some`.
     pub smart_case: bool,
     /// Explicit case mode; overrides `smart_case` when set.
-    pub case_mode: Option<CaseMode>,
+    pub case_mode: Option<Casing>,
     /// File-based pagination offset: index into the sorted/filtered file list
     /// to start searching from. Pass 0 for the first page, then use
     /// `GrepResult::next_file_offset` for subsequent pages.
@@ -140,11 +140,11 @@ pub struct GrepSearchOptions {
 }
 
 impl GrepSearchOptions {
-    pub fn effective_case_mode(&self) -> CaseMode {
+    pub fn effective_case_mode(&self) -> Casing {
         match self.case_mode {
             Some(mode) => mode,
-            None if self.smart_case => CaseMode::Smart,
-            None => CaseMode::Sensitive,
+            None if self.smart_case => Casing::Smart,
+            None => Casing::Sensitive,
         }
     }
 }
