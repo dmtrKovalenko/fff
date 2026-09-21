@@ -40,9 +40,9 @@ let baseDir = "";
 
 describe("fff-node watch", { concurrency: 1 }, () => {
   before(async () => {
-    // realpath: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
-    // won't prefix-match the core's canonicalized base when used as a pattern
-    baseDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
+    // realpath.native: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
+    // won't match the core's canonicalized paths; only the native variant expands it
+    baseDir = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
     const dbDir = mkdtempSync(join(tmpdir(), "fff-watch-db-"));
 
     // Seed files so the initial scan has content
