@@ -678,9 +678,12 @@ fn match_and_score_in_arena<'a>(
         if fallback_filenames.is_empty() {
             vec![]
         } else {
+            // Match on `&str` so frizbee reuses the instantiation its index
+            // resolver already emits instead of a separate `Cow<str>` copy.
+            let filename_strs: Vec<&str> = fallback_filenames.iter().map(Cow::as_ref).collect();
             let mut matches = neo_frizbee::Matcher::new(fuzzy_parts[0], &options)
                 .match_list_parallel(
-                    &fallback_filenames,
+                    &filename_strs,
                     if path_matches.len() > 4096 {
                         context.max_threads.div_ceil(2048)
                     } else {

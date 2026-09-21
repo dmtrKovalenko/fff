@@ -39,7 +39,7 @@ signal-hook-registry = "1.4"
 zlob = { version = "=1.6.5" }
 
 mlua = { version = "0.11.1", features = ["module", "luajit"] }
-neo_frizbee = { version = "0.13.1", features = ["match_end_col"] }
+neo_frizbee = { version = "0.13.3", features = ["match_end_col"] }
 notify = { version = "9.0.0-rc.3" }
 notify-debouncer-full = { package = "fff-notify-debouncer-full", version = "0.9.4" }
 once_cell = "1.20.2"
@@ -56,7 +56,7 @@ tracing = "0.1"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = "debuginfo"
+strip = "symbols"
 
 [profile.ci]
 inherits = "release"
