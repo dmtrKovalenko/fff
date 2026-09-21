@@ -104,6 +104,7 @@ compile_error!(
 );
 
 /// Primary entry points with thread-safe [`SharedFilePicker`](shared::FilePicker) instance
+pub mod gpu_index;
 pub mod shared;
 pub use shared::*;
 

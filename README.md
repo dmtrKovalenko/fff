@@ -571,6 +571,31 @@ docs/archive/**/*.md
 
 Run `:FFFScan` to force a rescan.
 
+### GPU fuzzy matching (experimental, Apple silicon)
+
+Build the Rust library with the `gpu` feature and the fuzzy path match runs on
+the GPU (wgpu/Metal) instead of the CPU:
+
+```bash
+make build-gpu   # cargo build --release --no-default-features --features zlob,gpu
+```
+
+Neovim loads `target/release/libfff_nvim.dylib` ahead of the downloaded
+binary, so a restart is enough. It is on by default in that build; start
+Neovim with `FFF_GPU=0` to switch back to the CPU matcher without
+rebuilding. `:checkhealth fff` reports `GPU matcher active on <adapter>`
+once a search has run.
+
+What the GPU build does differently:
+
+- The whole index is scored on the GPU with frecency, git status and filename
+  bonuses folded in, and only the top candidates come back; per-keystroke
+  latency on a 500K-file repo drops from ~15ms to ~1ms.
+- Matching is exact-subsequence only: no typo tolerance. A query with a typo
+  returns nothing instead of a fuzzy guess.
+- The first search after a scan builds the GPU index (~150ms per million
+  files). Files created afterwards are appended without a rebuild.
+
 ### Troubleshooting
 
 - `:FFFHealth` verifies picker init, optional dependencies, and DB connectivity.

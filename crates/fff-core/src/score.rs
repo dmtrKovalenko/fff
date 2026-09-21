@@ -152,18 +152,34 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     //
     // putting them first in the list makes sorting more efficient and gives
     // them tiebreaker advantage in case sorting is the same
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = context.gpu {
+        let set = crate::gpu_index::Files {
+            files,
+            base_count,
+            base_arena,
+            overflow_arena,
+        };
+        if let Some((results, matched)) = gpu_match_and_score(gpu, &set, context) {
+            let (items, scores, total) = sort_and_paginate(results, context);
+            return (items, scores, total.max(matched));
+        }
+    }
+
     let results = if files.len() > base_count {
-        let mut results = match_and_score_in_arena(&files[base_count..], context, overflow_arena);
+        let mut results =
+            match_and_score_in_arena(&files[base_count..], context, overflow_arena, None);
 
         results.extend(match_and_score_in_arena(
             &files[..base_count],
             context,
             base_arena,
+            None,
         ));
 
         results
     } else {
-        match_and_score_in_arena(files, context, base_arena)
+        match_and_score_in_arena(files, context, base_arena, None)
     };
 
     sort_and_paginate(results, context)
@@ -602,17 +618,20 @@ fn sort_and_paginate_dirs<'a>(
     (items, scores, total_matched)
 }
 
+// `precomputed`: matches already found for `files` (GPU); constraints and
+// frizbee are skipped and only the per-match scoring runs.
 fn match_and_score_in_arena<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    precomputed: Option<Vec<neo_frizbee::Match>>,
 ) -> Vec<(&'a FileItem, Score)> {
     if files.is_empty() {
         return vec![];
     }
 
     let parsed = context.query;
-    let working_files: FileItems<'a> = if parsed.constraints.is_empty() {
+    let working_files: FileItems<'a> = if parsed.constraints.is_empty() || precomputed.is_some() {
         FileItems::All(files)
     } else {
         match apply_constraints(files, &parsed.constraints, arena, arena) {
@@ -624,42 +643,22 @@ fn match_and_score_in_arena<'a>(
         }
     };
 
-    let fuzzy_parts: &[&str] = match &parsed.fuzzy_query {
-        FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
-        FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
-        _ => {
-            return score_filtered_by_frecency(&working_files, context, arena);
-        }
+    let Some(fuzzy_parts) = fuzzy_parts(parsed) else {
+        return score_filtered_by_frecency(&working_files, context, arena);
     };
+    let query_contains_path_separator = has_path_separator(fuzzy_parts);
+    let options = frizbee_config(context, fuzzy_parts);
 
-    debug_assert!(!fuzzy_parts.is_empty());
-    let has_uppercase = fuzzy_parts
-        .iter()
-        .any(|p| p.chars().any(|c| c.is_uppercase()));
-    // Users type `/` regardless of platform. Checking the OS separator alone
-    // would miss forward-slash queries on Windows.
-    let query_contains_path_separator = fuzzy_parts
-        .iter()
-        .any(|p| p.contains('/') || p.contains(MAIN_SEPARATOR));
-
-    let options = neo_frizbee::Config {
-        max_typos: Some(context.max_typos),
-        sort: false,
-        scoring: Scoring {
-            capitalization_bonus: if has_uppercase { 8 } else { 0 },
-            matching_case_bonus: if has_uppercase { 4 } else { 0 },
-            ..Default::default()
-        },
-        ..Default::default()
+    let path_matches = match precomputed {
+        Some(m) => m,
+        None => match_fuzzy_parts(
+            fuzzy_parts,
+            &working_files,
+            &options,
+            context.max_threads,
+            arena,
+        ),
     };
-
-    let path_matches = match_fuzzy_parts(
-        fuzzy_parts,
-        &working_files,
-        &options,
-        context.max_threads,
-        arena,
-    );
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
@@ -885,6 +884,157 @@ fn match_and_score_in_arena<'a>(
         .collect();
 
     results
+}
+
+fn fuzzy_parts<'q>(parsed: &'q FFFQuery<'q>) -> Option<&'q [&'q str]> {
+    match &parsed.fuzzy_query {
+        FuzzyQuery::Text(t) if t.len() >= 2 => Some(std::slice::from_ref(t)),
+        FuzzyQuery::Parts(parts) if !parts.is_empty() => Some(parts.as_slice()),
+        _ => None,
+    }
+}
+
+// Users type `/` regardless of platform. Checking the OS separator alone
+// would miss forward-slash queries on Windows.
+fn has_path_separator(parts: &[&str]) -> bool {
+    parts
+        .iter()
+        .any(|p| p.contains('/') || p.contains(MAIN_SEPARATOR))
+}
+
+fn frizbee_config(context: &ScoringContext, parts: &[&str]) -> neo_frizbee::Config {
+    let has_uppercase = parts.iter().any(|p| p.chars().any(|c| c.is_uppercase()));
+    neo_frizbee::Config {
+        max_typos: Some(context.max_typos),
+        sort: false,
+        scoring: Scoring {
+            capitalization_bonus: if has_uppercase { 8 } else { 0 },
+            matching_case_bonus: if has_uppercase { 4 } else { 0 },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+// GPU-only fuzzy matching: the kernel scores every file (0 typos, with the
+// frecency / git / filename boosts folded in) and hands back the top
+// candidates; only the per-match scoring runs on the CPU.
+// Returns (results, total matched).
+#[cfg(feature = "gpu")]
+fn gpu_match_and_score<'a>(
+    gpu: &crate::gpu_index::GpuState,
+    set: &crate::gpu_index::Files<'a>,
+    context: &ScoringContext,
+) -> Option<(Vec<(&'a FileItem, Score)>, usize)> {
+    let parsed = context.query;
+    let parts = fuzzy_parts(parsed)?;
+    if parts.iter().any(|p| p.len() < 2) {
+        return None;
+    }
+    let files = set.files;
+    let options = frizbee_config(context, parts);
+    let limit = if context.pagination.limit > 0 {
+        context.pagination.limit
+    } else {
+        100
+    };
+    let k = ((context.pagination.offset + limit) * 4).clamp(200, 1000);
+
+    // (score, id, end_col | exact << 16)
+    let (top, matched): (Vec<(u32, u32, u32)>, usize) = if parts.len() == 1
+        && parsed.constraints.is_empty()
+    {
+        let t = gpu.with_index(set, |m| m.search_topk(parts[0], &options.scoring, k))?;
+        let v = t
+            .entries
+            .iter()
+            .zip(&t.meta)
+            .map(|(&(s, id), &m)| (s, id, m))
+            .collect();
+        (v, t.matched as usize)
+    } else {
+        // Multi-part or constrained: full per-file scores, combined on the host.
+        let mut combined: Option<(Vec<u32>, Vec<u32>)> = None;
+        for part in parts {
+            let (scores, meta) = gpu.with_index(set, |m| m.search_full(part, &options.scoring))?;
+            combined = Some(match combined {
+                None => (scores, meta),
+                Some((mut acc, meta0)) => {
+                    for (a, s) in acc.iter_mut().zip(&scores) {
+                        *a = if *a > 0 && *s > 0 { *a + *s } else { 0 };
+                    }
+                    (acc, meta0)
+                }
+            });
+        }
+        let (mut scores, meta) = combined?;
+        if parts.len() > 1 {
+            let n = parts.len() as u32;
+            scores.iter_mut().for_each(|s| *s /= n);
+        }
+        if !parsed.constraints.is_empty() {
+            let allowed = apply_constraints(
+                files,
+                &parsed.constraints,
+                set.base_arena,
+                set.overflow_arena,
+            );
+            if let Some(allowed) = allowed {
+                let mut keep = vec![false; files.len()];
+                let base = files.as_ptr() as usize;
+                for f in allowed {
+                    keep[(f as *const FileItem as usize - base) / size_of::<FileItem>()] = true;
+                }
+                for (s, k) in scores.iter_mut().zip(&keep) {
+                    if !k {
+                        *s = 0;
+                    }
+                }
+            }
+        }
+        let matched = scores.iter().filter(|&&s| s > 0).count();
+        let mut v = fff_gpu::top_k_scores(&scores, k);
+        v.sort_by(|a, b| (b.0, a.1).cmp(&(a.0, b.1)));
+        (
+            v.into_iter()
+                .map(|(s, id)| (s, id, meta[id as usize]))
+                .collect(),
+            matched,
+        )
+    };
+
+    let to_match = |(s, id, m): &(u32, u32, u32), offset: u32| neo_frizbee::Match {
+        score: (*s).min(u16::MAX as u32) as u16,
+        index: id - offset,
+        exact: m >> 16 != 0,
+        end_col: (m & 0xffff) as u16,
+    };
+    let base_count = set.base_count;
+    let live = |id: u32| !files[id as usize].is_deleted();
+    let overflow: Vec<neo_frizbee::Match> = top
+        .iter()
+        .filter(|e| e.1 as usize >= base_count && live(e.1))
+        .map(|e| to_match(e, base_count as u32))
+        .collect();
+    let base: Vec<neo_frizbee::Match> = top
+        .iter()
+        .filter(|e| (e.1 as usize) < base_count && live(e.1))
+        .map(|e| to_match(e, 0))
+        .collect();
+
+    let mut results = match_and_score_in_arena(
+        &files[base_count..],
+        context,
+        set.overflow_arena,
+        Some(overflow),
+    );
+    results.extend(match_and_score_in_arena(
+        &files[..base_count],
+        context,
+        set.base_arena,
+        Some(base),
+    ));
+    Some((results, matched))
 }
 
 fn is_special_entry_point_file(filename: &str) -> bool {
@@ -1128,6 +1278,7 @@ mod tests {
         let parser = QueryParser::default();
         let query = parser.parse(query_str);
         let context = ScoringContext {
+            gpu: None,
             query: &query,
             max_threads: 1,
             max_typos: 2,
@@ -1179,6 +1330,7 @@ mod tests {
         let parser = QueryParser::default();
         let query = parser.parse(query_str);
         let context = ScoringContext {
+            gpu: None,
             query: &query,
             max_threads: 1,
             max_typos: 2,
@@ -1228,6 +1380,7 @@ mod tests {
         let parser = QueryParser::default();
         let query = parser.parse(query_str);
         let context = ScoringContext {
+            gpu: None,
             query: &query,
             max_threads: 1,
             max_typos: 2,
@@ -1315,6 +1468,7 @@ mod filename_bonus_tests {
         let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
 
         let ctx = ScoringContext {
+            gpu: None,
             query: &parsed,
             max_threads: 1,
             max_typos,
@@ -1562,6 +1716,7 @@ mod typo_resistance_tests {
         let parser = QueryParser::default();
         let parsed = parser.parse(query);
         let ctx = ScoringContext {
+            gpu: None,
             query: &parsed,
             max_threads: 1,
             max_typos,
@@ -1670,6 +1825,7 @@ mod constraint_only_query_tests {
         let parsed = parser.parse("git:modified");
 
         let ctx = ScoringContext {
+            gpu: None,
             query: &parsed,
             max_threads: 1,
             max_typos: 2,
@@ -1721,6 +1877,7 @@ mod constraint_only_query_tests {
         let parsed = parser.parse("status:modified");
 
         let ctx = ScoringContext {
+            gpu: None,
             query: &parsed,
             max_threads: 1,
             max_typos: 2,

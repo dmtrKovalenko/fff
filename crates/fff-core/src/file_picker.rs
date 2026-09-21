@@ -151,7 +151,7 @@ impl FileSync {
         self.chunked_paths
             .as_ref()
             .map(|s| s.as_arena_ptr())
-            .unwrap_or(ArenaPtr::null())
+            .(ArenaPtr::null())
     }
 
     #[inline]
@@ -533,6 +533,7 @@ impl FileItem {
         self.access_frecency_score = tracker.get_access_score(abs, mode) as i16;
         self.modification_frecency_score =
             tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
+        crate::gpu_index::bump_boost_gen();
 
         Ok(())
     }
@@ -598,6 +599,7 @@ pub struct FilePicker {
     enable_home_dir_scanning: bool,
     trace_span: tracing::Span,
     trace_id: String,
+    gpu: crate::gpu_index::GpuState,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -637,6 +639,10 @@ impl FFFStringStorage for &FilePicker {
 impl FilePicker {
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    pub fn gpu_status(&self) -> crate::gpu_index::GpuStatus {
+        self.gpu.status()
     }
 
     pub fn has_git_repo(&self) -> bool {
@@ -913,6 +919,7 @@ impl FilePicker {
             follow_symlinks: options.follow_symlinks,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
+            gpu: crate::gpu_index::GpuState::default(),
             trace_span,
             trace_id,
         })
@@ -1038,6 +1045,7 @@ impl FilePicker {
                     &mut path_buf,
                 ));
             }
+            crate::gpu_index::bump_boost_gen();
         }
 
         self.signals.scanning.store(false, Ordering::Relaxed);
@@ -1101,6 +1109,7 @@ impl FilePicker {
                 });
 
         let context = ScoringContext {
+            gpu: Some(&self.gpu),
             query,
             max_typos,
             max_threads,
@@ -1174,6 +1183,7 @@ impl FilePicker {
         let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
 
         let context = ScoringContext {
+            gpu: None,
             query,
             max_typos,
             max_threads,
@@ -1522,6 +1532,7 @@ impl FilePicker {
             .try_for_each(|(path, status)| -> Result<(), Error> {
                 if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
                     file.git_status = Some(status);
+                    crate::gpu_index::bump_boost_gen();
                     if let Some(ref f) = *frecency {
                         file.update_frecency_scores(f, arena, &bp, mode)?;
                     }
@@ -1731,6 +1742,7 @@ impl FilePicker {
         file.set_deleted(true);
         file.invalidate_mmap(&self.cache_budget);
         file.git_status = None;
+        crate::gpu_index::bump_boost_gen();
 
         // Only base-region files participate in the bigram overlay
         if index < self.sync_data.base_count

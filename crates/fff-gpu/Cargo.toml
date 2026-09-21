@@ -1,0 +1,12 @@
+[package]
+name = "fff-gpu"
+version = "0.10.6"
+edition = "2024"
+publish = false
+description = "GPU (wgpu) fuzzy path matcher used by fff-search behind the `gpu` feature"
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+neo_frizbee = { workspace = true }

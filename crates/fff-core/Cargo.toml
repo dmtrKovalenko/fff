@@ -54,6 +54,9 @@ mimalloc-collect = ["dep:libmimalloc-sys"]
 # Use zlob (Zig-compiled C globbing library) for glob matching.
 # Requires Zig to be installed. When disabled, falls back to globset (pure Rust).
 zlob = ["dep:zlob", "fff-query-parser/zlob"]
+# GPU (wgpu) candidate generation for the 0-typo fuzzy path match. Runtime
+# opt-out with FFF_GPU=0.
+gpu = ["dep:fff-gpu"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -75,6 +78,7 @@ heed = { workspace = true }
 ignore = { workspace = true, optional = true }
 memmap2 = { workspace = true }
 neo_frizbee = { workspace = true }
+fff-gpu = { path = "../fff-gpu", version = "0.10.6", optional = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 parking_lot = { workspace = true }

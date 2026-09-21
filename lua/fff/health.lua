@@ -241,6 +241,23 @@ function M.run(opts)
             rust_health.file_picker.base_path or 'unknown'
           ),
         })
+
+        local gpu = rust_health.file_picker.gpu
+        if gpu then
+          health.rust.file_picker.gpu = gpu
+          if not gpu.compiled then
+            table.insert(health.messages, { level = 'info', msg = 'GPU matcher not compiled in (build with `make build-gpu`)' })
+          elseif not gpu.enabled then
+            table.insert(health.messages, { level = 'info', msg = 'GPU matcher compiled but disabled (FFF_GPU=0)' })
+          elseif gpu.adapter then
+            table.insert(health.messages, {
+              level = 'ok',
+              msg = string.format('GPU matcher active on %s (%d files indexed)', gpu.adapter, gpu.indexed_files or 0),
+            })
+          else
+            table.insert(health.messages, { level = 'ok', msg = 'GPU matcher enabled (index builds on first search)' })
+          end
+        end
       else
         table.insert(health.messages, {
           level = 'info',

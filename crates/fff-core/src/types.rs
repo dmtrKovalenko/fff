@@ -878,6 +878,8 @@ pub struct ScoringContext<'a> {
     pub combo_boost_score_multiplier: i32,
     pub min_combo_count: u32,
     pub pagination: PaginationArgs,
+    /// GPU candidate generator for the base file list, when compiled in.
+    pub gpu: Option<&'a crate::gpu_index::GpuState>,
 }
 
 impl ScoringContext<'_> {

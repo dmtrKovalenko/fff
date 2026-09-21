@@ -7,6 +7,7 @@ members = [
   "crates/fff-python",
   "crates/fff-query-parser",
   "crates/fff-grep",
+  "crates/fff-gpu",
 ]
 
 resolver = "2"

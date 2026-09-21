@@ -12,7 +12,10 @@ const HEADER: &str = r#"struct Params {
     capitalization_bonus: u32,
     matching_case_bonus: u32,
     exact_match_bonus: u32,
-    _pad: u32,
+    thread_count: u32,
+    _reserved: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -22,8 +25,6 @@ const HEADER: &str = r#"struct Params {
 @group(0) @binding(4) var<storage, read_write> scores: array<u32>;
 @group(0) @binding(5) var<storage, read> survivors: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> survivor_count: u32;
-
-const LANES: u32 = 16u;
 
 fn hay_byte(idx: u32) -> u32 {
     return (hay[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xffu;
@@ -48,7 +49,7 @@ fn is_delim(c: u32) -> bool {
 
 // 16 lanes per haystack inside one subgroup; needle length is baked in so the
 // row loop unrolls and previous-chunk state stays in registers.
-@compute @workgroup_size(16)
+@compute @workgroup_size(LANES)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
@@ -77,10 +78,21 @@ fn main(
     var best = 0;
 "#;
 
-pub fn generate(n: usize) -> String {
-    let mut s = String::from(HEADER);
+pub fn generate(n: usize, lanes: u32) -> String {
+    let packed_masks = lanes == 16;
+    let lane_mask = if packed_masks {
+        "0xffffu"
+    } else {
+        "0xffffffffu"
+    };
+    let mut s = format!("const LANES: u32 = {lanes}u;\n");
+    s.push_str(HEADER);
     for k in 0..=(n / 2) {
-        let _ = writeln!(s, "    var pa{k} = 0u;\n    var pmm{k} = 0u;");
+        let _ = writeln!(s, "    var pa{k} = 0u;");
+    }
+    let mask_regs = if packed_masks { n / 2 + 1 } else { n + 1 };
+    for k in 0..mask_regs {
+        let _ = writeln!(s, "    var pmm{k} = 0u;");
     }
     for i in 0..n {
         let _ = writeln!(
@@ -109,21 +121,31 @@ pub fn generate(n: usize) -> String {
 "#,
     );
     let unpack = |i: usize, reg: &str| {
+        if reg == "pmm" && !packed_masks {
+            return format!("pmm{i}");
+        }
         let k = i / 2;
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             format!("({reg}{k} & 0xffffu)")
         } else {
             format!("({reg}{k} >> 16u)")
         }
     };
     let store = |i: usize, reg: &str, val: &str| {
+        if reg == "pmm" && !packed_masks {
+            return format!("pmm{i} = {val};");
+        }
         let k = i / 2;
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             format!("{reg}{k} = ({reg}{k} & 0xffff0000u) | u32({val});")
         } else {
             format!("{reg}{k} = ({reg}{k} & 0xffffu) | (u32({val}) << 16u);")
         }
     };
+    let shifts: Vec<u32> = (0..)
+        .map(|e| 1u32 << e)
+        .take_while(|&x| x < lanes)
+        .collect();
     for i in 1..=n {
         let p = i - 1;
         let ap = unpack(p, "pa");
@@ -149,10 +171,10 @@ pub fn generate(n: usize) -> String {
             var u = prev_row - gap_extend;
             if (up_mm) {{ u -= gap_open; }}
             s = max(d, max(u, 0));
-            let row_mask = subgroupBallot(m).x & 0xffffu;
+            let row_mask = subgroupBallot(m).x & {lane_mask};
 "#
         );
-        for shift in [1u32, 2, 4, 8] {
+        for &shift in &shifts {
             let _ = write!(
                 s,
                 r#"            {{

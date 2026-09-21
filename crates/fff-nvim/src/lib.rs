@@ -870,6 +870,13 @@ pub fn health_check(lua: &Lua, test_path: Option<String>) -> LuaResult<LuaValue>
                 picker_info.set("is_scanning", picker.is_scan_active())?;
                 let progress = picker.get_scan_progress();
                 picker_info.set("indexed_files", progress.scanned_files_count)?;
+                let gpu = picker.gpu_status();
+                let gpu_info = lua.create_table()?;
+                gpu_info.set("compiled", gpu.compiled)?;
+                gpu_info.set("enabled", gpu.enabled)?;
+                gpu_info.set("adapter", gpu.adapter)?;
+                gpu_info.set("indexed_files", gpu.indexed_files)?;
+                picker_info.set("gpu", gpu_info)?;
             } else {
                 picker_info.set("initialized", false)?;
             }

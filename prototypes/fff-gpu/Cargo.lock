@@ -205,8 +205,16 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "fff-gpu"
 version = "0.0.1"
 dependencies = [
- "bytemuck",
+ "fff-gpu 0.10.6",
  "ignore",
+ "neo_frizbee",
+]
+
+[[package]]
+name = "fff-gpu"
+version = "0.10.6"
+dependencies = [
+ "bytemuck",
  "neo_frizbee",
  "pollster",
  "wgpu",

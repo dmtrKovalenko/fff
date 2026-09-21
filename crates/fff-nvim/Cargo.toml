@@ -17,6 +17,8 @@ ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep", "dep:ignore"]
 zlob = ["fff/zlob", "fff-query-parser/zlob", "dep:zlob"]
 # Keep full-rescan accounting in a release build; required by rescan_probe.
 rescan-stats = ["fff/rescan-stats"]
+# GPU (wgpu/Metal) candidate generation for fuzzy path matching. FFF_GPU=0 disables at runtime.
+gpu = ["fff/gpu"]
 
 [dependencies]
 # Workspace dependencies

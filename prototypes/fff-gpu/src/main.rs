@@ -1,12 +1,13 @@
-mod gpu;
+mod e2e;
+mod hybrid;
 mod reference;
-mod subgroup;
+
+use fff_gpu as gpu;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 const TOP_K: usize = 50;
-const REPS: usize = 20;
 const DEFAULT_QUERIES: &[&str] = &[
     "main",
     "score",
@@ -25,11 +26,10 @@ fn main() {
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let mut kernels = vec![
-        gpu::Kernel::ThreadPerItem,
-        gpu::Kernel::LanePerThread,
-        gpu::Kernel::Subgroup,
-    ];
+    let mut hybrid = false;
+    let mut e2e = false;
+    let mut typos: u16 = 0;
+    let mut kernels = vec![gpu::Kernel::Scalar];
     while let Some(a) = args.next() {
         match a.as_str() {
             "--sizes" => {
@@ -41,11 +41,15 @@ fn main() {
                     .collect()
             }
             "--queries" => queries = args.next().unwrap().split(',').map(String::from).collect(),
+            "--hybrid" => hybrid = true,
+            "--e2e" => e2e = true,
+            "--typos" => typos = args.next().unwrap().parse().unwrap(),
             "--threads" => threads = args.next().unwrap().parse().unwrap(),
             "--kernel" => {
                 kernels = vec![match args.next().unwrap().as_str() {
                     "item" => gpu::Kernel::ThreadPerItem,
                     "lanes" => gpu::Kernel::LanePerThread,
+                    "scalar" => gpu::Kernel::Scalar,
                     _ => gpu::Kernel::Subgroup,
                 }]
             }
@@ -53,7 +57,36 @@ fn main() {
         }
     }
 
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     let base = walk(&root);
+    if std::env::var("CMP").is_ok() {
+        let scoring = neo_frizbee::Scoring::default();
+        let cfg = neo_frizbee::Config {
+            max_typos: Some(0),
+            sort: false,
+            scoring,
+            ..Default::default()
+        };
+        for q in &queries {
+            let mut shown = 0;
+            for p in &base {
+                let a = reference::score_scalar(q.as_bytes(), p.as_bytes(), &scoring);
+                let b = reference::score(q.as_bytes(), p.as_bytes(), &scoring, 16);
+                let f = neo_frizbee::match_list(q, &[p.as_str()], &cfg)
+                    .first()
+                    .map(|m| m.score)
+                    .unwrap_or(0);
+                if a != b && shown < 6 {
+                    println!("{q:>8} scalar={a:<4} lanes16={b:<4} frz={f:<4} {p}");
+                    shown += 1;
+                }
+            }
+        }
+        return;
+    }
     if std::env::var("DBG").is_ok() {
         for q in &queries {
             debug_mismatches(q, &base, &neo_frizbee::Scoring::default());
@@ -63,7 +96,7 @@ fn main() {
     println!("walked {} paths from {root}", base.len());
     let scoring = neo_frizbee::Scoring::default();
     let config = neo_frizbee::Config {
-        max_typos: Some(0),
+        max_typos: Some(typos),
         sort: false,
         scoring,
         ..Default::default()
@@ -71,6 +104,14 @@ fn main() {
 
     for size in sizes {
         let paths = scale(&base, size);
+        if hybrid {
+            hybrid::run(&paths, &queries, threads);
+            continue;
+        }
+        if e2e {
+            e2e::run(&paths, &queries, threads, reps);
+            continue;
+        }
         println!(
             "\n=== {} paths, avg len {:.1} ===",
             paths.len(),
@@ -80,26 +121,54 @@ fn main() {
             let t = Instant::now();
             let gpu = gpu::GpuMatcher::new(&paths, kernel);
             println!(
-                "gpu: {} | kernel {kernel:?} | index upload {:?}",
+                "gpu: {} | kernel {kernel:?} | lanes {} | index upload {:?}",
                 gpu.adapter_name,
+                gpu.lanes,
                 t.elapsed()
             );
             gpu.search("warmup", &scoring);
 
             println!(
-                "{:<16} {:>10} {:>10} {:>10} {:>8} {:>8} {:>10}",
-                "query", "gpu", "cpu-frz", "cpu-ref", "top50∩", "ref=gpu", "frz≈gpu"
+                "{:<16} {:>10} {:>8} {:>10} {:>10} {:>8} {:>8} {:>10}",
+                "query", "gpu", "", "cpu-frz", "cpu-ref", "top50∩", "ref=gpu", "frz≈gpu"
             );
             for q in &queries {
-                gpu.search(q, &scoring);
-                let (gpu_scores, gpu_t) = timed(REPS, || gpu.search(q, &scoring));
-                let (frz, frz_t) = timed(REPS, || {
+                // Burst first so the GPU clocks up before the timed reps.
+                for _ in 0..10 {
+                    gpu.search(q, &scoring);
+                }
+                gpu.take_pass_medians();
+                let ((gpu_scores, gpu_t), gpu_min) = timed_min(reps, || gpu.search(q, &scoring));
+                let mut passes = gpu
+                    .take_pass_medians()
+                    .map(|(p, d, _)| format!("  gpu prefilter {p:.2}ms dp {d:.2}ms"))
+                    .unwrap_or_default();
+                if std::env::var("TOPK").is_ok() {
+                    let (_, tk) = timed(reps, || gpu.search_topk(q, &scoring, 50));
+                    let extra = gpu
+                        .take_pass_medians()
+                        .map(|(_, _, k)| format!(" (topk pass {k:.2}ms)"))
+                        .unwrap_or_default();
+                    passes.push_str(&format!("  topk-e2e {}{extra}", fmt(tk)));
+                }
+                let (frz, frz_t) = timed(reps, || {
                     neo_frizbee::match_list_parallel(q, &paths, &config, threads)
                 });
                 let (reference, ref_t) = timed(1, || {
                     paths
                         .iter()
-                        .map(|p| reference::score(q.as_bytes(), p.as_bytes(), &scoring))
+                        .map(|p| {
+                            if gpu.uses_scalar(q.len().min(gpu::MAX_NEEDLE)) {
+                                reference::score_scalar(q.as_bytes(), p.as_bytes(), &scoring)
+                            } else {
+                                reference::score(
+                                    q.as_bytes(),
+                                    p.as_bytes(),
+                                    &scoring,
+                                    gpu.lanes as usize,
+                                )
+                            }
+                        })
                         .collect::<Vec<_>>()
                 });
 
@@ -134,9 +203,10 @@ fn main() {
                 frz_sorted.sort_by(|a, b| (b.0, a.1).cmp(&(a.0, b.1)));
                 let frz_top: HashSet<u32> = frz_sorted.iter().take(TOP_K).map(|m| m.1).collect();
                 println!(
-                    "{:<16} {:>10} {:>10} {:>10} {:>5}/{:<2} {:>7.1}% {:>9.1}%",
+                    "{:<16} {:>10} {:>8} {:>10} {:>10} {:>5}/{:<2} {:>7.1}% {:>9.1}%  frz-matches {:>7}{}",
                     q,
                     fmt(gpu_t),
+                    format!("min {}", fmt(gpu_min)),
                     fmt(frz_t),
                     fmt(ref_t),
                     gpu_top.intersection(&frz_top).count(),
@@ -147,13 +217,20 @@ fn main() {
                     } else {
                         100.0 * frz_agree as f64 / frz.len() as f64
                     },
+                    frz.len(),
+                    passes,
                 );
             }
         }
     }
 }
 
-fn timed<T>(reps: usize, mut f: impl FnMut() -> T) -> (T, Duration) {
+fn timed<T>(reps: usize, f: impl FnMut() -> T) -> (T, Duration) {
+    timed_min(reps, f).0
+}
+
+// (result, median), min
+fn timed_min<T>(reps: usize, mut f: impl FnMut() -> T) -> ((T, Duration), Duration) {
     let mut times = Vec::with_capacity(reps);
     let mut out = None;
     for _ in 0..reps {
@@ -162,7 +239,7 @@ fn timed<T>(reps: usize, mut f: impl FnMut() -> T) -> (T, Duration) {
         times.push(t.elapsed());
     }
     times.sort();
-    (out.unwrap(), times[reps / 2])
+    ((out.unwrap(), times[reps / 2]), times[0])
 }
 
 fn top_k(scores: &[u32], k: usize) -> Vec<u32> {
@@ -234,7 +311,7 @@ pub fn debug_mismatches(q: &str, paths: &[String], scoring: &neo_frizbee::Scorin
     };
     let mut shown = 0;
     for p in paths {
-        let r = reference::score(q.as_bytes(), p.as_bytes(), scoring);
+        let r = reference::score(q.as_bytes(), p.as_bytes(), scoring, 16);
         let f = neo_frizbee::match_list(q, &[p.as_str()], &config);
         let fs = f.first().map(|m| m.score as u32).unwrap_or(0);
         if r != fs && shown < 8 {
