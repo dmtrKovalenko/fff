@@ -306,7 +306,7 @@ function M.format_location(location)
 end
 
 -- `line_hl_group` bg overrides every `hl_group` bg on the line regardless of
--- priority, so emulate it with a low priority full-width range highlight.
+-- priority, so emulate it with a full-width range above syntax but below matches.
 set_cursor_line_mark = function(bufnr, namespace, row)
   return pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, row, 0, {
     end_row = row + 1,
@@ -314,7 +314,7 @@ set_cursor_line_mark = function(bufnr, namespace, row)
     hl_eol = true,
     hl_group = 'CursorLine',
     number_hl_group = 'CursorLineNr',
-    priority = 50,
+    priority = 999,
   })
 end
 
