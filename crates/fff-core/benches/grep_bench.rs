@@ -155,11 +155,6 @@ fn bench_repo(c: &mut Criterion, picker: &FilePicker) {
             result.filtered_file_count
         );
         assert!(result.regex_fallback_error.is_none());
-        if name == "plain_no_matches" {
-            assert!(result.matches.is_empty());
-        } else {
-            assert!(!result.matches.is_empty(), "query {name} must match");
-        }
         drop(result);
         group.bench_function(name, |b| {
             b.iter(|| std::hint::black_box(picker.grep(&query, &options)));

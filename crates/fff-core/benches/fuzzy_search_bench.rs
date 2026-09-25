@@ -6,9 +6,22 @@ mod support;
 
 fn bench_fuzzy_search(c: &mut Criterion) {
     if let Some(picker) = support::repo_picker() {
-        let current_file =
-            std::env::var("FFF_BENCH_CURRENT_FILE").unwrap_or_else(|_| "README.md".into());
-        assert!(picker.base_path().join(&current_file).is_file());
+        let current_file = match std::env::var("FFF_BENCH_CURRENT_FILE") {
+            Ok(file) => {
+                assert!(
+                    picker.base_path().join(&file).is_file(),
+                    "FFF_BENCH_CURRENT_FILE must exist in FFF_BENCH_PATH"
+                );
+                file
+            }
+            Err(_) => picker
+                .get_files()
+                .iter()
+                .find(|file| !file.is_deleted())
+                .map(|file| file.relative_path(&picker))
+                .expect("repository must contain files"),
+        };
+        eprintln!("Current file: {current_file}");
         bench_picker(c, &picker, "fuzzy_search_repo", &current_file, true);
         return;
     }

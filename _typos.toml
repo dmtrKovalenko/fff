@@ -12,6 +12,7 @@ thm = "thm"
 comparsion = "comparsion"
 modfiers = "modfiers"
 shcema = "shcema"
+contrller = "contrller"
 
 [default]
 extend-ignore-re = [

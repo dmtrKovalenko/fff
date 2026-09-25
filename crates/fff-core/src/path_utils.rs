@@ -1,29 +1,5 @@
 use std::path::{Components, Path, PathBuf};
 
-pub(crate) struct DirectoryDistance<'a> {
-    components: Components<'a>,
-    depth: usize,
-}
-
-impl<'a> DirectoryDistance<'a> {
-    pub(crate) fn new(current_file: &'a str) -> Self {
-        let directory = Path::new(current_file).parent().unwrap_or(Path::new(""));
-        let components = directory.components();
-        let depth = components.clone().count();
-        Self { components, depth }
-    }
-
-    pub(crate) fn penalty(&self, candidate_dir: &str) -> i32 {
-        let common = self
-            .components
-            .clone()
-            .zip(Path::new(candidate_dir).components())
-            .take_while(|(a, b)| a == b)
-            .count();
-        -((self.depth - common).min(20) as i32)
-    }
-}
-
 #[cfg(windows)]
 pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     dunce::canonicalize(path)
@@ -147,6 +123,30 @@ pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &st
     }
 
     (-(depth_from_common as i32)).max(-20)
+}
+
+pub(crate) struct DirectoryDistance<'a> {
+    components: Components<'a>,
+    depth: usize,
+}
+
+impl<'a> DirectoryDistance<'a> {
+    pub(crate) fn new(current_file: &'a str) -> Self {
+        let directory = Path::new(current_file).parent().unwrap_or(Path::new(""));
+        let components = directory.components();
+        let depth = components.clone().count();
+        Self { components, depth }
+    }
+
+    pub(crate) fn penalty(&self, candidate_dir: &str) -> i32 {
+        let common = self
+            .components
+            .clone()
+            .zip(Path::new(candidate_dir).components())
+            .take_while(|(a, b)| a == b)
+            .count();
+        -((self.depth - common).min(20) as i32)
+    }
 }
 
 #[cfg(test)]
