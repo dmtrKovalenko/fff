@@ -367,10 +367,6 @@ impl FileItem {
         s
     }
 
-    pub(crate) fn write_relative_path_from_arena(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_to_string(arena, out);
-    }
-
     pub fn relative_path_len(&self) -> usize {
         self.path.byte_len as usize
     }
@@ -380,12 +376,7 @@ impl FileItem {
     }
 
     pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
-        if other.len() != self.path.byte_len as usize {
-            return false;
-        }
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let mine = self.path.read_to_buf(arena, &mut buf);
-        mine == other
+        self.path.equals(arena, other)
     }
 
     pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {

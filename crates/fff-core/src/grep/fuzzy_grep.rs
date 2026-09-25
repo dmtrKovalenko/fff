@@ -1,3 +1,4 @@
+use crate::match_offsets::char_indices_to_byte_offsets;
 use crate::simd_path::ArenaPtr;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::lines::LineStep;
@@ -5,10 +6,7 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::sink::{
-    char_indices_to_byte_offsets, classify_definition, strip_line_terminators,
-    truncate_display_bytes,
-};
+use super::sink::{classify_definition, strip_line_terminators, truncate_display_bytes};
 use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 
 #[allow(clippy::too_many_arguments)]

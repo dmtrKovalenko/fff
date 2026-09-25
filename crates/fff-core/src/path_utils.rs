@@ -1,4 +1,28 @@
-use std::path::{Path, PathBuf};
+use std::path::{Components, Path, PathBuf};
+
+pub(crate) struct DirectoryDistance<'a> {
+    components: Components<'a>,
+    depth: usize,
+}
+
+impl<'a> DirectoryDistance<'a> {
+    pub(crate) fn new(current_file: &'a str) -> Self {
+        let directory = Path::new(current_file).parent().unwrap_or(Path::new(""));
+        let components = directory.components();
+        let depth = components.clone().count();
+        Self { components, depth }
+    }
+
+    pub(crate) fn penalty(&self, candidate_dir: &str) -> i32 {
+        let common = self
+            .components
+            .clone()
+            .zip(Path::new(candidate_dir).components())
+            .take_while(|(a, b)| a == b)
+            .count();
+        -((self.depth - common).min(20) as i32)
+    }
+}
 
 #[cfg(windows)]
 pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
@@ -76,13 +100,8 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Calculate distance penalty based on directory proximity.
-/// Returns a negative penalty score based on how far the candidate is from the current file.
-///
-/// `candidate_dir` is the directory portion of the candidate path (e.g. `"src/components/"`).
-/// It may have a trailing `/` which is stripped internally.
-///
-/// Zero-allocation: walks both directory part iterators in lockstep.
+/// Calculate the directory proximity penalty without allocating.
+/// `candidate_dir` may include a trailing separator.
 pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &str) -> i32 {
     let Some(current_path) = current_file else {
         return 0;
@@ -133,6 +152,38 @@ pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_distance_matches_existing_scoring() {
+        let paths = [
+            "",
+            "/",
+            "main.rs",
+            "./main.rs",
+            "src/lib.rs",
+            "src/./lib.rs",
+            "src//nested/lib.rs",
+            "src/../other/lib.rs",
+            "/src/nested/lib.rs",
+            "目录/é/lib.rs",
+            "C:\\src\\nested\\lib.rs",
+            "\\\\server\\share\\lib.rs",
+        ];
+        for current in paths {
+            let distance = DirectoryDistance::new(current);
+            for candidate in paths {
+                assert_eq!(
+                    distance.penalty(candidate),
+                    calculate_distance_penalty(Some(current), candidate),
+                    "{current:?}, {candidate:?}"
+                );
+            }
+        }
+        assert_eq!(
+            DirectoryDistance::new(&format!("{}file", "dir/".repeat(40))).penalty("elsewhere/"),
+            -20
+        );
+    }
 
     #[test]
     #[cfg(not(target_family = "windows"))]

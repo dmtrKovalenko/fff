@@ -1,7 +1,8 @@
 use crate::{
     git::is_modified_status,
     index::constraints::apply_constraints,
-    path_utils::calculate_distance_penalty,
+    match_offsets::char_indices_to_byte_offsets,
+    path_utils::DirectoryDistance,
     simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
     types::{DirItem, FileItem, Score, ScoringContext},
@@ -58,7 +59,7 @@ fn match_fuzzy_parts(
     max_threads: usize,
     arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
-    let valid_parts: Vec<&str> = fuzzy_parts
+    let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
         .filter(|p| p.len() >= 2)
@@ -169,10 +170,10 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> Vec<SmallVec<[(u32, u32); 4]>> {
-    let parts: Vec<&str> = match &query.fuzzy_query {
-        FuzzyQuery::Text(text) if text.len() >= 2 => vec![*text],
+    let parts: SmallVec<[&str; 4]> = match &query.fuzzy_query {
+        FuzzyQuery::Text(text) if text.len() >= 2 => smallvec::smallvec![*text],
         FuzzyQuery::Parts(parts) => parts.iter().copied().filter(|p| p.len() >= 2).collect(),
-        _ => Vec::new(),
+        _ => SmallVec::new(),
     };
 
     let mut ranges_by_item = vec![SmallVec::new(); items.len()];
@@ -180,16 +181,23 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         return ranges_by_item;
     }
 
-    let paths: Vec<String> = items
+    let mut paths = String::with_capacity(items.iter().map(|item| item.relative_path_len()).sum());
+    for item in items {
+        let arena = if item.is_overflow() {
+            overflow_arena
+        } else {
+            base_arena
+        };
+        item.path.append_to_string(arena, &mut paths);
+    }
+
+    let mut start = 0;
+    let path_strs: Vec<&str> = items
         .iter()
         .map(|item| {
-            let arena = if item.is_overflow() {
-                overflow_arena
-            } else {
-                base_arena
-            };
-            let mut path = String::with_capacity(item.relative_path_len());
-            item.write_relative_path_from_arena(arena, &mut path);
+            let end = start + item.relative_path_len();
+            let path = &paths[start..end];
+            start = end;
             path
         })
         .collect();
@@ -208,8 +216,6 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         ..Default::default()
     };
 
-    // Match on `&str` so this shares frizbee's instantiation with fuzzy grep.
-    let path_strs: Vec<&str> = paths.iter().map(String::as_str).collect();
     for (idx, part) in parts.iter().copied().enumerate() {
         let mut part_config = config;
         if idx > 0 {
@@ -219,7 +225,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         let mut matcher = neo_frizbee::Matcher::new(part, &part_config);
         for mut matched in matcher.match_list_indices(&path_strs) {
             let item_idx = matched.index as usize;
-            let Some(path) = paths.get(item_idx) else {
+            let Some(path) = path_strs.get(item_idx) else {
                 continue;
             };
 
@@ -235,55 +241,31 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     ranges_by_item
 }
 
-fn char_indices_to_byte_offsets(line: &str, char_indices: &[u32]) -> SmallVec<[(u32, u32); 4]> {
-    let char_byte_ranges: Vec<(usize, usize)> = line
-        .char_indices()
-        .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
-        .collect();
-    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
-
-    for &char_idx in char_indices {
-        let Some(&(start, end)) = char_byte_ranges.get(char_idx as usize) else {
-            continue;
-        };
-
-        if let Some(last) = result.last_mut()
-            && last.1 == start as u32
-        {
-            last.1 = end as u32;
-            continue;
-        }
-
-        result.push((start as u32, end as u32));
-    }
-
-    result
-}
-
 fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, u32); 4]> {
     if ranges.len() <= 1 {
         return ranges;
     }
 
     ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut merged: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(ranges.len());
-
-    for (start, end) in ranges {
+    let mut merged = 0;
+    for index in 0..ranges.len() {
+        let (start, end) = ranges[index];
         if end <= start {
             continue;
         }
 
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
+        if merged > 0 && start <= ranges[merged - 1].1 {
+            let last = &mut ranges[merged - 1];
             last.1 = last.1.max(end);
             continue;
         }
 
-        merged.push((start, end));
+        ranges[merged] = (start, end);
+        merged += 1;
     }
 
-    merged
+    ranges.truncate(merged);
+    ranges
 }
 
 /// Resolve a DirItem's chunked path into frizbee's pointer buffer.
@@ -313,7 +295,7 @@ fn match_fuzzy_parts_dirs(
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
-    let valid_parts: Vec<&str> = fuzzy_parts
+    let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
         .filter(|p| p.len() >= 2)
@@ -417,7 +399,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         }
     };
 
-    let valid_parts: Vec<&str> = fuzzy_parts
+    let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
         .filter(|p| p.len() >= 2)
@@ -456,6 +438,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
 
     let mut dir_buf = String::with_capacity(64);
     let mut dirname_buf = String::with_capacity(32);
+    let distance = context.current_file.map(DirectoryDistance::new);
 
     let results: Vec<(&DirItem, Score)> = path_matches
         .into_iter()
@@ -470,9 +453,9 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
             let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
 
             // Distance penalty from current file's directory.
-            let distance_penalty = if context.current_file.is_some() {
+            let distance_penalty = if let Some(distance) = &distance {
                 dir.path.write_to_string(dir_arena, &mut dir_buf);
-                calculate_distance_penalty(context.current_file, &dir_buf)
+                distance.penalty(&dir_buf)
             } else {
                 0
             };
@@ -584,18 +567,24 @@ fn sort_and_paginate_dirs<'a>(
 
     sort_with_buffer(&mut results, |a, b| b.1.total.cmp(&a.1.total));
 
-    if results.len() > limit {
-        let page_end = std::cmp::min(offset + limit, results.len());
-        let page_size = page_end - offset;
-        results.drain(0..offset);
-        results.truncate(page_size);
-    }
-
-    let (items, scores): (Vec<&DirItem>, Vec<Score>) = results.into_iter().unzip();
+    let (items, scores): (Vec<&DirItem>, Vec<Score>) =
+        results.into_iter().skip(offset).take(limit).unzip();
     (items, scores, total_matched)
 }
 
 fn match_and_score_in_arena<'a>(
+    files: &'a [FileItem],
+    context: &ScoringContext,
+    arena: ArenaPtr,
+) -> Vec<(&'a FileItem, Score)> {
+    if context.current_file.is_some() {
+        match_and_score_in_arena_inner::<true>(files, context, arena)
+    } else {
+        match_and_score_in_arena_inner::<false>(files, context, arena)
+    }
+}
+
+fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
@@ -700,6 +689,15 @@ fn match_and_score_in_arena<'a>(
     let mut dir_buf = String::with_capacity(64);
     let mut fname_buf = String::with_capacity(32);
     let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    let distance = context
+        .current_file
+        .filter(|_| WITH_CURRENT_FILE)
+        .map(DirectoryDistance::new);
+    let mut last_dir_penalty = None;
+    let combo_path = context
+        .last_same_query_match
+        .as_ref()
+        .map(|entry| entry.file_path.to_string_lossy());
 
     let results: Vec<_> = path_matches
         .into_iter()
@@ -718,12 +716,18 @@ fn match_and_score_in_arena<'a>(
             };
             let git_recency_boost = file.git_recency_score as i32;
 
-            if context.current_file.is_some() || context.last_same_query_match.is_some() {
-                file.write_dir_str(arena, &mut dir_buf);
-            }
-
-            let distance_penalty = if context.current_file.is_some() {
-                calculate_distance_penalty(context.current_file, &dir_buf)
+            let distance_penalty = if WITH_CURRENT_FILE && let Some(distance) = &distance {
+                if let Some((parent, penalty)) = last_dir_penalty
+                    && parent == file.parent_dir_index
+                    && parent != u32::MAX
+                {
+                    penalty
+                } else {
+                    file.write_dir_str(arena, &mut dir_buf);
+                    let penalty = distance.penalty(&dir_buf);
+                    last_dir_penalty = Some((file.parent_dir_index, penalty));
+                    penalty
+                }
             } else {
                 0
             };
@@ -787,18 +791,21 @@ fn match_and_score_in_arena<'a>(
                 0
             };
 
-            let current_file_penalty =
-                calculate_current_file_penalty(file, base_score / 4, context, arena);
+            let current_file_penalty = if WITH_CURRENT_FILE {
+                calculate_current_file_penalty(file, base_score / 4, context, arena)
+            } else {
+                0
+            };
             let combo_match_boost = {
-                let last_same_query_match = context.last_same_query_match.as_ref().filter(|m| {
-                    let file_path_str = m.file_path.to_string_lossy();
-                    let total_len = file.path.byte_len as usize;
-                    if file_path_str.len() < total_len {
-                        return false;
-                    }
-                    // Reuse dir_buf (already has capacity) for the full path
-                    file.write_relative_path_from_arena(arena, &mut dir_buf);
-                    file_path_str.ends_with(dir_buf.as_str())
+                let last_same_query_match = context.last_same_query_match.as_ref().filter(|_| {
+                    combo_path
+                        .as_ref()
+                        .and_then(|path| {
+                            path.len()
+                                .checked_sub(file.relative_path_len())
+                                .and_then(|start| path.get(start..))
+                        })
+                        .is_some_and(|suffix| file.relative_path_eq(arena, suffix))
                 });
 
                 match last_same_query_match {
@@ -952,19 +959,23 @@ fn score_filtered_by_frecency<'a>(
     };
 
     match files {
-        FileItems::All(s) => s
+        // Small indexes cannot amortize Rayon scheduling for this cheap scoring pass.
+        FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => s
             .par_iter()
-            .filter_map(|f| {
-                let live = !f.is_deleted();
-                live.then_some(score_file(f))
-            })
+            .with_min_len(4096)
+            .filter(|f| !f.is_deleted())
+            .map(score_file)
+            .collect(),
+        FileItems::All(s) => s
+            .iter()
+            .filter(|f| !f.is_deleted())
+            .map(score_file)
             .collect(),
         FileItems::Filtered(v) => v
             .iter()
-            .filter_map(|f| {
-                let live = !f.is_deleted();
-                live.then_some(score_file(f))
-            })
+            .copied()
+            .filter(|f| !f.is_deleted())
+            .map(score_file)
             .collect(),
     }
 }
@@ -1041,16 +1052,8 @@ fn sort_and_paginate<'a>(
             .then_with(|| b.0.modified.cmp(&a.0.modified))
     });
 
-    // in the best scenario truncation happened in the select_nth step
-    if results.len() > limit {
-        let page_end = std::cmp::min(offset + limit, results.len());
-        let page_size = page_end - offset;
-
-        results.drain(0..offset);
-        results.truncate(page_size);
-    }
-
-    let (items, scores): (Vec<&FileItem>, Vec<Score>) = results.into_iter().unzip();
+    let (items, scores): (Vec<&FileItem>, Vec<Score>) =
+        results.into_iter().skip(offset).take(limit).unzip();
     (items, scores, total_matched)
 }
 
@@ -1059,6 +1062,144 @@ mod tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
+
+    #[test]
+    fn frecency_parallel_and_sequential_scores_match() {
+        let files: Vec<_> = (0..33_000)
+            .map(|index| {
+                let mut file =
+                    FileItem::new_raw(0, 0, index, Some(git2::Status::WT_MODIFIED), false);
+                file.access_frecency_score = (index % 97) as i16;
+                file.modification_frecency_score = (index % 29) as i16;
+                file.git_recency_score = (index % 13) as i16;
+                file.set_deleted(index % 7 == 0);
+                file
+            })
+            .collect();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        let mut context = ScoringContext {
+            query: &query,
+            max_threads: 4,
+            max_typos: 0,
+            project_path: None,
+            current_file: None,
+            last_same_query_match: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        for count in [0, 1, 1000, 33_000] {
+            let files = FileItems::All(&files[..count]);
+            context.max_threads = 4;
+            let parallel = score_filtered_by_frecency(&files, &context, ArenaPtr::null());
+            context.max_threads = 1;
+            let sequential = score_filtered_by_frecency(&files, &context, ArenaPtr::null());
+            assert_eq!(parallel.len(), count - count.div_ceil(7));
+            assert_eq!(parallel.len(), sequential.len());
+            for ((a, a_score), (b, b_score)) in parallel.iter().zip(&sequential) {
+                assert!(std::ptr::eq(*a, *b));
+                assert!(!a.is_deleted());
+                assert_eq!(a_score.total, b_score.total);
+                assert_eq!(a_score.frecency_boost, b_score.frecency_boost);
+                assert_eq!(a_score.git_status_boost, b_score.git_status_boost);
+                assert_eq!(a_score.git_recency_boost, b_score.git_recency_boost);
+            }
+        }
+    }
+
+    #[test]
+    fn pagination_matches_full_ranking() {
+        let files: Vec<_> = (0..257)
+            .map(|i| FileItem::new_raw(0, 0, i as u64, None, false))
+            .collect();
+        let dirs: Vec<_> = (0..257)
+            .map(|_| DirItem::new(crate::simd_path::ChunkedString::empty(), 0))
+            .collect();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        for count in [0, 1, 3, 100, 101, 257] {
+            let results: Vec<_> = files[..count]
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    (
+                        file,
+                        Score {
+                            total: (index * 73 % 257) as i32,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            let mut expected = results.clone();
+            expected.sort_by(|a, b| {
+                b.1.total
+                    .cmp(&a.1.total)
+                    .then_with(|| b.0.modified.cmp(&a.0.modified))
+            });
+            for offset in [0, 1, count / 2, count, usize::MAX] {
+                for limit in [0, 1, 2, 50, count, usize::MAX] {
+                    let context = ScoringContext {
+                        query: &query,
+                        max_threads: 1,
+                        max_typos: 0,
+                        project_path: None,
+                        current_file: None,
+                        last_same_query_match: None,
+                        combo_boost_score_multiplier: 0,
+                        min_combo_count: 0,
+                        pagination: PaginationArgs { offset, limit },
+                    };
+                    let expected_page: Vec<_> = expected
+                        .iter()
+                        .skip(offset)
+                        .take(if limit == 0 { count } else { limit })
+                        .map(|(_, score)| score.total)
+                        .collect();
+                    let (items, scores, total) = sort_and_paginate(results.clone(), &context);
+                    assert_eq!(total, count);
+                    assert_eq!(items.len(), expected_page.len());
+                    assert_eq!(
+                        scores.iter().map(|score| score.total).collect::<Vec<_>>(),
+                        expected_page
+                    );
+                    let dir_results = results
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, score))| (&dirs[index], score.clone()))
+                        .collect();
+                    let (items, scores, total) = sort_and_paginate_dirs(dir_results, &context);
+                    assert_eq!(total, count);
+                    assert_eq!(items.len(), expected_page.len());
+                    assert_eq!(
+                        scores.iter().map(|score| score.total).collect::<Vec<_>>(),
+                        expected_page
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_offsets_reuses_storage() {
+        let mut ranges: SmallVec<[(u32, u32); 4]> = smallvec::smallvec![
+            (20, 25),
+            (2, 6),
+            (0, 3),
+            (6, 10),
+            (11, 11),
+            (24, 30),
+            (40, 45),
+        ];
+        let storage = ranges.as_mut_ptr();
+        let merged = merge_byte_offsets(ranges);
+        assert_eq!(merged.as_slice(), &[(0, 10), (20, 30), (40, 45)]);
+        assert_eq!(merged.as_ptr(), storage);
+    }
 
     fn make_test_files(specs: &[(&str, i32, u64)]) -> (Vec<(FileItem, Score)>, ArenaPtr) {
         let path_strings: Vec<String> = specs.iter().map(|(p, _, _)| p.to_string()).collect();
@@ -1263,6 +1404,67 @@ mod filename_bonus_tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
+
+    #[test]
+    fn page_highlights_use_each_files_arena() {
+        let base_path = "src/ui_controller.rs";
+        let overflow_path = "other/test_controller.rs";
+        let (base, base_arena) = make_files(&[base_path]);
+        let (overflow, overflow_arena) = make_files(&[overflow_path]);
+        overflow[0].set_overflow(true);
+        let parser = QueryParser::default();
+        let query = parser.parse("controller");
+        let ranges = fuzzy_match_byte_offsets_for_page(
+            &query,
+            &[&base[0], &overflow[0]],
+            0,
+            base_arena,
+            overflow_arena,
+        );
+        for (path, ranges) in [base_path, overflow_path].into_iter().zip(ranges) {
+            let start = path.find("controller").unwrap() as u32;
+            assert_eq!(ranges.as_slice(), &[(start, start + 10)]);
+        }
+    }
+
+    #[test]
+    fn distance_scoring_handles_repeated_and_unknown_parents() {
+        let paths = [
+            "src/widgets/file_a.rs",
+            "src/widgets/file_b.rs",
+            "src/file_c.rs",
+            "tests/file_d.rs",
+        ];
+        let (mut files, arena) = make_files(&paths);
+        files[0].parent_dir_index = 0;
+        files[1].parent_dir_index = 0;
+        let parser = QueryParser::default();
+        let query = parser.parse("file");
+        let current_file = Some("src/widgets/current.rs");
+        let context = ScoringContext {
+            query: &query,
+            current_file,
+            max_threads: 1,
+            max_typos: 0,
+            project_path: None,
+            last_same_query_match: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let results = match_and_score_in_arena(&files, &context, arena);
+        assert_eq!(results.len(), files.len());
+        for (file, score) in results {
+            assert_eq!(
+                score.distance_penalty,
+                crate::path_utils::calculate_distance_penalty(current_file, &file.dir_str(arena))
+            );
+        }
+    }
+
     fn make_files(paths: &[&str]) -> (Vec<FileItem>, ArenaPtr) {
         let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
         let items: Vec<FileItem> = paths

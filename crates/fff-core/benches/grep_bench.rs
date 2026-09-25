@@ -3,6 +3,8 @@ use fff_search::file_picker::{FilePicker, FilePickerOptions};
 use fff_search::{GrepMode, GrepSearchOptions, parse_grep_query};
 use std::io::Write;
 
+mod support;
+
 /// Synthetic repo: half the files contain the needle on every line (stresses
 /// the per-match find/highlight path), half are pure noise (stresses the
 /// whole-file prefilter path).
@@ -41,6 +43,10 @@ fn options(mode: GrepMode) -> GrepSearchOptions {
 }
 
 fn bench_grep(c: &mut Criterion) {
+    if let Some(picker) = support::repo_picker() {
+        bench_repo(c, &picker);
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     setup_repo(dir.path());
 
@@ -98,6 +104,67 @@ fn bench_grep(c: &mut Criterion) {
         });
     });
 
+    let fuzzy_opts = options(GrepMode::Fuzzy);
+    for (name, text) in [
+        ("fuzzy_exact_many_matches", "controller"),
+        ("fuzzy_typo_many_matches", "contrller"),
+    ] {
+        let query = parse_grep_query(text);
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let result = picker.grep(&query, &fuzzy_opts);
+                assert_eq!(result.files_with_matches, 400);
+                std::hint::black_box(result.matches.len())
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_repo(c: &mut Criterion, picker: &FilePicker) {
+    let mut group = c.benchmark_group("grep_repo");
+    group.sample_size(10);
+    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for (name, text, mode) in [
+        ("plain_sensitive", "Controller", GrepMode::PlainText),
+        ("plain_insensitive", "controller", GrepMode::PlainText),
+        (
+            "plain_no_matches",
+            "FFF_BENCH_absent_f891c75d",
+            GrepMode::PlainText,
+        ),
+        ("regex", "Contr[a-z]+ller", GrepMode::Regex),
+        ("fuzzy_exact", "controller", GrepMode::Fuzzy),
+        ("fuzzy_typo", "contrller", GrepMode::Fuzzy),
+    ] {
+        let query = parse_grep_query(text);
+        let options = GrepSearchOptions {
+            max_file_size: 10 * 1024 * 1024,
+            mode,
+            ..Default::default()
+        };
+        let result = picker.grep(&query, &options);
+        eprintln!(
+            "Query {name}: matches={} files_with_matches={} searched={} filtered={}",
+            result.matches.len(),
+            result.files_with_matches,
+            result.total_files_searched,
+            result.filtered_file_count
+        );
+        assert!(result.regex_fallback_error.is_none());
+        if name == "plain_no_matches" {
+            assert!(result.matches.is_empty());
+        } else {
+            assert!(!result.matches.is_empty(), "query {name} must match");
+        }
+        drop(result);
+        group.bench_function(name, |b| {
+            b.iter(|| std::hint::black_box(picker.grep(&query, &options)));
+        });
+    }
     group.finish();
 }
 

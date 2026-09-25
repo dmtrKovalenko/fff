@@ -136,6 +136,8 @@ pub mod path_utils;
 pub mod types;
 pub use types::*;
 
+mod match_offsets;
+
 pub mod constants;
 
 /// Watcher rescan request accounting.

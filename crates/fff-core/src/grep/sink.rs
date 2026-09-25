@@ -190,52 +190,6 @@ pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>)
     }
 }
 
-/// Convert character-position indices from neo_frizbee into byte-offset
-/// pairs (start, end) suitable for `match_byte_offsets`.
-///
-/// frizbee returns character positions (0-based index into the char
-/// iterator). We need byte ranges because the UI renderer and Lua layer
-/// use byte offsets for extmark highlights.
-///
-/// Each matched character becomes its own (byte_start, byte_end) pair.
-/// Adjacent characters are merged into a single contiguous range.
-pub(super) fn char_indices_to_byte_offsets(
-    line: &str,
-    char_indices: &[u32],
-) -> SmallVec<[(u32, u32); 4]> {
-    if char_indices.is_empty() {
-        return SmallVec::new();
-    }
-
-    // Build a map: char_index -> (byte_start, byte_end) for all chars.
-    // Iterating all chars is O(n) in the line length which is bounded by MAX_LINE_DISPLAY_LEN (512).
-    let char_byte_ranges: Vec<(usize, usize)> = line
-        .char_indices()
-        .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
-        .collect();
-
-    // Convert char indices to byte ranges, merging adjacent ranges
-    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
-
-    for &ci in char_indices {
-        let ci = ci as usize;
-        if ci >= char_byte_ranges.len() {
-            continue; // out of bounds (shouldn't happen with valid data)
-        }
-        let (start, end) = char_byte_ranges[ci];
-        // Merge with previous range if adjacent
-        if let Some(last) = result.last_mut()
-            && last.1 == start as u32
-        {
-            last.1 = end as u32;
-            continue;
-        }
-        result.push((start as u32, end as u32));
-    }
-
-    result
-}
-
 // copied from the rust u8 private method
 #[inline]
 const fn is_utf8_char_boundary(b: u8) -> bool {

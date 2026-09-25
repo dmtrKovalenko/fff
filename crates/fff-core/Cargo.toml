@@ -34,6 +34,10 @@ required-features = ["zlob"]
 name = "grep_bench"
 harness = false
 
+[[bench]]
+name = "fuzzy_search_bench"
+harness = false
+
 [features]
 # `ripgrep` is the pure-Rust walker/glob backend and is on by default so
 # consumers build without a Zig toolchain. CI/release opt into zlob via
@@ -102,4 +106,3 @@ proptest = { version = "1", default-features = false, features = ["std", "fork"]
 rand = { version = "0.8", features = ["small_rng"] }
 tempfile = "3.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
