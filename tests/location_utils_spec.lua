@@ -1,6 +1,10 @@
 ---@diagnostic disable: undefined-field, need-check-nil
 local location_utils = require('fff.location_utils')
 
+--- Collect extmarks grouped by hl_group, asserting none use line_hl_group
+--- @param buf number Buffer number
+--- @param ns number Namespace to read extmarks from
+--- @return table<string, table[]> marks Marks keyed by hl_group with row, col and details
 local function marks_by_group(buf, ns)
   local by_group = {}
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
@@ -14,6 +18,10 @@ local function marks_by_group(buf, ns)
   return by_group
 end
 
+--- Assert a single full-width CursorLine mark on row, with lower priority than every match
+--- @param marks table<string, table[]> Result of marks_by_group
+--- @param match_group string Highlight group of the match marks
+--- @param row number 0-based row expected to carry the CursorLine mark
 local function assert_cursor_line_below(marks, match_group, row)
   local cursor_line = marks.CursorLine[1]
   assert.are.equal(1, #marks.CursorLine)

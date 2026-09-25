@@ -305,8 +305,12 @@ function M.format_location(location)
   return ''
 end
 
--- `line_hl_group` bg overrides every `hl_group` bg on the line regardless of
--- priority, so emulate it with a full-width range above syntax but below matches.
+--- Pin a row with a full-width CursorLine range, above syntax but below matches
+--- (`line_hl_group` bg would override every `hl_group` bg regardless of priority)
+--- @param bufnr number Buffer number
+--- @param namespace number Namespace for extmarks
+--- @param row number 0-based row to highlight
+--- @return boolean ok, number|string mark_id_or_err pcall result of nvim_buf_set_extmark
 set_cursor_line_mark = function(bufnr, namespace, row)
   return pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, row, 0, {
     end_row = row + 1,
