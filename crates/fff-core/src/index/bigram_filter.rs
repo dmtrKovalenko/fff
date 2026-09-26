@@ -1046,7 +1046,7 @@ const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 /// Sparse-column cutoff for the skip-1 sub-index. Rare skip columns add
 /// little filtering power but ~25-30% of index memory, so we drop
 /// anything appearing in < 12 % of populated files.
-const SKIP_INDEX_MIN_DENSITY_PCT: u32 = 12;
+pub(crate) const SKIP_INDEX_MIN_DENSITY_PCT: u32 = 12;
 
 thread_local! {
     /// Per-thread file read buffer, grown on demand and released after the build.

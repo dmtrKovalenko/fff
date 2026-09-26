@@ -38,17 +38,18 @@ pub(crate) fn literal_candidates(
 
     let mut combined: Option<Vec<u64>> = None;
     for pattern in patterns {
-        if let Some(candidates) = index.query(pattern.as_bytes()) {
-            combined = Some(match combined {
-                None => candidates,
-                Some(mut acc) => {
-                    acc.iter_mut()
-                        .zip(candidates.iter())
-                        .for_each(|(a, b)| *a |= *b);
-                    acc
-                }
-            });
-        }
+        // A pattern the index can't narrow matches any file, and the union with
+        // it is every file — so bail out of prefiltering instead of dropping it.
+        let candidates = index.query(pattern.as_bytes())?;
+        combined = Some(match combined {
+            None => candidates,
+            Some(mut acc) => {
+                acc.iter_mut()
+                    .zip(candidates.iter())
+                    .for_each(|(a, b)| *a |= *b);
+                acc
+            }
+        });
     }
 
     let mut candidates = combined?;
