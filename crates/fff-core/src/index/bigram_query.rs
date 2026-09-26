@@ -92,9 +92,9 @@ impl BigramQuery {
         match self {
             BigramQuery::Any => None,
 
-            BigramQuery::Consec(key) => index.column_bitset(*key),
+            BigramQuery::Consec(key) => index.common_column_bitset(*key),
 
-            BigramQuery::Skip1(key) => index.skip_index()?.column_bitset(*key),
+            BigramQuery::Skip1(key) => index.skip_index()?.common_column_bitset(*key),
 
             BigramQuery::And(children) => {
                 let mut result: Option<Vec<u64>> = None;

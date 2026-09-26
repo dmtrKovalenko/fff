@@ -23,6 +23,10 @@ pub(super) fn fuzzy_grep_search<'a>(
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> GrepResult<'a> {
+    #[cfg(unix)]
+    let base_dir = std::fs::File::open(base_path).ok();
+    #[cfg(not(unix))]
+    let base_dir = None;
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" -> "schema") costs ~1 typo with
     // default gap penalties. We scale max_typos by needle length:
@@ -169,8 +173,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                         arena
                     };
 
-                    let file_bytes =
-                        file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
+                    let file_bytes = file.get_content_for_search(
+                        buf,
+                        mmap_slot,
+                        file_arena,
+                        base_path,
+                        budget,
+                        base_dir.as_ref(),
+                    )?;
 
                     if min_chars_required > 0 {
                         let mut chars_found = 0usize;
