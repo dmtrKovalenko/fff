@@ -519,10 +519,6 @@ fn regex_fallback_keeps_file_path_scope_issue_756() {
     );
 }
 
-/// Candidate bitsets are OR-ed across the patterns of a multi-pattern grep. A
-/// pattern the bigram index cannot prefilter (no printable-ASCII bigram, e.g. a
-/// CJK needle) matches any file, so leaving it out of the union hides every file
-/// that only it matches.
 #[test]
 fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
     let dir = tempfile::tempdir().unwrap();
@@ -557,8 +553,11 @@ fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
     for (i, (_, content)) in base_contents.iter().enumerate() {
         consec_builder.add_file_content(&skip_builder, i, content.as_bytes());
     }
-    let mut index = consec_builder.compress(Some(0));
-    index.set_skip_index(skip_builder.compress(Some(0)));
+    // Compressed as build_bigram_index does, so this is the production prefilter.
+    let mut index = consec_builder.compress(None);
+    index.set_skip_index(skip_builder.compress(Some(
+        crate::index::bigram_filter::SKIP_INDEX_MIN_DENSITY_PCT,
+    )));
     picker.set_bigram_index(index);
 
     let options = crate::GrepSearchOptions {
@@ -568,7 +567,7 @@ fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
         ..Default::default()
     };
 
-    let matched_paths = |patterns: &[&str]| -> Vec<String> {
+    let grep = |patterns: &[&str]| -> (Vec<String>, usize) {
         let result = picker.multi_grep(patterns, &[], &options);
         let mut paths: Vec<String> = result
             .files
@@ -576,20 +575,21 @@ fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
             .map(|f| f.relative_path(&picker))
             .collect();
         paths.sort();
-        paths
+        (paths, result.total_files_searched)
     };
 
-    assert_eq!(
-        matched_paths(&["unicorn", "日本語"]),
-        vec!["a.txt", "b.txt", "c.txt", "e.txt"],
-        "the CJK needle has no usable bigram, so its file must still be searched"
-    );
+    // The CJK needle has no printable-ASCII bigram, so nothing can be
+    // prefiltered: every file is searched and e.txt is found.
+    let (paths, searched) = grep(&["unicorn", "日本語"]);
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt", "e.txt"]);
+    assert_eq!(searched, base_contents.len());
 
-    // Pins that the prefilter still narrows (both hold before and after):
-    // every pattern indexable => files matching none of them stay out.
-    assert_eq!(
-        matched_paths(&["unicorn", "rainbow"]),
-        vec!["a.txt", "b.txt", "c.txt", "f.txt"]
-    );
-    assert_eq!(matched_paths(&["unicorn"]), vec!["a.txt", "b.txt", "c.txt"]);
+    // Every pattern indexable: only the files carrying some pattern's
+    // bigrams are searched, so the prefilter still narrows.
+    let (paths, searched) = grep(&["unicorn", "rainbow"]);
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt", "f.txt"]);
+    assert_eq!(searched, 4);
+    let (paths, searched) = grep(&["unicorn"]);
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(searched, 3);
 }
