@@ -59,7 +59,10 @@ fn sparse_matches_after_empty_batches_preserve_pagination() {
             "ordinary content\n"
         };
         std::fs::write(&path, content).unwrap();
-        std::fs::File::open(path)
+        // `File::open` is read-only and Windows requires write access to set file times.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + index),
