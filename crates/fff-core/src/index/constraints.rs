@@ -14,6 +14,11 @@ pub(crate) trait Constrainable {
     fn git_status(&self) -> Option<git2::Status>;
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String);
     fn is_overflow(&self) -> bool;
+
+    fn has_extension(&self, arena: ArenaPtr, extension: &str, scratch: &mut String) -> bool {
+        self.write_file_name(arena, scratch);
+        file_has_extension(scratch, extension)
+    }
 }
 
 /// Stored/canonical paths use `/`; also accept `\` so a Windows user typing
@@ -289,10 +294,9 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         if self.extensions.is_empty() {
             return true;
         }
-        item.write_file_name(arena, &mut scratch.fname);
         self.extensions
             .iter()
-            .any(|ext| file_has_extension(&scratch.fname, ext))
+            .any(|ext| item.has_extension(arena, ext, &mut scratch.fname))
     }
 }
 
@@ -330,10 +334,7 @@ fn evaluate<T: Constrainable>(
         }
         // Reachable only via `Not(Extension(_))` — bare extensions are split out
         // up front and handled in `passes_extensions`.
-        Constraint::Extension(ext) => {
-            item.write_file_name(arena, &mut scratch.fname);
-            file_has_extension(&scratch.fname, ext)
-        }
+        Constraint::Extension(ext) => item.has_extension(arena, ext, &mut scratch.fname),
         Constraint::PathSegment(segment) => {
             item.write_relative_path(arena, &mut scratch.path);
             path_contains_segment(&scratch.path, segment)

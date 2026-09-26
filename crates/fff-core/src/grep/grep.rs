@@ -7,7 +7,7 @@ use crate::index::{
     regex_candidates,
 };
 use crate::simd_string_utils::memmem;
-use crate::types::{ContentCacheBudget, FileItem, FileSliceExt, MmapSlot};
+use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::{
     Searcher, SearcherBuilder, Sink, SinkMatch,
     matcher::{Match, Matcher, NoError},
@@ -191,6 +191,7 @@ impl Sink for PlainTextSink<'_> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grep_search<'a>(
     files: &'a [FileItem],
+    total_files: usize,
     query: &FFFQuery<'_>,
     options: &GrepSearchOptions,
     budget: &ContentCacheBudget,
@@ -203,6 +204,7 @@ pub(crate) fn grep_search<'a>(
 ) -> GrepResult<'a> {
     let result = grep_search_parsed(
         files,
+        total_files,
         query,
         options,
         budget,
@@ -248,6 +250,7 @@ pub(crate) fn grep_search<'a>(
 
     let mut fallback = grep_search_parsed(
         files,
+        total_files,
         &literal_query,
         options,
         budget,
@@ -270,6 +273,7 @@ pub(crate) fn grep_search<'a>(
 #[allow(clippy::too_many_arguments)]
 fn grep_search_parsed<'a>(
     files: &'a [FileItem],
+    total_files: usize,
     query: &FFFQuery<'_>,
     options: &GrepSearchOptions,
     budget: &ContentCacheBudget,
@@ -280,7 +284,6 @@ fn grep_search_parsed<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
-    let total_files = files.live_count();
     let constraints_from_query = &query.constraints[..];
 
     let grep_text = extract_grep_text(query);
@@ -377,7 +380,10 @@ fn grep_search_parsed<'a>(
     );
 
     if files_to_search.is_empty() {
-        return GrepResult::empty(total_files, filtered_file_count);
+        return GrepResult {
+            regex_fallback_error,
+            ..GrepResult::empty(total_files, filtered_file_count)
+        };
     }
 
     // `PlainTextMatcher` is used by the grep-searcher engine for line detection.
@@ -557,6 +563,10 @@ where
     };
 
     let search_start = std::time::Instant::now();
+    #[cfg(unix)]
+    let base_dir = std::fs::File::open(ctx.base_path).ok();
+    #[cfg(not(unix))]
+    let base_dir = None;
     let page_limit = options.page_limit;
     // Lowest index an abort skipped; everything below it was searched, so it is
     // the resume point for the next page. usize::MAX means no abort happened.
@@ -568,21 +578,11 @@ where
     let mut page_filled = false;
     let mut aborted = false;
 
-    // Each chunk is a rayon barrier. A flat small chunk over 500k files = ~7800
-    // barriers; x2 growth makes it logarithmic. But a too-aggressive growth
-    // over-scans: when a page fills mid-chunk, the whole submitted chunk still
-    // runs.
-    //
-    // So only grow when the prefilter is weak (large candidate set);
-    // when bigram cut the set in half, keep fixed small chunks for cheap page-fill termination.
+    // Grow empty batches to avoid repeated barriers on absent queries.
+    // A strong prefilter returns to small batches as soon as matches appear.
     let base_chunk = rayon::current_num_threads() * 4;
     let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
-    let max_chunk = if prefilter_strong {
-        base_chunk
-    } else {
-        (base_chunk * 256).max(8 * 1024)
-    };
-    let growth = if prefilter_strong { 1 } else { 2 };
+    let max_chunk = (base_chunk * 256).max(8 * 1024);
     let mut chunk_size = base_chunk;
     let mut chunk_start = 0;
 
@@ -590,7 +590,6 @@ where
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
         let chunk = &files_to_search[chunk_start..chunk_end];
         chunk_start = chunk_end;
-        chunk_size = (chunk_size * growth).min(max_chunk);
         let chunk_offset = files_consumed;
 
         // Unless enforced, the budget stays dormant until something matched.
@@ -624,6 +623,7 @@ where
                         ctx.arena_for_file(file),
                         ctx.base_path,
                         ctx.budget,
+                        base_dir.as_ref(),
                     )?;
 
                     // Fast whole-file memmem check before entering the
@@ -646,6 +646,12 @@ where
             )
             .flatten()
             .collect();
+
+        chunk_size = if prefilter_strong && !chunk_results.is_empty() {
+            base_chunk
+        } else {
+            (chunk_size * 2).min(max_chunk)
+        };
 
         // Every file in the chunk was visited unless an abort cut it short.
         let resume_at = first_skipped.load(Ordering::Relaxed);

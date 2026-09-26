@@ -70,15 +70,23 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // Index-based resolver: no `Vec<&FileItem>` materialization for either the
-    // full list or the per-part subsets, and a single monomorphized hot loop.
-    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
-        valid_parts[0],
+    let reverse_pair = valid_parts.len() == 2 && valid_parts[1].len() > valid_parts[0].len();
+    let first_part = usize::from(reverse_pair);
+    let mut first_options = *options;
+    if reverse_pair {
+        first_options.max_typos = options
+            .max_typos
+            .map(|t| t.min(valid_parts[1].len() as u16));
+    }
+
+    // Narrow two-part queries with the longer part before scoring the shorter part.
+    let first_part_matches = match_file_range(
+        valid_parts[first_part],
         working_files.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
             resolve_file_chunks(working_files.index(index as usize), arena, buf)
         },
-        options,
+        &first_options,
         max_threads,
     );
 
@@ -88,14 +96,20 @@ fn match_fuzzy_parts(
 
     let total_parts = valid_parts.len() as u32;
     let mut matches = first_part_matches;
-    for part in valid_parts[1..].iter() {
+    for (part_index, part) in valid_parts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != first_part)
+    {
         let mut part_options = *options;
-        part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
+        if part_index > 0 {
+            part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
+        }
 
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_matches = neo_frizbee::match_range_parallel_resolved(
+        let sub_matches = match_file_range(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
@@ -121,7 +135,11 @@ fn match_fuzzy_parts(
                 neo_frizbee::Match {
                     index: prev.index,
                     score: avg.min(u16::MAX as u32) as u16,
-                    end_col: prev.end_col, // keep first part's position for filename bonus
+                    end_col: if reverse_pair {
+                        sm.end_col
+                    } else {
+                        prev.end_col
+                    },
                     exact: prev.exact && sm.exact,
                 }
             })
@@ -756,7 +774,6 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             let ScoreBuffers {
                 dir_buf,
                 fname_buf,
-                path_buf,
                 last_dir_penalty,
             } = bufs;
             let file_idx = path_match.index as usize;
@@ -867,19 +884,10 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
                 }
             };
 
-            // Path alignment bonus: when the query looks like a file path,
-            // reward candidates whose path closely matches the typed query.
-            // Uses suffix overlap — bytes matching from the end. A full prefix
-            // match is just the 100% coverage case, so no separate branch needed.
-            let path_alignment_bonus = if query_contains_path_separator {
-                let rel_path = file.path.read_to_buf(arena, path_buf);
-                let path_bytes = rel_path.as_bytes();
-                let common_suffix = main_needle
-                    .iter()
-                    .rev()
-                    .zip(path_bytes.iter().rev())
-                    .take_while(|(n, p): &(&u8, &u8)| n.eq_ignore_ascii_case(p))
-                    .count();
+            let path_alignment_bonus = if query_contains_path_separator && main_needle.len() > 10 {
+                let common_suffix = file
+                    .path
+                    .common_suffix_len_ignore_ascii_case(arena, main_needle);
 
                 let needle_len = main_needle.len();
                 if common_suffix > 10 && needle_len > 0 {
@@ -963,7 +971,6 @@ const PARALLEL_SCORING_MIN_MATCHES: usize = 8192;
 struct ScoreBuffers {
     dir_buf: String,
     fname_buf: String,
-    path_buf: [u8; crate::simd_path::PATH_BUF_SIZE],
     last_dir_penalty: Option<(u32, i32)>,
 }
 
@@ -972,7 +979,6 @@ impl ScoreBuffers {
         Self {
             dir_buf: String::with_capacity(64),
             fname_buf: String::with_capacity(32),
-            path_buf: [0u8; crate::simd_path::PATH_BUF_SIZE],
             last_dir_penalty: None,
         }
     }
@@ -1145,11 +1151,224 @@ fn sort_and_paginate<'a, S>(
     (items, scores, total_matched)
 }
 
+fn match_file_range<F>(
+    needle: &str,
+    len: usize,
+    resolve: &F,
+    options: &neo_frizbee::Config,
+    max_threads: usize,
+) -> Vec<neo_frizbee::Match>
+where
+    F: Fn(u32, &mut [*const u8; MAX_PATH_CHUNKS]) -> Option<(usize, u16)> + Sync,
+{
+    // The rayon path below flattens per-worker results and never sorts, so
+    // any sorted strategy stays on frizbee's own k-merge implementation.
+    let unsorted = matches!(options.sort, neo_frizbee::SortStrategy::Unsorted);
+    if len < 32_768 || !unsorted {
+        return neo_frizbee::match_range_parallel_resolved(
+            needle,
+            len,
+            resolve,
+            options,
+            max_threads,
+        );
+    }
+    assert!(
+        len <= u32::MAX as usize,
+        "too many files for fuzzy matching"
+    );
+    let mut matcher = neo_frizbee::Matcher::new(needle, options);
+    let max_threads = if max_threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2))
+            .unwrap_or(1)
+    } else {
+        max_threads
+    };
+    let workers = max_threads.max(1).min(len.div_ceil(2000));
+    if workers <= 1 {
+        return matcher.match_range_resolved(len, resolve);
+    }
+    let chunk_size = len.div_ceil(workers * 4).clamp(2048, 16_384);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    (0..workers)
+        .into_par_iter()
+        .map(|_| {
+            let mut matcher = matcher.clone();
+            let mut matches = Vec::new();
+            loop {
+                let start = next.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                if start >= len {
+                    break;
+                }
+                let end = (start + chunk_size).min(len);
+                matcher.match_range_resolved_into(start as u32..end as u32, resolve, &mut matches);
+            }
+            matches
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
+
+    #[test]
+    fn longer_second_part_preserves_matches_and_first_part_positions() {
+        let paths: Vec<_> = [
+            "src/controller.rs",
+            "src/contrller.rs",
+            "test/src.rs",
+            "日本語/controller.tsx",
+            "src/utils.rs",
+            "src/controller/controller.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .map(|path| FileItem::new_raw(path.rfind('/').unwrap() as u16 + 1, 0, 0, None, false))
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let working = FileItems::All(&files);
+        for parts in [
+            ["src", "controller"],
+            ["rs", "contrller"],
+            ["rs", "日本語"],
+            ["no", "absent"],
+            ["src", "src/controller.rs"],
+        ] {
+            for max_typos in [0, 2, 4] {
+                let options = neo_frizbee::Config {
+                    max_typos: Some(max_typos),
+                    sort: neo_frizbee::SortStrategy::Unsorted,
+                    ..Default::default()
+                };
+                let first = match_fuzzy_parts(&parts[..1], &working, &options, 1, arena);
+                let mut second_options = options;
+                second_options.max_typos = Some(max_typos.min(parts[1].len() as u16));
+                let second = match_fuzzy_parts(&parts[1..], &working, &second_options, 1, arena);
+                let mut expected: Vec<_> = first
+                    .iter()
+                    .filter_map(|a| {
+                        let b = second.iter().find(|b| b.index == a.index)?;
+                        Some((
+                            a.index,
+                            ((a.score as u32 + b.score as u32) / 2) as u16,
+                            a.end_col,
+                            a.exact && b.exact,
+                        ))
+                    })
+                    .collect();
+                let mut actual: Vec<_> = match_fuzzy_parts(&parts, &working, &options, 4, arena)
+                    .iter()
+                    .map(|m| (m.index, m.score, m.end_col, m.exact))
+                    .collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "{parts:?}, typos={max_typos}");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzzy_parallel_and_sequential_scores_match() {
+        let paths: Vec<_> = (0..36_000)
+            .map(|index| {
+                format!(
+                    "src/components/group_{}/controller_é_{index}.tsx",
+                    index / 100
+                )
+            })
+            .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = FileItem::new_raw(
+                    path.rfind('/').unwrap() as u16 + 1,
+                    0,
+                    index as u64,
+                    Some(git2::Status::WT_MODIFIED),
+                    false,
+                );
+                file.parent_dir_index = (index / 100) as u32;
+                file.access_frecency_score = (index % 97) as i16;
+                file.modification_frecency_score = (index % 29) as i16;
+                file.git_recency_score = (index % 13) as i16;
+                file.set_deleted(index % 97 == 0);
+                file
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let parser = QueryParser::default();
+        for text in [
+            "mo",
+            "controller",
+            "src controller",
+            "group_0/controller_é_1.tsx",
+            "*.tsx",
+        ] {
+            let query = parser.parse(text);
+            for current_file in [None, Some(paths[1].as_str())] {
+                let mut context = ScoringContext {
+                    query: &query,
+                    max_threads: 4,
+                    max_typos: 2,
+                    project_path: None,
+                    current_file,
+                    last_same_query_match: None,
+                    combo_boost_score_multiplier: 100,
+                    min_combo_count: 3,
+                    pagination: PaginationArgs::default(),
+                };
+                let mut parallel = match_and_score_in_arena(&files, &context, arena);
+                context.max_threads = 1;
+                let mut sequential = match_and_score_in_arena(&files, &context, arena);
+                parallel.sort_unstable_by_key(|(file, _)| file.modified);
+                sequential.sort_unstable_by_key(|(file, _)| file.modified);
+                assert_eq!(parallel.len(), sequential.len(), "{text}");
+                for ((a, a_score), (b, b_score)) in parallel.iter().zip(&sequential) {
+                    assert!(std::ptr::eq(*a, *b));
+                    assert_eq!(format!("{a_score:?}"), format!("{b_score:?}"), "{text}");
+                }
+                let (parallel_items, parallel_scores, _) =
+                    sort_and_paginate(parallel, &context, |score| score.total);
+                let (sequential_items, sequential_scores, _) =
+                    sort_and_paginate(sequential, &context, |score| score.total);
+                assert_eq!(
+                    parallel_items
+                        .iter()
+                        .map(|f| f.modified)
+                        .collect::<Vec<_>>(),
+                    sequential_items
+                        .iter()
+                        .map(|f| f.modified)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    format!("{parallel_scores:?}"),
+                    format!("{sequential_scores:?}")
+                );
+            }
+        }
+    }
 
     #[test]
     fn frecency_parallel_and_sequential_scores_match() {

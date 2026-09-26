@@ -370,10 +370,8 @@ impl BigramIndexBuilder {
 
     /// Compress the dense builder into a compact `BigramFilter`.
     ///
-    /// Retains columns where the bigram appears in ≥`min_density_pct`% (or
-    /// the default ~3.1% heuristic when `None`) and <90% of indexed files.
-    /// Sparse columns carry too little data to justify their memory;
-    /// ubiquitous columns (≥90%) are nearly all-ones and barely filter.
+    /// Keeps rare columns as gap lists unless `min_density_pct` excludes them.
+    /// Ubiquitous columns (≥90%) are omitted because they barely filter.
     #[inline(always)]
     pub fn compress(self, min_density_pct: Option<u32>) -> BigramFilter {
         let cols = self.columns_used() as usize;
@@ -405,15 +403,9 @@ impl BigramIndexBuilder {
                 let bitset = &col_data[col_start..col_start + words];
                 let popcount: u32 = bitset.iter().map(|w| w.count_ones()).sum();
 
-                // drop bigrams appearing in too few files
-                let not_to_rare = if let Some(min_pct) = min_density_pct {
-                    // Percentage-based: require ≥ min_pct% of populated files.
-                    populated > 0 && (popcount as usize) * 100 >= populated * min_pct as usize
-                } else {
-                    // Default: popcount ≥ words × 2 (~3.1% of files).
-                    (popcount as usize * 4) >= dense_bytes
-                };
-                if !not_to_rare {
+                if min_density_pct.is_some_and(|min_pct| {
+                    populated == 0 || (popcount as usize) * 100 < populated * min_pct as usize
+                }) {
                     continue;
                 }
 
@@ -427,6 +419,14 @@ impl BigramIndexBuilder {
             }
         }
         kept.sort_unstable_by_key(|&(_, old_col, _)| old_col);
+        let mut rare_keys = vec![0u64; BIGRAM_KEY_SLOTS.div_ceil(64)];
+        if min_density_pct.is_none() {
+            for &(slot, _, count) in &kept {
+                if (count as usize) * 4 < dense_bytes {
+                    rare_keys[slot / 64] |= 1 << (slot % 64);
+                }
+            }
+        }
         let column = |old_col: u16| -> &[u64] {
             let start = old_col as usize * words;
             &col_data.as_deref().expect("kept columns imply a slab")[start..start + words]
@@ -491,6 +491,7 @@ impl BigramIndexBuilder {
         sparse_data.shrink_to_fit();
 
         BigramFilter {
+            rare_keys,
             lookup,
             dense_data,
             dense_count,
@@ -574,6 +575,7 @@ unsafe impl Send for BigramIndexBuilder {}
 #[derive(Debug)]
 pub struct BigramFilter {
     lookup: Vec<u16>,
+    rare_keys: Vec<u64>,
     /// Flat buffer of all dense column data laid out at fixed stride `words`.
     /// Column `i` starts at `i * words`.
     dense_data: ColumnSlab, // do not try to change this to u8 it has to be wordsize
@@ -697,6 +699,18 @@ impl BigramFilter {
         }
     }
 
+    // Regex and fuzzy filters keep their original columns; literals can use rare ones.
+    pub(crate) fn common_column_bitset(&self, key: u16) -> Option<std::borrow::Cow<'_, [u64]>> {
+        if self.column(key) == NO_COLUMN {
+            return None;
+        }
+        let slot = key_slot(key);
+        if self.rare_keys[slot / 64] & (1 << (slot % 64)) != 0 {
+            return None;
+        }
+        self.column_bitset(key)
+    }
+
     /// Column as a materialized bitset (borrowed for dense, decoded for sparse).
     pub(crate) fn column_bitset(&self, key: u16) -> Option<std::borrow::Cow<'_, [u64]>> {
         Some(match self.column_ref(key)? {
@@ -752,7 +766,7 @@ impl BigramFilter {
         let lookup_bytes = self.lookup.len() * std::mem::size_of::<u16>();
         let dense_bytes = self.dense_data.len() * std::mem::size_of::<u64>();
         let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
-        lookup_bytes + dense_bytes + self.sparse_bytes() + skip_bytes
+        lookup_bytes + self.rare_keys.len() * 8 + dense_bytes + self.sparse_bytes() + skip_bytes
     }
 
     /// Check whether a bigram key is present in this index.
@@ -818,6 +832,7 @@ impl BigramFilter {
         };
         Self {
             lookup,
+            rare_keys: vec![0; BIGRAM_KEY_SLOTS.div_ceil(64)],
             dense_data,
             dense_count,
             sparse_offsets: vec![0],
@@ -1239,6 +1254,31 @@ mod tests {
         and_sparse_column(&mut anded, &data);
         let expected: Vec<u64> = partner.iter().zip(bitset).map(|(a, b)| a & b).collect();
         assert_eq!(anded, expected);
+    }
+
+    #[test]
+    fn rare_bigrams_reject_absent_queries_without_losing_matches() {
+        let builder = BigramIndexBuilder::new(4096);
+        let skip = BigramIndexBuilder::new(4096);
+        for file_idx in 0..4096 {
+            let content: &[u8] = match file_idx {
+                31 => b"marker Qq blah",
+                500 => b"marker qz blah",
+                1000 => b"marker zy blah",
+                3000 => b"marker yx blah",
+                _ => b"ordinary content",
+            };
+            builder.add_file_content(&skip, file_idx, content);
+        }
+        let index = builder.compress(None);
+        let absent = index.query(b"Qqzyx").expect("rare bigrams retained");
+        assert_eq!(BigramFilter::count_candidates(&absent), 0);
+        let present = index.query(b"qq").unwrap();
+        assert_eq!(BigramFilter::count_candidates(&present), 1);
+        assert!(BigramFilter::is_candidate(&present, 31));
+        assert!(index.common_column_bitset(key(b'q', b'q')).is_none());
+        assert!(index.sparse_count() > 0);
+        assert!(!skip.compress(Some(12)).has_key(key(b'q', b' ')));
     }
 
     #[test]
