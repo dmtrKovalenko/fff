@@ -173,6 +173,8 @@ export interface Score {
   currentFilePenalty: number;
   /** Boost from query history combo matching */
   comboMatchBoost: number;
+  /** Bonus for query segments aligning with path segments */
+  pathAlignmentBonus: number;
   /** Whether this was an exact match */
   exactMatch: boolean;
   /** Type of match: 'fuzzy', 'exact', 'prefix', etc. */

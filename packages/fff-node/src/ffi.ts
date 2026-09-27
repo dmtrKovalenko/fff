@@ -474,6 +474,7 @@ const FFF_SCORE_STRUCT = {
   distance_penalty: DataType.I32,
   current_file_penalty: DataType.I32,
   combo_match_boost: DataType.I32,
+  path_alignment_bonus: DataType.I32,
   exact_match: DataType.U8,
   match_type: DataType.External,
 };
@@ -487,6 +488,7 @@ interface FffScoreRaw {
   distance_penalty: number;
   current_file_penalty: number;
   combo_match_boost: number;
+  path_alignment_bonus: number;
   exact_match: number;
   match_type: JsExternal;
 }
@@ -623,7 +625,7 @@ const FFF_GREP_MATCH_STRUCT = {
   match_ranges_count: DataType.U32,
   context_before_count: DataType.U32,
   context_after_count: DataType.U32,
-  fuzzy_score: DataType.U32, // actually u16 in C, but ffi-rs doesn't so we read it as u32 with padding
+  fuzzy_score: DataType.I16, // u16 in C; ffi-rs has no U16, so read I16 and mask (#888)
   has_fuzzy_score: DataType.U8,
   is_binary: DataType.U8,
   is_definition: DataType.U8,
@@ -713,6 +715,7 @@ function readScoreFromRaw(raw: FffScoreRaw): Score {
     distancePenalty: raw.distance_penalty,
     currentFilePenalty: raw.current_file_penalty,
     comboMatchBoost: raw.combo_match_boost,
+    pathAlignmentBonus: raw.path_alignment_bonus,
     exactMatch: raw.exact_match !== 0,
     matchType: readCString(raw.match_type) ?? "",
   };
@@ -841,7 +844,7 @@ function readGrepMatchFromRaw(raw: FffGrepMatchRaw): GrepMatch {
   };
 
   if (raw.has_fuzzy_score !== 0) {
-    match.fuzzyScore = raw.fuzzy_score;
+    match.fuzzyScore = raw.fuzzy_score & 0xffff;
   }
   if (raw.context_before_count > 0) {
     match.contextBefore = readCStringArray(raw.context_before, raw.context_before_count);

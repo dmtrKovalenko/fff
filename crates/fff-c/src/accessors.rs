@@ -7,7 +7,7 @@ use std::ffi::c_char;
 use std::ptr;
 
 use crate::ffi_types::{
-    FffFileItem, FffGrepMatch, FffGrepResult, FffMatchRange, FffResult, FffSearchResult,
+    FffFileItem, FffGrepMatch, FffGrepResult, FffMatchRange, FffResult, FffScore, FffSearchResult,
 };
 
 // ── FffResult ────────────────────────────────────────────────────────────────
@@ -472,6 +472,140 @@ pub unsafe extern "C" fn fff_grep_match_get_is_binary(m: *const FffGrepMatch) ->
         return false;
     }
     unsafe { (*m).is_binary }
+}
+
+// ── FffScore ─────────────────────────────────────────────────────────────────
+
+/// Final combined score used for ranking. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_total(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).total }
+}
+
+/// Raw fuzzy match score before bonuses and penalties. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_base_score(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).base_score }
+}
+
+/// Bonus for matching the file name rather than only the path. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_filename_bonus(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).filename_bonus }
+}
+
+/// Bonus for special file names (e.g. `README`, `main.rs`). Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_special_filename_bonus(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).special_filename_bonus }
+}
+
+/// Boost from the frecency database. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_frecency_boost(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).frecency_boost }
+}
+
+/// Penalty based on directory distance from the current file. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_distance_penalty(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).distance_penalty }
+}
+
+/// Penalty applied to the currently open file. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_current_file_penalty(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).current_file_penalty }
+}
+
+/// Boost when several scoring signals agree. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_combo_match_boost(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).combo_match_boost }
+}
+
+/// Bonus for query segments aligning with path segments. Returns `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_path_alignment_bonus(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).path_alignment_bonus }
+}
+
+/// `true` if the query matched the file name or directory exactly; `false` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_exact_match(s: *const FffScore) -> bool {
+    if s.is_null() {
+        return false;
+    }
+    unsafe { (*s).exact_match }
+}
+
+/// Match type label (e.g. `"exact_filename"`, `"fuzzy_path"`); null if `s` is null. Do not free.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_match_type(s: *const FffScore) -> *const c_char {
+    if s.is_null() {
+        return ptr::null();
+    }
+    unsafe { (*s).match_type }
 }
 
 // ── FffSearchResult ──────────────────────────────────────────────────────────

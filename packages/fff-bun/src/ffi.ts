@@ -661,7 +661,8 @@ const SC_FREC = 16; // i32         (4)
 const SC_DIST = 20; // i32         (4)
 const SC_CURFILE = 24; // i32         (4)
 const SC_COMBO = 28; // i32         (4)
-const SC_EXACT = 32; // bool        (1 + 7 pad)
+const SC_PATH_ALIGN = 32; // i32         (4)
+const SC_EXACT = 36; // bool        (1 + 3 pad)
 const SC_MTYPE = 40; // *mut c_char (8)
 const SC_SIZE_OF = 48;
 
@@ -701,6 +702,7 @@ function readScoreStruct(p: number): Score {
     distancePenalty: read.i32(pp, SC_DIST),
     currentFilePenalty: read.i32(pp, SC_CURFILE),
     comboMatchBoost: read.i32(pp, SC_COMBO),
+    pathAlignmentBonus: read.i32(pp, SC_PATH_ALIGN),
     exactMatch: read.u8(pp, SC_EXACT) !== 0,
     matchType: readCString(read.ptr(pp, SC_MTYPE)) ?? "",
   };
