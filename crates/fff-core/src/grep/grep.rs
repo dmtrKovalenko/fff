@@ -578,11 +578,15 @@ where
     let mut page_filled = false;
     let mut aborted = false;
 
-    // Grow empty batches to avoid repeated barriers on absent queries.
-    // A strong prefilter returns to small batches as soon as matches appear.
+    // Grow empty batches to avoid repeated barriers. A strong prefilter caps
+    // growth low (bounds over-scan past a filled page) and resets on a match.
     let base_chunk = rayon::current_num_threads() * 4;
     let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
-    let max_chunk = (base_chunk * 256).max(8 * 1024);
+    let max_chunk = if prefilter_strong {
+        base_chunk * 8
+    } else {
+        (base_chunk * 256).max(8 * 1024)
+    };
     let mut chunk_size = base_chunk;
     let mut chunk_start = 0;
 
