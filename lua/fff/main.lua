@@ -81,9 +81,23 @@ end
 --- @deprecated Use `find_files` instead
 function M.find_in_git_root()
   local fuzzy = require('fff.core').ensure_initialized()
+  pcall(fuzzy.wait_for_initial_scan, 5000)
+
   local ok, git_root = pcall(fuzzy.get_git_root)
 
-  if not ok or not git_root then
+  if (not ok or not git_root or git_root == '') and vim.system then
+    local result = vim.system({ 'git', 'rev-parse', '--show-toplevel' }, {
+      cwd = vim.fn.getcwd(),
+      text = true,
+    }):wait()
+
+    if result.code == 0 and result.stdout and result.stdout ~= '' then
+      git_root = result.stdout:gsub('%s+$', '')
+      ok = true
+    end
+  end
+
+  if not ok or not git_root or git_root == '' then
     vim.notify('Not in a git repository', vim.log.levels.WARN)
     return
   end
