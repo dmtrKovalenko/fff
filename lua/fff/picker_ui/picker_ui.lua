@@ -191,7 +191,7 @@ local function restore_from_state(state, source_label)
     if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
       local prompt_len = #M.state.config.prompt
       vim.api.nvim_win_set_cursor(M.state.input_win, { 1, prompt_len + #state.query })
-      vim.cmd('stopinsert')
+      ui_creator.stop_insert()
     end
   end)
 
