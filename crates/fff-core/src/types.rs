@@ -561,7 +561,8 @@ impl FileItem {
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
-        if self.size == 0 {
+        // files above the grep cap are never searched, don't read them to EOF
+        if self.size == 0 || self.size > MAX_FFFILE_SIZE {
             return;
         }
 
@@ -584,6 +585,7 @@ impl FileItem {
                 Ok(n) => {
                     if detect_binary_content(&chunk[..n]) {
                         self.set_binary(true);
+                        break;
                     }
                 }
             }
@@ -1144,5 +1146,34 @@ mod content_cache_budget_tests {
         let default = ContentCacheBudget::default();
         assert_eq!(budget.max_bytes, default.max_bytes);
         assert_eq!(budget.max_file_size, default.max_file_size);
+    }
+}
+
+#[cfg(test)]
+mod detect_binary_tests {
+    use super::*;
+
+    fn classify(content: &[u8]) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("f");
+        std::fs::write(&path, content).unwrap();
+        let (item, _) = FileItem::new(path.clone(), root.path(), None);
+        item.detect_binary_per_byte(&path, &mut [0u8; BINARY_CLASSIFICATION_CHUNK_SIZE]);
+        item.is_binary()
+    }
+
+    #[test]
+    fn detects_nul_in_small_file() {
+        let mut content = vec![b'a'; BINARY_CLASSIFICATION_CHUNK_SIZE * 3];
+        content[10] = 0;
+        assert!(classify(&content));
+        assert!(!classify(b"plain text\n"));
+    }
+
+    #[test]
+    fn skips_files_above_max_size() {
+        let mut content = vec![b'a'; MAX_FFFILE_SIZE as usize + 1];
+        content[0] = 0;
+        assert!(!classify(&content));
     }
 }
