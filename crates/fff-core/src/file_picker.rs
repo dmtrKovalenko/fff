@@ -1071,17 +1071,20 @@ impl FilePicker {
         if let Some(handle) = git_handle
             && let Ok(Some(mut git_cache)) = handle.join()
         {
-            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            // Ignored dirs first so explicit per-file statuses win, as in `update_git_statuses`.
+            self.mark_files_in_ignored_dirs(&git_cache.take_ignored_dirs());
 
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             let arena = self.arena_base_ptr();
             for file in self.sync_data.files.iter_mut() {
-                file.git_status = git_cache.lookup_status(file.write_absolute_path(
+                if let Some(status) = git_cache.lookup_status(file.write_absolute_path(
                     arena,
                     &self.base_path,
                     &mut path_buf,
-                ));
+                )) {
+                    file.git_status = Some(status);
+                }
             }
-            self.mark_files_in_ignored_dirs(&git_cache.take_ignored_dirs());
         }
 
         if let Some(workdir) = self.sync_data.git_workdir.clone()

@@ -253,10 +253,12 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         opts.cache_budget_max_file_size,
     );
 
-    let extra_ignore = if opts.version >= 3 {
-        unsafe { optional_cstr(opts.extra_ignore) }
-            .map(|s| s.lines().map(String::from).collect())
-            .unwrap_or_default()
+    let extra_ignore = if opts.version >= 3 && !opts.extra_ignore.is_null() {
+        // Fail loudly: silently dropping the rules would index paths the caller excluded.
+        match unsafe { cstr_to_str(opts.extra_ignore) } {
+            Some(s) => s.lines().map(String::from).collect(),
+            None => return FffResult::err("opts.extra_ignore is not valid UTF-8"),
+        }
     } else {
         Vec::new()
     };

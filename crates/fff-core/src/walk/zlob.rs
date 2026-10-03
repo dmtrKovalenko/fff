@@ -42,14 +42,18 @@ pub(crate) fn walk_collect_files(
     if !is_git_repo {
         ignore_lines.extend_from_slice(IGNORED_DIRS);
     }
-    ignore_lines.extend(extra_ignore.iter().map(String::as_str));
+    // zlob rejects the whole list on an interior NUL, so drop such lines up front.
+    ignore_lines.extend(extra_ignore.iter().map(String::as_str).filter(|line| {
+        let valid = !line.contains('\0');
+        if !valid {
+            tracing::warn!(?line, "skipping extra_ignore line containing NUL");
+        }
+        valid
+    }));
 
     if !ignore_lines.is_empty()
         && let Err(e) = builder.extra_ignore(&ignore_lines)
     {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
         tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
     }
 
