@@ -805,6 +805,8 @@ fn index_new_directory(
         dir,
         repo.is_some(),
         follow_symlinks,
+        // Lines are base-relative; `filter` below applies them via the walker rules.
+        &[],
         1,
         &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     ) {

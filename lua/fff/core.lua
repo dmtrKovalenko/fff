@@ -126,6 +126,7 @@ M.change_indexing_directory = function(new_path)
     enable_home_dir_scanning = config.enable_home_dir_scanning,
     enable_filename_constraint = config.grep and config.grep.enable_filename_constraint,
     git_recency = config.git and config.git.recency,
+    extra_ignore = config.extra_ignore,
   })
   if not ok then
     vim.notify('Failed to change directory: ' .. err, vim.log.levels.ERROR)
@@ -193,6 +194,7 @@ M.ensure_initialized = function()
       enable_home_dir_scanning = config.enable_home_dir_scanning,
       enable_filename_constraint = config.grep and config.grep.enable_filename_constraint,
       git_recency = config.git and config.git.recency,
+      extra_ignore = config.extra_ignore,
     })
     if not ok then
       vim.notify('Failed to initialize file picker: ' .. tostring(result), vim.log.levels.ERROR)

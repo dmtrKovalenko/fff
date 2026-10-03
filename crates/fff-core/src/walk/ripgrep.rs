@@ -14,9 +14,14 @@ pub(crate) fn walk_collect_files(
     base_path: &Path,
     is_git_repo: bool,
     follow_symlinks: bool,
+    extra_ignore: &[String],
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
 ) -> crate::Result<WalkOutput> {
+    if !extra_ignore.is_empty() {
+        tracing::warn!("extra_ignore is only supported by the zlob walker; ignoring it");
+    }
+
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
         // this is a very important guard for the user opening ~/ or other root non-git dir

@@ -94,6 +94,12 @@ export interface InitOptions {
   enableHomeDirScanning?: boolean;
   /** Follow symlinks for directories */
   followSymlinks?: boolean;
+  /**
+   * Extra `.gitignore`-syntax lines relative to `basePath`, taking precedence
+   * over every ignore file. `!pattern` force-includes ignored paths, e.g.
+   * `["!.env*", "!logs/"]`; plain patterns exclude more.
+   */
+  extraIgnore?: string[];
 }
 
 /**

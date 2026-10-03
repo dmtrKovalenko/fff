@@ -178,6 +178,11 @@ pub(crate) struct Args {
     #[arg(long = "follow-symlinks")]
     follow_symlinks: bool,
 
+    /// Extra `.gitignore`-syntax line relative to the base path, taking precedence
+    /// over every ignore file. Repeatable; `!pattern` force-includes ignored paths.
+    #[arg(long = "extra-ignore", value_name = "LINE")]
+    extra_ignore: Vec<String>,
+
     /// Allow indexing the user's home directory. FFF refuses to init in `~`
     /// unless this is set. Also settable via FFF_ENABLE_HOME_SCAN=1.
     #[arg(
@@ -366,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_home_dir_scanning: args.enable_home_scan,
             enable_fs_root_scanning: args.enable_root_scan,
             git_recency: Default::default(),
+            extra_ignore: args.extra_ignore.clone(),
         },
     )
     .map_err(|e| format!("Failed to init file picker: {}", e))?;
