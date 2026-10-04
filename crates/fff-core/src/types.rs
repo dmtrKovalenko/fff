@@ -561,12 +561,11 @@ impl FileItem {
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
-        // files above the grep cap are never searched, don't read them to EOF
-        if self.size == 0 || self.size > MAX_FFFILE_SIZE {
+        if self.size == 0 {
             return;
         }
 
-        let Ok(mut file) = std::fs::OpenOptions::new()
+        let Ok(file) = std::fs::OpenOptions::new()
             .write(false)
             .read(true)
             .open(path)
@@ -574,6 +573,8 @@ impl FileItem {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
             return;
         };
+        // only classify the first MAX_FFFILE_SIZE bytes, never read large files to EOF
+        let mut file = file.take(MAX_FFFILE_SIZE);
 
         loop {
             match file.read(chunk) {
@@ -1171,9 +1172,13 @@ mod detect_binary_tests {
     }
 
     #[test]
-    fn skips_files_above_max_size() {
+    fn reads_only_first_max_size_bytes() {
         let mut content = vec![b'a'; MAX_FFFILE_SIZE as usize + 1];
         content[0] = 0;
+        assert!(classify(&content));
+
+        content[0] = b'a';
+        content[MAX_FFFILE_SIZE as usize] = 0;
         assert!(!classify(&content));
     }
 }
