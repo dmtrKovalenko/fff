@@ -164,10 +164,7 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
 
     // Process overflow files first: newly added files (created after the
     // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search.
-    //
-    // putting them first in the list makes sorting more efficient and gives
-    // them tiebreaker advantage in case sorting is the same
+    // relevant to the current search. Exact ties are broken by index order.
     let results = if files.len() > base_count {
         let mut results = match_and_score_in_arena(&files[base_count..], context, overflow_arena);
 
@@ -645,12 +642,17 @@ fn sort_and_paginate_dirs<'a>(
     let items_needed = offset.saturating_add(limit).min(total_matched);
     let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
 
+    let compare = |a: &(&DirItem, Score), b: &(&DirItem, Score)| {
+        b.1.total
+            .cmp(&a.1.total)
+            .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
+    };
     if use_partial_sort {
-        results.select_nth_unstable_by(items_needed - 1, |a, b| b.1.total.cmp(&a.1.total));
+        results.select_nth_unstable_by(items_needed - 1, compare);
         results.truncate(items_needed);
     }
 
-    sort_with_buffer(&mut results, |a, b| b.1.total.cmp(&a.1.total));
+    sort_with_buffer(&mut results, compare);
 
     let (items, scores): (Vec<&DirItem>, Vec<Score>) =
         results.into_iter().skip(offset).take(limit).unzip();
@@ -1136,6 +1138,8 @@ fn sort_and_paginate<'a, S>(
         total(&b.1)
             .cmp(&total(&a.1))
             .then_with(|| b.0.modified.cmp(&a.0.modified))
+            // Total order: parallel matching yields scheduling-dependent input order.
+            .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
     };
     // Use partial sort if we need less than half the results and dataset is large
     if items_needed < total_matched / 2 && total_matched > 100 {
@@ -1511,6 +1515,44 @@ mod tests {
                         expected_page
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn tied_scores_paginate_deterministically() {
+        let files: Vec<_> = (0..3000)
+            .map(|_| FileItem::new_raw(0, 0, 1, None, false))
+            .collect();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        let page = |shuffle: usize, offset: usize| {
+            let mut results: Vec<_> = files.iter().map(|file| (file, Score::default())).collect();
+            results.rotate_left(shuffle);
+            results.reverse();
+            let context = ScoringContext {
+                query: &query,
+                max_threads: 1,
+                max_typos: 0,
+                project_path: None,
+                current_file: None,
+                last_same_query_match: None,
+                combo_boost_score_multiplier: 0,
+                min_combo_count: 0,
+                pagination: PaginationArgs { offset, limit: 8 },
+            };
+            sort_and_paginate(results, &context, |s| s.total).0
+        };
+        for offset in [0, 8, 16] {
+            let expected: Vec<_> = files[offset..offset + 8].iter().collect();
+            for shuffle in [0, 7, 1500, 2999] {
+                assert!(
+                    page(shuffle, offset)
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| std::ptr::eq(*a, *b)),
+                    "offset={offset} shuffle={shuffle}"
+                );
             }
         }
     }
