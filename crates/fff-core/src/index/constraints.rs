@@ -2,6 +2,7 @@
 
 use fff_query_parser::{Constraint, GitStatusFilter};
 use smallvec::SmallVec;
+use std::borrow::Cow;
 
 use crate::git::is_modified_status;
 use crate::simd_path::ArenaPtr;
@@ -485,7 +486,7 @@ fn precompute_masks(rest: &[&Constraint<'_>], paths: &[&str]) -> Vec<Vec<bool>> 
     let mut out = Vec::new();
     for c in rest {
         walk_globs(c, &mut |pattern| {
-            out.push(match_glob_pattern(pattern, paths))
+            out.push(match_glob_pattern(&unanchor_glob(pattern), paths))
         });
     }
     out
@@ -494,7 +495,9 @@ fn precompute_masks(rest: &[&Constraint<'_>], paths: &[&str]) -> Vec<Vec<bool>> 
 fn compile_globs(rest: &[&Constraint<'_>]) -> Vec<Option<GlobPattern>> {
     let mut out = Vec::new();
     for c in rest {
-        walk_globs(c, &mut |pattern| out.push(compile_one(pattern)));
+        walk_globs(c, &mut |pattern| {
+            out.push(compile_one(&unanchor_glob(pattern)))
+        });
     }
     out
 }
@@ -506,6 +509,17 @@ fn walk_globs<F: FnMut(&str)>(c: &Constraint<'_>, f: &mut F) {
         Constraint::Glob(p) => f(p),
         Constraint::Not(inner) => walk_globs(inner, f),
         _ => {}
+    }
+}
+
+/// Slash-less globs match by basename (`foo*` -> `**/foo*`), like `*.ext` does.
+/// Leading `*` already crosses `/`; braces stay anchored for `{src,lib}` dir alternatives.
+fn unanchor_glob(pattern: &str) -> Cow<'_, str> {
+    let b = pattern.as_bytes();
+    if b.first() == Some(&b'*') || b.contains(&b'/') || b.contains(&b'{') {
+        Cow::Borrowed(pattern)
+    } else {
+        Cow::Owned(format!("**/{pattern}"))
     }
 }
 
@@ -952,5 +966,49 @@ mod tests {
             .map(|i| i.relative_path)
             .collect();
         assert_eq!(paths, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn test_slash_less_glob_matches_basename() {
+        let arena_ptr = ArenaPtr::null();
+        let items = vec![
+            TestItem {
+                relative_path: "hash-glibc/lib/libc.so.6",
+                file_name: "libc.so.6",
+            },
+            TestItem {
+                relative_path: "libc.so.1",
+                file_name: "libc.so.1",
+            },
+            TestItem {
+                relative_path: "src/main.rs",
+                file_name: "main.rs",
+            },
+        ];
+        let run = |constraints: Vec<Constraint<'_>>| -> Vec<&str> {
+            apply_constraints(&items, &constraints, arena_ptr, arena_ptr)
+                .unwrap_or_default()
+                .iter()
+                .map(|i| i.relative_path)
+                .collect()
+        };
+
+        let expected = vec!["hash-glibc/lib/libc.so.6", "libc.so.1"];
+        // Prepass (pure glob) and inline (with pre-filter) paths.
+        assert_eq!(run(vec![Constraint::Glob("libc.so*")]), expected);
+        assert_eq!(
+            run(vec![
+                Constraint::Glob("libc.so*"),
+                Constraint::Not(Box::new(Constraint::Extension("rs"))),
+            ]),
+            expected
+        );
+        assert_eq!(run(vec![Constraint::Glob("src/*")]), vec!["src/main.rs"]);
+        assert_eq!(
+            run(vec![Constraint::Not(Box::new(Constraint::Glob(
+                "libc.so*"
+            )))]),
+            vec!["src/main.rs"]
+        );
     }
 }
