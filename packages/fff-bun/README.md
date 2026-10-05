@@ -29,6 +29,20 @@ The correct native binary for your platform is installed automatically via platf
 
 If the platform package isn't available, the postinstall script will attempt to download from GitHub releases as a fallback.
 
+### Platforms without a prebuilt package
+
+On a platform that has no `@ff-labs/fff-bin-*` package, build the C library from
+source and point `@ff-labs/fff-bun` at it with `FFF_C_LIB`:
+
+```bash
+cargo build --release -p fff-c
+FFF_C_LIB=target/release/libfff_c.so bun ./app.ts
+```
+
+`FFF_C_LIB` is checked before the platform package and the local dev build, so it
+also works for a regular `bun add @ff-labs/fff-bun` install. If the path does not
+exist, resolution fails with an explicit error rather than silently falling back.
+
 ### Standalone executables (`bun build --compile`)
 
 `@ff-labs/fff-bun` embeds the native library into single-file executables built
