@@ -499,6 +499,7 @@ pub fn live_grep(
         trim_whitespace,
         enforce_time_budget,
         casing,
+        definitions_first,
     ): (
         String,
         Option<usize>,
@@ -511,6 +512,7 @@ pub fn live_grep(
         Option<bool>,
         Option<bool>,
         Option<String>,
+        Option<bool>,
     ),
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
@@ -544,12 +546,15 @@ pub fn live_grep(
         enforce_time_budget: enforce_time_budget.unwrap_or(false),
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: definitions_first.unwrap_or(false),
         trim_whitespace: trim_whitespace.unwrap_or(false),
         abort_signal: None,
     };
 
-    let result = picker.grep(&parsed_query, &options);
+    let mut result = picker.grep(&parsed_query, &options);
+    if options.classify_definitions {
+        result.definitions_first();
+    }
     lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }
 

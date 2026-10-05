@@ -6,18 +6,6 @@ use smallvec::SmallVec;
 /// JS or huge single-line files from blowing up memory.
 pub(super) const MAX_LINE_DISPLAY_LEN: usize = 512;
 
-#[cfg(feature = "definitions")]
-#[inline]
-pub(super) fn classify_definition(enabled: bool, line: &str) -> bool {
-    enabled && super::classify::is_definition_line(line)
-}
-
-#[cfg(not(feature = "definitions"))]
-#[inline]
-pub(super) fn classify_definition(_enabled: bool, _line: &str) -> bool {
-    false
-}
-
 #[inline]
 pub(super) fn debug_assert_newline_terminator(searcher: &Searcher) {
     debug_assert_eq!(
@@ -42,7 +30,6 @@ pub(super) struct SinkState {
     pub(super) max_matches: usize,
     pub(super) before_context: usize,
     pub(super) after_context: usize,
-    pub(super) classify_definitions: bool,
 }
 
 impl SinkState {
@@ -76,7 +63,6 @@ impl SinkState {
         context_before: Vec<String>,
         context_after: Vec<String>,
     ) {
-        let is_definition = classify_definition(self.classify_definitions, &line_content);
         self.matches.push(GrepMatch {
             file_index: self.file_index,
             line_number,
@@ -85,7 +71,7 @@ impl SinkState {
             line_content,
             match_byte_offsets,
             fuzzy_score: None,
-            is_definition,
+            is_definition: false,
             context_before,
             context_after,
         });

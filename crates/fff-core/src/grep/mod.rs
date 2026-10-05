@@ -14,10 +14,10 @@ mod regex;
 mod sink;
 mod types;
 
-#[cfg(feature = "definitions")]
 mod classify;
-#[cfg(feature = "definitions")]
-pub use classify::*;
+pub use classify::{
+    Definition, DefinitionKind, Lang, classify_line, is_definition_line, is_import_line,
+};
 
 pub(crate) use multi_pattern::multi_grep_search;
 pub use regex::has_regex_metacharacters;

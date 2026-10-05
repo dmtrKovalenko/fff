@@ -40,7 +40,8 @@ function M.search(query, file_offset, page_size, config, grep_mode)
     conf.time_budget_ms,
     conf.trim_whitespace,
     conf.enforce_time_budget,
-    conf.casing
+    conf.casing,
+    conf.definitions_first == true
   )
   return last_result
 end
@@ -260,7 +261,10 @@ function M.render_line(item, ctx, item_idx)
   -- First rendered item in this pass always gets header — fixes missing header
   -- when paginating backward in multi-page grep results (ctx is fresh per render).
   local is_first_visible = (item_idx == ctx.iter_start)
-  local is_new_group = is_first_visible or (item.relative_path ~= ctx.grep_last_file)
+  -- The definitions separator splits a file's matches into two groups; repeat the header below it.
+  local after_separator = ctx.after_separator
+  ctx.after_separator = nil
+  local is_new_group = is_first_visible or after_separator or (item.relative_path ~= ctx.grep_last_file)
   ctx.grep_last_file = item.relative_path
 
   local match_line = render_match_line(item, ctx)

@@ -269,6 +269,7 @@ impl IntoLua for GrepResultLua<'_> {
             item.set("line_content", m.line_content.as_str())?;
 
             set_match_ranges(lua, &item, m.match_byte_offsets.as_slice())?;
+            item.set("is_definition", m.is_definition)?;
 
             // Fuzzy match score (only set in fuzzy grep mode, nil otherwise)
             if let Some(score) = m.fuzzy_score {

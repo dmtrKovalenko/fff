@@ -335,6 +335,7 @@ end
 --- @field time_budget_ms? number Max wall-clock time, 0 = unlimited (default: config.grep.time_budget_ms).
 --- @field enforce_time_budget? boolean Apply the budget even with zero matches (default: config.grep.enforce_time_budget).
 --- @field trim_whitespace? boolean Strip leading whitespace from matched lines (default: config.grep.trim_whitespace).
+--- @field definitions_first? boolean Tag matches on definitions (`is_definition`) and return them first (default: config.grep.definitions_first).
 --- @field cwd? string Switch indexed root before grepping (same semantics as `file_search`).
 --- @field wait_for_index_ms? number Block up to this many ms for the index to be ready.
 
@@ -381,7 +382,9 @@ function M.content_search(query, opts)
     time_budget_ms = opts.time_budget_ms or grep_cfg.time_budget_ms,
     enforce_time_budget = opts.enforce_time_budget == nil and grep_cfg.enforce_time_budget or opts.enforce_time_budget,
     trim_whitespace = opts.trim_whitespace == nil and grep_cfg.trim_whitespace or opts.trim_whitespace,
+    definitions_first = opts.definitions_first,
   }
+  if merged_grep_cfg.definitions_first == nil then merged_grep_cfg.definitions_first = grep_cfg.definitions_first end
 
   local ok, result = pcall(grep.search, query, opts.file_offset or 0, opts.page_size or 50, merged_grep_cfg, mode)
   if not ok then

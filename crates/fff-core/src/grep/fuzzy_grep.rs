@@ -5,10 +5,8 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::sink::{
-    char_indices_to_byte_offsets, classify_definition, strip_line_terminators,
-    truncate_display_bytes,
-};
+use super::classify::{file_lang, mark_definitions};
+use super::sink::{char_indices_to_byte_offsets, strip_line_terminators, truncate_display_bytes};
 use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 
 #[allow(clippy::too_many_arguments)]
@@ -311,10 +309,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                             line_number: ln,
                             col,
                             byte_offset: bo,
-                            is_definition: classify_definition(
-                                options.classify_definitions,
-                                display_line,
-                            ),
+                            is_definition: false,
                             line_content: display_line.to_string(),
                             match_byte_offsets,
                             fuzzy_score: Some(match_indices.score),
@@ -329,6 +324,9 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                     if file_matches.is_empty() {
                         return None;
+                    }
+                    if options.classify_definitions {
+                        mark_definitions(file_lang(file, file_arena), &mut file_matches);
                     }
 
                     Some((idx, *file, file_matches))

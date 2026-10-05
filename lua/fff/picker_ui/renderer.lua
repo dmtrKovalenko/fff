@@ -147,6 +147,24 @@ local function render_grep_empty_state(ctx)
   end
 end
 
+--- Grep results come with definitions first (see `grep.definitions_first`):
+--- box them off from the usages below with the same separator as combo.
+--- @return ListSeparator|nil
+local function definitions_separator(items, config)
+  local count = 0
+  while items[count + 1] and items[count + 1].is_definition do
+    count = count + 1
+  end
+  if count == 0 or count == #items then return nil end
+
+  return {
+    idx = count,
+    text = count == 1 and 'Definition' or string.format('Definitions (%d)', count),
+    text_hl = config.hl.definitions_header or 'Function',
+    border_hl = config.hl.border,
+  }
+end
+
 --- Build rendering context with all necessary data.
 local function build_render_context()
   local config = S.config or {}
@@ -180,12 +198,14 @@ local function build_render_context()
       border_hl = config.hl.border,
     }
     S.combo_initial_cursor = combo_info.idx
+  elseif S.mode == 'grep' and not S.suggestion_source then
+    separator = definitions_separator(items, config)
   end
 
   local display_start = 1
   local display_end = #items
 
-  if separator and (display_end - display_start + 1) >= win_height then
+  if combo_info and separator and (display_end - display_start + 1) >= win_height then
     if separator.idx == display_start then
       display_end = display_end - 1
     else
@@ -226,23 +246,52 @@ local function build_render_context()
   }
 end
 
-local function finalize_render(separator_line, ctx)
-  if ctx.separator and separator_line then
-    local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
-
-    local list_cfg = vim.api.nvim_win_get_config(S.list_win)
-    local screen_row = list_cfg.row + separator_line
-
-    list_separator.update({
-      list_win = S.list_win,
-      row = screen_row,
-      text = arrow .. ' ' .. ctx.separator.text,
-      text_hl = ctx.separator.text_hl,
-      border_hl = ctx.separator.border_hl,
-    })
-  else
+--- Place the separator float over its buffer line, following the list scroll;
+--- hidden while that line is scrolled out of view.
+function M.sync_separator()
+  local ctx = S.last_render_ctx
+  local line = S.separator_line
+  if not (ctx and ctx.separator and line and S.list_win and vim.api.nvim_win_is_valid(S.list_win)) then
     list_separator.hide()
+    return
   end
+
+  local topline = vim.fn.line('w0', S.list_win)
+  local height = vim.api.nvim_win_get_height(S.list_win)
+  if line < topline or line >= topline + height then
+    list_separator.hide()
+    return
+  end
+
+  local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
+  local list_cfg = vim.api.nvim_win_get_config(S.list_win)
+  list_separator.update({
+    list_win = S.list_win,
+    row = list_cfg.row + line - topline + 1,
+    text = arrow .. ' ' .. ctx.separator.text,
+    text_hl = ctx.separator.text_hl,
+    border_hl = ctx.separator.border_hl,
+  })
+end
+
+--- Grep pages are taller than the window, so the separator has to follow
+--- scrolling that does not re-render (mouse wheel, <C-e>, cursor moves).
+local function watch_list_scroll()
+  if S.separator_scroll_win == S.list_win then return end
+  S.separator_scroll_win = S.list_win
+  vim.api.nvim_create_autocmd('WinScrolled', {
+    group = vim.api.nvim_create_augroup('fff_list_separator', { clear = true }),
+    pattern = tostring(S.list_win),
+    callback = function()
+      if P.state.active then M.sync_separator() end
+    end,
+  })
+end
+
+local function finalize_render(separator_line, ctx)
+  S.separator_line = ctx.separator and separator_line or nil
+  M.sync_separator()
+  if S.separator_line then watch_list_scroll() end
 
   if ctx.mode ~= 'grep' and not ctx.suggestion_source then
     scrollbar.render(S.layout, ctx.config, S.list_win, S.pagination, ctx.prompt_position)
@@ -316,7 +365,10 @@ end
 
 function M.render_after_cursor_move(old_cursor)
   if old_cursor == S.cursor then return false end
-  if old_cursor and rerender_cursor_rows(old_cursor, S.cursor) then return true end
+  if old_cursor and rerender_cursor_rows(old_cursor, S.cursor) then
+    M.sync_separator()
+    return true
+  end
   M.render_list()
   return true
 end

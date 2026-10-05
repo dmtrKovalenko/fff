@@ -67,6 +67,7 @@ local M = {}
 --- @field enforce_time_budget boolean
 --- @field modes string[]
 --- @field trim_whitespace boolean
+--- @field definitions_first boolean Show matches on definitions first, boxed off from usages
 --- @field location_format string
 --- @field enable_filename_constraint boolean
 
@@ -349,6 +350,7 @@ local function init()
       frecency = 'Number',
       debug = 'Comment',
       combo_header = 'Number',
+      definitions_header = 'Function', -- Label of the separator above definitions in grep results
       scrollbar = 'Comment',
       directory_path = 'Comment',
       -- Multi-select highlights
@@ -496,6 +498,11 @@ local function init()
       -- Uses vim's printf-style format: %d placeholders for line and column (1-based).
       -- Default ':%d:%d' renders as ':356:1'. Use ':%d' for line-only ':356'.
       location_format = ':%d:%d',
+      -- Show matches on definitions (fn, struct, class, def, ...) of the searched symbol
+      -- first, boxed off from the usages like combo results. Classified per file
+      -- language: Rust, Go, Python, JS/TS, Lua, C/C++, Java/C#, Kotlin, Scala, Swift,
+      -- Ruby, Elixir, Zig, PHP, shell, OCaml/ReScript and Haskell.
+      definitions_first = true,
     },
   }
 

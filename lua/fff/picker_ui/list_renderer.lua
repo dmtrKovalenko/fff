@@ -22,6 +22,7 @@ local M = {}
 --- @field mode string|nil Current mode (nil or 'grep')
 --- @field format_file_display function Helper for formatting file display
 --- @field suggestion_source string|nil Active cross-mode suggestion source ('grep' or 'files')
+--- @field after_separator boolean|nil Set right after the separator gap; renderers that group items start a new group
 
 --- @class ItemLineMapping
 --- @field first number First buffer line (1-based) this item occupies
@@ -93,6 +94,7 @@ local function generate_item_lines(ctx)
     if ctx.separator and ctx.separator.idx == i and gap_before_anchor then
       table.insert(lines, '')
       separator_line = #lines
+      ctx.after_separator = true
     end
 
     local item = ctx.items[i]
@@ -113,6 +115,7 @@ local function generate_item_lines(ctx)
     if ctx.separator and ctx.separator.idx == i and not gap_before_anchor then
       table.insert(lines, '')
       separator_line = #lines
+      ctx.after_separator = true
     end
   end
 

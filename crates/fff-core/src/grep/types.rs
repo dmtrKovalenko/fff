@@ -59,8 +59,10 @@ pub struct GrepMatch {
     pub match_byte_offsets: SmallVec<[(u32, u32); 4]>,
     /// Fuzzy match score from neo_frizbee (only set in Fuzzy grep mode).
     pub fuzzy_score: Option<u16>,
-    /// Whether the matched line looks like a definition (struct, fn, class, etc.).
-    /// Computed at match time so output formatters don't need to re-scan.
+    /// Whether this match is on a definition: the line declares something
+    /// (fn, struct, class, ...) and the match touches its header, from the
+    /// first modifier through the name. Only computed with
+    /// `GrepSearchOptions::classify_definitions`.
     pub is_definition: bool,
     /// Lines before the match (for context display). Empty when context is 0.
     pub context_before: Vec<String>,
@@ -125,8 +127,9 @@ pub struct GrepSearchOptions {
     pub before_context: usize,
     /// Number of context lines to include after each match. 0 = disabled.
     pub after_context: usize,
-    /// Whether to classify each match as a definition line. Adds ~2% overhead
-    /// on large repos; disable for interactive grep where it is not needed.
+    /// Whether to classify each returned match as a definition (see
+    /// `GrepMatch::is_definition`). Runs only on the returned matches, using
+    /// the grammar of each file's language.
     pub classify_definitions: bool,
     /// Strip leading whitespace from matched lines and context lines, adjusting
     /// highlight byte offsets accordingly. Useful for AI/MCP consumers and UIs
@@ -197,6 +200,13 @@ pub struct GrepResult<'a> {
 }
 
 impl<'a> GrepResult<'a> {
+    /// Move definition matches to the front, keeping the file order inside
+    /// both groups. Pagination is unaffected: it is tracked in files, and
+    /// this only reorders the matches of the current page.
+    pub fn definitions_first(&mut self) {
+        self.matches.sort_by_key(|m| !m.is_definition);
+    }
+
     /// Empty result carrying only the file counts (empty query / prefilter miss)
     pub(crate) fn empty(total_files: usize, filtered_file_count: usize) -> Self {
         Self {

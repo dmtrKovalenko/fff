@@ -34,6 +34,10 @@ required-features = ["zlob"]
 name = "grep_bench"
 harness = false
 
+[[bench]]
+name = "classify_bench"
+harness = false
+
 [features]
 # `ripgrep` is the pure-Rust walker/glob backend and is on by default so
 # consumers build without a Zig toolchain. CI/release opt into zlob via
@@ -44,7 +48,8 @@ ffi = []
 # Count full rescans and their causes. Always on in debug builds; enable this
 # to keep the accounting in a release build (used by the rescan_probe binary).
 rescan-stats = []
-# Enables POC definition classification for grep result matched lines
+# No-op, kept for compatibility: definition classification is always built in
+# and enabled per search with `GrepSearchOptions::classify_definitions`.
 definitions = []
 # Pure-Rust filesystem walker + glob matcher (ignore + globset crates).
 ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]

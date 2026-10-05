@@ -42,6 +42,11 @@ M.state = {
   combo_visible = true,
   combo_initial_cursor = nil,
 
+  -- List separator (combo or grep definitions): 1-based buffer line of its gap
+  -- row, and the list window whose scrolling repositions it
+  separator_line = nil,
+  separator_scroll_win = nil,
+
   -- History cycling state (tracked alongside combo state)
   updating_from_history = false,
 

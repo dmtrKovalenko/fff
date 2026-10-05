@@ -17,6 +17,8 @@ local function get_prompt_position() return layout.resolve_prompt_position(S.con
 
 --- After cursor moves, decide whether the combo separator should hide.
 local function maybe_hide_combo_separator()
+  -- the grep definitions separator scrolls with the list instead
+  if S.mode == 'grep' then return end
   if not (S.combo_initial_cursor and S.combo_visible) then return end
   local distance_past = S.cursor - S.combo_initial_cursor
   if distance_past == 0 then return end

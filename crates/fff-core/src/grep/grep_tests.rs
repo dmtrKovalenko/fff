@@ -522,3 +522,91 @@ fn regex_fallback_keeps_file_path_scope_issue_756() {
         "regex fallback must not leak outside the FilePath scope"
     );
 }
+
+#[test]
+fn definitions_are_classified_per_language_and_sorted_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+    let files: &[(&str, &str)] = &[
+        (
+            "usage.rs",
+            "fn main() {\n    let h = Handler::new();\n    run(h);\n}\n",
+        ),
+        (
+            "handler.rs",
+            "pub struct Handler {\n    inner: u8,\n}\n\nimpl Handler {\n    pub fn new() -> Handler {\n        Handler { inner: 0 }\n    }\n}\n",
+        ),
+        (
+            "app.ts",
+            "export function useHandler(h: Handler) {\n  const local = new Handler()\n}\n",
+        ),
+        ("notes.md", "class Handler is described here\n"),
+    ];
+    for (name, content) in files {
+        std::fs::write(base.join(name), content).unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let line = |result: &GrepResult, m: &GrepMatch| {
+        format!(
+            "{}:{}",
+            result.files[m.file_index].relative_path(&picker),
+            m.line_content.trim()
+        )
+    };
+    let definitions = |result: &GrepResult| -> Vec<String> {
+        let mut defs: Vec<String> = result
+            .matches
+            .iter()
+            .filter(|m| m.is_definition)
+            .map(|m| line(result, m))
+            .collect();
+        defs.sort();
+        defs
+    };
+
+    for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
+        let options = GrepSearchOptions {
+            page_limit: 100,
+            max_matches_per_file: 0,
+            classify_definitions: true,
+            mode,
+            ..Default::default()
+        };
+        let mut result = picker.grep(&parse_grep_query("Handler"), &options);
+        assert_eq!(
+            definitions(&result),
+            [
+                "app.ts:export function useHandler(h: Handler) {",
+                "handler.rs:impl Handler {",
+                "handler.rs:pub struct Handler {",
+            ],
+            "{mode:?}"
+        );
+
+        result.definitions_first();
+        let first_usage = result.matches.iter().position(|m| !m.is_definition);
+        assert_eq!(first_usage, Some(3), "{mode:?}");
+        assert!(
+            result.matches[3..].iter().all(|m| !m.is_definition),
+            "{mode:?}"
+        );
+    }
+
+    // Off by default: nothing is classified.
+    let result = picker.grep(
+        &parse_grep_query("Handler"),
+        &GrepSearchOptions {
+            page_limit: 100,
+            ..Default::default()
+        },
+    );
+    assert!(result.matches.iter().all(|m| !m.is_definition));
+}

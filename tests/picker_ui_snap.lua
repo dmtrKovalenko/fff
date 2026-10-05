@@ -9,7 +9,7 @@ local child, fixture
 
 local function setup(geometry, opts)
   opts = opts or {}
-  fixture = fixture_lib.create()
+  fixture = fixture_lib.create(opts.extra_files)
   child = MiniTest.new_child_neovim()
   child.start({
     '--clean',
@@ -88,6 +88,13 @@ local function assert_snapshot_match(opts)
     force = FORCE,
     ignore_text = opts.ignore_text or false,
   })
+end
+
+local function open_grep(prompt_position, query)
+  child.lua(string.format('require("fff").live_grep({ layout = { prompt_position = %q } })', prompt_position))
+  vim.loop.sleep(400)
+  child.type_keys(query)
+  vim.loop.sleep(400)
 end
 
 local function open_picker(prompt_position, query)
@@ -229,6 +236,44 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
     open_picker(prompt, 'main')
     -- Combo overlay float renders asynchronously after render_list.
     vim.loop.sleep(400)
+    assert_snapshot_match()
+  end
+end
+
+-- Grep matches on definitions of the query come first, boxed off from the
+-- usages; handler.rs has both, so its header repeats below the separator.
+local DEFINITION_FILES = {
+  ['src/handler.rs'] = table.concat({
+    'pub struct Handler {',
+    '    inner: Inner,',
+    '}',
+    '',
+    'impl Handler {',
+    '    pub fn new() -> Handler {',
+    '        Handler { inner: Inner::default() }',
+    '    }',
+    '}',
+    '',
+  }, '\n'),
+  ['src/app.ts'] = table.concat({
+    'export function useHandler(h: Handler) {',
+    '  const local = new Handler()',
+    '  return local',
+    '}',
+    '',
+  }, '\n'),
+}
+
+T['definitions'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }, { extra_files = DEFINITION_FILES }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['definitions']['grep_' .. prompt] = function()
+    open_grep(prompt, 'Handler')
     assert_snapshot_match()
   end
 end

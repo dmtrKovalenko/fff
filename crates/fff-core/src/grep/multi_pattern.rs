@@ -172,7 +172,6 @@ pub(crate) fn multi_grep_search<'a>(
                 max_matches,
                 before_context: options.before_context,
                 after_context: options.after_context,
-                classify_definitions: options.classify_definitions,
             };
 
             let mut sink = AhoCorasickSink { state, ac: &ac };

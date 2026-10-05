@@ -1,3 +1,4 @@
+use super::classify::{file_lang, mark_definitions};
 use super::prefilter::prefilter_with_filepath_retry;
 use super::regex::{RegexMatcher, RegexSink, build_regex};
 use super::sink::{SinkState, debug_assert_newline_terminator};
@@ -414,7 +415,6 @@ fn grep_search_parsed<'a>(
                 max_matches,
                 before_context: options.before_context,
                 after_context,
-                classify_definitions: options.classify_definitions,
             };
 
             match regex {
@@ -635,10 +635,14 @@ where
                         return None;
                     }
 
-                    let file_matches = search_file(content, options.max_matches_per_file);
+                    let mut file_matches = search_file(content, options.max_matches_per_file);
 
                     if file_matches.is_empty() {
                         return None;
+                    }
+                    if options.classify_definitions {
+                        let lang = file_lang(file, ctx.arena_for_file(file));
+                        mark_definitions(lang, &mut file_matches);
                     }
 
                     Some((idx, *file, file_matches))

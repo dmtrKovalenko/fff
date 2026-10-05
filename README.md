@@ -272,7 +272,7 @@ end
 
 #### `content_search(query, opts)`
 
-Returns a `GrepResult` `{ items, total_matched, total_files_searched, total_files, filtered_file_count, next_file_offset, regex_fallback_error? }`. Each match item has `relative_path`, `name`, `line_number`, `col`, `line_content`, `match_ranges`, plus the same file metadata as `file_search`.
+Returns a `GrepResult` `{ items, total_matched, total_files_searched, total_files, filtered_file_count, next_file_offset, regex_fallback_error? }`. Each match item has `relative_path`, `name`, `line_number`, `col`, `line_content`, `match_ranges`, `is_definition`, plus the same file metadata as `file_search`.
 
 ```lua
 local r = require('fff').content_search('TODO', {
@@ -286,6 +286,7 @@ local r = require('fff').content_search('TODO', {
   time_budget_ms        = 0,
   enforce_time_budget   = false,    -- also bound zero-match searches
   trim_whitespace       = false,
+  definitions_first     = nil,      -- default config.grep.definitions_first: tag `is_definition`, definitions first
   cwd                   = nil,      -- switch indexed root if different
   wait_for_index_ms     = nil,      -- override the default scan wait timeout
 })
@@ -450,6 +451,7 @@ require('fff').setup({
     trim_whitespace = false,
     enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
+    definitions_first = true, -- show matches on definitions (fn, struct, class, def...) first, boxed off from usages
   },
   suggestions = {
     enabled = true, -- when a query has no results, look them up in the other mode (files <-> grep) and show as a hint
