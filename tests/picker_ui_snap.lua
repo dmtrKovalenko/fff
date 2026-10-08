@@ -90,10 +90,9 @@ local function assert_snapshot_match(opts)
   })
 end
 
-local function open_picker(prompt_position, query)
-  child.lua(
-    string.format('require("fff.picker_ui.picker_ui").open({ layout = { prompt_position = %q } })', prompt_position)
-  )
+local function open_picker(prompt_position, query, layout_opts)
+  local layout = vim.tbl_extend('force', { prompt_position = prompt_position }, layout_opts or {})
+  child.lua(string.format('require("fff.picker_ui.picker_ui").open({ layout = %s })', vim.inspect(layout)))
   vim.loop.sleep(400)
 
   if query and query ~= '' then
@@ -199,6 +198,20 @@ T['show_path_first'] = MiniTest.new_set({
 for _, prompt in ipairs(PROMPT_POSITIONS) do
   T['show_path_first']['query_main_' .. prompt] = function()
     open_picker(prompt, 'main')
+    assert_snapshot_match()
+  end
+end
+
+T['title_center_no_count'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['title_center_no_count']['empty_' .. prompt] = function()
+    open_picker(prompt, nil, { title_position = 'center', show_file_count = false })
     assert_snapshot_match()
   end
 end

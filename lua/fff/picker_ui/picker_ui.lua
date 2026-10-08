@@ -390,6 +390,8 @@ function M.update_status(progress)
   local status_info
   if progress and progress.is_scanning then
     status_info = string.format('Indexing files %d', progress.scanned_files_count)
+  elseif config.layout.show_file_count == false then
+    status_info = ''
   else
     local search_metadata = file_picker.get_search_metadata()
     if #M.state.query < 2 then
@@ -403,6 +405,7 @@ function M.update_status(progress)
   M.state.last_status_info = status_info
 
   vim.api.nvim_buf_clear_namespace(M.state.input_buf, M.state.ns_id, 0, -1)
+  if status_info == '' then return end
 
   local win_width = vim.api.nvim_win_get_width(M.state.input_win)
   local available_width = win_width - 2
