@@ -253,6 +253,16 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         opts.cache_budget_max_file_size,
     );
 
+    let extra_ignore = if opts.version >= 3 && !opts.extra_ignore.is_null() {
+        // Fail loudly: silently dropping the rules would index paths the caller excluded.
+        match unsafe { cstr_to_str(opts.extra_ignore) } {
+            Some(s) => s.lines().map(String::from).collect(),
+            None => return FffResult::err("opts.extra_ignore is not valid UTF-8"),
+        }
+    } else {
+        Vec::new()
+    };
+
     if let Err(e) = FilePicker::new_with_shared_state(
         shared_picker.clone(),
         shared_frecency.clone(),
@@ -267,6 +277,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
             git_recency: Default::default(),
+            extra_ignore,
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -1020,6 +1031,10 @@ pub unsafe extern "C" fn fff_restart_index(
         .as_ref()
         .map(|p| p.git_recency_config())
         .unwrap_or_default();
+    let extra_ignore = guard
+        .as_ref()
+        .map(|p| p.extra_ignore().to_vec())
+        .unwrap_or_default();
 
     drop(guard);
 
@@ -1037,6 +1052,7 @@ pub unsafe extern "C" fn fff_restart_index(
             enable_fs_root_scanning: fs_root,
             enable_home_dir_scanning: home_dir,
             git_recency,
+            extra_ignore,
         },
     ) {
         Ok(()) => FffResult::ok_empty(),

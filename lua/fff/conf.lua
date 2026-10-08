@@ -90,6 +90,7 @@ local M = {}
 --- @field lazy_sync boolean
 --- @field prompt_vim_mode boolean
 --- @field follow_symlinks boolean
+--- @field extra_ignore string[] `.gitignore`-syntax lines overriding every ignore file; `!pattern` force-includes
 --- @field enable_fs_root_scanning boolean
 --- @field enable_home_dir_scanning boolean
 --- @field layout FffLayoutConfig
@@ -259,6 +260,9 @@ local function init()
     prompt_vim_mode = false, -- set to true to enable vim-mode in the prompt: <Esc> leaves insert for normal mode bindings (also allows <leader>p or <leader>l to jump around) the second <Esc> closes the picker
     wrap_around = false, -- set to true to wrap cursor to the opposite end when reaching the first/last item
     follow_symlinks = false, -- set to true to follow symbolic links during file indexing
+    -- Extra .gitignore-syntax lines relative to the indexed root, taking precedence over every
+    -- ignore file. `!pattern` force-includes ignored paths, e.g. { '!.env*', '!logs/' }
+    extra_ignore = {},
     -- Allow fff in the user's $HOME director.
     enable_home_dir_scanning = true,
     -- Allow fff in a filesystem root (e.g. `/`, `C:\`)

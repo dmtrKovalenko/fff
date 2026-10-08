@@ -143,6 +143,8 @@ export class FileFinder implements FileFinderApi {
       BigInt(options.cacheBudgetMaxFileSize ?? 0),
       options.enableFsRootScanning ?? false,
       options.enableHomeDirScanning ?? false,
+      options.followSymlinks ?? false,
+      options.extraIgnore ?? [],
     );
 
     if (!result.ok) {

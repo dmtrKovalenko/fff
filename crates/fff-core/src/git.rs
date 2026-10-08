@@ -21,12 +21,13 @@ pub(crate) fn tune_libgit2_for_local_reads() {
     });
 }
 
-pub(crate) fn default_status_options() -> StatusOptions {
+pub(crate) fn default_status_options(include_ignored: bool) -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_unmodified(true)
         .exclude_submodules(true);
+    with_ignored(&mut opts, include_ignored);
     opts
 }
 
@@ -36,34 +37,50 @@ pub(crate) fn default_status_options() -> StatusOptions {
 /// `git_status: None` (== clean), so a missing cache entry already means
 /// "clean" — no need to ask libgit2 to enumerate every tracked path.
 /// Saves seconds on huge dirty trees (e.g. chromium with 400k+ entries).
-pub(crate) fn initial_scan_status_options() -> StatusOptions {
+pub(crate) fn initial_scan_status_options(include_ignored: bool) -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .exclude_submodules(true);
+    with_ignored(&mut opts, include_ignored);
     opts
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct GitStatusCache(AHashMap<PathBuf, Status>);
+pub(crate) struct GitStatusCache {
+    statuses: AHashMap<PathBuf, Status>,
+    // Ignored dirs reported without recursion (absolute, no trailing slash).
+    ignored_dirs: Vec<PathBuf>,
+}
 
 impl IntoIterator for GitStatusCache {
     type Item = (PathBuf, Status);
     type IntoIter = <AHashMap<PathBuf, Status> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        self.statuses.into_iter()
     }
 }
 
 impl GitStatusCache {
+    fn from_statuses(statuses: AHashMap<PathBuf, Status>) -> Self {
+        Self {
+            statuses,
+            ignored_dirs: Vec::new(),
+        }
+    }
+
     pub fn statuses_len(&self) -> usize {
-        self.0.len()
+        self.statuses.len()
     }
 
     #[inline]
     pub fn lookup_status(&self, full_path: &Path) -> Option<Status> {
-        self.0.get(full_path).copied()
+        self.statuses.get(full_path).copied()
+    }
+
+    pub(crate) fn take_ignored_dirs(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.ignored_dirs)
     }
 
     #[tracing::instrument(skip(repo, status_options))]
@@ -73,22 +90,31 @@ impl GitStatusCache {
     ) -> Result<Self> {
         let statuses = repo.statuses(Some(status_options))?;
         let Some(repo_path) = repo.workdir() else {
-            return Ok(Self(AHashMap::new())); // repo is bare
+            return Ok(Self::default()); // repo is bare
         };
 
         let repo_path = crate::path_utils::normalize(repo_path.to_path_buf());
 
-        let mut entries = AHashMap::with_capacity(statuses.len());
+        let mut cache = Self::from_statuses(AHashMap::with_capacity(statuses.len()));
         for entry in &statuses {
             if let Ok(entry_path) = entry.path() {
+                let status = entry.status();
+                if let Some(dir) = entry_path.strip_suffix('/')
+                    && status.contains(Status::IGNORED)
+                {
+                    let dir = crate::path_utils::normalize(repo_path.join(dir));
+                    cache.ignored_dirs.push(dir);
+                    continue;
+                }
+
                 // libgit2 returns entry paths with forward slashes on every platform
                 // fff stores native paths - meaning we have forward slash issue on windows
                 let full_path = crate::path_utils::normalize(repo_path.join(entry_path));
-                entries.insert(full_path, entry.status());
+                cache.statuses.insert(full_path, status);
             }
         }
 
-        Ok(Self(entries))
+        Ok(cache)
     }
 
     pub fn read_git_status(
@@ -114,13 +140,14 @@ impl GitStatusCache {
     pub fn git_status_for_paths<TPath: AsRef<Path> + Debug>(
         repo: &Repository,
         paths: &[TPath],
+        include_ignored: bool,
     ) -> Result<Self> {
         if paths.is_empty() {
-            return Ok(Self(AHashMap::new()));
+            return Ok(Self::default());
         }
 
         let Some(workdir) = repo.workdir() else {
-            return Ok(Self(AHashMap::new()));
+            return Ok(Self::default());
         };
         let workdir = crate::path_utils::normalize(workdir.to_path_buf());
 
@@ -133,10 +160,10 @@ impl GitStatusCache {
 
             let mut map = AHashMap::with_capacity(1);
             map.insert(full_path.to_path_buf(), status);
-            return Ok(Self(map));
+            return Ok(Self::from_statuses(map));
         }
 
-        let mut status_options = default_status_options();
+        let mut status_options = default_status_options(include_ignored);
         for path in paths {
             status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
         }
@@ -190,6 +217,13 @@ pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
 
 pub fn format_git_status(status: Option<Status>) -> &'static str {
     format_git_status_opt(status).unwrap_or("unknown")
+}
+
+// Ignored dirs are reported once without recursion, keeping the extra cost small.
+fn with_ignored(opts: &mut StatusOptions, include_ignored: bool) {
+    if include_ignored {
+        opts.include_ignored(true).recurse_ignored_dirs(false);
+    }
 }
 
 #[cfg(test)]
@@ -283,7 +317,7 @@ mod tests {
 
         let repo = Repository::open(&base).unwrap();
         let paths: Vec<PathBuf> = names.iter().map(|n| base.join(n)).collect();
-        let cache = GitStatusCache::git_status_for_paths(&repo, &paths).unwrap();
+        let cache = GitStatusCache::git_status_for_paths(&repo, &paths, false).unwrap();
 
         for (n, abs) in names.iter().zip(paths.iter()) {
             let status = cache.lookup_status(abs);

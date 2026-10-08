@@ -340,6 +340,8 @@ require('fff').setup({
   prompt_vim_mode = false,
   wrap_around = false, -- true to wrap the cursor around when moving past the first/last item
   follow_symlinks = false,
+  -- Extra .gitignore-syntax lines, see "File filtering". `!pattern` force-includes ignored paths
+  extra_ignore = {},
   -- Allow indexing the user's $HOME directory. Enabled by default.
   -- Disable if you strictly sure you don't want this, as it makes whole fff error hard
   enable_home_dir_scanning = true,
@@ -588,6 +590,23 @@ FFF honours `.gitignore`. For picker-only ignores that do not touch git, add a s
 docs/archive/**/*.md
 ```
 
+To keep the rules out of the repo, use `extra_ignore`. It takes `.gitignore`-syntax lines relative to the indexed
+root and takes precedence over every ignore file, so `!pattern` makes gitignored files searchable:
+
+```lua
+extra_ignore = {
+  '!.env*',       -- gitignored env files, at any depth
+  '!logs/',       -- a directory ignored by a `logs/` rule
+  '!nvim/', '!nvim/**', -- dotfiles repos ignoring everything with `*` need both lines
+  'fixtures/',    -- plain lines exclude more
+},
+```
+
+Plain git semantics apply: a file inside an ignored directory is only reachable once the directory itself is included.
+Included files keep the `ignored` git status. The same option is `extraIgnore` in the Node/Bun SDKs, `extra_ignore` in
+Python and the C `FffCreateOptions` (newline-separated), and a repeatable `--extra-ignore` flag in fff-mcp. It needs the
+zlob walker that release builds use; the pure-Rust walker logs a warning and skips it.
+
 Run `:FFFScan` to force a rescan.
 
 ### Troubleshooting
@@ -774,6 +793,7 @@ FffResult *res = fff_create_instance_with(&(FffCreateOptions){
     .watch = true,
     .enable_fs_root_scanning = false,   // off by default
     .enable_home_dir_scanning = false,  // off by default
+    .extra_ignore = "!.env*\nfixtures/", // newline-separated .gitignore lines (v3)
 });
 ```
 

@@ -15,6 +15,7 @@ pub(crate) fn walk_collect_files(
     base_path: &Path,
     is_git_repo: bool,
     follow_symlinks: bool,
+    extra_ignore: &[String],
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
 ) -> crate::Result<WalkOutput> {
@@ -36,13 +37,23 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
+    // User lines go last so they win over the non-git defaults (last match wins).
+    let mut ignore_lines: Vec<&str> = Vec::new();
+    if !is_git_repo {
+        ignore_lines.extend_from_slice(IGNORED_DIRS);
+    }
+    // zlob rejects the whole list on an interior NUL, so drop such lines up front.
+    ignore_lines.extend(extra_ignore.iter().map(String::as_str).filter(|line| {
+        let valid = !line.contains('\0');
+        if !valid {
+            tracing::warn!(?line, "skipping extra_ignore line containing NUL");
+        }
+        valid
+    }));
+
+    if !ignore_lines.is_empty()
+        && let Err(e) = builder.extra_ignore(&ignore_lines)
     {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
         tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
     }
 
