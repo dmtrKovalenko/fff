@@ -91,6 +91,7 @@ impl BackgroundWatcher {
         let watch_tx_for_debouncer = watch_tx.clone();
 
         let owner_weak_picker = shared_picker.weaken();
+        let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git_workdir.clone();
         let owner_git_worker = Arc::clone(&git_status_worker);
 
@@ -141,6 +142,7 @@ impl BackgroundWatcher {
                         let subdirs = index_new_directory(
                             &dir,
                             &strong_picker,
+                            &owner_frecency,
                             &owner_git_workdir,
                             &owner_git_worker,
                         );
@@ -783,6 +785,7 @@ pub(crate) fn handle_debounced_events(
 fn index_new_directory(
     dir: &Path,
     shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
@@ -839,7 +842,8 @@ fn index_new_directory(
         return subdirs;
     }
 
-    let mut indexed_files = Vec::with_capacity(files_to_add.len());
+    let mut indexed_files = Vec::with_capacity(files_to_add.len().min(MAX_OVERFLOW_FILES));
+    let mut index_update_rejected = false;
     {
         let Ok(mut guard) = shared_picker.write() else {
             return subdirs;
@@ -852,13 +856,32 @@ fn index_new_directory(
         for path in files_to_add {
             if picker.handle_create_or_modify(&path).is_some() {
                 indexed_files.push(path);
+            } else {
+                index_update_rejected = true;
+                break;
             }
         }
     }
     let added = indexed_files.len();
 
     let watch_registry = shared_picker.watch_registry();
-    if watch_registry.is_active() {
+    // Capacity rejection cannot fall back to incremental processing if a rescan is throttled.
+    let rescan_started = if index_update_rejected {
+        match shared_picker.trigger_full_rescan_async(shared_frecency) {
+            Ok(()) => {
+                watch_registry.dispatch_rescan(&base_path);
+                true
+            }
+            Err(e) => {
+                error!(?e, dir = %dir.display(), "Failed to rescan after new-directory overflow");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !rescan_started && watch_registry.is_active() {
         let events = indexed_files
             .iter()
             .map(|path| RawWatchEvent {
@@ -872,7 +895,7 @@ fn index_new_directory(
         watch_registry.dispatch(&base_path, events);
     }
 
-    if repo.is_some() {
+    if !rescan_started && repo.is_some() {
         git_status_worker.enqueue_paths(indexed_files);
     }
 
@@ -1162,6 +1185,108 @@ mod tests {
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn overflow_admission_is_bounded_without_rejecting_existing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        for i in 0..MAX_OVERFLOW_FILES {
+            let path = base.join(format!("file-{i}.txt"));
+            std::fs::write(&path, "initial").unwrap();
+            assert!(picker.handle_create_or_modify(&path).is_some());
+        }
+        let extra = base.join("extra.txt");
+        std::fs::write(&extra, "extra").unwrap();
+        assert!(picker.add_new_file(&extra).is_none());
+        assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+
+        let existing = base.join("file-0.txt");
+        std::fs::write(&existing, "modified content").unwrap();
+        assert!(picker.handle_create_or_modify(&existing).is_some());
+        assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+    }
+
+    #[test]
+    fn new_directory_overflow_rescans_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let shared_picker = SharedFilePicker::default();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        *shared_picker.write().unwrap() = Some(picker);
+        shared_picker.rebase_watches(&base);
+        let (sender, receiver) = mpsc::channel::<Vec<WatchEvent>>();
+        shared_picker
+            .watch_registry()
+            .subscribe(
+                &base,
+                "**",
+                WatchOptions::default(),
+                Box::new(move |_, events| {
+                    let _ = sender.send(events.to_vec());
+                }),
+            )
+            .unwrap();
+
+        let dir = base.join("new-directory");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            std::fs::write(dir.join(format!("file-{i}.txt")), "content").unwrap();
+        }
+        index_new_directory(
+            &dir,
+            &shared_picker,
+            &SharedFrecency::noop(),
+            &None,
+            &GitStatusWorker::new(),
+        );
+        {
+            let guard = shared_picker.read().unwrap();
+            assert!(guard.as_ref().unwrap().get_overflow_files().len() <= MAX_OVERFLOW_FILES);
+        }
+        let marker = base.join("after-overflow.txt");
+        shared_picker.watch_registry().dispatch(
+            &base,
+            vec![RawWatchEvent {
+                path: marker.clone(),
+                kind: WatchEventKind::Removed,
+                is_ignored: false,
+                from: None,
+            }],
+        );
+        let events = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, WatchEventKind::Rescan);
+        assert_eq!(events[0].path, base);
+        let next = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].kind, WatchEventKind::Removed);
+        assert_eq!(next[0].path, marker);
+        assert!(shared_picker.wait_for_indexing_complete(Duration::from_secs(10)));
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            assert!(
+                picker
+                    .get_file_by_path(dir.join(format!("file-{i}.txt")))
+                    .is_some()
+            );
+        }
+        assert_eq!(picker.get_overflow_files().len(), 0);
+    }
 
     #[test]
     fn replacement_batch_emits_one_modified_event() {

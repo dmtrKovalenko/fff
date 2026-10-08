@@ -1715,6 +1715,10 @@ impl FilePicker {
     /// which indicates that it's time to trigger a new sync
     #[tracing::instrument(skip(self))]
     pub fn add_new_file(&mut self, path: &Path) -> Option<&FileItem> {
+        if self.get_overflow_files().len() >= MAX_OVERFLOW_FILES {
+            return None;
+        }
+
         // On Windows `pathdiff::diff_paths` is byte-wise, so a short-name
         // input never shares a prefix with the canonicalized base_path and
         // the resulting relative path becomes absolute. Canonicalize first.
