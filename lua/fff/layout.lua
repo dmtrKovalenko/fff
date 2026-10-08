@@ -255,6 +255,8 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   local border_chars, t_junctions = get_border_chars(config)
   local has_preview = layout.preview ~= nil
   local title = ' ' .. (config.title or 'FFFiles') .. ' '
+  local title_pos = config.layout.title_position
+  if not utils.is_one_of(title_pos, { 'left', 'center', 'right' }) then title_pos = 'left' end
 
   local list_neighbour_input_top = prompt_position == 'top'
   local list_neighbour_input_bottom = prompt_position == 'bottom'
@@ -314,7 +316,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   }
   if prompt_position == 'bottom' then
     list_cfg.title = title
-    list_cfg.title_pos = 'left'
+    list_cfg.title_pos = title_pos
   end
 
   local input_neighbour_preview_left = has_preview and preview_position == 'left'
@@ -381,7 +383,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   }
   if prompt_position == 'top' then
     input_cfg.title = title
-    input_cfg.title_pos = 'left'
+    input_cfg.title_pos = title_pos
   end
 
   local preview_cfg = nil
