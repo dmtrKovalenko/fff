@@ -10,6 +10,7 @@ local M = {}
 --- @field show_scrollbar boolean
 --- @field show_file_count boolean
 --- @field title_position 'left'|'center'|'right'
+--- @field filename_position 'left'|'center'|'right'
 --- @field path_shorten_strategy string
 --- @field show_path_first boolean
 --- @field border? 'single'|'double'|'rounded'|'solid'|'shadow'|'none'|table<string[],string[]> Border preset; falls back to `vim.o.winborder` when nil
@@ -284,6 +285,7 @@ local function init()
       show_scrollbar = true, -- Show scrollbar for pagination
       show_file_count = true, -- Show the matched/total file count on the right of the prompt
       title_position = 'left', -- or 'center', 'right'
+      filename_position = 'left', -- preview title (file path) alignment: 'left', 'center', 'right'
       -- How to shorten long directory paths in the file list:
       -- 'middle' (default): always uses dots (a/./b, a/../b, a/.../b)
       -- 'middle_number' uses dots for 1-3 hidden (a/./b, a/../b, a/.../b)

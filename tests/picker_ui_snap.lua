@@ -216,6 +216,20 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
   end
 end
 
+T['filename_center'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['filename_center']['empty_' .. prompt] = function()
+    open_picker(prompt, nil, { filename_position = 'center' })
+    assert_snapshot_match()
+  end
+end
+
 T['combo'] = MiniTest.new_set({
   hooks = {
     pre_case = function() setup({ cols = 140, rows = 32 }) end,
