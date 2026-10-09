@@ -32,6 +32,17 @@ pub(crate) fn walk_collect_files(
         walk_builder.overrides(overrides);
     }
 
+    // `git_global` above only consults the user-level gitconfig; resolve
+    // core.excludesFile through the repo's config chain instead (#874).
+    if is_git_repo && let Some(excludes) = crate::ignore::git_excludes_file(base_path) {
+        // Roots the matcher at the walk root, which is where git anchors
+        // core.excludesFile patterns. Must precede `add_ignore`.
+        walk_builder.current_dir(base_path);
+        if let Some(e) = walk_builder.add_ignore(&excludes) {
+            tracing::warn!(?e, ?excludes, "core.excludesFile not fully applied");
+        }
+    }
+
     let walker = walk_builder.build_parallel();
 
     // Single lock for both collections: every entry is either a file or a
