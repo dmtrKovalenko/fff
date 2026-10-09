@@ -547,7 +547,11 @@ function M.select(action)
           opened_via_split = true
         end
 
-        if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(edit_path)) end
+        -- `:edit` of the current file reloads it and fails with E37 if modified.
+        -- bufadd() matches names like :edit does (relative paths, symlinks).
+        if not opened_via_split and vim.fn.bufadd(edit_path) ~= vim.api.nvim_get_current_buf() then
+          vim.cmd('edit ' .. vim.fn.fnameescape(edit_path))
+        end
       elseif action == 'split' then
         vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
       elseif action == 'vsplit' then
