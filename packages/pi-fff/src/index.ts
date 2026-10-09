@@ -891,8 +891,9 @@ export default function fffExtension(pi: ExtensionAPI) {
       }
 
       const markerWidth = visibleWidth(this.marker);
+      if (previewWidth < markerWidth) return [this.suffix];
       return [
-        `${sliceByColumn(this.preview, 0, Math.max(0, previewWidth - markerWidth), true)}${this.marker} ${this.suffix}`,
+        `${sliceByColumn(this.preview, 0, previewWidth - markerWidth, true)}${this.marker} ${this.suffix}`,
       ];
     }
 
