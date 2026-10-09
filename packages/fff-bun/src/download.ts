@@ -2,8 +2,9 @@
  * Binary resolution utilities for fff
  *
  * Resolves the native library from:
- * 1. Platform-specific npm package (e.g. @ff-labs/fff-bin-darwin-arm64)
- * 2. Local dev build (target/release or target/debug)
+ * 1. The FFF_C_LIB environment variable (explicit path to libfff_c.so/.dylib/.dll)
+ * 2. Platform-specific npm package (e.g. @ff-labs/fff-bin-darwin-arm64)
+ * 3. Local dev build (target/release or target/debug)
  */
 
 import { existsSync } from "node:fs";
@@ -54,7 +55,13 @@ export function binaryExists(): boolean {
  * in the same directory.
  */
 function resolveFromNpmPackage(): string | null {
-  const packageName = getNpmPackageName();
+  let packageName: string;
+  try {
+    packageName = getNpmPackageName();
+  } catch {
+    // Unsupported platform, or no platform package mapped for it.
+    return null;
+  }
 
   try {
     // Use createRequire to resolve the platform package's location
@@ -105,12 +112,23 @@ function isDevWorkspace(): boolean {
  * Find the native library binary.
  *
  * Resolution order:
+ * - FFF_C_LIB (if set) always wins
  * - Dev workspace: local dev build first, then npm package
  * - Production: npm package first, then dev build
  *
  * @returns Absolute path to the library, or null if not found
  */
 export function findBinary(): string | null {
+  // Explicit override for platforms without a prebuilt package (for example a
+  // libfff_c.so built from source on FreeBSD, or any custom build).
+  const override = process.env["FFF_C_LIB"];
+  if (override) {
+    if (!existsSync(override)) {
+      throw new Error(`FFF_C_LIB points to a file that does not exist: ${override}`);
+    }
+    return override;
+  }
+
   if (isDevWorkspace()) {
     // 1. Local bin/ directory (populated by `make prepare-bun`)
     const binPath = join(getPackageDir(), "bin", getLibFilename());
