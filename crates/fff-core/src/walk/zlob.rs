@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::SystemTime;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
 const PROGRESS_STEP: usize = 13;
@@ -51,7 +52,16 @@ pub(crate) fn walk_collect_files(
     let collected = Mutex::new((Vec::new(), Vec::new()));
 
     let outcome = match builder.run(|entry| {
-        if !entry.is_file() {
+        // Followed links keep the Symlink kind and lstat metadata, so stat
+        // the target to index the ones resolving to files (#912).
+        let target = if entry.is_file() {
+            None
+        } else if follow_symlinks && entry.is_symlink() {
+            match std::fs::metadata(entry.path()) {
+                Ok(meta) if meta.is_file() => Some(meta),
+                _ => return WalkState::Continue,
+            }
+        } else {
             // unlike ripgrep walker zlob doesnt show .git files
             if entry.is_dir() {
                 let relative_path = entry.relative_path_lossy();
@@ -63,26 +73,41 @@ pub(crate) fn walk_collect_files(
             }
 
             return WalkState::Continue;
-        }
-
-        // `basename()` returns `&str` for files only.
-        let basename = entry.basename().unwrap_or("");
-        let is_binary = is_known_binary_extension_basename(basename);
-
-        let size = entry.size().unwrap_or(0);
-        // zlob reports mtime in ns since the Unix epoch; FileItem wants secs.
-        let modified = entry
-            .modified_ns()
-            .map(|ns| (ns / 1_000_000_000).max(0) as u64)
-            .unwrap_or(0);
+        };
 
         // Lossy pair: the offset must index the decoded string, not the raw
         // bytes, or it lands inside a U+FFFD on invalid-UTF-8 names (#799).
-        let basename_offset = entry.basename_offset_in_relative_lossy() as u16;
+        let basename_offset = entry.basename_offset_in_relative_lossy();
         // zlob emits '/'-separated relative paths, which is fff's canonical
         // internal form on every platform — store them verbatim.
         let relative_path = entry.relative_path_lossy().into_owned();
-        let item = FileItem::new_raw(basename_offset, size, modified, None, is_binary);
+
+        // `basename()` returns `&str` for files only.
+        let basename = match target {
+            None => entry.basename().unwrap_or(""),
+            Some(_) => &relative_path[basename_offset..],
+        };
+        let is_binary = is_known_binary_extension_basename(basename);
+
+        let (size, modified) = match target {
+            Some(meta) => (
+                meta.len(),
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            // zlob reports mtime in ns since the Unix epoch; FileItem wants secs.
+            None => (
+                entry.size().unwrap_or(0),
+                entry
+                    .modified_ns()
+                    .map(|ns| (ns / 1_000_000_000).max(0) as u64)
+                    .unwrap_or(0),
+            ),
+        };
+
+        let item = FileItem::new_raw(basename_offset as u16, size, modified, None, is_binary);
 
         let mut guard = collected.lock();
         guard.0.push((item, relative_path));
