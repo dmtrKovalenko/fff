@@ -230,6 +230,23 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
   end
 end
 
+-- Non-default position on a non-default file: title is re-set on cursor move.
+T['filename_right'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['filename_right']['cursor_second_item_' .. prompt] = function()
+    open_picker(prompt, nil, { filename_position = 'right' })
+    child.type_keys(prompt == 'bottom' and '<Up>' or '<Down>')
+    vim.loop.sleep(200)
+    assert_snapshot_match()
+  end
+end
+
 T['combo'] = MiniTest.new_set({
   hooks = {
     pre_case = function() setup({ cols = 140, rows = 32 }) end,
