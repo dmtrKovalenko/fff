@@ -364,6 +364,7 @@ require('fff').setup({
     show_scrollbar = true,
     show_file_count = true, -- false hides the matched/total file count next to the prompt
     title_position = 'left', -- 'left' | 'center' | 'right'
+    filename_position = 'left', -- preview title (file path) alignment: 'left' | 'center' | 'right'
     path_shorten_strategy = 'middle', -- 'middle' | 'middle_number' | 'end' | 'start'
     -- 'center' | 'top' | 'bottom' | 'left' | 'right' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'
     anchor = 'center',

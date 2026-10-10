@@ -74,6 +74,11 @@ end
 
 M.resolve_prompt_position = resolve_prompt_position
 
+function M.resolve_title_pos(value)
+  if utils.is_one_of(value, { 'left', 'center', 'right' }) then return value end
+  return 'left'
+end
+
 local function resolve_preview_position(config)
   if config and config.layout and config.layout.preview_position then
     local terminal_width = vim.o.columns
@@ -255,8 +260,8 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   local border_chars, t_junctions = get_border_chars(config)
   local has_preview = layout.preview ~= nil
   local title = ' ' .. (config.title or 'FFFiles') .. ' '
-  local title_pos = config.layout.title_position
-  if not utils.is_one_of(title_pos, { 'left', 'center', 'right' }) then title_pos = 'left' end
+  local title_pos = M.resolve_title_pos(config.layout.title_position)
+  local filename_pos = M.resolve_title_pos(config.layout.filename_position)
 
   local list_neighbour_input_top = prompt_position == 'top'
   local list_neighbour_input_bottom = prompt_position == 'bottom'
@@ -426,7 +431,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
       border = preview_border,
       -- Title hidden when file_info renders above — its footer already says "Preview".
       title = layout.file_info and '' or ' Preview ',
-      title_pos = 'left',
+      title_pos = filename_pos,
       zindex = 51,
     }
   end
@@ -451,7 +456,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
       style = 'minimal',
       border = fi_border,
       title = ' File Info ',
-      title_pos = 'left',
+      title_pos = filename_pos,
       -- Above the list/preview zindex so its borders win the shared rows.
       zindex = 53,
     }
