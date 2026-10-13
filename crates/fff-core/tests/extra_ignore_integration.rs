@@ -150,3 +150,24 @@ fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
     }
     false
 }
+
+// A rejected user line must not drop the non-git default ignores.
+#[test]
+fn bad_line_keeps_default_ignores_outside_git() {
+    let tmp = TempDir::new().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    write(&base, "main.rs");
+    write(&base, "node_modules/dep/index.js");
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_string_lossy().into_owned(),
+        watch: false,
+        extra_ignore: vec!["bad\0line".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    assert!(is_indexed(&picker, "main.rs"));
+    assert!(!is_indexed(&picker, "node_modules/dep/index.js"));
+}

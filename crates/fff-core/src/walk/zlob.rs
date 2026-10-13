@@ -47,10 +47,12 @@ pub(crate) fn walk_collect_files(
     if !ignore_lines.is_empty()
         && let Err(e) = builder.extra_ignore(&ignore_lines)
     {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
-        tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
+        // Interior NUL in a user line rejects the whole list; drop the user
+        // lines but keep the non-git defaults rather than aborting the walk.
+        tracing::warn!(?e, "zlob extra_ignore rejected; walking with defaults only");
+        if !is_git_repo && let Err(e) = builder.extra_ignore(IGNORED_DIRS) {
+            tracing::warn!(?e, "zlob default ignores rejected; walking without them");
+        }
     }
 
     // Single lock for both collections: every entry is either a file or a
