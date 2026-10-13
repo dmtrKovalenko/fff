@@ -706,13 +706,6 @@ impl FilePicker {
         Arc::clone(&self.extra_ignore)
     }
 
-    /// Whether `extra_ignore` can surface gitignored files, which then need the ignored git status.
-    pub(crate) fn reincludes_ignored(&self) -> bool {
-        self.extra_ignore
-            .iter()
-            .any(|line| line.trim_start().starts_with('!'))
-    }
-
     pub fn trace_id(&self) -> &str {
         &self.trace_id
     }
@@ -1043,10 +1036,7 @@ impl FilePicker {
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
         let git_workdir = FileSync::discover_git_workdir(&self.base_path);
-        let include_ignored = self.reincludes_ignored();
-        let git_handle = git_workdir
-            .clone()
-            .map(|workdir| FileSync::spawn_git_status(workdir, include_ignored));
+        let git_handle = git_workdir.clone().map(FileSync::spawn_git_status);
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
@@ -1069,21 +1059,17 @@ impl FilePicker {
         }
 
         if let Some(handle) = git_handle
-            && let Ok(Some(mut git_cache)) = handle.join()
+            && let Ok(Some(git_cache)) = handle.join()
         {
-            // Ignored dirs first so explicit per-file statuses win, as in `update_git_statuses`.
-            self.mark_files_in_ignored_dirs(&git_cache.take_ignored_dirs());
-
             let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+
             let arena = self.arena_base_ptr();
             for file in self.sync_data.files.iter_mut() {
-                if let Some(status) = git_cache.lookup_status(file.write_absolute_path(
+                file.git_status = git_cache.lookup_status(file.write_absolute_path(
                     arena,
                     &self.base_path,
                     &mut path_buf,
-                )) {
-                    file.git_status = Some(status);
-                }
+                ));
             }
         }
 
@@ -1562,14 +1548,13 @@ impl FilePicker {
     /// Update git statuses for files, using the provided shared frecency tracker.
     pub(crate) fn update_git_statuses(
         &mut self,
-        mut status_cache: GitStatusCache,
+        status_cache: GitStatusCache,
         shared_frecency: &SharedFrecency,
     ) -> Result<(), Error> {
         debug!(
             statuses_count = status_cache.statuses_len(),
             "Updating git status",
         );
-        self.mark_files_in_ignored_dirs(&status_cache.take_ignored_dirs());
 
         let mode = self.mode;
         let bp = self.base_path.clone();
@@ -1601,58 +1586,6 @@ impl FilePicker {
             })?;
 
         Ok(())
-    }
-
-    // libgit2 reports an ignored dir once without recursing, so its indexed
-    // (force-included) descendants get the ignored status here.
-    fn mark_files_in_ignored_dirs(&mut self, ignored_dirs: &[PathBuf]) {
-        if ignored_dirs.is_empty() {
-            return;
-        }
-        if ignored_dirs
-            .iter()
-            .any(|dir| self.base_path.starts_with(dir))
-        {
-            for file in self.sync_data.files.iter_mut() {
-                file.git_status = Some(git2::Status::IGNORED);
-            }
-            return;
-        }
-
-        let prefixes: ahash::AHashSet<String> = ignored_dirs
-            .iter()
-            .filter_map(|dir| dir.strip_prefix(&self.base_path).ok())
-            .map(|rel| {
-                let mut rel =
-                    crate::path_utils::to_canonical_slashes(&rel.to_string_lossy()).into_owned();
-                rel.push('/');
-                rel
-            })
-            .collect();
-        if prefixes.is_empty() {
-            return;
-        }
-
-        let in_ignored_dir: Vec<bool> = self
-            .sync_data
-            .dirs
-            .iter()
-            .map(|dir| {
-                let path = dir.relative_path(&*self);
-                path.match_indices('/')
-                    .any(|(i, _)| prefixes.contains(&path[..=i]))
-            })
-            .collect();
-
-        for file in self.sync_data.files.iter_mut() {
-            if in_ignored_dir
-                .get(file.parent_dir_index as usize)
-                .copied()
-                .unwrap_or(false)
-            {
-                file.git_status = Some(git2::Status::IGNORED);
-            }
-        }
     }
 
     // Replaces every recency score with a freshly computed set. `None` zeroes
@@ -2145,14 +2078,11 @@ impl FileSync {
         git_workdir
     }
 
-    pub(crate) fn spawn_git_status(
-        git_workdir: PathBuf,
-        include_ignored: bool,
-    ) -> JoinHandle<Option<GitStatusCache>> {
+    pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
         std::thread::spawn(move || {
             GitStatusCache::read_git_status(
                 Some(git_workdir.as_path()),
-                &mut crate::git::initial_scan_status_options(include_ignored),
+                &mut crate::git::initial_scan_status_options(),
             )
         })
     }

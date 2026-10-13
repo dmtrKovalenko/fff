@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use fff_search::file_picker::FilePicker;
 use fff_search::{FilePickerOptions, SharedFilePicker, SharedFrecency};
-use git2::Status;
 use tempfile::TempDir;
 
 #[test]
-fn collect_files_applies_extra_ignore_and_marks_included_files_ignored() {
+fn collect_files_applies_extra_ignore() {
     let (_tmp, base) = init_repo("secrets/\n*.log\n");
     for rel in [
         "main.rs",
@@ -32,23 +31,20 @@ fn collect_files_applies_extra_ignore_and_marks_included_files_ignored() {
     .unwrap();
     picker.collect_files().unwrap();
 
-    for rel in ["keep.log", "secrets/key.env", "secrets/deep/token.env"] {
-        assert_eq!(
-            status_of(&picker, rel),
-            Some(Some(Status::IGNORED)),
-            "{rel}"
-        );
+    for rel in [
+        "main.rs",
+        "keep.log",
+        "secrets/key.env",
+        "secrets/deep/token.env",
+    ] {
+        assert!(is_indexed(&picker, rel), "{rel}");
     }
-    assert!(status_of(&picker, "main.rs").is_some());
-    assert_ne!(status_of(&picker, "main.rs"), Some(Some(Status::IGNORED)));
-    assert_eq!(
-        status_of(&picker, "debug.log"),
-        None,
+    assert!(
+        !is_indexed(&picker, "debug.log"),
         "non-included ignores stay out"
     );
-    assert_eq!(
-        status_of(&picker, "generated/out.rs"),
-        None,
+    assert!(
+        !is_indexed(&picker, "generated/out.rs"),
         "extra ignores apply"
     );
 }
@@ -94,13 +90,12 @@ fn nul_line_does_not_drop_other_rules() {
     .unwrap();
     picker.collect_files().unwrap();
 
-    assert!(status_of(&picker, "secrets/key.env").is_some());
+    assert!(is_indexed(&picker, "secrets/key.env"));
 }
 
-// Runtime path: the git-status worker marks included files, and the watcher
-// filters new files with the same rules the walk used.
+// The watcher filters new files with the same rules the walk used.
 #[test]
-fn watcher_and_git_worker_honor_extra_ignore() {
+fn watcher_honors_extra_ignore() {
     let (_tmp, base) = init_repo("secrets/\n*.log\n");
     write(&base, "main.rs");
     write(&base, "secrets/key.env");
@@ -121,25 +116,21 @@ fn watcher_and_git_worker_honor_extra_ignore() {
     assert!(shared.wait_for_scan(Duration::from_secs(30)));
     assert!(shared.wait_for_watcher(Duration::from_secs(30)));
 
-    assert!(
-        wait_until(|| shared_status(&shared, "secrets/key.env") == Some(Some(Status::IGNORED))),
-        "included file never got the ignored status"
-    );
+    assert!(shared_indexed(&shared, "secrets/key.env"));
 
     write(&base, "debug.log");
     write(&base, "generated/new.rs");
     write(&base, "secrets/new.env");
     assert!(
-        wait_until(|| shared_status(&shared, "secrets/new.env").is_some()),
+        wait_until(|| shared_indexed(&shared, "secrets/new.env")),
         "watcher dropped a force-included file"
     );
-    assert_eq!(shared_status(&shared, "debug.log"), None);
-    assert_eq!(shared_status(&shared, "generated/new.rs"), None);
+    assert!(!shared_indexed(&shared, "debug.log"));
+    assert!(!shared_indexed(&shared, "generated/new.rs"));
 }
 
 fn init_repo(gitignore: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().unwrap();
-    // Git statuses only map onto the index under a symlink-free base (macOS /var -> /private/var).
     let base = fs::canonicalize(tmp.path()).unwrap();
     git2::Repository::init(&base).unwrap();
     fs::write(base.join(".gitignore"), gitignore).unwrap();
@@ -152,18 +143,19 @@ fn write(base: &Path, rel: &str) {
     fs::write(path, b"x").unwrap();
 }
 
-// `None` when not indexed, otherwise the file's git status.
-fn status_of(picker: &FilePicker, rel: &str) -> Option<Option<Status>> {
+fn is_indexed(picker: &FilePicker, rel: &str) -> bool {
     picker
         .get_files()
         .iter()
-        .find(|f| f.relative_path(picker) == rel)
-        .map(|f| f.git_status)
+        .any(|f| f.relative_path(picker) == rel)
 }
 
-fn shared_status(shared: &SharedFilePicker, rel: &str) -> Option<Option<Status>> {
-    let guard = shared.read().ok()?;
-    status_of(guard.as_ref()?, rel)
+fn shared_indexed(shared: &SharedFilePicker, rel: &str) -> bool {
+    shared
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|p| is_indexed(p, rel)))
+        .unwrap_or(false)
 }
 
 fn wait_until(mut cond: impl FnMut() -> bool) -> bool {

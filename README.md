@@ -601,7 +601,7 @@ extra_ignore = {
 ```
 
 Plain git semantics apply: a file inside an ignored directory is only reachable once the directory itself is included.
-Included files keep the `ignored` git status. The same option is `extraIgnore` in the Node/Bun SDKs, `extra_ignore` in
+The same option is `extraIgnore` in the Node/Bun SDKs, `extra_ignore` in
 Python and the C `FffCreateOptions` (newline-separated), and a repeatable `--extra-ignore` flag in fff-mcp. It needs the
 zlob walker that release builds use; the pure-Rust walker logs a warning and skips it.
 

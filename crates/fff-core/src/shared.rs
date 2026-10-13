@@ -350,7 +350,7 @@ impl SharedFilePicker {
     /// Refresh git statuses for all indexed files
     #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
-        let (git_root, recency_config, base_path, picker_id, include_ignored) = {
+        let (git_root, recency_config, base_path, picker_id) = {
             // we do the libgit2 off lock cause it might take quite some time on very large repos
             let guard = self.read()?;
             let Some(ref picker) = *guard else {
@@ -361,7 +361,6 @@ impl SharedFilePicker {
                 picker.git_recency_config(),
                 picker.base_path().to_path_buf(),
                 picker.trace_id().to_owned(),
-                picker.reincludes_ignored(),
             )
         };
 
@@ -373,12 +372,9 @@ impl SharedFilePicker {
         });
 
         let git_status = repo.as_ref().and_then(|repo| {
-            GitStatusCache::read_status(
-                repo,
-                &mut crate::git::default_status_options(include_ignored),
-            )
-            .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
-            .ok()
+            GitStatusCache::read_status(repo, &mut crate::git::default_status_options())
+                .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
+                .ok()
         });
 
         let recency = repo
@@ -416,15 +412,12 @@ impl SharedFilePicker {
             return Ok(());
         }
 
-        let (git_root, include_ignored) = {
+        let git_root = {
             let guard = self.read()?;
             let Some(ref picker) = *guard else {
                 return Err(Error::FilePickerMissing);
             };
-            (
-                picker.git_root().map(|p| p.to_path_buf()),
-                picker.reincludes_ignored(),
-            )
+            picker.git_root().map(|p| p.to_path_buf())
         };
         let Some(git_root) = git_root else {
             return Ok(());
@@ -433,7 +426,7 @@ impl SharedFilePicker {
         wait_for_git_index_lock_release(&git_root);
 
         let repo = Repository::open(&git_root)?;
-        let status = GitStatusCache::git_status_for_paths(&repo, paths, include_ignored)?;
+        let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
