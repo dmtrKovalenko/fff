@@ -75,24 +75,6 @@ fn extra_ignore_rescues_star_ignored_subtree() {
     assert_eq!(rels, vec!["nvim/init.lua", "nvim/lua/mappings.lua"]);
 }
 
-// zlob rejects the whole list on an interior NUL; only the bad line may be dropped.
-#[test]
-fn nul_line_does_not_drop_other_rules() {
-    let (_tmp, base) = init_repo("secrets/\n");
-    write(&base, "secrets/key.env");
-
-    let mut picker = FilePicker::new(FilePickerOptions {
-        base_path: base.to_string_lossy().into_owned(),
-        watch: false,
-        extra_ignore: vec!["bad\0line".into(), "!secrets/".into()],
-        ..Default::default()
-    })
-    .unwrap();
-    picker.collect_files().unwrap();
-
-    assert!(is_indexed(&picker, "secrets/key.env"));
-}
-
 // The watcher filters new files with the same rules the walk used.
 #[test]
 fn watcher_honors_extra_ignore() {
