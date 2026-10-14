@@ -32,7 +32,7 @@ git2 = { version = "0.21.0", default-features = false, features = [
 glidesort = "0.1"
 globset = "0.4"
 heed = "0.22.0"
-ignore = "0.4.22"
+ignore = "0.4.33"
 memmap2 = "0.9"
 mimalloc = "0.1.47"
 signal-hook-registry = "1.4"
