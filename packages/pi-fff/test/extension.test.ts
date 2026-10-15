@@ -7,6 +7,7 @@ type MockFinder = {
   isDestroyed: boolean;
   waitForScan: ReturnType<typeof mock>;
   mixedSearch: ReturnType<typeof mock>;
+  fileSearch: ReturnType<typeof mock>;
   grep: ReturnType<typeof mock>;
   multiGrep: ReturnType<typeof mock>;
   getScanProgress: ReturnType<typeof mock>;
@@ -16,6 +17,7 @@ type MockFinder = {
 const createCalls: unknown[] = [];
 let finders: MockFinder[] = [];
 let mixedSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
+let fileSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
 let grepImpl: ((query: string, options: unknown) => unknown) | undefined;
 let multiGrepImpl: ((options: unknown) => unknown) | undefined;
 let scanProgressImpl: (() => unknown) | undefined;
@@ -47,6 +49,13 @@ function createMockFinder(): MockFinder {
           totalFiles: 0,
           totalDirs: 0,
         },
+      };
+    }),
+    fileSearch: mock((query: string, options: unknown) => {
+      if (fileSearchImpl) return fileSearchImpl(query, options);
+      return {
+        ok: true,
+        value: { items: [], scores: [], totalMatched: 0, totalFiles: 0 },
       };
     }),
     grep: mock((query: string, options: unknown) => {
@@ -253,6 +262,7 @@ beforeEach(() => {
   createCalls.length = 0;
   finders = [];
   mixedSearchImpl = undefined;
+  fileSearchImpl = undefined;
   grepImpl = undefined;
   multiGrepImpl = undefined;
   scanProgressImpl = undefined;
@@ -1250,6 +1260,7 @@ for (const stage of [1, 2, 3, 4]) {
       const params = { pattern: "Needle", definitions_only: true };
       const first = await tool.execute("partial", params, abortOptions().signal);
       expect(calls).toHaveLength(stage);
+      expect(finders[0].fileSearch).not.toHaveBeenCalled();
       const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
       const last = await tool.execute(
         "finish",
@@ -1287,9 +1298,72 @@ for (const stage of [1, 2, 3, 4]) {
     await tool.execute("finish", { pattern: "Needle", cursor }, abortOptions().signal);
     expect(calls).toHaveLength(stage + 1);
     expect(calls[stage].cursor).toEqual({ _offset: 7 });
+    expect(finders[0].fileSearch).not.toHaveBeenCalled();
     await shutdown(setup);
   });
 }
+
+test("empty definition search suggests other files and preserves exclusions", async () => {
+  const calls: any[] = [];
+  grepImpl = (query, options) => {
+    calls.push({ query, options });
+    if (calls.length <= 4) return grepPage();
+    const page = grepPage("Needle");
+    page.value.items[0].relativePath = "other/hit.rs";
+    return page;
+  };
+  const setup = await start("tools-and-ui");
+  const tool = setup.pi.registerTool.mock.calls
+    .map(([tool]) => tool)
+    .find((tool) => tool.name === "ffgrep");
+  const result = await tool.execute(
+    "suggest",
+    {
+      pattern: "Needle",
+      path: "missing/",
+      exclude: "vendor/",
+      definitions_only: true,
+    },
+    abortOptions().signal,
+  );
+  expect(calls).toHaveLength(5);
+  expect(calls[4].query).toBe("!vendor/ Needle");
+  expect(calls[4].options).toMatchObject({
+    classifyDefinitions: "off",
+    enforceTimeBudget: true,
+    pageSize: 3,
+  });
+  expect(result.content[0].text).toContain("elsewhere in the indexed project");
+  expect(result.content[0].text).toContain("other/hit.rs");
+  expect(result.content[0].text).not.toContain("cursor=");
+  expect(result.details.totalMatched).toBe(0);
+  await shutdown(setup);
+});
+
+test("empty definition search labels filename suggestions as unverified", async () => {
+  fileSearchImpl = () => ({
+    ok: true,
+    value: {
+      items: [{ relativePath: "NeedleGuide.md" }],
+      scores: [{ baseScore: 200 }],
+      totalMatched: 1,
+      totalFiles: 1,
+    },
+  });
+  const setup = await start("tools-and-ui");
+  const tool = setup.pi.registerTool.mock.calls
+    .map(([tool]) => tool)
+    .find((tool) => tool.name === "ffgrep");
+  const result = await tool.execute(
+    "suggest",
+    { pattern: "NeedleGuide", definitions_only: true },
+    abortOptions().signal,
+  );
+  expect(result.content[0].text).toContain("contents are unverified");
+  expect(result.content[0].text).toContain("NeedleGuide.md");
+  expect(finders[0].grep).toHaveBeenCalledTimes(4);
+  await shutdown(setup);
+});
 
 test("definition fallback stops on cancellation or a native error", async () => {
   for (const cancel of [false, true]) {

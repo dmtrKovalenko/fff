@@ -6,4 +6,4 @@ Set definitions_only=true for declarations. Returned source lines verify declara
 
 Regex searches one line. Use multi_grep for literal alternatives, with its constraints field for the shared file scope. Inline query constraints are also supported.
 
-Definition search reports fallback to references or fuzzy matches when no declarations match. Multi-grep stays literal. Keep query, path, and other constraints unchanged when continuing a cursor.
+Definition search reports fallback to references or fuzzy matches when no declarations match. If all stages find nothing, it suggests files from a broader search, preserving exclusions. Suggestions are not declaration results. Multi-grep stays literal. Keep query, path, and other constraints unchanged when continuing a cursor.

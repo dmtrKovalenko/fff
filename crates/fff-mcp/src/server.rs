@@ -526,6 +526,12 @@ impl FffServer {
         let path_notice = missing_path
             .map(|path| format!("No indexed file matches '{path}'. Searched all files instead."));
         if result.matches.is_empty() && result.next_file_offset == 0 {
+            if prefer_definitions
+                && !cursor.found_matches
+                && let Some(suggestions) = suggest_other_files(picker, &original, mode)
+            {
+                return Ok(with_notice(grep_response(suggestions, false), path_notice));
+            }
             let response = grep_response(
                 "0 matches.".into(),
                 prefer_definitions && !cursor.found_matches,
@@ -899,6 +905,67 @@ fn parse_scoped_grep<'a>(
     parsed
 }
 
+fn suggest_other_files(
+    picker: &fff::FilePicker,
+    query: &FFFQuery<'_>,
+    mode: GrepMode,
+) -> Option<String> {
+    let mut broader = query.clone();
+    broader.raw_query = "";
+    broader
+        .constraints
+        .retain(|c| matches!(c, Constraint::Exclude(_) | Constraint::Not(_)));
+    if broader.constraints.len() < query.constraints.len() {
+        let result = picker.grep(
+            &broader,
+            &GrepSearchOptions {
+                mode,
+                max_matches_per_file: 1,
+                page_limit: 3,
+                time_budget_ms: 100,
+                enforce_time_budget: true,
+                ..Default::default()
+            },
+        );
+        if !result.files.is_empty() {
+            let files = result
+                .files
+                .iter()
+                .take(3)
+                .map(|file| file.relative_path(picker))
+                .collect::<Vec<_>>();
+            return Some(format!(
+                "No matches in the requested scope. These files elsewhere in the indexed project contain the pattern:\n{}",
+                files.join("\n")
+            ));
+        }
+    }
+    let text = cleanup_fuzzy_query(&query.grep_text());
+    if text.is_empty() {
+        return None;
+    }
+    broader.fuzzy_query = fff_query_parser::FuzzyQuery::Text(&text);
+    let result = picker.fuzzy_search(
+        &broader,
+        None,
+        FuzzySearchOptions {
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 3,
+            },
+            ..Default::default()
+        },
+    );
+    let files = result
+        .items
+        .iter()
+        .zip(&result.scores)
+        .filter(|(_, score)| score.base_score > text.len() as i32 * 10)
+        .map(|(file, _)| file.relative_path(picker))
+        .collect::<Vec<_>>();
+    (!files.is_empty()).then(|| format!("No matching definitions or other matches found in the requested scope. These filenames may be relevant; their contents are unverified:\n{}", files.join("\n")))
+}
+
 fn path_scope(path: Option<&str>, base: &std::path::Path) -> Result<Option<String>, ErrorData> {
     let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
         return Ok(None);
@@ -1242,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn definition_fallback_keeps_exclusions_out_of_literal_retries() {
+    fn empty_scopes_only_broaden_with_a_file_suggestion_notice() {
         let (_dir, server) = definition_server(&[
             ("a.rs".into(), "fn Needle() {}\nNeedle();\n*.txt Needle\n"),
             ("b.txt".into(), "unrelated\n"),
@@ -1252,11 +1319,20 @@ mod tests {
                 "query": query, "definitions_only": true,
             }))
             .unwrap();
-            assert_eq!(
-                response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap()),
-                "No matching definitions or other matches found.",
-                "{query}"
-            );
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            if query.starts_with('!') {
+                assert_eq!(
+                    text, "No matching definitions or other matches found.",
+                    "{query}"
+                );
+            } else {
+                assert!(
+                    text.contains("elsewhere in the indexed project"),
+                    "{query}: {text}"
+                );
+                assert!(text.ends_with("a.rs"), "{query}: {text}");
+                assert!(!text.contains("fn Needle"), "{query}: {text}");
+            }
         }
     }
 
@@ -1501,6 +1577,33 @@ mod tests {
                     .any(|key| key == "path")
             );
         }
+    }
+
+    #[test]
+    fn empty_definition_search_suggests_files_without_claiming_declarations() {
+        let (_dir, server) = definition_server(&[
+            ("other/target.rs".into(), "fn Needle() {}"),
+            ("excluded/target.rs".into(), "fn Needle() {}"),
+            ("NeedleGuide.md".into(), "Unrelated content"),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "!excluded/ Needle", "path": "missing", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("elsewhere in the indexed project"), "{text}");
+        assert!(text.contains("other/target.rs"), "{text}");
+        assert!(!text.contains("excluded/target.rs"), "{text}");
+        assert!(!text.contains("fn Needle"), "{text}");
+        assert!(!text.contains("cursor:"), "{text}");
+
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "!other/ !excluded/ NeedleGuide", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("contents are unverified"), "{text}");
+        assert!(text.contains("NeedleGuide.md"), "{text}");
     }
 
     #[test]
