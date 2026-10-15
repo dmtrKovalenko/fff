@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                        For Neovim >= 0.10.0    Last change: 2026 September 21
+                          For Neovim >= 0.10.0    Last change: 2026 October 15
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -141,6 +141,7 @@ Each match item has `relative_path`, `name`, `line_number`, `col`,
       time_budget_ms        = 0,
       enforce_time_budget   = false,    -- also bound zero-match searches
       trim_whitespace       = false,
+      classify_definitions  = false,
       cwd                   = nil,      -- switch indexed root if different
       wait_for_index_ms     = nil,      -- override the default scan wait timeout
     })
@@ -313,8 +314,9 @@ Defaults are sensible. Override only what you care about.
         casing = nil, -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case when set
         time_budget_ms = 150,
         enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
-        modes = { 'plain', 'regex', 'fuzzy' },
+        modes = { 'plain', 'regex', 'fuzzy', 'definition_only' },
         trim_whitespace = false,
+        classify_definitions = false, -- classify matching definitions and show them before other matches
         enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
         location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
       },
@@ -352,15 +354,108 @@ Defaults are sensible. Override only what you care about.
 
 LIVE GREP MODES ~
 
-`<S-Tab>` cycles between `plain`, `regex`, and `fuzzy`. The list is
-configurable via `grep.modes`, and single-mode setups hide the indicator
-entirely.
+`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The
+list is configurable via `grep.modes`, and single-mode setups hide the
+indicator entirely. `definition_only` uses plain substring matching and returns
+only matched declarations, regardless of `grep.classify_definitions`. Its
+status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
+
+Set `grep.classify_definitions = true` to search matching definition lines
+first across pages, grouped under their file names, then show the remaining
+matches. It defaults to `false`, which skips definition classification and
+grouping. A **Definitions** divider separates the sections when both are on the
+same page. With a bottom prompt, the order reverses so definitions stay nearest
+the prompt. Files with both kinds of matches appear in both sections, with each
+match shown once.
+
+Each core grep call uses one `classify_definitions` mode. Rust stores it in
+`GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript
+SDKs expose the same setting as `classifyDefinitions`.
+
+  -----------------------------------------------------------------------
+  Mode              Rust variant      C integer         Result
+  ----------------- ----------------- ----------------- -----------------
+  off               Off               0                 All matches,
+                                                        without
+                                                        classification
+
+  classify          Classify          1                 All matches, with
+                                                        definition labels
+
+  definition_only   DefinitionOnly    2                 Only matches on
+                                                        declared names
+
+  usage_only        UsageOnly         3                 Only other
+                                                        matches
+  -----------------------------------------------------------------------
+JavaScript and Neovim also accept the existing booleans: `false` means `off`,
+and `true` means `classify`. Neovim groups `classify` results into definitions
+first, then usages. The SDK default is `off`. Use the same mode when continuing
+with a cursor. The C argument is a `uint8_t`, preserving the byte
+representation of existing boolean calls (`0` and `1`). Modes `2` and `3`
+require the updated native library; never send them to a library that still
+expects `bool`.
+
+>typescript
+    finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });
+    finder.multiGrep({ patterns: ['AudioMap', 'audio_map'], classifyDefinitions: 'definition_only' });
+<
+
+MCP and Pi expose only the optional `definitions_only` boolean to the model.
+MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi’s
+`ffgrep` uses `pattern` instead of `query`. If the completed search finds no
+matching declarations, the tool reports that and returns ordinary matches.
+Cursors preserve the definition search or fallback state, so the model does not
+need to repeat a mode. The multi-pattern tools accept the same flag.
+
+SDK definition filtering occurs before page and per-file result limits. Cursors
+resume at the next file; page size is a soft limit because the current file is
+returned together. Repeat the same query, mode, and constraints for each page.
+A timed-out page can be empty with a continuation cursor. In Neovim, move down
+(top prompt) or up (bottom prompt) to continue an empty page. Context lines can
+still contain ordinary code.
+
+Definition classification accepts source lines up to 256 bytes, including
+indentation and excluding line endings. Longer lines stay ordinary matches and
+are excluded from `definition_only`. The limit uses the original source bytes,
+regardless of display truncation or whitespace trimming. For multiline regex
+matches, it applies to the first physical line.
+
+Supported language families are Rust, Python, Go, JavaScript/TypeScript, Lua,
+C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Elixir,
+Zig, PHP, shell, OCaml/ReScript/F#, and Haskell. The byte-keyword rules in
+`definition/languages.rs` <crates/fff-core/src/definition/languages.rs> compile
+into per-language checkers. Each checker has fixed grammar constants and
+returns a boolean without a runtime rule dispatcher. Language detection checks
+at most the last eight filename bytes against a compile-time suffix table.
+Unknown extensions and extensionless filenames are not classified.
+`definition_only` excludes them before sorting, pagination, or content reads,
+and preserves explicit file constraints on empty results.
+
+Identifier scanning uses compile-time byte tables for short tokens, then checks
+16 bytes at a time with NEON on little-endian ARM64 or SSE2 on x86-64. Other
+targets use the scalar table. Loads stay within the source slice, including the
+final partial block. The parser uses `memchr` for quotes and bracket groups and
+does not allocate.
+
+Files are flagged during scanning. A Rust byte parser uses SIMD-backed
+delimiter searches on matched lines before pagination, including common
+modifiers, methods, and function assignments. Matches must overlap the declared
+name: `user_file` recognizes `fn user_file`, `mod user_file`, and `fn
+test_user_file`. Implementation and extension blocks stay with ordinary
+matches. In fuzzy mode, every matched character must fall inside the declared
+name; matches spread across the name and its arguments, receiver, or return
+type are ordinary matches. Classification adds no file reads or heap
+allocations. This is a line heuristic; multiline declarations and surrounding
+comment or string context can be missed.
 
 Per-call override:
 
 >lua
     require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } })
     require('fff').live_grep({ query = 'search term' }) -- pre-fill
+    require('fff').live_grep({ query = 'user_file', grep = { modes = { 'definition_only' } } })
+    local page = require('fff').content_search('user_file', { mode = 'definition_only' })
 <
 
 
