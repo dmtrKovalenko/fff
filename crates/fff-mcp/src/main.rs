@@ -51,7 +51,7 @@ pub const MCP_INSTRUCTIONS: &str = concat!(
     "Grep matches single lines. Search for ONE identifier per query:\n",
     "  + 'InProgressQuote'           -> finds definition + all usages\n",
     "  + 'ActorAuth'                 -> finds enum, struct, all call sites\n",
-    "Set definitions_only to true to find declarations. If none are found, the tool reports that and returns other matches. Cursors preserve this behavior.\n",
+    "Set definitions_only to true to find declarations. Grep tries declarations, exact matches, fuzzy declarations, then fuzzy matches; it reports fallbacks. Multi-grep stays literal. Cursors keep the current stage; fallback starts only after a completed search with no matches.\n",
     "  x 'load.*metadata.*InProgressQuote' -> regex spanning multiple tokens, 0 results\n",
     "  x 'ctx.data::<ActorAuth>'     -> code syntax, too specific, 0 results\n",
     "  x 'struct ActorAuth'          -> adding keywords narrows results, misses enums/traits/type aliases\n",

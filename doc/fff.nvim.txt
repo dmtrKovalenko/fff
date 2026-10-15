@@ -404,11 +404,21 @@ expects `bool`.
 <
 
 MCP and Pi expose only the optional `definitions_only` boolean to the model.
-MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi’s
-`ffgrep` uses `pattern` instead of `query`. If the completed search finds no
-matching declarations, the tool reports that and returns ordinary matches.
-Cursors preserve the definition search or fallback state, so the model does not
-need to repeat a mode. The multi-pattern tools accept the same flag.
+MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi’s `ffgrep`
+uses `pattern` instead of `query`. Single-query grep tries these stages in
+order:
+
+1. Matching declarations.
+2. Ordinary exact matches, with a notice that no matching declarations were
+   found.
+3. Fuzzy declarations, labeled “Maybe you meant these definitions”.
+4. Fuzzy matches of any kind, labeled “Maybe you meant these other matches”.
+
+A stage advances only after its complete search returns no matches. A partial
+page keeps its current stage, and a stage that returned matches never broadens
+when pagination ends. Cursors preserve the stage, and all stages keep the
+original file constraints. The multi-pattern tools accept the same flag but
+use only the first two stages; their patterns remain literal.
 
 SDK definition filtering occurs before page and per-file result limits. Cursors
 resume at the next file; page size is a soft limit because the current file is

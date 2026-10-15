@@ -89,11 +89,18 @@ function toolNameList(names: ToolNames): string[] {
 // Cursor store — simple bounded Map for pagination cursors
 // ---------------------------------------------------------------------------
 
+type GrepStage =
+  | "normal"
+  | "definitions"
+  | "references"
+  | "fuzzy_definitions"
+  | "fuzzy_matches";
+
 interface ToolGrepCursor {
   cursor: GrepCursor;
   finder: FileFinderApi;
-  definitionsOnly: boolean;
-  foundDefinitions: boolean;
+  stage: GrepStage;
+  foundMatches: boolean;
   mode?: GrepMode;
   query?: string;
 }
@@ -1013,7 +1020,7 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptSnippet: "Grep contents",
     promptGuidelines: (names) => [
       `${names.grep}: prefer bare identifiers as patterns. Literal queries are most efficient.`,
-      `${names.grep}: use definitions_only: true to find declarations; if none are found, the tool returns other matches with a notice.`,
+      `${names.grep}: use definitions_only: true to try declarations, exact matches, fuzzy declarations, then fuzzy matches. Each fallback starts only after a completed search with no matches and includes a notice.`,
       `${names.grep}: use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').`,
       `${names.grep}: caseSensitive: true when you need exact case (smart-case otherwise).`,
       `${names.grep}: after 1-2 greps, read the top match instead of more greps.`,
@@ -1083,41 +1090,37 @@ export default function fffExtension(pi: ExtensionAPI) {
       // (case-insensitive when pattern is all lowercase).
       const smartCase = params.caseSensitive !== true;
 
-      let definitionsOnly = resumed?.definitionsOnly ?? params.definitions_only ?? false;
-      const preferDefinitions = definitionsOnly;
-      const foundDefinitions = resumed?.foundDefinitions ?? false;
+      let stage = resumed?.stage ?? (params.definitions_only ? "definitions" : "normal");
+      const preferDefinitions = stage !== "normal";
+      const foundMatches = resumed?.foundMatches ?? false;
       const options = {
-        mode,
         smartCase,
         maxMatchesPerFile: GREP_MAX_MATCHES_PER_FILE,
         pageSize,
-        cursor: resumed?.cursor ?? null,
         beforeContext: context,
         afterContext: context,
         timeBudgetMs: GREP_TIME_BUDGET_MS,
       };
-      const grepResult = picker.grep(query, {
-        ...options,
-        classifyDefinitions: definitionsOnly ? "definition_only" : "classify",
-      });
-
-      if (!grepResult.ok) throw new Error(grepResult.error);
-
-      let result = grepResult.value;
-      const definitionsFallback =
-        definitionsOnly &&
-        !foundDefinitions &&
-        result.items.length === 0 &&
-        !result.nextCursor;
-      if (definitionsFallback) {
-        const fallback = picker.grep(query, {
+      let result: GrepResult;
+      let nativeCursor = resumed?.cursor ?? null;
+      for (;;) {
+        if (signal?.aborted) throw new Error("Operation aborted");
+        if (isFuzzyGrepStage(stage)) mode = "fuzzy";
+        const page = picker.grep(query, {
           ...options,
-          cursor: null,
-          classifyDefinitions: "classify",
+          mode,
+          cursor: nativeCursor,
+          classifyDefinitions:
+            stage === "definitions" || stage === "fuzzy_definitions"
+              ? "definition_only"
+              : "classify",
         });
-        if (!fallback.ok) throw new Error(fallback.error);
-        result = fallback.value;
-        definitionsOnly = false;
+        if (!page.ok) throw new Error(page.error);
+        result = page.value;
+        const next = nextGrepStage(stage);
+        if (result.items.length > 0 || result.nextCursor || foundMatches || !next) break;
+        stage = next;
+        nativeCursor = null;
       }
       let fuzzyNotice: string | null = null;
 
@@ -1126,7 +1129,8 @@ export default function fffExtension(pi: ExtensionAPI) {
       if (
         result.items.length === 0 &&
         !result.nextCursor &&
-        (!params.cursor || definitionsFallback) &&
+        !params.cursor &&
+        !preferDefinitions &&
         mode !== "regex"
       ) {
         // When the caller pinned a specific file (path has an extension), the
@@ -1136,7 +1140,7 @@ export default function fffExtension(pi: ExtensionAPI) {
         // excluded / out-of-scope directories.
         const lastSeg = params.path?.split(/[\\/]/).pop() ?? "";
         const pathTargetsFile = /\.[a-zA-Z][a-zA-Z0-9]{0,9}$/.test(lastSeg);
-        const fuzzyQuery = pathTargetsFile && !preferDefinitions ? pattern : query;
+        const fuzzyQuery = pathTargetsFile ? pattern : query;
         const fuzzy = picker.grep(fuzzyQuery, {
           mode: "fuzzy",
           smartCase,
@@ -1145,7 +1149,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           cursor: null,
           beforeContext: 0,
           afterContext: 0,
-          classifyDefinitions: definitionsOnly ? "definition_only" : "classify",
+          classifyDefinitions: "classify",
           timeBudgetMs: GREP_TIME_BUDGET_MS,
         });
 
@@ -1166,9 +1170,8 @@ export default function fffExtension(pi: ExtensionAPI) {
         const cursor = storeCursor({
           cursor: result.nextCursor,
           finder: picker,
-          definitionsOnly,
-          foundDefinitions:
-            foundDefinitions || (definitionsOnly && result.items.length > 0),
+          stage,
+          foundMatches: foundMatches || result.items.length > 0,
           mode,
           query,
         });
@@ -1177,12 +1180,12 @@ export default function fffExtension(pi: ExtensionAPI) {
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
       if (fuzzyNotice) output = `[${fuzzyNotice}]\n${output}`;
-      if (definitionsFallback) {
+      if (preferDefinitions && (!foundMatches || isFuzzyGrepStage(stage))) {
         const notice =
-          result.items.length > 0 || result.nextCursor
-            ? "No matching definitions found. Showing other matches:"
-            : "No matching definitions or other matches found.";
-        output = `[${notice}]\n${output}`;
+          result.items.length === 0 && !result.nextCursor && !foundMatches
+            ? "No matching definitions or other matches found."
+            : grepStageNotice(stage);
+        if (notice) output = `[${notice}]\n${output}`;
       }
 
       return {
@@ -1411,9 +1414,9 @@ export default function fffExtension(pi: ExtensionAPI) {
         const pageSize = Math.min(effectiveLimit, GREP_PAGE_SIZE_MAX);
         const context = clampContext(params.context);
 
-        let definitionsOnly =
-          resumed?.definitionsOnly ?? params.definitions_only ?? false;
-        const foundDefinitions = resumed?.foundDefinitions ?? false;
+        let stage =
+          resumed?.stage ?? (params.definitions_only ? "definitions" : "normal");
+        const foundMatches = resumed?.foundMatches ?? false;
         const options = {
           patterns: params.patterns,
           constraints: params.constraints,
@@ -1426,15 +1429,15 @@ export default function fffExtension(pi: ExtensionAPI) {
         };
         const grepResult = f.multiGrep({
           ...options,
-          classifyDefinitions: definitionsOnly ? "definition_only" : "off",
+          classifyDefinitions: stage === "definitions" ? "definition_only" : "off",
         });
 
         if (!grepResult.ok) throw new Error(grepResult.error);
 
         let result = grepResult.value;
         const definitionsFallback =
-          definitionsOnly &&
-          !foundDefinitions &&
+          stage === "definitions" &&
+          !foundMatches &&
           result.items.length === 0 &&
           !result.nextCursor;
         if (definitionsFallback) {
@@ -1445,7 +1448,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           });
           if (!fallback.ok) throw new Error(fallback.error);
           result = fallback.value;
-          definitionsOnly = false;
+          stage = "references";
         }
         let output = formatGrepOutput(result);
 
@@ -1456,9 +1459,8 @@ export default function fffExtension(pi: ExtensionAPI) {
           const cursor = storeCursor({
             cursor: result.nextCursor,
             finder: f,
-            definitionsOnly,
-            foundDefinitions:
-              foundDefinitions || (definitionsOnly && result.items.length > 0),
+            stage,
+            foundMatches: foundMatches || result.items.length > 0,
           });
           notices.push(`More available. cursor="${cursor}" to continue`);
         }
@@ -1622,4 +1624,34 @@ function sessionModes(entries: unknown): FffMode[] {
     }
   }
   return modes;
+}
+
+function nextGrepStage(stage: GrepStage): GrepStage | undefined {
+  switch (stage) {
+    case "definitions":
+      return "references";
+    case "references":
+      return "fuzzy_definitions";
+    case "fuzzy_definitions":
+      return "fuzzy_matches";
+    default:
+      return undefined;
+  }
+}
+
+function isFuzzyGrepStage(stage: GrepStage): boolean {
+  return stage === "fuzzy_definitions" || stage === "fuzzy_matches";
+}
+
+function grepStageNotice(stage: GrepStage): string | undefined {
+  switch (stage) {
+    case "references":
+      return "No matching definitions found. Showing other matches:";
+    case "fuzzy_definitions":
+      return "No exact matches found. Maybe you meant these definitions:";
+    case "fuzzy_matches":
+      return "No exact matches or approximate definitions found. Maybe you meant these other matches:";
+    default:
+      return undefined;
+  }
 }

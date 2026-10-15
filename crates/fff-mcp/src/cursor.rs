@@ -10,8 +10,53 @@ const MAX_CURSORS: usize = 20;
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GrepCursor {
     pub file_offset: usize,
-    pub definitions_only: bool,
-    pub found_definitions: bool,
+    pub stage: GrepStage,
+    pub found_matches: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum GrepStage {
+    #[default]
+    Normal,
+    Definitions,
+    References,
+    FuzzyDefinitions,
+    FuzzyMatches,
+}
+
+impl GrepStage {
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Definitions => Some(Self::References),
+            Self::References => Some(Self::FuzzyDefinitions),
+            Self::FuzzyDefinitions => Some(Self::FuzzyMatches),
+            _ => None,
+        }
+    }
+
+    pub fn is_fuzzy(self) -> bool {
+        matches!(self, Self::FuzzyDefinitions | Self::FuzzyMatches)
+    }
+
+    pub fn definition_mode(self) -> fff::DefinitionMode {
+        match self {
+            Self::Definitions | Self::FuzzyDefinitions => fff::DefinitionMode::DefinitionOnly,
+            _ => fff::DefinitionMode::Classify,
+        }
+    }
+
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::References => Some("No matching definitions found. Showing other matches:"),
+            Self::FuzzyDefinitions => {
+                Some("No exact matches found. Maybe you meant these definitions:")
+            }
+            Self::FuzzyMatches => Some(
+                "No exact matches or approximate definitions found. Maybe you meant these other matches:",
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// Stores cursor state for paginated grep results.

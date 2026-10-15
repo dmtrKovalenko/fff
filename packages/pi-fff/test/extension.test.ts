@@ -1151,34 +1151,143 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
   });
 }
 
-test("definition fallback keeps fuzzy query and mode in the cursor", async () => {
-  const calls: { query: string; options: any }[] = [];
-  grepImpl = (query, options) => {
-    calls.push({ query, options });
-    if (calls.length <= 2) return grepPage();
-    return grepPage("Needle();", calls.length === 3 ? { _offset: 9 } : null);
-  };
-  const setup = await start("tools-and-ui");
-  const tool = setup.pi.registerTool.mock.calls
-    .map(([tool]) => tool)
-    .find((tool) => tool.name === "ffgrep");
-  const params = {
-    pattern: "Nedle", // spellchecker:disable-line
-    path: "src/",
-    definitions_only: true,
-  };
-  const first = await tool.execute("typo", params, abortOptions().signal);
-  const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
-  await tool.execute("next", { ...params, cursor }, abortOptions().signal);
-  expect(calls.map((call) => call.options.mode)).toEqual([
-    "plain",
-    "plain",
-    "fuzzy",
-    "fuzzy",
-  ]);
-  expect(calls[3].query).toBe(calls[2].query);
-  expect(calls[3].options.classifyDefinitions).toBe("classify");
-  await shutdown(setup);
+for (const fuzzyDefinitions of [true, false]) {
+  test(`definition fallback preserves fuzzy ${fuzzyDefinitions ? "definitions" : "matches"} across pages`, async () => {
+    const calls: { query: string; options: any }[] = [];
+    const firstHit = fuzzyDefinitions ? 3 : 4;
+    grepImpl = (query, options) => {
+      calls.push({ query, options });
+      if (calls.length < firstHit) return grepPage();
+      return grepPage(
+        fuzzyDefinitions ? "fn Needle() {}" : "Needle();",
+        calls.length === firstHit ? { _offset: 9 } : null,
+        fuzzyDefinitions,
+      );
+    };
+    const setup = await start("tools-and-ui");
+    const tool = setup.pi.registerTool.mock.calls
+      .map(([tool]) => tool)
+      .find((tool) => tool.name === "ffgrep");
+    const params = {
+      pattern: "Nedle",
+      path: "src/",
+      exclude: "test/",
+      definitions_only: true,
+    }; // spellchecker:disable-line
+    const first = await tool.execute("typo", params, abortOptions().signal);
+    expect(first.content[0].text).toContain(
+      fuzzyDefinitions
+        ? "Maybe you meant these definitions:"
+        : "Maybe you meant these other matches:",
+    );
+    const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
+    const second = await tool.execute(
+      "next",
+      { pattern: params.pattern, cursor },
+      abortOptions().signal,
+    );
+    expect(calls.map((call) => call.options.mode)).toEqual([
+      "plain",
+      "plain",
+      ...Array(firstHit - 1).fill("fuzzy"),
+    ]);
+    expect(calls.map((call) => call.options.classifyDefinitions)).toEqual([
+      "definition_only",
+      "classify",
+      "definition_only",
+      ...(fuzzyDefinitions ? ["definition_only"] : ["classify", "classify"]),
+    ]);
+    expect(new Set(calls.map((call) => call.query))).toEqual(
+      new Set(["src/ !test/ " + params.pattern]),
+    );
+    expect(calls[firstHit].options.cursor).toEqual({ _offset: 9 });
+    expect(second.content[0].text).toContain("Maybe you meant");
+    await shutdown(setup);
+  });
+}
+
+for (const stage of [1, 2, 3, 4]) {
+  test(`definition fallback waits for an empty partial page at stage ${stage}`, async () => {
+    const calls: any[] = [];
+    grepImpl = (_query, options) => {
+      calls.push(options);
+      if (calls.length === stage) return grepPage(undefined, { _offset: 7 });
+      return grepPage();
+    };
+    const setup = await start("tools-and-ui");
+    const tool = setup.pi.registerTool.mock.calls
+      .map(([tool]) => tool)
+      .find((tool) => tool.name === "ffgrep");
+    const params = { pattern: "Needle", definitions_only: true };
+    const first = await tool.execute("partial", params, abortOptions().signal);
+    expect(calls).toHaveLength(stage);
+    const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
+    const last = await tool.execute(
+      "finish",
+      { pattern: params.pattern, cursor },
+      abortOptions().signal,
+    );
+    expect(calls).toHaveLength(5);
+    expect(calls[stage].cursor).toEqual({ _offset: 7 });
+    expect(calls[stage].mode).toBe(calls[stage - 1].mode);
+    expect(calls[stage].classifyDefinitions).toBe(calls[stage - 1].classifyDefinitions);
+    for (const call of calls.slice(stage + 1)) expect(call.cursor).toBeNull();
+    expect(last.content[0].text).toContain(
+      "No matching definitions or other matches found.",
+    );
+    await shutdown(setup);
+  });
+
+  test(`definition fallback stops after matches were returned at stage ${stage}`, async () => {
+    const calls: any[] = [];
+    grepImpl = (_query, options) => {
+      calls.push(options);
+      return calls.length === stage ? grepPage("Needle", { _offset: 7 }) : grepPage();
+    };
+    const setup = await start("tools-and-ui");
+    const tool = setup.pi.registerTool.mock.calls
+      .map(([tool]) => tool)
+      .find((tool) => tool.name === "ffgrep");
+    const first = await tool.execute(
+      "found",
+      { pattern: "Needle", definitions_only: true },
+      abortOptions().signal,
+    );
+    expect(calls).toHaveLength(stage);
+    const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
+    await tool.execute("finish", { pattern: "Needle", cursor }, abortOptions().signal);
+    expect(calls).toHaveLength(stage + 1);
+    expect(calls[stage].cursor).toEqual({ _offset: 7 });
+    await shutdown(setup);
+  });
+}
+
+test("definition fallback stops on cancellation or a native error", async () => {
+  for (const cancel of [false, true]) {
+    let calls = 0;
+    const controller = new AbortController();
+    grepImpl = () => {
+      calls++;
+      if (cancel) {
+        controller.abort();
+        return grepPage();
+      }
+      return { ok: false, error: "Search failed" };
+    };
+    const setup = await start("tools-and-ui");
+    const tool = setup.pi.registerTool.mock.calls
+      .map(([tool]) => tool)
+      .find((tool) => tool.name === "ffgrep");
+    await expect(
+      tool.execute(
+        "failed",
+        { pattern: "Needle", definitions_only: true },
+        controller.signal,
+      ),
+    ).rejects.toThrow(cancel ? "Operation aborted" : "Search failed");
+    expect(calls).toBe(1);
+    await shutdown(setup);
+  }
 });
 
 test("grep cursors keep the original finder when path changes or is omitted", async () => {

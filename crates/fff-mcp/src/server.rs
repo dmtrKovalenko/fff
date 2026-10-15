@@ -1,4 +1,4 @@
-use crate::cursor::{CursorStore, GrepCursor};
+use crate::cursor::{CursorStore, GrepCursor, GrepStage};
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
 use fff::types::{FileItem, PaginationArgs};
@@ -116,7 +116,7 @@ pub struct GrepParams {
     pub output_mode: Option<String>,
     /// Context lines before/after each match.
     pub context: Option<f64>,
-    /// Return matching declarations. If none are found, report that and return other matches.
+    /// Try declarations, exact matches, fuzzy declarations, then fuzzy matches. Report fallbacks.
     #[serde(default)]
     pub definitions_only: bool,
 }
@@ -287,16 +287,17 @@ impl FffServer {
             .as_deref()
             .and_then(|id| self.cursor_store.lock().ok()?.get_grep(id))
             .unwrap_or(GrepCursor {
-                definitions_only: params.definitions_only,
+                stage: if params.definitions_only {
+                    GrepStage::Definitions
+                } else {
+                    GrepStage::Normal
+                },
                 ..Default::default()
             });
-        let prefer_definitions = cursor.definitions_only;
+        let prefer_definitions = cursor.stage != GrepStage::Normal;
 
         let (mut options, auto_expand) =
             make_grep_options(output_mode, mode, cursor.file_offset, context);
-        if cursor.definitions_only {
-            options.classify_definitions = fff::DefinitionMode::DefinitionOnly;
-        }
         let ctx_lines = options.before_context;
 
         // Acquire picker lock once for the entire operation.
@@ -308,23 +309,47 @@ impl FffServer {
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
 
         let parser = QueryParser::new(AiGrepConfig);
-        let parsed = parser.parse(query);
-        let mut result = picker.grep(&parsed, &options);
-        let definitions_fallback = cursor.definitions_only
-            && !cursor.found_definitions
-            && result.matches.is_empty()
-            && result.next_file_offset == 0;
-        if definitions_fallback {
-            cursor = GrepCursor::default();
-            options.file_offset = 0;
-            options.classify_definitions = fff::DefinitionMode::Classify;
-            result = picker.grep(&parsed, &options);
-        }
+        let original = parser.parse(query);
+        let fuzzy_query = prefer_definitions.then(|| cleanup_fuzzy_query(&original.grep_text()));
+        let mut fuzzy = None;
+        let result = loop {
+            options.classify_definitions = cursor.stage.definition_mode();
+            options.file_offset = cursor.file_offset;
+            options.mode = if cursor.stage.is_fuzzy() {
+                GrepMode::Fuzzy
+            } else {
+                mode
+            };
+            let parsed = if cursor.stage.is_fuzzy() {
+                fuzzy.get_or_insert_with(|| {
+                    let mut parsed = parser.parse(fuzzy_query.as_deref().unwrap_or(query));
+                    parsed.constraints = original.constraints.clone();
+                    parsed
+                })
+            } else {
+                &original
+            };
+            let result = picker.grep(parsed, &options);
+            if result.matches.is_empty()
+                && result.next_file_offset == 0
+                && !cursor.found_matches
+                && let Some(next) = cursor.stage.next()
+            {
+                cursor.stage = next;
+                cursor.file_offset = 0;
+                continue;
+            }
+            break result;
+        };
 
-        if result.matches.is_empty() && result.next_file_offset == 0 && options.file_offset == 0 {
+        if !prefer_definitions
+            && result.matches.is_empty()
+            && result.next_file_offset == 0
+            && options.file_offset == 0
+        {
             // Auto-retry: try broadening multi-word queries by dropping first non-constraint word
             let parts: Vec<&str> = query.split_whitespace().collect();
-            if parts.len() >= 2 && !prefer_definitions {
+            if parts.len() >= 2 {
                 let first_word = parts[0];
                 let is_valid_constraint = first_word.starts_with('!')
                     || first_word.starts_with('*')
@@ -368,25 +393,18 @@ impl FffServer {
                                 "0 matches for '{}'. Auto-broadened to '{}':\n{}",
                                 query, rest_query, text
                             ),
-                            definitions_fallback,
+                            false,
                         ));
                     }
                 }
             }
 
             // Fuzzy fallback for typo tolerance
-            let fuzzy_query = if prefer_definitions {
-                cleanup_fuzzy_query(&parsed.grep_text())
-            } else {
-                cleanup_fuzzy_query(query)
-            };
+            let fuzzy_query = cleanup_fuzzy_query(query);
             let (mut fuzzy_options, _) =
                 make_grep_options(output_mode, GrepMode::Fuzzy, 0, Some(0));
             fuzzy_options.classify_definitions = options.classify_definitions;
-            let mut fuzzy_parsed = parser.parse(&fuzzy_query);
-            if prefer_definitions {
-                fuzzy_parsed.constraints = parsed.constraints.clone();
-            }
+            let fuzzy_parsed = parser.parse(&fuzzy_query);
             let fuzzy_result = picker.grep(&fuzzy_parsed, &fuzzy_options);
 
             if !fuzzy_result.matches.is_empty() {
@@ -405,11 +423,11 @@ impl FffServer {
                     }
                     lines.push(format!(" {}: {}", m.line_number, m.line_content));
                 }
-                return Ok(grep_response(lines.join("\n"), definitions_fallback));
+                return Ok(grep_response(lines.join("\n"), false));
             }
 
             // File path fallback: if query looks like a path, suggest the matching file
-            if query.contains('/') && !prefer_definitions {
+            if query.contains('/') {
                 let file_parser = QueryParser::default();
                 let file_query = file_parser.parse(query);
                 let file_opts = FuzzySearchOptions {
@@ -435,21 +453,29 @@ impl FffServer {
                                 "0 content matches. But there is a relevant file path: {}",
                                 top.relative_path(picker)
                             ),
-                            definitions_fallback,
+                            false,
                         ));
                     }
                 }
             }
 
-            return Ok(grep_response("0 matches.".into(), definitions_fallback));
+            return Ok(grep_response("0 matches.".into(), false));
         }
 
         if result.matches.is_empty() && result.next_file_offset == 0 {
-            return Ok(grep_response("0 matches.".into(), definitions_fallback));
+            return Ok(grep_response(
+                "0 matches.".into(),
+                prefer_definitions && !cursor.found_matches,
+            ));
         }
 
+        let notice = if !cursor.found_matches || cursor.stage.is_fuzzy() {
+            cursor.stage.notice()
+        } else {
+            None
+        };
         cursor.file_offset = result.next_file_offset;
-        cursor.found_definitions |= cursor.definitions_only && !result.matches.is_empty();
+        cursor.found_matches |= !result.matches.is_empty();
 
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
@@ -465,7 +491,11 @@ impl FffServer {
         }
         .format(&mut cs);
 
-        Ok(grep_response(text, definitions_fallback))
+        let text = match notice {
+            Some(notice) => format!("{notice}\n{text}"),
+            None => text,
+        };
+        Ok(grep_response(text, false))
     }
 }
 
@@ -598,7 +628,7 @@ impl FffServer {
     /// Prefer plain text over regex. Filter files with constraints.
     #[tool(
         name = "grep",
-        description = "Search file contents. Search for bare identifiers (e.g. 'InProgressQuote', 'ActorAuth'), NOT code syntax or regex. Set definitions_only to true to find declarations; if none are found, return other matches with a notice. Filter files with constraints (e.g. '*.rs query', 'src/ query'). Use filename, directory (ending with /) or glob expressions to prefilter. See server instructions for constraint syntax and core rules.",
+        description = "Search file contents. Search for bare identifiers (e.g. 'InProgressQuote', 'ActorAuth'), NOT code syntax or regex. Set definitions_only to true to try declarations, exact matches, fuzzy declarations, then fuzzy matches; report fallbacks. Filter files with constraints (e.g. '*.rs query', 'src/ query'). Use filename, directory (ending with /) or glob expressions to prefilter. See server instructions for constraint syntax and core rules.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -661,7 +691,11 @@ impl FffServer {
             .as_deref()
             .and_then(|id| self.cursor_store.lock().ok()?.get_grep(id))
             .unwrap_or(GrepCursor {
-                definitions_only: params.definitions_only,
+                stage: if params.definitions_only {
+                    GrepStage::Definitions
+                } else {
+                    GrepStage::Normal
+                },
                 ..Default::default()
             });
 
@@ -671,7 +705,7 @@ impl FffServer {
             cursor.file_offset,
             context,
         );
-        if cursor.definitions_only {
+        if cursor.stage == GrepStage::Definitions {
             options.classify_definitions = fff::DefinitionMode::DefinitionOnly;
         }
 
@@ -689,12 +723,15 @@ impl FffServer {
         let constraints = parser.parse_constraints(constraint_query);
 
         let mut result = picker.multi_grep(&patterns_refs, &constraints, &options);
-        let definitions_fallback = cursor.definitions_only
-            && !cursor.found_definitions
+        let definitions_fallback = cursor.stage == GrepStage::Definitions
+            && !cursor.found_matches
             && result.matches.is_empty()
             && result.next_file_offset == 0;
         if definitions_fallback {
-            cursor = GrepCursor::default();
+            cursor = GrepCursor {
+                stage: GrepStage::References,
+                ..Default::default()
+            };
             options.file_offset = 0;
             options.classify_definitions = fff::DefinitionMode::Classify;
             result = picker.multi_grep(&patterns_refs, &constraints, &options);
@@ -706,7 +743,7 @@ impl FffServer {
         }
 
         cursor.file_offset = result.next_file_offset;
-        cursor.found_definitions |= cursor.definitions_only && !result.matches.is_empty();
+        cursor.found_matches |= !result.matches.is_empty();
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
             matches: &result.matches,
@@ -895,7 +932,7 @@ mod tests {
         assert!(text.contains("No matching definitions found"), "{text}");
         let id = text.split("cursor: ").nth(1).unwrap().trim();
         let cursor = server.cursor_store.lock().unwrap().get_grep(id).unwrap();
-        assert!(!cursor.definitions_only);
+        assert_eq!(cursor.stage, GrepStage::References);
         assert!(cursor.file_offset > 0);
 
         let params = serde_json::from_value(serde_json::json!({
@@ -908,22 +945,180 @@ mod tests {
     }
 
     #[test]
-    fn completed_definition_pages_do_not_restart_as_usages() {
-        let (_dir, server) =
-            definition_server(&[("a.rs".into(), "Needle();"), ("b.rs".into(), "Needle();")]);
-        let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
-            file_offset: 1,
-            definitions_only: true,
-            found_definitions: true,
-        });
+    fn exact_references_precede_fuzzy_definitions() {
+        let (_dir, server) = definition_server(&[
+            ("definition.rs".into(), "fn Needle() {}"),
+            ("reference.txt".into(), "Nedle();"), // spellchecker:disable-line
+        ]);
         let params = serde_json::from_value(serde_json::json!({
-            "query": "Needle", "cursor": id,
+            "query": "Nedle", "definitions_only": true, // spellchecker:disable-line
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("Showing other matches:"), "{text}");
+        assert!(text.contains("reference.txt"), "{text}");
+        assert!(!text.contains("definition.rs"), "{text}");
+        assert!(!text.contains("Maybe you meant"), "{text}");
+    }
+
+    #[test]
+    fn fuzzy_definitions_precede_fuzzy_references_and_keep_scope() {
+        let (_dir, server) = definition_server(&[
+            ("definition.rs".into(), "fn Needle() {}"),
+            ("reference.txt".into(), "Needle();"),
+        ]);
+        for (query, expected, absent, notice) in [
+            (
+                "Nedle",
+                "definition.rs",
+                "reference.txt",
+                "Maybe you meant these definitions:",
+            ), // spellchecker:disable-line
+            (
+                "reference.txt Nedle",
+                "reference.txt",
+                "definition.rs",
+                "Maybe you meant these other matches:",
+            ), // spellchecker:disable-line
+            (
+                "!*.rs Nedle",
+                "reference.txt",
+                "definition.rs",
+                "Maybe you meant these other matches:",
+            ), // spellchecker:disable-line
+        ] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": query, "definitions_only": true,
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.contains(notice), "{text}");
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains(absent), "{text}");
+        }
+    }
+
+    #[test]
+    fn fuzzy_fallback_cursors_keep_their_stage() {
+        for definitions in [true, false] {
+            let files: Vec<_> = (0..60)
+                .map(|i| {
+                    (
+                        format!("file_{i:02}.rs"),
+                        if definitions {
+                            "fn Needle() {}"
+                        } else {
+                            "Needle();"
+                        },
+                    )
+                })
+                .collect();
+            let (_dir, server) = definition_server(&files);
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Nedle", "definitions_only": true, "maxResults": 50, // spellchecker:disable-line
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.contains("Maybe you meant"), "{text}");
+            let id = text.split("cursor: ").nth(1).unwrap().trim();
+            let cursor = server.cursor_store.lock().unwrap().get_grep(id).unwrap();
+            assert_eq!(
+                cursor.stage,
+                if definitions {
+                    GrepStage::FuzzyDefinitions
+                } else {
+                    GrepStage::FuzzyMatches
+                }
+            );
+            assert!(cursor.found_matches);
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Nedle", "cursor": id, "maxResults": 50, // spellchecker:disable-line
+            }))
+            .unwrap();
+            let next = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(next.contains("Needle"), "{next}");
+            assert!(next.contains("Maybe you meant"), "{next}");
+            assert!(!next.contains("cursor:"), "{next}");
+        }
+    }
+
+    #[test]
+    fn empty_definition_fallback_reports_no_matches() {
+        let (_dir, server) = definition_server(&[("a.rs".into(), "fn unrelated() {}")]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "Needle", "definitions_only": true,
         }))
         .unwrap();
         assert_eq!(
             response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap()),
-            "0 matches."
+            "No matching definitions or other matches found."
         );
+    }
+
+    #[test]
+    fn completed_pages_do_not_restart_a_fallback_after_returning_matches() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "fn Needle() {}"),
+            ("b.rs".into(), "unrelated();"),
+        ]);
+        for stage in [
+            GrepStage::Definitions,
+            GrepStage::References,
+            GrepStage::FuzzyDefinitions,
+            GrepStage::FuzzyMatches,
+        ] {
+            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
+                file_offset: 1,
+                stage,
+                found_matches: true,
+            });
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Needle", "cursor": id,
+            }))
+            .unwrap();
+            assert_eq!(
+                response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap()),
+                "0 matches.",
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_resumed_stages_restart_the_next_stage_at_the_first_file() {
+        for (stage, query, source, notice) in [
+            (
+                GrepStage::Definitions,
+                "Needle",
+                "Needle();",
+                "Showing other matches:",
+            ),
+            (
+                GrepStage::References,
+                "Nedle",
+                "fn Needle() {}",
+                "Maybe you meant these definitions:",
+            ), // spellchecker:disable-line
+            (
+                GrepStage::FuzzyDefinitions,
+                "Nedle",
+                "Needle();",
+                "Maybe you meant these other matches:",
+            ), // spellchecker:disable-line
+        ] {
+            let (_dir, server) =
+                definition_server(&[("a.rs".into(), source), ("b.rs".into(), "unrelated();")]);
+            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
+                file_offset: 1,
+                stage,
+                found_matches: false,
+            });
+            let params =
+                serde_json::from_value(serde_json::json!({"query": query, "cursor": id})).unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.contains(notice), "{stage:?}: {text}");
+            assert!(text.contains(source), "{stage:?}: {text}");
+        }
     }
 
     fn definition_server(files: &[(String, &str)]) -> (tempfile::TempDir, FffServer) {

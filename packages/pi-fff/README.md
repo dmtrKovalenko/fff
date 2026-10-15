@@ -83,11 +83,11 @@ This extension registers FFF-powered tools (`fffind`, `ffgrep`, `fff-multi-grep`
 
 Search file contents. Smart case, plain text by default, regex optional.
 
-Set `definitions_only: true` to search for matching declarations. If the completed search finds none, the tool reports that and returns ordinary matches. Cursors remember the search or fallback state. The optional `fff-multi-grep` tool accepts the same flag. Omitting the flag keeps ordinary search behavior.
+Set `definitions_only: true` to try matching declarations, ordinary exact matches, fuzzy declarations, then fuzzy matches of any kind. Each stage runs only if the previous stage completed with zero matches. Fallback results carry a notice; fuzzy results say “Maybe you meant”. Cursors keep the current stage and file constraints, including through empty partial pages. Once a stage returns matches, pagination stays in that stage. The optional `fff-multi-grep` tool accepts the same flag but only tries declarations and ordinary literal matches. Omitting the flag keeps ordinary search behavior.
 
 Parameters:
 - `pattern` — search text or regex
-- `definitions_only` — prefer declarations; fall back to ordinary matches with a notice when none exist
+- `definitions_only` — try declarations, exact matches, fuzzy declarations, then fuzzy matches; report fallbacks
 - `path` — directory/file constraint (e.g. `src/`, `*.ts`)
 - `ignoreCase` — force case-insensitive
 - `literal` — treat as literal string (default: true)
@@ -110,7 +110,7 @@ OR-logic multi-pattern content search. SIMD-accelerated Aho-Corasick.
 
 Parameters:
 - `patterns` — array of literal patterns (OR logic)
-- `definitions_only` — prefer declarations with the same fallback behavior
+- `definitions_only` — prefer declarations; fall back to ordinary literal matches with a notice
 - `constraints` — file constraints (e.g. `*.{ts,tsx} !test/`)
 - `context` — context lines
 - `limit` — max matches (default: 100)
