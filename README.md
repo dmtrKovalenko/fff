@@ -514,11 +514,11 @@ MCP and Pi expose only the optional `definitions_only` boolean to the model. MCP
 1. Matching declarations.
 2. Ordinary exact matches, with a notice that no matching declarations were found.
 3. Fuzzy declarations, labeled “Maybe you meant these definitions”.
-4. Fuzzy matches of any kind, labeled “Maybe you meant these other matches”.
+4. Fuzzy ordinary matches, labeled “Maybe you meant these other matches”.
 
 A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage, and all stages keep the original file constraints. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
 
-SDK definition filtering occurs before page and per-file result limits. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. In Neovim, move down (top prompt) or up (bottom prompt) to continue an empty page. Context lines can still contain ordinary code.
+SDK definition filtering occurs before page and per-file result limits. Both `definition_only` and `usage_only` retain file constraints when no matches exist. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. In Neovim, move down (top prompt) or up (bottom prompt) to continue an empty page. Context lines can still contain ordinary code.
 
 Definition classification accepts source lines up to 256 bytes, including indentation and excluding line endings. Longer lines stay ordinary matches and are excluded from `definition_only`. The limit uses the original source bytes, regardless of display truncation or whitespace trimming. For multiline regex matches, it applies to the first physical line.
 

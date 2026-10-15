@@ -1007,6 +1007,7 @@ describe("ffgrep per-file cap (#825)", () => {
 for (const name of ["ffgrep", "fff-multi-grep"]) {
   describe(`${name} definitions_only`, () => {
     const normal = name === "ffgrep" ? "classify" : "off";
+    const fallbackMode = name === "ffgrep" ? "usage_only" : "off";
     const params =
       name === "ffgrep"
         ? { pattern: "Needle", path: "src/" }
@@ -1072,8 +1073,8 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
       );
       expect(calls.map((call) => call.classifyDefinitions)).toEqual([
         "definition_only",
-        normal,
-        normal,
+        fallbackMode,
+        fallbackMode,
       ]);
       expect(calls[2].cursor).toEqual(next);
       expect(second.content[0].text).not.toContain("No matching definitions");
@@ -1103,7 +1104,7 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
       expect(calls.map((call) => call.classifyDefinitions)).toEqual([
         "definition_only",
         "definition_only",
-        normal,
+        fallbackMode,
       ]);
       expect(calls[2].cursor).toBeNull();
       expect(second.content[0].text).toContain("No matching definitions found");
@@ -1193,9 +1194,9 @@ for (const fuzzyDefinitions of [true, false]) {
     ]);
     expect(calls.map((call) => call.options.classifyDefinitions)).toEqual([
       "definition_only",
-      "classify",
+      "usage_only",
       "definition_only",
-      ...(fuzzyDefinitions ? ["definition_only"] : ["classify", "classify"]),
+      ...(fuzzyDefinitions ? ["definition_only"] : ["usage_only", "usage_only"]),
     ]);
     expect(new Set(calls.map((call) => call.query))).toEqual(
       new Set(["src/ !test/ " + params.pattern]),

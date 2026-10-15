@@ -41,7 +41,8 @@ impl GrepStage {
     pub fn definition_mode(self) -> fff::DefinitionMode {
         match self {
             Self::Definitions | Self::FuzzyDefinitions => fff::DefinitionMode::DefinitionOnly,
-            _ => fff::DefinitionMode::Classify,
+            Self::References | Self::FuzzyMatches => fff::DefinitionMode::UsageOnly,
+            Self::Normal => fff::DefinitionMode::Classify,
         }
     }
 

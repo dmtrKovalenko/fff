@@ -228,36 +228,10 @@ pub(crate) fn grep_search<'a>(
     let full_scan_empty = result.matches.is_empty() && result.next_file_offset == 0;
     if !full_scan_empty
         || query.constraints.is_empty()
-        || options.classify_definitions == super::DefinitionMode::DefinitionOnly
+        || options.classify_definitions.is_filtered()
         || abort_signal.load(Ordering::Relaxed)
     {
         return result;
-    }
-
-    // An empty section must not trigger a literal retry when the query matched the other section.
-    if options.classify_definitions.is_filtered() {
-        let probe = GrepSearchOptions {
-            file_offset: 0,
-            page_limit: 1,
-            classify_definitions: Default::default(),
-            ..options.clone()
-        };
-        let unfiltered = grep_search_parsed(
-            files,
-            total_files,
-            query,
-            &probe,
-            budget,
-            bigram_index,
-            bigram_overlay,
-            abort_signal,
-            base_path,
-            arena,
-            overflow_arena,
-        );
-        if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
-            return result;
-        }
     }
 
     let raw = query.raw_query.trim();

@@ -148,6 +148,46 @@ fn definition_only_keeps_unknown_language_files_out_of_fallbacks() {
 }
 
 #[test]
+fn filtered_grep_keeps_empty_scopes_instead_of_retrying_without_constraints() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn Needle() {}\nNeedle();\n*.txt Needle\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("b.txt"), "unrelated\n").unwrap();
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: dir.path().to_string_lossy().into_owned(),
+        enable_content_indexing: false,
+        enable_mmap_cache: false,
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let parser = fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig);
+    for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
+        for classify_definitions in [DefinitionMode::DefinitionOnly, DefinitionMode::UsageOnly] {
+            let options = GrepSearchOptions {
+                mode,
+                classify_definitions,
+                time_budget_ms: 0,
+                ..Default::default()
+            };
+            for raw in ["missing.rs Needle", "*.txt Needle", "!*.rs Needle"] {
+                let result = picker.grep(&parser.parse(raw), &options);
+                assert!(
+                    result.matches.is_empty(),
+                    "{mode:?} {classify_definitions:?}: {raw}"
+                );
+                assert_eq!(result.next_file_offset, 0);
+                assert!(!result.literal_fallback);
+            }
+        }
+    }
+}
+
+#[test]
 fn pagination_keeps_unreturned_files_before_abort() {
     let file = crate::types::FileItem::new_raw(0, 1, 0, None, false);
     for (page_limit, next_offset) in [(1, 11), (2, 12), (10, 13)] {

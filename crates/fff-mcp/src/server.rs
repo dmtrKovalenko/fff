@@ -1056,6 +1056,25 @@ mod tests {
     }
 
     #[test]
+    fn definition_fallback_does_not_leave_empty_file_constraints() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "fn Needle() {}\nNeedle();\n*.txt Needle\n"),
+            ("b.txt".into(), "unrelated\n"),
+        ]);
+        for query in ["missing.rs Needle", "*.txt Needle", "!*.rs Needle"] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": query, "definitions_only": true,
+            }))
+            .unwrap();
+            assert_eq!(
+                response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap()),
+                "No matching definitions or other matches found.",
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
     fn completed_pages_do_not_restart_a_fallback_after_returning_matches() {
         let (_dir, server) = definition_server(&[
             ("a.rs".into(), "fn Needle() {}"),
