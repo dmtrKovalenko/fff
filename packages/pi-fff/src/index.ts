@@ -1022,9 +1022,10 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptGuidelines: (names) => [
       `${names.grep}: prefer bare identifiers as patterns. Literal queries are most efficient.`,
       `${names.grep}: use definitions_only: true to try declarations, exact matches, fuzzy declarations, then fuzzy matches. Each fallback starts only after a completed search with no matches and includes a notice.`,
-      `${names.grep}: use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').`,
+      `${names.grep}: keep module words in path, e.g. '**/*billing*client*/**'. Use exclude for noise ('test/,*.min.js').`,
       `${names.grep}: caseSensitive: true when you need exact case (smart-case otherwise).`,
-      `${names.grep}: after 1-2 greps, read the top match instead of more greps.`,
+      `${names.grep}: returned source lines verify declaration locations. Do not re-read identical lines just to verify a location.`,
+      `${names.grep}: results include source lines. Read more only when you need context. Ranking includes recency, not semantic relevance.`,
     ],
     parameters: grepSchema,
 

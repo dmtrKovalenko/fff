@@ -87,7 +87,8 @@ fn make_grep_options(
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindFilesParams {
-    /// Fuzzy search query. Supports path prefixes and glob constraints.
+    /// Fuzzy filename or path query. Use a glob to constrain a module.
+    /// Example: "**/*billing*client*/** retry".
     // `pattern` alias for consistency with grep's alias and the common
     // file-search parameter name (#311).
     #[serde(alias = "pattern")]
@@ -102,8 +103,8 @@ pub struct FindFilesParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GrepParams {
-    /// Search text or regex query with optional constraint prefixes.
-    /// Matches within single lines only — use ONE specific term, not multiple words.
+    /// Content pattern after path constraints. Keep module words in a directory glob.
+    /// Example: "**/*billing*client*/** Invoice".
     // `pattern` alias: LLMs that have seen multi_grep (which uses `patterns`)
     // routinely call grep with `pattern`; accept it instead of erroring out
     // with an unhelpful "missing field `query`" (#311).
@@ -118,7 +119,7 @@ pub struct GrepParams {
     pub output_mode: Option<String>,
     /// Context lines before/after each match.
     pub context: Option<f64>,
-    /// Try declarations, exact matches, fuzzy declarations, then fuzzy matches. Report fallbacks.
+    /// Find declarations. If none match, return references or fuzzy matches with a fallback notice.
     #[serde(default)]
     pub definitions_only: bool,
 }
@@ -174,7 +175,7 @@ pub struct MultiGrepParams {
     /// Patterns to match (OR logic). Include all naming conventions: snake_case, PascalCase, camelCase.
     #[serde(deserialize_with = "deserialize_patterns")]
     pub patterns: Vec<String>,
-    /// File constraints (e.g. '*.{ts,tsx} !test/'). ALWAYS provide when possible.
+    /// Known directory, module glob, filename, or extension, e.g. "src/net/" or "**/billing/**".
     pub constraints: Option<String>,
     /// Max matching lines (default 20).
     #[serde(rename = "maxResults")]
@@ -552,14 +553,9 @@ impl FffServer {
 
 #[tool_router]
 impl FffServer {
-    /// Fuzzy file search by name. Searches FILE NAMES, not file contents.
-    /// Use it when you need to find a file, not a definition.
-    /// Use grep instead for searching code content (definitions, usage patterns).
-    /// Supports fuzzy matching, path prefixes ('shc/'), and glob constraints.
-    /// IMPORTANT: Keep queries SHORT — prefer 1-2 terms max.
     #[tool(
         name = "find_files",
-        description = "Fuzzy file search by name. Searches FILE NAMES, not file contents. Use it when you need to find a file, not a definition. Use grep instead for searching code content (definitions, usage patterns). Supports fuzzy matching, path prefixes ('src/'), and glob constraints ('name **/src/*.{ts,tsx} !test/'). IMPORTANT: Keep queries SHORT — prefer 1-2 terms max. Multiple words are a waterfall (each narrows results), NOT OR. If unsure, start broad with 1 term and refine.",
+        description = "Find filenames with fuzzy matching. Keep module context in a directory or glob constraint, e.g. \"**/*billing*client*/** retry\". Read the returned file when you need its implementation.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -675,11 +671,9 @@ impl FffServer {
         Ok(result)
     }
 
-    /// Search file contents for text patterns. This is the DEFAULT search tool.
-    /// Prefer plain text over regex. Filter files with constraints.
     #[tool(
         name = "grep",
-        description = "Search file contents. Search for bare identifiers (e.g. 'InProgressQuote', 'ActorAuth'), NOT code syntax or regex. Set definitions_only to true to try declarations, exact matches, fuzzy declarations, then fuzzy matches; report fallbacks. Filter files with constraints (e.g. '*.rs query', 'src/ query'). Use filename, directory (ending with /) or glob expressions to prefilter. See server instructions for constraint syntax and core rules.",
+        description = "Search code within known paths or module globs. Use definitions_only=true for declarations. Returned source lines verify locations without a second read. Example: {\"query\":\"**/*billing*client*/** Invoice\",\"definitions_only\":true}.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -711,7 +705,7 @@ impl FffServer {
     /// Patterns are literal text — NEVER escape special characters.
     #[tool(
         name = "multi_grep",
-        description = "Search file contents for lines matching ANY of multiple patterns (OR logic). IMPORTANT: This returns files where ANY query matches, NOT all patterns. Patterns are literal text — NEVER escape special characters (no \\( \\) \\. etc). Set definitions_only to true to find declarations; if none are found, return other matches with a notice. Faster than regex alternation for literal text. See server instructions for constraint syntax.",
+        description = "Search for any of several literal identifiers in one call. Set constraints to the directory, module, filename, or glob from the request. Set definitions_only=true for declarations. Results contain source lines and line numbers.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -998,6 +992,40 @@ mod tests {
         );
         assert!(text.contains("references.txt"), "{text}");
         assert!(!text.contains("definition.rs"), "{text}");
+    }
+
+    #[test]
+    fn definition_context_budget_does_not_hide_matches() {
+        let content: Vec<_> = (0..20)
+            .map(|i| {
+                (format!("module{i}.rs"), format!(
+                    "struct Needle{i} {{\n    first_field_with_a_long_name: String,\n    second_field_with_a_long_name: String,\n    third_field_with_a_long_name: String,\n}}"
+                ))
+            })
+            .collect();
+        let files: Vec<_> = content
+            .iter()
+            .map(|(p, s)| (p.clone(), s.as_str()))
+            .collect();
+        let (_dir, server) = definition_server(&files);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "Needle", "definitions_only": true, "maxResults": 50,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("Context omitted"), "{text}");
+        for i in 0..20 {
+            assert!(text.contains(&format!("struct Needle{i} {{")), "{text}");
+        }
+        assert!(!text.contains("→ Read"), "{text}");
+        assert!(!text.contains("cursor:"), "{text}");
+
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "module0.rs Needle", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("first_field_with_a_long_name"), "{text}");
     }
 
     #[test]

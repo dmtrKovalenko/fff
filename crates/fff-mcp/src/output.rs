@@ -216,35 +216,6 @@ impl GrepFormatter<'_> {
             2500
         };
 
-        // File overview: collect first match per file
-        let file_preview = collect_file_preview(items, files, picker);
-        let mut content_def_file = String::new();
-        let mut content_first_file = String::new();
-        for fm in &file_preview {
-            if content_first_file.is_empty() {
-                content_first_file = fm.file.relative_path(picker);
-            }
-            if content_def_file.is_empty() && fm.is_definition {
-                content_def_file = fm.file.relative_path(picker);
-            }
-        }
-
-        let content_suggest = if !content_def_file.is_empty() {
-            &content_def_file
-        } else {
-            &content_first_file
-        };
-        if !content_suggest.is_empty() {
-            let file_count = file_preview.len();
-            if file_count == 1 {
-                lines.push(format!("→ Read {} (only match)", content_suggest));
-            } else if !content_def_file.is_empty() {
-                lines.push(format!("→ Read {} [def]", content_suggest));
-            } else if file_count <= 3 {
-                lines.push(format!("→ Read {} (best match)", content_suggest));
-            }
-        }
-
         if total_matched > items.len() {
             lines.push(format!("{}/{} matches shown", items.len(), total_matched));
         }
@@ -357,7 +328,7 @@ impl GrepFormatter<'_> {
 
             let chunk = match_lines.join("\n");
             if char_count + chunk.len() > max_output_chars && shown_count > 0 {
-                break;
+                return self.format_compact(items, &sorted_items, cursor_store);
             }
 
             char_count += chunk.len();
@@ -370,6 +341,38 @@ impl GrepFormatter<'_> {
             lines.push(format!("\ncursor: {}", cursor_id));
         }
 
+        lines.join("\n")
+    }
+
+    fn format_compact(
+        &self,
+        items: &[GrepMatch],
+        order: &[usize],
+        cursor_store: &mut CursorStore,
+    ) -> String {
+        let mut lines = vec![format!(
+            "{}/{} page matches shown. Context omitted to show matching lines.",
+            items.len(),
+            self.total_matched
+        )];
+        let mut current_file = String::new();
+        for &idx in order {
+            let m = &items[idx];
+            let path = self.files[m.file_index].relative_path(self.picker);
+            if path != current_file {
+                current_file = path;
+                lines.push(current_file.clone());
+            }
+            lines.push(format!(
+                " {}: {}",
+                m.line_number,
+                trauncate_line_for_ai(&m.line_content, Some(&m.match_byte_offsets), MAX_LINE_LEN)
+            ));
+        }
+        if self.cursor.file_offset > 0 {
+            let cursor_id = cursor_store.store_grep(self.cursor);
+            lines.push(format!("\ncursor: {}", cursor_id));
+        }
         lines.join("\n")
     }
 }
@@ -386,40 +389,6 @@ fn format_files_with_matches(
 
     let mut lines: Vec<String> = Vec::new();
     let file_count = file_map.len();
-
-    // Find best Read target
-    let mut first_def_file = String::new();
-    let mut first_file = String::new();
-    for fm in &file_map {
-        if first_file.is_empty() {
-            first_file = fm.file.relative_path(picker);
-        }
-        if first_def_file.is_empty() && fm.is_definition {
-            first_def_file = fm.file.relative_path(picker);
-        }
-    }
-    let suggest_path = if !first_def_file.is_empty() {
-        &first_def_file
-    } else {
-        &first_file
-    };
-
-    if !suggest_path.is_empty() {
-        if file_count == 1 {
-            lines.push(format!(
-                "→ Read {} (only match — no need to search further)",
-                suggest_path
-            ));
-        } else if !first_def_file.is_empty() && file_count <= 5 {
-            lines.push(format!("→ Read {} (definition found)", suggest_path));
-        } else if !first_def_file.is_empty() {
-            lines.push(format!("→ Read {} (definition)", suggest_path));
-        } else if file_count <= 3 {
-            lines.push(format!("→ Read {} (best match)", suggest_path));
-        } else {
-            lines.push(format!("→ Read {}", suggest_path));
-        }
-    }
 
     let is_small_set = file_count <= 5;
     let mut def_expanded_count = 0usize;
