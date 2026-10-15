@@ -3,7 +3,7 @@ use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
 use fff::types::{FileItem, PaginationArgs};
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
-use fff_query_parser::{AiGrepConfig, Constraint, FFFQuery};
+use fff_query_parser::{AiGrepConfig, Constraint, FFFQuery, glob_detect::has_wildcards};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
@@ -87,12 +87,14 @@ fn make_grep_options(
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindFilesParams {
-    /// Fuzzy filename or path query. Use a glob to constrain a module.
-    /// Example: "**/*billing*client*/** retry".
+    /// Fuzzy filename or path query. Put known module constraints in path.
     // `pattern` alias for consistency with grep's alias and the common
     // file-search parameter name (#311).
     #[serde(alias = "pattern")]
     pub query: String,
+    /// Directory, filename, or one glob to search. Set this from the request's module context.
+    /// Examples: "src/net", "client.py", "**/*billing*client*/**".
+    pub path: Option<String>,
     /// Max results (default 20).
     #[serde(rename = "maxResults")]
     // this has to be float because llms are stupid
@@ -103,13 +105,16 @@ pub struct FindFilesParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GrepParams {
-    /// Content pattern after path constraints. Keep module words in a directory glob.
-    /// Example: "**/*billing*client*/** Invoice".
+    /// Content text or regex. Put known module constraints in path.
+    /// Inline path constraints are also supported.
     // `pattern` alias: LLMs that have seen multi_grep (which uses `patterns`)
     // routinely call grep with `pattern`; accept it instead of erroring out
     // with an unhelpful "missing field `query`" (#311).
     #[serde(alias = "pattern")]
     pub query: String,
+    /// Directory, filename, or one glob to search. Set this from the request's module context.
+    /// Examples: "src/net", "client.py", "**/*billing*client*/**".
+    pub path: Option<String>,
     /// Max matching lines (default 20).
     #[serde(rename = "maxResults")]
     pub max_results: Option<f64>, // this has to be float because llms are stupid
@@ -319,7 +324,8 @@ impl FffServer {
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
 
         let parser = QueryParser::new(AiGrepConfig);
-        let mut original = parser.parse(query);
+        let scope = path_scope(params.path.as_deref(), picker.base_path())?;
+        let mut original = parse_scoped_grep(&parser, query, scope.as_deref());
         if let Some(shorter) = &broadened_query {
             original.fuzzy_query = parser.parse(shorter).fuzzy_query;
             original.raw_query = "";
@@ -356,7 +362,11 @@ impl FffServer {
             };
             let parsed = if cursor.stage.is_fuzzy() {
                 fuzzy.get_or_insert_with(|| {
-                    let mut parsed = parser.parse(fuzzy_query.as_deref().unwrap_or(query));
+                    let mut parsed = parse_scoped_grep(
+                        &parser,
+                        fuzzy_query.as_deref().unwrap_or(query),
+                        scope.as_deref(),
+                    );
                     parsed.constraints = original.constraints.clone();
                     parsed
                 })
@@ -402,7 +412,8 @@ impl FffServer {
 
                 if !is_valid_constraint {
                     let rest_query = parts[1..].join(" ");
-                    let rest_parsed = parser.parse(&rest_query);
+                    let mut rest_parsed = parse_scoped_grep(&parser, &rest_query, scope.as_deref());
+                    rest_parsed.constraints = original.constraints.clone();
 
                     let rest_text = rest_parsed.grep_text();
                     let retry_mode = if has_regex_metacharacters(&rest_text) {
@@ -446,11 +457,12 @@ impl FffServer {
             }
 
             // Fuzzy fallback for typo tolerance
-            let fuzzy_query = cleanup_fuzzy_query(query);
+            let fuzzy_query = cleanup_fuzzy_query(&original.grep_text());
             let (mut fuzzy_options, _) =
                 make_grep_options(output_mode, GrepMode::Fuzzy, 0, Some(0));
             fuzzy_options.classify_definitions = options.classify_definitions;
-            let fuzzy_parsed = parser.parse(&fuzzy_query);
+            let mut fuzzy_parsed = parse_scoped_grep(&parser, &fuzzy_query, scope.as_deref());
+            fuzzy_parsed.constraints = original.constraints.clone();
             let fuzzy_result = picker.grep(&fuzzy_parsed, &fuzzy_options);
 
             if !fuzzy_result.matches.is_empty() {
@@ -475,7 +487,10 @@ impl FffServer {
             // File path fallback: if query looks like a path, suggest the matching file
             if query.contains('/') {
                 let file_parser = QueryParser::default();
-                let file_query = file_parser.parse(query);
+                let mut file_query = file_parser.parse(query);
+                file_query
+                    .constraints
+                    .extend(scope.as_deref().map(Constraint::Glob));
                 let file_opts = FuzzySearchOptions {
                     max_threads: 0,
                     current_file: None,
@@ -555,7 +570,7 @@ impl FffServer {
 impl FffServer {
     #[tool(
         name = "find_files",
-        description = "Find filenames with fuzzy matching. Keep module context in a directory or glob constraint, e.g. \"**/*billing*client*/** retry\". Read the returned file when you need its implementation.",
+        description = "Find files by fuzzy name. Put directory or module scope in path and the filename in query. An empty query lists files in path.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -598,7 +613,11 @@ impl FffServer {
         };
 
         let parser = QueryParser::default();
-        let fff_query = parser.parse(query);
+        let scope = path_scope(params.path.as_deref(), base_path)?;
+        let mut fff_query = parser.parse(query);
+        fff_query
+            .constraints
+            .extend(scope.as_deref().map(Constraint::Glob));
         let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
         let total_files = result.total_files;
 
@@ -609,7 +628,8 @@ impl FffServer {
         let (items, scores, total_matched) =
             if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
                 if let Some(shorter) = &shorter {
-                    let shorter_query = parser.parse(shorter);
+                    let mut shorter_query = parser.parse(shorter);
+                    shorter_query.constraints = fff_query.constraints.clone();
                     let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
 
                     (retry.items, retry.scores, retry.total_matched)
@@ -673,7 +693,7 @@ impl FffServer {
 
     #[tool(
         name = "grep",
-        description = "Search code within known paths or module globs. Use definitions_only=true for declarations. Returned source lines verify locations without a second read. Example: {\"query\":\"**/*billing*client*/** Invoice\",\"definitions_only\":true}.",
+        description = "Search source text or regex. Put directory or module scope in path and the content pattern in query. Use definitions_only=true for declarations. Returned source lines verify locations without another read.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -865,6 +885,60 @@ fn indexes_file_path(picker: &fff::FilePicker, suffix: &str) -> bool {
     })
 }
 
+fn parse_scoped_grep<'a>(
+    parser: &QueryParser<AiGrepConfig>,
+    query: &'a str,
+    scope: Option<&'a str>,
+) -> FFFQuery<'a> {
+    let mut parsed = parser.parse(query);
+    if let Some(scope) = scope {
+        parsed.constraints.push(Constraint::Glob(scope));
+        // A separate path must survive retries that drop ambiguous inline constraints.
+        parsed.raw_query = "";
+    }
+    parsed
+}
+
+fn path_scope(path: Option<&str>, base: &std::path::Path) -> Result<Option<String>, ErrorData> {
+    let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(path);
+    let path = if path.is_absolute() {
+        path.strip_prefix(base).map_err(|_| {
+            ErrorData::invalid_params("path must be inside the indexed checkout", None)
+        })?
+    } else {
+        path
+    };
+    if path
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(ErrorData::invalid_params(
+            "path must not contain '..' components",
+            None,
+        ));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| ErrorData::invalid_params("path must be UTF-8", None))?;
+    #[cfg(windows)]
+    let normalized = path.replace('\\', "/");
+    #[cfg(windows)]
+    let path = normalized.as_str();
+    let path = path.trim_start_matches("./").trim_end_matches('/');
+    if path.is_empty() || path == "." {
+        return Ok(None);
+    }
+    Ok(Some(if has_wildcards(path) {
+        path.to_owned()
+    } else {
+        let path = path.replace(',', "\\,");
+        format!("{{**/{path},**/{path}/**}}")
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +980,7 @@ mod tests {
         let via_query: GrepParams =
             serde_json::from_str(r#"{"query":"foo"}"#).expect("query field");
         assert_eq!(via_query.query, "foo");
+        assert!(via_query.path.is_none());
 
         let via_pattern: GrepParams =
             serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
@@ -933,6 +1008,7 @@ mod tests {
         let via_query: FindFilesParams =
             serde_json::from_str(r#"{"query":"foo"}"#).expect("query field");
         assert_eq!(via_query.query, "foo");
+        assert!(via_query.path.is_none());
 
         let via_pattern: FindFilesParams =
             serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
@@ -1319,6 +1395,111 @@ mod tests {
             assert!(text.contains("before"), "{text}");
             assert!(text.contains("after"), "{text}");
             assert!(!text.contains("excluded.txt"), "{text}");
+        }
+    }
+
+    #[test]
+    fn named_path_keeps_grep_fallbacks_scoped() {
+        let (_dir, server) = definition_server(&[
+            ("scope_a/defs.rs".into(), "fn Needle() {}"),
+            ("scope_a/uses.txt".into(), "Needle();"),
+            ("scope_b/defs.rs".into(), "fn Needle() {}"),
+        ]);
+        for path in ["scope_a", "scope_a/", "**/scope_a/**", "scope_a/defs.rs"] {
+            for definitions_only in [false, true] {
+                for query in ["Needle", "Nedle"] {
+                    let params = serde_json::from_value(serde_json::json!({
+                        "query": query, "path": path, "definitions_only": definitions_only,
+                    }))
+                    .unwrap();
+                    let text =
+                        response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+                    assert!(text.contains("scope_a/defs.rs"), "{query} {path}: {text}");
+                    assert!(!text.contains("scope_b"), "{query} {path}: {text}");
+                }
+            }
+        }
+        for (query, path) in [("wrong Needle", "scope_a"), ("Needle", "missing.rs")] {
+            let params =
+                serde_json::from_value(serde_json::json!({"query": query, "path": path})).unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(!text.contains("scope_b"), "{text}");
+            assert_eq!(text.contains("scope_a"), path == "scope_a", "{text}");
+        }
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "*.txt Needle", "path": "scope_a", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("scope_a/uses.txt"), "{text}");
+        assert!(!text.contains("defs.rs"), "{text}");
+    }
+
+    #[test]
+    fn named_path_supports_literal_spaces_and_commas() {
+        let (_dir, server) = definition_server(&[
+            ("space dir/a,b.rs".into(), "fn Needle() {}"),
+            ("other.rs".into(), "fn Needle() {}"),
+        ]);
+        for path in ["space dir", "space dir/a,b.rs", "a,b.rs"] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Needle", "path": path, "definitions_only": true,
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.contains("space dir/a,b.rs"), "{path}: {text}");
+            assert!(!text.contains("other.rs"), "{path}: {text}");
+        }
+    }
+
+    #[test]
+    fn named_path_scopes_file_search_and_its_retry() {
+        let (_dir, server) = definition_server(&[
+            ("scope_a/defs.rs".into(), "fn Needle() {}"),
+            ("scope_b/defs.rs".into(), "fn Needle() {}"),
+        ]);
+        for query in ["", "defs", "de fs unfindable"] {
+            let params =
+                serde_json::from_value(serde_json::json!({"query": query, "path": "scope_a"}))
+                    .unwrap();
+            let text = response_text(server.find_files(Parameters(params)).unwrap());
+            assert!(text.contains("scope_a/defs.rs"), "{text}");
+            assert!(!text.contains("scope_b"), "{text}");
+        }
+    }
+
+    #[test]
+    fn named_paths_stay_inside_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let child = base.join("src");
+        let outside = base.parent().unwrap().join("outside-fff-index");
+        assert_eq!(path_scope(None, base).unwrap(), None);
+        assert_eq!(path_scope(Some("."), base).unwrap(), None);
+        assert_eq!(path_scope(base.to_str(), base).unwrap(), None);
+        assert_eq!(
+            path_scope(child.to_str(), base).unwrap(),
+            path_scope(Some("src/"), base).unwrap()
+        );
+        assert!(path_scope(Some("../other"), base).is_err());
+        assert!(path_scope(outside.to_str(), base).is_err());
+    }
+
+    #[test]
+    fn named_path_is_optional_in_search_schemas() {
+        for schema in [
+            schemars::schema_for!(GrepParams),
+            schemars::schema_for!(FindFilesParams),
+        ] {
+            let value = serde_json::to_value(schema).unwrap();
+            assert!(value["properties"].get("path").is_some());
+            assert!(
+                !value["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key == "path")
+            );
         }
     }
 
