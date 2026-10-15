@@ -969,23 +969,23 @@ mod tests {
         ]);
         for (query, expected, absent, notice) in [
             (
-                "Nedle",
+                "Nedle", // spellchecker:disable-line
                 "definition.rs",
                 "reference.txt",
                 "Maybe you meant these definitions:",
-            ), // spellchecker:disable-line
+            ),
             (
-                "reference.txt Nedle",
+                "reference.txt Nedle", // spellchecker:disable-line
                 "reference.txt",
                 "definition.rs",
                 "Maybe you meant these other matches:",
-            ), // spellchecker:disable-line
+            ),
             (
-                "!*.rs Nedle",
+                "!*.rs Nedle", // spellchecker:disable-line
                 "reference.txt",
                 "definition.rs",
                 "Maybe you meant these other matches:",
-            ), // spellchecker:disable-line
+            ),
         ] {
             let params = serde_json::from_value(serde_json::json!({
                 "query": query, "definitions_only": true,
@@ -1095,16 +1095,16 @@ mod tests {
             ),
             (
                 GrepStage::References,
-                "Nedle",
+                "Nedle", // spellchecker:disable-line
                 "fn Needle() {}",
                 "Maybe you meant these definitions:",
-            ), // spellchecker:disable-line
+            ),
             (
                 GrepStage::FuzzyDefinitions,
-                "Nedle",
+                "Nedle", // spellchecker:disable-line
                 "Needle();",
                 "Maybe you meant these other matches:",
-            ), // spellchecker:disable-line
+            ),
         ] {
             let (_dir, server) =
                 definition_server(&[("a.rs".into(), source), ("b.rs".into(), "unrelated();")]);

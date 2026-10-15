@@ -1169,11 +1169,11 @@ for (const fuzzyDefinitions of [true, false]) {
       .map(([tool]) => tool)
       .find((tool) => tool.name === "ffgrep");
     const params = {
-      pattern: "Nedle",
+      pattern: "Nedle", // spellchecker:disable-line
       path: "src/",
       exclude: "test/",
       definitions_only: true,
-    }; // spellchecker:disable-line
+    };
     const first = await tool.execute("typo", params, abortOptions().signal);
     expect(first.content[0].text).toContain(
       fuzzyDefinitions
