@@ -1143,6 +1143,9 @@ fn live_grep_with_options(
         return Err(error::to_lua_error(Error::FilePickerMissing));
     };
     let parsed_query = FFFQuery::parse(query, NvimGrepConfig);
-    let result = picker.grep(&parsed_query, options);
+    let mut result = picker.grep(&parsed_query, options);
+    if options.classify_definitions == fff::DefinitionMode::Classify {
+        result.matches.sort_by_key(|m| !m.is_definition);
+    }
     lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }
