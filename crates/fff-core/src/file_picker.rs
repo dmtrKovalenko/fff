@@ -2344,14 +2344,14 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
     is_binary_extension_str(ext)
 }
 
-// Extension check plus a content sniff for names that are text or binary depending on the file.
+// Extension check, then a content sniff for extensions shared by text and binary formats.
 pub(crate) fn is_binary_file(path: &Path) -> bool {
     is_known_binary_extension(path)
-        || path
+        && (!path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(is_ambiguous_binary_name)
-            && starts_with_binary_content(path)
+            || starts_with_binary_content(path))
 }
 
 // `.blp` names both GTK Blueprint text and a binary texture format.
@@ -2422,8 +2422,8 @@ fn is_binary_extension_str(ext: &str) -> bool {
         // ML/Data Science
         "npy" | "npz" | "h5" | "hdf5" | "pt" | "onnx" |
         "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib" |
-        // 3D/Game assets (`.blp` is sniffed instead, see `is_ambiguous_binary_name`)
-        "glb" | "blend" |
+        // 3D/Game assets (indexing also sniffs `.blp`, see `is_ambiguous_binary_name`)
+        "glb" | "blend" | "blp" |
         // Gzipped-XML / binary maps
         "dia" | "bcmap" |
         // Protobuf wire format
@@ -2538,6 +2538,8 @@ mod tests {
             .collect();
         assert_eq!(files, ["window.blp"]);
 
+        // The public extension helper keeps reporting `.blp` as binary.
+        assert!(is_known_binary_extension(Path::new("window.blp")));
         for (name, binary) in [("texture.blp", true), ("window.blp", false)] {
             let (item, _) = crate::types::FileItem::new(dir.path().join(name), dir.path(), None);
             assert_eq!(item.is_binary(), binary, "{name}");

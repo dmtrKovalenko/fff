@@ -90,7 +90,7 @@ pub(crate) fn walk_collect_files(
             Some(_) => &relative_path[basename_offset..],
         };
         let is_binary = is_known_binary_extension_basename(basename)
-            || is_ambiguous_binary_name(basename) && starts_with_binary_content(entry.path());
+            && (!is_ambiguous_binary_name(basename) || starts_with_binary_content(entry.path()));
 
         let (size, modified) = match target {
             Some(meta) => (
