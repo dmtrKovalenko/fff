@@ -504,7 +504,7 @@ require('fff').setup({
 
 `<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
 
-Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
+Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
 
 Definition filtering occurs before page and per-file result limits. A timed-out page can be empty; move down (top prompt) or up (bottom prompt) to continue searching. Context lines can still contain ordinary code.
 
@@ -685,7 +685,7 @@ finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });
 finder.multiGrep({ patterns: ['AudioMap', 'audio_map'], classifyDefinitions: 'definition_only' });
 ```
 
-SDK definition filtering occurs before page and per-file result limits. Both `definition_only` and `usage_only` retain file constraints when no matches exist. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. Context lines can still contain ordinary code.
+SDK definition filtering occurs before page and per-file result limits. `definition_only` retains file constraints when no matches exist. `usage_only` keeps the file-path and literal retries of ordinary grep. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. Context lines can still contain ordinary code.
 
 </details>
 
