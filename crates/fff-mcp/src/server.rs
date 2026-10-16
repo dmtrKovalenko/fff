@@ -2629,6 +2629,27 @@ mod tests {
     }
 
     #[test]
+    fn matches_inside_an_expanded_definition_body_print_once() {
+        let (_dir, server) = definition_server(&[(
+            "a.rs".into(),
+            "fn needle() {\n    needle_helper();\n}\nfn other() {\n    needle_helper();\n}\n",
+        )]);
+        let params = serde_json::from_value(serde_json::json!({"query": "needle"})).unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains(" 1: fn needle() {"), "{text}");
+        for line in ["2", "5"] {
+            let printed = text
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| {
+                    l.starts_with(&format!("{line}:")) || l.starts_with(&format!("{line}|"))
+                })
+                .count();
+            assert_eq!(printed, 1, "{line}: {text}");
+        }
+    }
+
+    #[test]
     fn matching_lines_only_do_not_claim_omitted_details() {
         let body: String = (0..300)
             .map(|i| format!("let needle_{i} = {i};\n"))

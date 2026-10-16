@@ -258,8 +258,13 @@ impl GrepFormatter<'_> {
         };
 
         let mut compacted = 0usize;
+        let mut body_lines = std::collections::HashSet::new();
         for (shown_count, &idx) in sorted_items.iter().enumerate() {
             let m = &items[idx];
+            // Already printed inside an expanded definition body.
+            if body_lines.contains(&(m.file_index, m.line_number)) {
+                continue;
+            }
             let file = files[m.file_index];
             let mut match_lines: Vec<String> = Vec::new();
             let over_budget = shown_count > 0 && char_count >= max_output_chars;
@@ -301,6 +306,7 @@ impl GrepFormatter<'_> {
                     if ctx.trim().is_empty() {
                         break;
                     }
+                    body_lines.insert((m.file_index, start_line + i as u64));
                     match_lines.push(format!(
                         "  {}| {}",
                         start_line + i as u64,
