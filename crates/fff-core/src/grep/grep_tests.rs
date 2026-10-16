@@ -148,7 +148,7 @@ fn definition_only_keeps_unknown_language_files_out_of_fallbacks() {
 }
 
 #[test]
-fn filtered_grep_keeps_empty_scopes_instead_of_retrying_without_constraints() {
+fn definition_only_keeps_empty_scopes_while_usage_only_retries() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.rs"),
@@ -167,24 +167,34 @@ fn filtered_grep_keeps_empty_scopes_instead_of_retrying_without_constraints() {
     picker.collect_files().unwrap();
     let parser = fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig);
     for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
-        for classify_definitions in [DefinitionMode::DefinitionOnly, DefinitionMode::UsageOnly] {
-            let options = GrepSearchOptions {
-                mode,
-                classify_definitions,
-                time_budget_ms: 0,
-                ..Default::default()
-            };
-            for raw in ["missing.rs Needle", "*.txt Needle", "!*.rs Needle"] {
-                let result = picker.grep(&parser.parse(raw), &options);
-                assert!(
-                    result.matches.is_empty(),
-                    "{mode:?} {classify_definitions:?}: {raw}"
-                );
-                assert_eq!(result.next_file_offset, 0);
-                assert!(!result.literal_fallback);
-            }
+        let options = GrepSearchOptions {
+            mode,
+            classify_definitions: DefinitionMode::DefinitionOnly,
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        for raw in ["missing.rs Needle", "*.txt Needle", "!*.rs Needle"] {
+            let result = picker.grep(&parser.parse(raw), &options);
+            assert!(result.matches.is_empty(), "{mode:?}: {raw}");
+            assert_eq!(result.next_file_offset, 0);
+            assert!(!result.literal_fallback);
         }
     }
+
+    // usage_only is public API: it keeps the path and literal retries of unfiltered grep.
+    let options = GrepSearchOptions {
+        classify_definitions: DefinitionMode::UsageOnly,
+        time_budget_ms: 0,
+        ..Default::default()
+    };
+    let lines = |raw: &str| {
+        let result = picker.grep(&parser.parse(raw), &options);
+        let lines: Vec<u64> = result.matches.iter().map(|m| m.line_number).collect();
+        (lines, result.literal_fallback)
+    };
+    assert_eq!(lines("missing.rs Needle"), (vec![2, 3], false));
+    assert_eq!(lines("*.txt Needle"), (vec![3], true));
+    assert_eq!(lines("!*.rs Needle"), (vec![], false));
 }
 
 #[test]

@@ -12,6 +12,7 @@ pub(crate) struct GrepCursor {
     pub file_offset: usize,
     pub stage: GrepStage,
     pub found_matches: bool,
+    pub missing_path: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]

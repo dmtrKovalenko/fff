@@ -28,7 +28,9 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         overflow_arena,
     );
 
-    if !files_to_search.is_empty() || options.classify_definitions.is_filtered() {
+    if !files_to_search.is_empty()
+        || options.classify_definitions == super::DefinitionMode::DefinitionOnly
+    {
         return (files_to_search, filtered_file_count);
     }
 

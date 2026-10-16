@@ -3,7 +3,7 @@ use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
 use fff::types::{FileItem, PaginationArgs};
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
-use fff_query_parser::AiGrepConfig;
+use fff_query_parser::{AiGrepConfig, Constraint, FFFQuery};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
@@ -326,6 +326,15 @@ impl FffServer {
         } else {
             mode
         };
+        let fresh = cursor.stage == GrepStage::Definitions && cursor.file_offset == 0;
+        let missing_path = file_path_constraint(&original)
+            .filter(|path| cursor.missing_path || (fresh && !indexes_file_path(picker, path)));
+        if missing_path.is_some() {
+            original
+                .constraints
+                .retain(|c| !matches!(c, Constraint::FilePath(_)));
+            cursor.missing_path = true;
+        }
         let fuzzy_query = prefer_definitions.then(|| cleanup_fuzzy_query(&original.grep_text()));
         let mut fuzzy = None;
         let result = loop {
@@ -345,7 +354,14 @@ impl FffServer {
             } else {
                 &original
             };
-            let result = picker.grep(parsed, &options);
+            let mut result = picker.grep(parsed, &options);
+            if prefer_definitions && result.literal_fallback {
+                // A literal retry drops exclusions, so treat it as an empty stage.
+                result.matches.clear();
+                result.files.clear();
+                result.next_file_offset = 0;
+                result.literal_fallback = false;
+            }
             if result.matches.is_empty()
                 && result.next_file_offset == 0
                 && !cursor.found_matches
@@ -479,11 +495,14 @@ impl FffServer {
             return Ok(grep_response("0 matches.".into(), false));
         }
 
+        let path_notice = missing_path
+            .map(|path| format!("No indexed file matches '{path}'. Searched all files instead."));
         if result.matches.is_empty() && result.next_file_offset == 0 {
-            return Ok(grep_response(
+            let response = grep_response(
                 "0 matches.".into(),
                 prefer_definitions && !cursor.found_matches,
-            ));
+            );
+            return Ok(with_notice(response, path_notice));
         }
 
         let notice = if !cursor.found_matches || cursor.stage.is_fuzzy() {
@@ -515,7 +534,7 @@ impl FffServer {
             (_, Some(notice)) => format!("{notice}\n{text}"),
             _ => text,
         };
-        Ok(grep_response(text, false))
+        Ok(with_notice(grep_response(text, false), path_notice))
     }
 }
 
@@ -809,6 +828,33 @@ fn grep_response(text: String, definitions_fallback: bool) -> CallToolResult {
     CallToolResult::success(vec![Content::text(text)])
 }
 
+fn with_notice(mut response: CallToolResult, notice: Option<String>) -> CallToolResult {
+    if let Some(notice) = notice
+        && let Some(RawContent::Text(text)) = response.content.first_mut().map(|c| &mut c.raw)
+    {
+        text.text = format!("{notice}\n{}", text.text);
+    }
+    response
+}
+
+fn file_path_constraint<'a>(query: &FFFQuery<'a>) -> Option<&'a str> {
+    query.constraints.iter().find_map(|c| match c {
+        Constraint::FilePath(path) => Some(*path),
+        _ => None,
+    })
+}
+
+fn indexes_file_path(picker: &fff::FilePicker, suffix: &str) -> bool {
+    let suffix = suffix.replace('\\', "/");
+    picker.get_files().iter().any(|file| {
+        let path = file.relative_path(picker).replace('\\', "/");
+        !file.is_deleted()
+            && path
+                .strip_suffix(suffix.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,12 +1122,12 @@ mod tests {
     }
 
     #[test]
-    fn definition_fallback_does_not_leave_empty_file_constraints() {
+    fn definition_fallback_keeps_exclusions_out_of_literal_retries() {
         let (_dir, server) = definition_server(&[
             ("a.rs".into(), "fn Needle() {}\nNeedle();\n*.txt Needle\n"),
             ("b.txt".into(), "unrelated\n"),
         ]);
-        for query in ["missing.rs Needle", "*.txt Needle", "!*.rs Needle"] {
+        for query in ["*.txt Needle", "!*.rs Needle"] {
             let params = serde_json::from_value(serde_json::json!({
                 "query": query, "definitions_only": true,
             }))
@@ -1092,6 +1138,48 @@ mod tests {
                 "{query}"
             );
         }
+    }
+
+    #[test]
+    fn definition_search_reports_and_drops_a_missing_file_path() {
+        let (_dir, server) = definition_server(&[
+            ("src/a.rs".into(), "fn Needle() {}\nNeedle();\n"),
+            ("b.rs".into(), "unrelated();\n"),
+        ]);
+        let notice = "No indexed file matches 'missing.rs'. Searched all files instead.";
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "missing.rs Needle", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.starts_with(notice), "{text}");
+        assert!(
+            text.contains("src/a.rs") && text.contains("fn Needle()"),
+            "{text}"
+        );
+
+        for query in ["a.rs Needle", "src/a.rs Needle"] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": query, "definitions_only": true,
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(!text.contains("No indexed file"), "{query}: {text}");
+            assert!(text.contains("fn Needle()"), "{query}: {text}");
+        }
+
+        let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
+            stage: GrepStage::References,
+            missing_path: true,
+            ..Default::default()
+        });
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "missing.rs Needle", "cursor": id,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.starts_with(notice), "{text}");
+        assert!(text.contains("Needle();"), "{text}");
     }
 
     #[test]
@@ -1110,6 +1198,7 @@ mod tests {
                 file_offset: 1,
                 stage,
                 found_matches: true,
+                ..Default::default()
             });
             let params = serde_json::from_value(serde_json::json!({
                 "query": "Needle", "cursor": id,
@@ -1151,6 +1240,7 @@ mod tests {
                 file_offset: 1,
                 stage,
                 found_matches: false,
+                ..Default::default()
             });
             let params =
                 serde_json::from_value(serde_json::json!({"query": query, "cursor": id})).unwrap();
@@ -1172,6 +1262,7 @@ mod tests {
                 file_offset: 1,
                 stage: GrepStage::Broadened,
                 found_matches: true,
+                ..Default::default()
             });
             let params = serde_json::from_value(serde_json::json!({
                 "query": query, "cursor": id, "context": 1,
@@ -1190,7 +1281,9 @@ mod tests {
     fn definition_server(files: &[(String, &str)]) -> (tempfile::TempDir, FffServer) {
         let dir = tempfile::tempdir().unwrap();
         for (name, content) in files {
-            std::fs::write(dir.path().join(name), content).unwrap();
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
         }
         let mut picker = fff::FilePicker::new(fff::FilePickerOptions {
             base_path: dir.path().to_string_lossy().into_owned(),
