@@ -1011,7 +1011,7 @@ impl FffServer {
             cursor,
             output_mode,
             max_results,
-            show_context: ctx_lines > 0,
+            show_context: !auto_expand && ctx_lines > 0,
             auto_expand_defs: auto_expand,
             picker,
         }
@@ -1467,6 +1467,41 @@ mod tests {
     }
 
     #[test]
+    fn default_multi_grep_does_not_print_collected_context() {
+        let body: String = (0..20)
+            .map(|i| format!("call_needle({i});\n{}", "let filler = 0;\n".repeat(20)))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let params =
+            serde_json::from_value(serde_json::json!({"patterns": ["call_needle"]})).unwrap();
+        let text = response_text(server.multi_grep_inner(params).unwrap());
+        assert!(text.contains("call_needle(19)"), "{text}");
+        assert!(!text.contains("filler"), "{text}");
+        assert!(text.len() < 5000, "{}", text.len());
+    }
+
+    #[test]
+    fn explicit_context_is_budgeted_without_hiding_matches() {
+        let body: String = (0..400)
+            .map(|i| format!("needle_{i}();\n{}", "let filler = 0;\n".repeat(10)))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "needle_", "context": 5, "maxResults": 400,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.starts_with("Context shown for "), "{}", &text[..200]);
+        assert!(text.contains(" 2- let filler = 0;"), "{}", &text[..400]);
+        let last = text
+            .lines()
+            .filter(|line| line.contains(": needle_"))
+            .count();
+        assert_eq!(last, text.matches("needle_").count());
+        assert!(text.len() < 25_000, "{}", text.len());
+    }
+
+    #[test]
     fn definition_context_budget_does_not_hide_matches() {
         let content: Vec<_> = (0..20)
             .map(|i| {
@@ -1485,7 +1520,11 @@ mod tests {
         }))
         .unwrap();
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-        assert!(text.contains("Context omitted"), "{text}");
+        assert!(text.contains("Details omitted for the last"), "{text}");
+        assert!(
+            text.contains("  2|     first_field_with_a_long_name"),
+            "{text}"
+        );
         for i in 0..20 {
             assert!(text.contains(&format!("struct Needle{i} {{")), "{text}");
         }

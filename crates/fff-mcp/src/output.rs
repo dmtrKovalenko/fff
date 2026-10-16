@@ -67,6 +67,8 @@ const MAX_LINE_LEN: usize = 180;
 const MAX_DEF_EXPAND_FIRST: usize = 8;
 const MAX_DEF_EXPAND: usize = 5;
 const MAX_FIRST_MATCH_EXPAND: usize = 8;
+const AUTO_CONTEXT_CHARS: usize = 5000;
+const EXPLICIT_CONTEXT_CHARS: usize = 8000;
 
 fn trauncate_line_for_ai(
     line: &str,
@@ -193,10 +195,17 @@ impl GrepFormatter<'_> {
         if output_mode == OutputMode::Count {
             return format_count(items, files, cursor, cursor_store, picker);
         }
-        if (show_context
-            || (auto_expand_defs && items.len() <= 8 && !items.iter().any(|m| m.is_definition)))
+        if show_context
             && let Some(text) =
-                self.format_with_context(items, cursor_store, (!show_context).then_some(5000))
+                self.format_with_context(items, cursor_store, EXPLICIT_CONTEXT_CHARS, false)
+        {
+            return text;
+        }
+        if auto_expand_defs
+            && items.len() <= 8
+            && !items.iter().any(|m| m.is_definition)
+            && let Some(text) =
+                self.format_with_context(items, cursor_store, AUTO_CONTEXT_CHARS, true)
         {
             return text;
         }
@@ -248,10 +257,12 @@ impl GrepFormatter<'_> {
             (0..items.len()).collect()
         };
 
+        let mut compacted = 0usize;
         for (shown_count, &idx) in sorted_items.iter().enumerate() {
             let m = &items[idx];
             let file = files[m.file_index];
             let mut match_lines: Vec<String> = Vec::new();
+            let over_budget = compacted > 0 || (shown_count > 0 && char_count >= max_output_chars);
 
             let file_rel_path = file.relative_path(picker);
             if file_rel_path != current_file {
@@ -273,7 +284,7 @@ impl GrepFormatter<'_> {
             // Auto-expand definitions with body context
             let file_rel_for_expand = file.relative_path(picker);
             if auto_expand_defs
-                && !show_context
+                && !over_budget
                 && m.is_definition
                 && !m.context_after.is_empty()
                 && !def_expanded_files.contains(&file_rel_for_expand)
@@ -298,12 +309,16 @@ impl GrepFormatter<'_> {
             }
 
             let chunk = match_lines.join("\n");
-            if char_count + chunk.len() > max_output_chars && shown_count > 0 {
-                return self.format_compact(items, &sorted_items, cursor_store);
+            if over_budget {
+                compacted += 1;
             }
-
             char_count += chunk.len();
             lines.push(chunk);
+        }
+        if compacted > 0 {
+            let note =
+                format!("Details omitted for the last {compacted} matches to fit the output.");
+            lines.insert(usize::from(total_matched > items.len()), note);
         }
 
         if cursor.has_more() {
@@ -318,26 +333,57 @@ impl GrepFormatter<'_> {
         &self,
         items: &[GrepMatch],
         cursor_store: &mut CursorStore,
-        max_chars: Option<usize>,
+        max_chars: usize,
+        all_or_nothing: bool,
     ) -> Option<String> {
         let mut rows = std::collections::BTreeMap::new();
+        let mut chars = 0;
+        let mut with_context = 0;
+        for m in items {
+            let line =
+                trauncate_line_for_ai(&m.line_content, Some(&m.match_byte_offsets), MAX_LINE_LEN);
+            // Explicit context budgets only context rows; matching lines are always shown.
+            if all_or_nothing {
+                chars += line.len() + 8;
+            }
+            rows.insert((m.file_index, m.line_number), (line, true));
+        }
         for m in items {
             let start = m.line_number.saturating_sub(m.context_before.len() as u64);
-            for (i, text) in m.context_before.iter().enumerate() {
-                rows.entry((m.file_index, start + i as u64))
-                    .or_insert((text.as_str(), false));
+            let context = m
+                .context_before
+                .iter()
+                .enumerate()
+                .map(|(i, text)| (start + i as u64, text))
+                .chain(
+                    m.context_after
+                        .iter()
+                        .enumerate()
+                        .map(|(i, text)| (m.line_number + 1 + i as u64, text)),
+                )
+                .filter(|(line, _)| !rows.contains_key(&(m.file_index, *line)))
+                .map(|(line, text)| (line, trauncate_line_for_ai(text, None, MAX_LINE_LEN)))
+                .collect::<Vec<_>>();
+            let cost: usize = context.iter().map(|(_, text)| text.len() + 8).sum();
+            if chars + cost > max_chars {
+                if all_or_nothing {
+                    return None;
+                }
+                break;
             }
-            rows.insert(
-                (m.file_index, m.line_number),
-                (m.line_content.as_str(), true),
-            );
-            for (i, text) in m.context_after.iter().enumerate() {
-                rows.entry((m.file_index, m.line_number + 1 + i as u64))
-                    .or_insert((text.as_str(), false));
+            chars += cost;
+            with_context += 1;
+            for (line, text) in context {
+                rows.insert((m.file_index, line), (text, false));
             }
         }
         let mut lines = Vec::new();
-        let mut chars = 0;
+        if with_context < items.len() {
+            lines.push(format!(
+                "Context shown for {with_context}/{} matches to fit the output.",
+                items.len()
+            ));
+        }
         let mut previous = None;
         for ((file_index, line), (text, matched)) in rows {
             if previous.is_none_or(|(file, _)| file != file_index) {
@@ -346,10 +392,6 @@ impl GrepFormatter<'_> {
                 lines.push("--".into());
             }
             lines.push(format!(" {line}{} {text}", if matched { ':' } else { '-' }));
-            chars += text.len() + 20;
-            if max_chars.is_some_and(|limit| chars > limit) {
-                return None;
-            }
             previous = Some((file_index, line));
         }
         if self.cursor.has_more() {
@@ -357,38 +399,6 @@ impl GrepFormatter<'_> {
             lines.push(format!("\ncursor: {id}"));
         }
         Some(lines.join("\n"))
-    }
-
-    fn format_compact(
-        &self,
-        items: &[GrepMatch],
-        order: &[usize],
-        cursor_store: &mut CursorStore,
-    ) -> String {
-        let mut lines = vec![format!(
-            "{}/{} page matches shown. Context omitted to show matching lines.",
-            items.len(),
-            self.total_matched
-        )];
-        let mut current_file = String::new();
-        for &idx in order {
-            let m = &items[idx];
-            let path = self.files[m.file_index].relative_path(self.picker);
-            if path != current_file {
-                current_file = path;
-                lines.push(current_file.clone());
-            }
-            lines.push(format!(
-                " {}: {}",
-                m.line_number,
-                trauncate_line_for_ai(&m.line_content, Some(&m.match_byte_offsets), MAX_LINE_LEN)
-            ));
-        }
-        if self.cursor.has_more() {
-            let cursor_id = cursor_store.store_grep(self.cursor);
-            lines.push(format!("\ncursor: {}", cursor_id));
-        }
-        lines.join("\n")
     }
 }
 
