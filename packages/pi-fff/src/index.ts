@@ -1138,6 +1138,7 @@ export default function fffExtension(pi: ExtensionAPI) {
         stage = next;
         nativeCursor = null;
       }
+      if (stage === "definitions") result.items = exactDefinitionsFirst(result.items);
       let fuzzyNotice: string | null = null;
 
       // if we hit the timeout do not run the fuzzy fallback
@@ -1481,6 +1482,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           result = fallback.value;
           stage = "references";
         }
+        if (stage === "definitions") result.items = exactDefinitionsFirst(result.items);
         let output = formatGrepOutput(result);
 
         const notices: string[] = [];
@@ -1714,6 +1716,25 @@ function nextGrepStage(stage: GrepStage): GrepStage | undefined {
   }
 }
 
+// Files that define the whole matched word lead the page; the native order is kept otherwise.
+function exactDefinitionsFirst(items: GrepResult["items"]): GrepResult["items"] {
+  const encoder = new TextEncoder();
+  const exact = new Set(
+    items
+      .filter((item) => {
+        const line = encoder.encode(item.lineContent);
+        return item.matchRanges.some(
+          ([start, end]) =>
+            start < end && !isWordByte(line[start - 1]) && !isWordByte(line[end]),
+        );
+      })
+      .map((item) => item.relativePath),
+  );
+  return [...items].sort(
+    (a, b) => Number(!exact.has(a.relativePath)) - Number(!exact.has(b.relativePath)),
+  );
+}
+
 function isFuzzyGrepStage(stage: GrepStage): boolean {
   return stage === "fuzzy_definitions" || stage === "fuzzy_matches";
 }
@@ -1729,4 +1750,12 @@ function grepStageNotice(stage: GrepStage): string | undefined {
     default:
       return undefined;
   }
+}
+
+function isWordByte(byte: number | undefined): boolean {
+  if (byte === undefined) return false;
+  const lower = byte | 0x20;
+  return (
+    byte === 0x5f || (byte >= 0x30 && byte <= 0x39) || (lower >= 0x61 && lower <= 0x7a)
+  );
 }

@@ -1058,6 +1058,35 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
       await shutdown(setup);
     });
 
+    test("lists files that define the exact name first on a page", async () => {
+      const definition = (relativePath: string, lineContent: string, start: number) => ({
+        relativePath,
+        fileName: relativePath.split("/").pop(),
+        lineNumber: 1,
+        lineContent,
+        matchRanges: [[start, start + 5]],
+        isDefinition: true,
+        totalFrecencyScore: 0,
+      });
+      const { setup, tool } = await prepare(() => {
+        const page = grepPage();
+        page.value.items = [
+          definition("src/a.rs", "pub struct ArgValueCompletion {}", 14),
+          definition("src/b.rs", "pub enum Value {", 9),
+        ] as any;
+        return page;
+      });
+      const result = await tool.execute(
+        "exact",
+        { ...params, pattern: "Value", definitions_only: true },
+        abortOptions().signal,
+      );
+      const text = result.content[0].text;
+      expect(text.indexOf("src/b.rs")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("src/b.rs")).toBeLessThan(text.indexOf("src/a.rs"));
+      await shutdown(setup);
+    });
+
     test("falls back with a notice and preserves the ordinary cursor", async () => {
       const calls: any[] = [];
       const next = { _offset: 7 };
@@ -1478,6 +1507,7 @@ function grepPage(line?: string, nextCursor: unknown = null, isDefinition = fals
           fileName: "hit.rs",
           lineNumber: 1,
           lineContent: line,
+          matchRanges: [],
           isDefinition,
           totalFrecencyScore: 0,
         },

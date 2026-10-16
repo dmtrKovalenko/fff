@@ -2397,6 +2397,36 @@ mod tests {
     }
 
     #[test]
+    fn definition_pages_list_exact_names_before_partial_names() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "pub struct ArgValueCompletion {}\n"),
+            ("b.rs".into(), "pub enum Value {\n    Int,\n}\n"),
+            ("c.rs".into(), "fn value_of(v: Value) -> i64 { 0 }\n"),
+            (
+                "dict.h".into(),
+                "struct _xmlDict {\n    int ref;\n};\ntypedef struct _xmlDict xmlDict;\n",
+            ),
+        ]);
+        let grep = |query: &str| {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": query, "definitions_only": true,
+            }))
+            .unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let text = grep("Value");
+        let exact = text.find("pub enum Value {").expect(&text);
+        let partial = text.find("ArgValueCompletion").expect(&text);
+        assert!(exact < partial, "{text}");
+        assert!(!text.contains("value_of"), "{text}");
+
+        // A typedef alias leads, but the struct body it names stays on the page.
+        let text = grep("xmlDict");
+        assert!(text.contains("typedef struct _xmlDict xmlDict;"), "{text}");
+        assert!(text.contains("struct _xmlDict {"), "{text}");
+    }
+
+    #[test]
     fn named_path_is_optional_in_search_schemas() {
         for schema in [
             schemars::schema_for!(GrepParams),

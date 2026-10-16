@@ -241,16 +241,21 @@ impl GrepFormatter<'_> {
         let mut char_count = 0usize;
         let mut current_file = String::new();
 
-        // Reorder: definitions first, then usages, then imports (when auto-expanding)
+        // Definitions first, led by files that define the whole word; then usages, then imports.
         let sorted_items: Vec<usize> = if auto_expand_defs {
+            let exact_files: std::collections::HashSet<usize> = items
+                .iter()
+                .filter(|m| m.is_definition && matches_whole_word(m))
+                .map(|m| m.file_index)
+                .collect();
             let mut indices: Vec<usize> = (0..items.len()).collect();
             indices.sort_by_key(|&i| {
                 if items[i].is_definition {
-                    0
+                    usize::from(!exact_files.contains(&items[i].file_index))
                 } else if is_import_line(&items[i].line_content) {
-                    2
+                    3
                 } else {
-                    1
+                    2
                 }
             });
 
@@ -541,6 +546,18 @@ fn collect_file_preview<'a>(
         }
     }
     file_preview
+}
+
+fn matches_whole_word(m: &GrepMatch) -> bool {
+    let line = m.line_content.as_bytes();
+    let word = |i: usize| {
+        line.get(i)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    };
+    m.match_byte_offsets.iter().any(|&(start, end)| {
+        let (start, end) = (start as usize, end as usize);
+        start < end && (start == 0 || !word(start - 1)) && !word(end)
+    })
 }
 
 #[cfg(test)]
