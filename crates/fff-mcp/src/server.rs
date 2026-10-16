@@ -580,6 +580,7 @@ impl FffServer {
                             max_results,
                             show_context,
                             auto_expand_defs: auto_expand,
+                            auto_context: auto_expand && params.max_results.is_none(),
                             picker,
                         }
                         .format(&mut cs);
@@ -614,7 +615,7 @@ impl FffServer {
             };
             fuzzy_result
                 .matches
-                .retain(|m| strong_suggestion(m, fuzzy_query.len()));
+                .retain(|m| strong_suggestion(m, fuzzy_query.len(), original.grep_text().len()));
             fuzzy_result
                 .matches
                 .sort_by_key(|m| std::cmp::Reverse(m.fuzzy_score));
@@ -729,6 +730,8 @@ impl FffServer {
             max_results,
             show_context,
             auto_expand_defs: auto_expand,
+            // An explicit page size asks for matching lines, not surrounding source.
+            auto_context: auto_expand && params.max_results.is_none(),
             picker,
         }
         .format(&mut cs);
@@ -863,7 +866,10 @@ impl FffServer {
             ));
         }
 
-        let mut lines: Vec<String> = vec!["Approximate filename matches:".into()];
+        let mut lines: Vec<String> = Vec::new();
+        if !fff_query.grep_text().trim().is_empty() {
+            lines.push("Approximate filename matches:".into());
+        }
 
         let next_offset = page_offset + items.len();
         let has_more = next_offset < total_matched;
@@ -1033,6 +1039,7 @@ impl FffServer {
             max_results,
             show_context: !auto_expand && ctx_lines > 0,
             auto_expand_defs: auto_expand,
+            auto_context: auto_expand && params.max_results.is_none(),
             picker,
         }
         .format(&mut cs);
@@ -1228,13 +1235,15 @@ fn format_broader_matches(
         max_results: 8,
         show_context: false,
         auto_expand_defs: true,
+        auto_context: true,
         picker,
     }
     .format(&mut CursorStore::new());
     format!("{notice}\n{text}\nSuggestions are limited; search a suggested path for more matches.")
 }
 
-fn strong_suggestion(m: &fff::GrepMatch, needle_len: usize) -> bool {
+// The span allows the separators the cleaned fuzzy query dropped (`get_ful_help`).
+fn strong_suggestion(m: &fff::GrepMatch, needle_len: usize, query_len: usize) -> bool {
     let Some((start, _)) = m.match_byte_offsets.first() else {
         return false;
     };
@@ -1247,7 +1256,7 @@ fn strong_suggestion(m: &fff::GrepMatch, needle_len: usize) -> bool {
         .map(|(start, end)| (end - start) as usize)
         .sum();
     let typos = if needle_len < 9 { 1 } else { 2 };
-    matched + typos >= needle_len && (*end - *start) as usize <= needle_len + 2
+    matched + typos >= needle_len && (*end - *start) as usize <= needle_len.max(query_len) + 2
 }
 
 #[derive(Debug, PartialEq)]
@@ -1550,6 +1559,59 @@ mod tests {
         let second = grep(Some(&cursor));
         assert!(second.contains(&format!("Needle({other}, 0)")), "{second}");
         assert!(!second.contains(&format!("Needle({shown},")), "{second}");
+    }
+
+    #[test]
+    fn typo_suggestions_keep_identifiers_with_separators() {
+        let (_dir, server) = definition_server(&[
+            (
+                "src/help.rs".into(),
+                "pub fn get_full_help(cmd: &str) -> String {\n    String::new()\n}\n",
+            ),
+            (
+                "src/idx.rs".into(),
+                "let get = 1;\nlet full = get + help_index;\n",
+            ),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({"query": "get_ful_help"})).unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        let first = text
+            .lines()
+            .find(|line| line.starts_with(' '))
+            .unwrap_or_default();
+        assert!(first.contains("pub fn get_full_help("), "{text}");
+    }
+
+    #[test]
+    fn explicit_page_size_skips_automatic_context() {
+        let body: String = (0..3)
+            .map(|i| format!("call_needle({i});\n{}", "let filler = 0;\n".repeat(20)))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let grep = |args: serde_json::Value| {
+            let params = serde_json::from_value(args).unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        assert!(grep(serde_json::json!({"query": "call_needle"})).contains("filler"));
+        let text = grep(serde_json::json!({"query": "call_needle", "maxResults": 5}));
+        assert!(text.contains("call_needle(2)"), "{text}");
+        assert!(!text.contains("filler"), "{text}");
+    }
+
+    #[test]
+    fn glob_file_searches_are_not_labelled_approximate() {
+        let (_dir, server) = definition_server(&[
+            ("a.nu".into(), ""),
+            ("b.nu".into(), ""),
+            ("c.rs".into(), ""),
+        ]);
+        let find = |query: &str| {
+            let params = serde_json::from_value(serde_json::json!({"query": query})).unwrap();
+            response_text(server.find_files(Parameters(params)).unwrap())
+        };
+        let text = find("*.nu");
+        assert!(text.contains("a.nu") && text.contains("b.nu"), "{text}");
+        assert!(!text.contains("Approximate"), "{text}");
     }
 
     #[test]
