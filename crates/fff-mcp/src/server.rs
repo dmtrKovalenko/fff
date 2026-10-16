@@ -390,6 +390,7 @@ impl FffServer {
         }
         let ctx_lines = options.before_context;
         let show_context = !auto_expand && (ctx_lines > 0 || options.after_context > 0);
+        let suggestion_context = (!auto_expand).then_some((ctx_lines, options.after_context));
 
         // Acquire picker lock once for the entire operation.
         let guard = self.picker.read().map_err(|e| {
@@ -702,9 +703,9 @@ impl FffServer {
                     &original,
                     mode,
                     options.effective_casing(),
-                    params.path.as_deref(),
+                    params,
                     false,
-                    params.scope.hidden == Some(false),
+                    suggestion_context,
                 )
                 .unwrap_or_else(|| "0 matches.".into()),
                 false,
@@ -719,9 +720,9 @@ impl FffServer {
                     &original,
                     mode,
                     options.effective_casing(),
-                    params.path.as_deref(),
+                    params,
                     true,
-                    params.scope.hidden == Some(false),
+                    suggestion_context,
                 )
             {
                 return Ok(respond(suggestions, false));
@@ -1165,9 +1166,9 @@ fn suggest_other_files(
     query: &FFFQuery<'_>,
     mode: GrepMode,
     casing: fff::grep::Casing,
-    path: Option<&str>,
+    params: &GrepParams,
     definitions: bool,
-    hide_dotfiles: bool,
+    context: Option<(usize, usize)>,
 ) -> Option<String> {
     let mut broader = query.clone();
     broader.raw_query = "";
@@ -1175,7 +1176,7 @@ fn suggest_other_files(
         .constraints
         .retain(|c| matches!(c, Constraint::Exclude(_) | Constraint::Not(_)));
     let explicit = broader.constraints.len();
-    if hide_dotfiles {
+    if params.scope.hidden == Some(false) {
         // A named hidden root does not open other hidden paths to suggestions.
         let hidden = Constraint::Glob("{**/.*,**/.*/**}");
         broader.constraints.push(Constraint::Not(Box::new(hidden)));
@@ -1187,15 +1188,15 @@ fn suggest_other_files(
             casing: Some(casing),
             max_matches_per_file: 3,
             page_limit: 8,
-            before_context: 8,
-            after_context: 8,
+            before_context: context.map_or(8, |(before, _)| before),
+            after_context: context.map_or(8, |(_, after)| after),
             classify_definitions: true.into(),
             trim_whitespace: false,
             time_budget_ms: 100,
             enforce_time_budget: true,
             ..Default::default()
         };
-        if let Some(fragment) = path.map(str::trim).filter(|path| {
+        if let Some(fragment) = params.path.as_deref().map(str::trim).filter(|path| {
             !path.is_empty()
                 && path
                     .bytes()
@@ -1209,6 +1210,7 @@ fn suggest_other_files(
                 return Some(format_broader_matches(
                     picker,
                     &result,
+                    context,
                     &format!(
                         "No matches in the requested scope. Suggestions from paths containing '{fragment}' (broader scope):"
                     ),
@@ -1222,6 +1224,7 @@ fn suggest_other_files(
                 return Some(format_broader_matches(
                     picker,
                     &result,
+                    context,
                     "No matches in the requested scope. Suggestions elsewhere in the indexed project:",
                 ));
             }
@@ -1261,6 +1264,7 @@ fn suggest_other_files(
 fn format_broader_matches(
     picker: &fff::FilePicker,
     result: &fff::GrepResult<'_>,
+    context: Option<(usize, usize)>,
     notice: &str,
 ) -> String {
     let text = GrepFormatter {
@@ -1270,9 +1274,9 @@ fn format_broader_matches(
         cursor: GrepCursor::default(),
         output_mode: OutputMode::Content,
         max_results: 8,
-        show_context: false,
-        auto_expand_defs: true,
-        auto_context: true,
+        show_context: context.is_some_and(|(before, after)| before + after > 0),
+        auto_expand_defs: context.is_none(),
+        auto_context: context.is_none(),
         picker,
     }
     .format(&mut CursorStore::new());
@@ -1357,6 +1361,23 @@ fn path_scope(
             false,
         )));
     }
+    if !found.nested
+        && let Some((spelled, anchored)) = found.respelled
+    {
+        let escaped = crate::scope::escape_glob(&spelled);
+        return Ok(Some(PathScope {
+            glob: if anchored {
+                format!("{{{escaped},{escaped}/**}}")
+            } else {
+                format!("{{**/{escaped},**/{escaped}/**}}")
+            },
+            notice: Some(format!(
+                "Path '{raw}' matches no indexed file or directory; searched '{spelled}' instead."
+            )),
+            root: spelled,
+            nested: !anchored,
+        }));
+    }
     // A literal name such as `src` or `[id]` at any depth wins over reading it as a glob.
     if found.nested || !has_wildcards(path) {
         return Ok(Some(scope(
@@ -1398,6 +1419,8 @@ pub(crate) fn strip_root(
 struct PathLookup {
     anchored: bool,
     nested: bool,
+    // Indexed spelling that differs only in case or `-`/`_`, and whether it is a checkout path.
+    respelled: Option<(String, bool)>,
 }
 
 // One pass over the index: an exact checkout path wins, otherwise note a match at any depth.
@@ -1415,12 +1438,25 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
     for candidate in dirs.chain(files) {
         #[cfg(windows)]
         let candidate = candidate.replace('\\', "/");
-        match candidate.trim_end_matches('/').strip_suffix(path) {
+        let candidate = candidate.trim_end_matches('/');
+        match candidate.strip_suffix(path) {
             Some("") => {
                 found.anchored = true;
                 break;
             }
             Some(rest) if rest.ends_with('/') => found.nested = true,
+            _ if !found.nested && found.respelled.as_ref().is_none_or(|(_, a)| !a) => {
+                let Some(start) = candidate.len().checked_sub(path.len()) else {
+                    continue;
+                };
+                let anchored = start == 0;
+                if (anchored || candidate.as_bytes()[start - 1] == b'/')
+                    && let Some(tail) = candidate.get(start..)
+                    && same_spelling(tail, path)
+                {
+                    found.respelled = Some((tail.to_owned(), anchored));
+                }
+            }
             _ => {}
         }
     }
@@ -1429,6 +1465,13 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
 
 fn deserialize_filters<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     Ok(<Option<Vec<String>> as serde::Deserialize>::deserialize(d)?.unwrap_or_default())
+}
+
+fn same_spelling(indexed: &str, given: &str) -> bool {
+    indexed.len() == given.len()
+        && indexed.bytes().zip(given.bytes()).all(|(a, b)| {
+            a.eq_ignore_ascii_case(&b) || (matches!(a, b'-' | b'_') && matches!(b, b'-' | b'_'))
+        })
 }
 
 #[cfg(test)]
@@ -2484,6 +2527,64 @@ mod tests {
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("typedef struct _xmlDict xmlDict;"), "{text}");
         assert!(text.contains("struct _xmlDict {"), "{text}");
+    }
+
+    #[test]
+    fn snake_case_paths_find_kebab_case_directories() {
+        let (_dir, server) = definition_server(&[
+            ("crates/nu-cli/src/lib.rs".into(), "fn setup_config() {}"),
+            ("crates/nu-cmd/src/lib.rs".into(), "fn setup_config() {}"),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "setup_config", "path": "nu_cli",
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(
+            text.starts_with(
+                "Path 'nu_cli' matches no indexed file or directory; searched 'nu-cli' instead."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("crates/nu-cli/src/lib.rs"), "{text}");
+        assert!(!text.contains("nu-cmd"), "{text}");
+
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "setup_config", "path": "Crates/NU_CLI",
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("searched 'crates/nu-cli' instead."), "{text}");
+        assert!(!text.contains("nu-cmd"), "{text}");
+    }
+
+    #[test]
+    fn explicit_context_shapes_fallback_suggestions() {
+        let (_dir, server) = definition_server(&[(
+            "src/paste.rs".into(),
+            "fn is_safe_paste(input: &str) -> bool {\n    !input.contains('\\n')\n}\n",
+        )]);
+        let grep = |request: serde_json::Value| {
+            response_text(
+                server
+                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            )
+        };
+        let text =
+            grep(serde_json::json!({"query": "is_safe_paste", "path": "missing", "context": 0}));
+        assert!(text.contains("Suggestions elsewhere"), "{text}");
+        assert!(text.contains("src/paste.rs"), "{text}");
+        assert!(!text.contains("|"), "{text}");
+        assert!(!text.contains(" 2-"), "{text}");
+
+        let text = grep(serde_json::json!({
+            "query": "is_safe_paste", "path": "missing", "after_context": 1,
+        }));
+        assert!(text.contains("src/paste.rs"), "{text}");
+        assert!(text.contains(" 2- "), "{text}");
+        assert!(!text.contains(" 3- "), "{text}");
+        assert!(!text.contains("|"), "{text}");
     }
 
     #[test]
