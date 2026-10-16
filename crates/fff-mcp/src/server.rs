@@ -563,7 +563,7 @@ impl FffServer {
 
                     if !retry_result.matches.is_empty() && retry_result.matches.len() <= 10 {
                         cursor.stage = GrepStage::Broadened;
-                        cursor.paginate(&mut retry_result, max_results);
+                        cursor.paginate(&mut retry_result, max_results, picker);
                         let mut cs = self.lock_cursors()?;
                         let text = &GrepFormatter {
                             matches: &retry_result.matches,
@@ -706,7 +706,10 @@ impl FffServer {
         } else {
             None
         };
-        cursor.paginate(&mut result, max_results);
+        cursor.paginate(&mut result, max_results, picker);
+        if result.matches.is_empty() && !cursor.has_more() {
+            return Ok(respond("0 matches.".into(), false));
+        }
 
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
@@ -1002,7 +1005,10 @@ impl FffServer {
             return Ok(grep_response("0 matches.".into(), definitions_fallback));
         }
 
-        cursor.paginate(&mut result, max_results);
+        cursor.paginate(&mut result, max_results, picker);
+        if result.matches.is_empty() && !cursor.has_more() {
+            return Ok(grep_response("0 matches.".into(), false));
+        }
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
             matches: &result.matches,
@@ -1464,6 +1470,38 @@ mod tests {
         );
         assert!(text.contains("references.txt"), "{text}");
         assert!(!text.contains("definition.rs"), "{text}");
+    }
+
+    #[test]
+    fn stale_in_file_cursor_does_not_skip_other_files() {
+        let lines = |name: &str, count: usize| -> String {
+            (0..count)
+                .map(|i| format!("Needle({name}, {i});\n"))
+                .collect()
+        };
+        let (a, b) = (lines("a", 150), lines("b", 150));
+        let (dir, server) =
+            definition_server(&[("a.rs".into(), a.as_str()), ("b.rs".into(), b.as_str())]);
+        let grep = |cursor: Option<&str>| {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Needle", "maxResults": 100, "context": 0, "cursor": cursor,
+            }))
+            .unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let first = grep(None);
+        let (shown, other) = if first.contains("Needle(a, 0)") {
+            ("a", "b")
+        } else {
+            ("b", "a")
+        };
+        assert!(first.contains(&format!("Needle({shown}, 99)")), "{first}");
+        let cursor = first.rsplit("cursor: ").next().unwrap().trim().to_owned();
+        std::fs::write(dir.path().join(format!("{shown}.rs")), lines(shown, 20)).unwrap();
+
+        let second = grep(Some(&cursor));
+        assert!(second.contains(&format!("Needle({other}, 0)")), "{second}");
+        assert!(!second.contains(&format!("Needle({shown},")), "{second}");
     }
 
     #[test]

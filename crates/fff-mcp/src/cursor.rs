@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 const MAX_CURSORS: usize = 20;
 
@@ -6,6 +7,7 @@ const MAX_CURSORS: usize = 20;
 pub(crate) struct GrepCursor {
     pub file_offset: usize,
     pub match_offset: usize,
+    pub match_file: u64,
     pub stage: GrepStage,
     pub found_matches: bool,
     pub missing_path: bool,
@@ -18,8 +20,31 @@ impl GrepCursor {
             .saturating_add(1)
     }
 
-    pub fn paginate(&mut self, result: &mut fff::GrepResult<'_>, requested: usize) {
-        let start = self.match_offset.min(result.matches.len());
+    pub fn paginate(
+        &mut self,
+        result: &mut fff::GrepResult<'_>,
+        requested: usize,
+        picker: &fff::FilePicker,
+    ) {
+        let file_id = |index: usize| {
+            let mut hasher = std::hash::DefaultHasher::new();
+            result.files[index].relative_path(picker).hash(&mut hasher);
+            hasher.finish()
+        };
+        // Skip only matches already shown from the file where the last page stopped.
+        let start = match result.matches.first() {
+            Some(first)
+                if self.match_offset > 0 && file_id(first.file_index) == self.match_file =>
+            {
+                result
+                    .matches
+                    .iter()
+                    .take(self.match_offset)
+                    .take_while(|m| m.file_index == first.file_index)
+                    .count()
+            }
+            _ => 0,
+        };
         let end = start.saturating_add(requested).min(result.matches.len());
         if end < result.matches.len() {
             let last_file = result.matches.last().unwrap().file_index;
@@ -33,6 +58,7 @@ impl GrepCursor {
                 .rev()
                 .take_while(|m| m.file_index == last_file)
                 .count();
+            self.match_file = file_id(last_file);
         } else {
             self.file_offset = result.next_file_offset;
             self.match_offset = 0;
