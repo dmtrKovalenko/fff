@@ -69,7 +69,7 @@ fn make_grep_options(
         context.unwrap_or(0)
     };
     let auto_expand = !is_usage && context.is_none();
-    let after_ctx = if auto_expand { 8 } else { ctx_lines };
+    let after_ctx = if auto_expand { 16 } else { ctx_lines };
 
     (
         GrepSearchOptions {
@@ -602,7 +602,7 @@ impl FffServer {
                             max_results,
                             show_context,
                             auto_expand_defs: auto_expand,
-                            auto_context: auto_expand && params.max_results.is_none(),
+                            auto_context: auto_expand,
                             picker,
                         }
                         .format(&mut cs);
@@ -755,8 +755,7 @@ impl FffServer {
             max_results,
             show_context,
             auto_expand_defs: auto_expand,
-            // An explicit page size asks for matching lines, not surrounding source.
-            auto_context: auto_expand && params.max_results.is_none(),
+            auto_context: auto_expand,
             picker,
         }
         .format(&mut cs);
@@ -1071,7 +1070,7 @@ impl FffServer {
             max_results,
             show_context: !auto_expand && ctx_lines > 0,
             auto_expand_defs: auto_expand,
-            auto_context: auto_expand && params.max_results.is_none(),
+            auto_context: auto_expand,
             picker,
         }
         .format(&mut cs);
@@ -1771,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_page_size_skips_automatic_context() {
+    fn explicit_page_size_preserves_automatic_context() {
         let body: String = (0..3)
             .map(|i| format!("call_needle({i});\n{}", "let filler = 0;\n".repeat(20)))
             .collect();
@@ -1783,7 +1782,31 @@ mod tests {
         assert!(grep(serde_json::json!({"query": "call_needle"})).contains("filler"));
         let text = grep(serde_json::json!({"query": "call_needle", "maxResults": 5}));
         assert!(text.contains("call_needle(2)"), "{text}");
+        assert!(text.contains("filler"), "{text}");
+        let text = grep(serde_json::json!({
+            "query": "call_needle", "maxResults": 5, "context": 0,
+        }));
+        assert!(text.contains("call_needle(2)"), "{text}");
         assert!(!text.contains("filler"), "{text}");
+    }
+
+    #[test]
+    fn definition_preview_crosses_blank_lines_and_stays_bounded() {
+        let source = format!(
+            "pub fn needle() {{\n    let value = 1;\n\n{}    apply(value);\n{}    beyond_preview();\n}}\n",
+            "\n".repeat(6),
+            "\n".repeat(12),
+        );
+        let (_dir, server) = definition_server(&[("a.rs".into(), source.as_str())]);
+        for output_mode in ["content", "files_with_matches"] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "needle", "definitions_only": true, "output_mode": output_mode,
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.contains("10|     apply(value);"), "{text}");
+            assert!(!text.contains("beyond_preview"), "{text}");
+        }
     }
 
     #[test]

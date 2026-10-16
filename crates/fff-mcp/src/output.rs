@@ -64,7 +64,7 @@ fn size_tag(bytes: u64) -> String {
 
 const MAX_PREVIEW: usize = 120;
 const MAX_LINE_LEN: usize = 180;
-const MAX_DEF_EXPAND_FIRST: usize = 8;
+const MAX_DEF_EXPAND_FIRST: usize = 16;
 const MAX_DEF_EXPAND: usize = 5;
 const MAX_FIRST_MATCH_EXPAND: usize = 8;
 const AUTO_CONTEXT_CHARS: usize = 5000;
@@ -311,7 +311,7 @@ impl GrepFormatter<'_> {
                 let start_line = m.line_number + 1;
                 for (i, ctx) in m.context_after.iter().take(expand_limit).enumerate() {
                     if ctx.trim().is_empty() {
-                        break;
+                        continue;
                     }
                     body_lines.insert((m.file_index, start_line + i as u64));
                     match_lines.push(format!(
@@ -474,7 +474,7 @@ fn format_files_with_matches(
                     let start_line = fm.line_number + 1;
                     for (i, ctx) in fm.context_after.iter().take(expand_limit).enumerate() {
                         if ctx.trim().is_empty() {
-                            break;
+                            continue;
                         }
                         lines.push(format!(
                             "  {}| {}",
