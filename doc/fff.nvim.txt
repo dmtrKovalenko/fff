@@ -370,52 +370,9 @@ so definitions stay nearest
 the prompt. Files with both kinds of matches appear in both sections, with each
 match shown once.
 
-Each core grep call uses one `classify_definitions` mode. Rust stores it in
-`GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript
-SDKs expose the same setting as `classifyDefinitions`.
-
-  -----------------------------------------------------------------------
-  Mode              Rust variant      C integer         Result
-  ----------------- ----------------- ----------------- -----------------
-  off               Off               0                 All matches,
-                                                        without
-                                                        classification
-
-  classify          Classify          1                 All matches, with
-                                                        definition labels
-
-  definition_only   DefinitionOnly    2                 Only matches on
-                                                        declared names
-
-  usage_only        UsageOnly         3                 Only other
-                                                        matches
-  -----------------------------------------------------------------------
-JavaScript and Neovim also accept the existing booleans: `false` means `off`,
-and `true` means `classify`. Neovim groups each page of `classify` results into
-definitions first, then usages. The SDK default is `off`. Use the same mode
-when continuing with a cursor. The C argument is a `uint8_t`, preserving the byte
-representation of existing boolean calls (`0` and `1`). Modes `2` and `3`
-require the updated native library; never send them to a library that still
-expects `bool`.
-
->typescript
-    finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });
-    finder.multiGrep({ patterns: ['AudioMap', 'audio_map'], classifyDefinitions: 'definition_only' });
-<
-
-MCP and Pi expose only the optional `definitions_only` boolean to the model.
-MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi’s
-`ffgrep` uses `pattern` instead of `query`. If the completed search finds no
-matching declarations, the tool reports that and returns ordinary matches.
-Cursors preserve the definition search or fallback state, so the model does not
-need to repeat a mode. The multi-pattern tools accept the same flag.
-
-SDK definition filtering occurs before page and per-file result limits. Cursors
-resume at the next file; page size is a soft limit because the current file is
-returned together. Repeat the same query, mode, and constraints for each page.
-A timed-out page can be empty with a continuation cursor. In Neovim, move down
-(top prompt) or up (bottom prompt) to continue an empty page. Context lines can
-still contain ordinary code.
+Definition filtering occurs before page and per-file result limits. A timed-out
+page can be empty; move down (top prompt) or up (bottom prompt) to continue
+searching. Context lines can still contain ordinary code.
 
 Definition classification accepts source lines up to 256 bytes, including
 indentation and excluding line endings. Longer lines stay ordinary matches and

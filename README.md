@@ -112,6 +112,17 @@ Drop this into your project's `CLAUDE.md` or equivalent:
 For any file search or grep in the current git-indexed directory, use fff tools.
 ```
 
+### Definition search
+
+MCP and Pi expose only the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi's `ffgrep` uses `pattern` instead of `query`. Single-query grep tries these stages in order:
+
+1. Matching declarations.
+2. Ordinary exact matches, with a notice that no matching declarations were found.
+3. Fuzzy declarations, labeled “Maybe you meant these definitions”.
+4. Fuzzy ordinary matches, labeled “Maybe you meant these other matches”.
+
+A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage, and all stages keep the original file constraints. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
+
 ### What changes
 
 - Frecency memory. Files you actually open rank higher next time. Warm-up from git touch history runs automatically.
@@ -152,6 +163,8 @@ Env vars: `PI_FFF_MODE`, `FFF_FRECENCY_DB`, `FFF_HISTORY_DB`. Flags: `--fff-mode
 
 - `ffgrep`. Content search. Accepts `path`, `exclude` (comma, space, or array; leading `!` optional), `caseSensitive`, `context`, and cursor pagination. Auto-detects regex, falls back to fuzzy on zero exact matches, rejects `.*`-style wildcard-only patterns up front.
 - `fffind`. Path and filename search. Matches the whole repo-relative path, not just the filename. Frecency-aware. The weak-match detector flags scattered fuzzy noise before it floods the agent's context.
+
+Set `definitions_only: true` on `ffgrep` to try declarations first, then exact references, fuzzy declarations, and fuzzy references. Each fallback includes a notice. See the [extension documentation](packages/pi-fff/README.md) for pagination and multi-pattern behavior.
 
 ### Commands
 
@@ -491,27 +504,9 @@ require('fff').setup({
 
 `<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
 
-Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
+Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
 
-Each core grep call uses one `classify_definitions` mode. Rust stores it in `GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript SDKs expose the same setting as `classifyDefinitions`.
-
-| Mode | Rust variant | C integer | Result |
-| --- | --- | --- | --- |
-| `off` | `Off` | `0` | All matches, without classification |
-| `classify` | `Classify` | `1` | All matches, with definition labels |
-| `definition_only` | `DefinitionOnly` | `2` | Only matches on declared names |
-| `usage_only` | `UsageOnly` | `3` | Only other matches |
-
-JavaScript and Neovim also accept the existing booleans: `false` means `off`, and `true` means `classify`. Neovim groups each page of `classify` results into definitions first, then usages. The SDK default is `off`. Use the same mode when continuing with a cursor. The C argument is a `uint8_t`, preserving the byte representation of existing boolean calls (`0` and `1`). Modes `2` and `3` require the updated native library; never send them to a library that still expects `bool`.
-
-```typescript
-finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });
-finder.multiGrep({ patterns: ['AudioMap', 'audio_map'], classifyDefinitions: 'definition_only' });
-```
-
-MCP and Pi expose only the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi's `ffgrep` uses `pattern` instead of `query`. If the completed search finds no matching declarations, the tool reports that and returns ordinary matches. Cursors preserve the definition search or fallback state, so the model does not need to repeat a mode. The multi-pattern tools accept the same flag.
-
-SDK definition filtering occurs before page and per-file result limits. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. In Neovim, move down (top prompt) or up (bottom prompt) to continue an empty page. Context lines can still contain ordinary code.
+Definition filtering occurs before page and per-file result limits. A timed-out page can be empty; move down (top prompt) or up (bottom prompt) to continue searching. Context lines can still contain ordinary code.
 
 Definition classification accepts source lines up to 256 bytes, including indentation and excluding line endings. Longer lines stay ordinary matches and are excluded from `definition_only`. The limit uses the original source bytes, regardless of display truncation or whitespace trimming. For multiline regex matches, it applies to the first physical line.
 
@@ -671,6 +666,26 @@ finder.value.destroy();
 ```
 
 Every method returns a `Result<T>` (`{ ok: true, value } | { ok: false, error }`). Full type reference: [`packages/fff-node/src/fff-api.ts`](./packages/fff-node/src/fff-api.ts).
+
+### Definition modes
+
+Each core grep call uses one `classify_definitions` mode. Rust stores it in `GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript SDKs expose the same setting as `classifyDefinitions`.
+
+| Mode | Rust variant | C integer | Result |
+| --- | --- | --- | --- |
+| `off` | `Off` | `0` | All matches, without classification |
+| `classify` | `Classify` | `1` | All matches, with definition labels |
+| `definition_only` | `DefinitionOnly` | `2` | Only matches on declared names |
+| `usage_only` | `UsageOnly` | `3` | Only other matches |
+
+JavaScript also accepts the existing booleans: `false` means `off`, and `true` means `classify`. The SDK default is `off`. Use the same mode when continuing with a cursor. The C argument is a `uint8_t`, preserving the byte representation of existing boolean calls (`0` and `1`). Modes `2` and `3` require the updated native library; never send them to a library that still expects `bool`.
+
+```typescript
+finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });
+finder.multiGrep({ patterns: ['AudioMap', 'audio_map'], classifyDefinitions: 'definition_only' });
+```
+
+SDK definition filtering occurs before page and per-file result limits. `definition_only` retains file constraints when no matches exist. `usage_only` keeps the file-path and literal retries of ordinary grep. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. Context lines can still contain ordinary code.
 
 </details>
 

@@ -148,6 +148,56 @@ fn definition_only_keeps_unknown_language_files_out_of_fallbacks() {
 }
 
 #[test]
+fn definition_only_keeps_empty_scopes_while_usage_only_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "fn Needle() {}\nNeedle();\n*.txt Needle\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("b.txt"), "unrelated\n").unwrap();
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: dir.path().to_string_lossy().into_owned(),
+        enable_content_indexing: false,
+        enable_mmap_cache: false,
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let parser = fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig);
+    for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
+        let options = GrepSearchOptions {
+            mode,
+            classify_definitions: DefinitionMode::DefinitionOnly,
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        for raw in ["missing.rs Needle", "*.txt Needle", "!*.rs Needle"] {
+            let result = picker.grep(&parser.parse(raw), &options);
+            assert!(result.matches.is_empty(), "{mode:?}: {raw}");
+            assert_eq!(result.next_file_offset, 0);
+            assert!(!result.literal_fallback);
+        }
+    }
+
+    // usage_only is public API: it keeps the path and literal retries of unfiltered grep.
+    let options = GrepSearchOptions {
+        classify_definitions: DefinitionMode::UsageOnly,
+        time_budget_ms: 0,
+        ..Default::default()
+    };
+    let lines = |raw: &str| {
+        let result = picker.grep(&parser.parse(raw), &options);
+        let lines: Vec<u64> = result.matches.iter().map(|m| m.line_number).collect();
+        (lines, result.literal_fallback)
+    };
+    assert_eq!(lines("missing.rs Needle"), (vec![2, 3], false));
+    assert_eq!(lines("*.txt Needle"), (vec![3], true));
+    assert_eq!(lines("!*.rs Needle"), (vec![], false));
+}
+
+#[test]
 fn pagination_keeps_unreturned_files_before_abort() {
     let file = crate::types::FileItem::new_raw(0, 1, 0, None, false);
     for (page_limit, next_offset) in [(1, 11), (2, 12), (10, 13)] {
