@@ -331,7 +331,7 @@ local r = require('fff').content_search('TODO', {
   time_budget_ms        = 0,
   enforce_time_budget   = false,    -- also bound zero-match searches
   trim_whitespace       = false,
-  classify_definitions  = false,
+  classify_definitions  = nil,      -- defaults to grep.classify_definitions
   cwd                   = nil,      -- switch indexed root if different
   wait_for_index_ms     = nil,      -- override the default scan wait timeout
 })
@@ -497,7 +497,7 @@ require('fff').setup({
     enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
     modes = { 'plain', 'regex', 'fuzzy', 'definition_only' },
     trim_whitespace = false,
-    classify_definitions = false, -- show matching definitions first within each page
+    classify_definitions = true, -- show matching definitions first within each page
     enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
@@ -536,7 +536,7 @@ require('fff').setup({
 
 `<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`). `regex` matches stay within one line unless the pattern contains `\n`.
 
-Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
+`grep.classify_definitions` shows matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `true`. Set it to `false` to keep file order without definition grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
 
 Definition filtering occurs before page and per-file result limits. A timed-out page can be empty; move down (top prompt) or up (bottom prompt) to continue searching. Context lines can still contain ordinary code.
 

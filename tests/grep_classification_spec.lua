@@ -32,6 +32,12 @@ describe('grep classification bridge', function()
     end)
   end
 
+  it('classifies definitions by default', function()
+    grep.search('needle', 7, 5, nil, 'plain')
+    assert.are.equal(1, #calls)
+    assert.are.equal('classify', calls[1][12])
+  end)
+
   it('requests filtering only when the definitions mode is selected', function()
     grep.search('needle', 7, 5, { classify_definitions = true }, 'definition_only')
     assert.are.equal(1, #calls)
