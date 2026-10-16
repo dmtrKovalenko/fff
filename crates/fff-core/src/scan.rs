@@ -324,8 +324,11 @@ impl ScanJob {
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
             let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
 
+            // A root change may have replaced the picker while this index was building.
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
+                && !signals.cancelled.load(Ordering::Acquire)
+                && picker.base_path() == unsafe_snapshot.base_path
             {
                 picker.set_bigram_index(index);
             }
@@ -396,4 +399,68 @@ fn rescubscribe_watcher_post_scan(shared_picker: &SharedFilePicker) {
         watcher.request_watch_dir(dir.to_path_buf());
         std::ops::ControlFlow::Continue(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_picker::{FilePicker, FilePickerOptions};
+
+    fn collected(root: &std::path::Path) -> FilePicker {
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: root.to_string_lossy().into_owned(),
+            enable_mmap_cache: false,
+            enable_content_indexing: true,
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        picker
+    }
+
+    #[test]
+    fn replaced_picker_does_not_install_its_bigram_index_into_the_successor() {
+        let old_root = tempfile::tempdir().unwrap();
+        // The stale index tracks the marker, but only for a file the new root does not have.
+        std::fs::write(old_root.path().join("a.txt"), "unrelated words").unwrap();
+        std::fs::write(old_root.path().join("b.txt"), "isolated_marker").unwrap();
+        let new_root = tempfile::tempdir().unwrap();
+        std::fs::write(new_root.path().join("new.txt"), "isolated_marker").unwrap();
+
+        let shared = SharedFilePicker::default();
+        let old = collected(old_root.path());
+        let signals = old.scan_signals();
+        *shared.write().unwrap() = Some(old);
+        let snapshot = shared
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|picker| unsafe { picker.post_scan_snapshot() })
+            .unwrap();
+        // The root changes while the old post-scan is still building its index.
+        let old = shared.write().unwrap().replace(collected(new_root.path()));
+        let config = ScanConfig {
+            warmup: false,
+            content_indexing: true,
+            watch: false,
+            auto_cache_budget: false,
+            install_watcher: false,
+            follow_symlinks: false,
+            enable_fs_root_scanning: false,
+            enable_home_dir_scanning: false,
+        };
+        ScanJob::run_post_scan(&shared, &signals, &config, &snapshot);
+        drop(snapshot);
+        drop(old);
+
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let query = crate::grep::parse_grep_query("isolated_marker");
+        let options = crate::grep::GrepSearchOptions {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(picker.grep(&query, &options).matches.len(), 1);
+    }
 }
