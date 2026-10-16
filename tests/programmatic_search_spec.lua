@@ -132,6 +132,24 @@ describe('programmatic search APIs', function()
         assert.is_true(count >= 2, 'expected the marker in at least 2 files, got ' .. count)
       end)
 
+      it('keeps file order unless the user config enables classification', function()
+        local fuzzy = require('fff.fuzzy')
+        local original, saved = fuzzy.live_grep, vim.g.fff
+        local modes = {}
+        fuzzy.live_grep = function(...)
+          modes[#modes + 1] = select(12, ...)
+          return original(...)
+        end
+        local ok, err = pcall(function()
+          fff.content_search(marker)
+          vim.g.fff = vim.tbl_deep_extend('force', saved or {}, { grep = { classify_definitions = true } })
+          fff.content_search(marker)
+        end)
+        fuzzy.live_grep, vim.g.fff = original, saved
+        assert(ok, err)
+        assert.are.same({ 'off', 'classify' }, modes)
+      end)
+
       it('regex mode matches a pattern', function()
         local result = fff.content_search('canonicalize_\\w+', { mode = 'regex' })
         assert.is_true(#result.items > 0, 'regex content_search returned no matches')

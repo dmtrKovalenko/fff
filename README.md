@@ -331,7 +331,7 @@ local r = require('fff').content_search('TODO', {
   time_budget_ms        = 0,
   enforce_time_budget   = false,    -- also bound zero-match searches
   trim_whitespace       = false,
-  classify_definitions  = nil,      -- defaults to grep.classify_definitions
+  classify_definitions  = nil,      -- off unless grep.classify_definitions is set in your config
   cwd                   = nil,      -- switch indexed root if different
   wait_for_index_ms     = nil,      -- override the default scan wait timeout
 })
