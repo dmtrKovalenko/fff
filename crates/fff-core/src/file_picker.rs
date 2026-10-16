@@ -2470,7 +2470,8 @@ pub(crate) fn hint_allocator_collect() {
         // Collect BACKGROUND_THREAD_POOL workers — that's where the bigram
         // builder allocated memory. `rayon::broadcast` would target the global
         // pool, which is the wrong set of threads.
-        BACKGROUND_THREAD_POOL.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+        // Non-blocking: a blocking broadcast stalls the scan behind any busy or stuck worker.
+        BACKGROUND_THREAD_POOL.spawn_broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
 
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };

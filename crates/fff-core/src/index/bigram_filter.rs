@@ -1209,7 +1209,7 @@ pub(crate) fn release_thread_buffers() {
         READ_BUF.with_borrow_mut(|buf| *buf = Vec::new());
         NORM_BUF.with_borrow_mut(|buf| *buf = Vec::new());
     }
-    crate::parallelism::BACKGROUND_THREAD_POOL.broadcast(|_| release());
+    crate::parallelism::BACKGROUND_THREAD_POOL.spawn_broadcast(|_| release());
     release();
 }
 
@@ -1673,5 +1673,32 @@ mod tests {
         assert!(BigramFilter::is_candidate(&candidates, 2));
         // Files without the needle stay filtered out.
         assert!(!BigramFilter::is_candidate(&candidates, 5));
+    }
+
+    // A stuck pool worker (e.g. a hung FSEvents join) must not stall the caller (#938).
+    #[test]
+    fn release_thread_buffers_does_not_wait_for_busy_workers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        crate::parallelism::BACKGROUND_THREAD_POOL.spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ = unblock_rx.recv();
+        });
+        started_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            release_thread_buffers();
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        unblock_tx.send(()).unwrap();
+        assert!(
+            finished,
+            "release_thread_buffers blocked on a busy pool worker"
+        );
     }
 }

@@ -8,7 +8,7 @@ use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -234,8 +234,24 @@ impl BackgroundWatcher {
             config,
         )?;
 
+        // The .git directory is excluded from the file list but we still need
+        // to observe changes that affect git status (staging, unstaging,
+        // committing, branch switches, merges, etc)
+        let git_paths = git_status_paths(git_workdir.as_ref());
+
         if use_recursive {
-            debouncer.watch(base_path.as_path(), RecursiveMode::Recursive)?;
+            // FSEvents restarts the stream on every watch() and can lose a stop issued right after
+            // a start, hanging the join forever (notify-rs/notify#942). Register paths in one batch.
+            let mut ops = vec![PathOp::watch_recursive(base_path.clone())];
+            ops.extend(git_paths.into_iter().map(PathOp::watch_non_recursive));
+            if let Err(e) = debouncer.update_paths(ops) {
+                match e.origin {
+                    Some(ref op) if op.as_path() != base_path => {
+                        warn!("Failed to watch {}: {}", op.as_path().display(), e.source)
+                    }
+                    _ => return Err(e.source.into()),
+                }
+            }
             info!(
                 "File watcher initialized with single recursive watch on {}",
                 base_path.display(),
@@ -288,12 +304,13 @@ impl BackgroundWatcher {
                 path = ?base_path.display(),
                 "File watcher initialized"
             );
-        }
 
-        // The .git directory is excluded from the file list but we still need
-        // to observe changes that affect git status (staging, unstaging,
-        // committing, branch switches, merges, etc)
-        watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+            for path in git_paths {
+                if let Err(e) = debouncer.watch(&path, RecursiveMode::NonRecursive) {
+                    warn!("Failed to watch {}: {}", path.display(), e);
+                }
+            }
+        }
 
         Ok(debouncer)
     }
@@ -1022,33 +1039,30 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     false
 }
 
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBuf>) {
+fn git_status_paths(git_workdir: Option<&PathBuf>) -> Vec<PathBuf> {
     let Some(workdir) = git_workdir else {
-        return;
+        return Vec::new();
     };
 
     let git_dir = workdir.join(".git");
     if !git_dir.is_dir() {
-        return;
+        return Vec::new();
     }
 
     // We have tried to be smart about the internal git state but
     // it appeared more harmful that it's worth it, so we just watch
     // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
-    if let Err(e) = debouncer.watch(&git_dir, RecursiveMode::NonRecursive) {
-        warn!("Failed to watch .git directory: {}", e);
-    }
-
-    // `.git` above is non-recursive, so on Linux (per-dir inotify watches)
+    //
+    // `.git` is non-recursive, so on Linux (per-dir inotify watches)
     // events for `logs/HEAD` — the commit-finished signal used by
     // `is_dotgit_change_affecting_status` — would never be delivered without
     // watching `.git/logs` itself. On macOS/Windows the recursive base watch
     // already covers it; an extra watch is harmless there.
     let logs_dir = git_dir.join("logs");
-    if logs_dir.is_dir()
-        && let Err(e) = debouncer.watch(&logs_dir, RecursiveMode::NonRecursive)
-    {
-        warn!("Failed to watch .git/logs directory: {}", e);
+    if logs_dir.is_dir() {
+        vec![git_dir, logs_dir]
+    } else {
+        vec![git_dir]
     }
 }
 
