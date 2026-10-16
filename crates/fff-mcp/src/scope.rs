@@ -13,10 +13,15 @@ pub(crate) struct SearchScope {
 }
 
 impl SearchScope {
-    pub fn patterns(&self, picker: &fff::FilePicker) -> Result<Vec<(String, bool)>, ErrorData> {
+    pub fn patterns(
+        &self,
+        picker: &fff::FilePicker,
+        path_root: Option<&str>,
+    ) -> Result<Vec<(String, bool)>, ErrorData> {
         let base = picker.base_path();
         let mut result = Vec::new();
-        let mut roots = Vec::new();
+        // The singular `path` scope is an explicit root too, so it can opt into hidden paths.
+        let mut roots: Vec<String> = path_root.map(str::to_owned).into_iter().collect();
         if let Some(paths) = &self.paths {
             let mut patterns = Vec::new();
             let mut all = false;

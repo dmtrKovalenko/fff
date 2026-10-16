@@ -262,7 +262,7 @@ impl GrepFormatter<'_> {
             let m = &items[idx];
             let file = files[m.file_index];
             let mut match_lines: Vec<String> = Vec::new();
-            let over_budget = compacted > 0 || (shown_count > 0 && char_count >= max_output_chars);
+            let over_budget = shown_count > 0 && char_count >= max_output_chars;
 
             let file_rel_path = file.relative_path(picker);
             if file_rel_path != current_file {
@@ -283,12 +283,13 @@ impl GrepFormatter<'_> {
 
             // Auto-expand definitions with body context
             let file_rel_for_expand = file.relative_path(picker);
-            if auto_expand_defs
-                && !over_budget
+            let expands = auto_expand_defs
                 && m.is_definition
                 && !m.context_after.is_empty()
-                && !def_expanded_files.contains(&file_rel_for_expand)
-            {
+                && !def_expanded_files.contains(&file_rel_for_expand);
+            if expands && over_budget {
+                compacted += 1;
+            } else if expands {
                 let expand_limit = if def_expanded_files.is_empty() {
                     MAX_DEF_EXPAND_FIRST
                 } else {
@@ -309,15 +310,12 @@ impl GrepFormatter<'_> {
             }
 
             let chunk = match_lines.join("\n");
-            if over_budget {
-                compacted += 1;
-            }
             char_count += chunk.len();
             lines.push(chunk);
         }
         if compacted > 0 {
             let note =
-                format!("Details omitted for the last {compacted} matches to fit the output.");
+                format!("Definition bodies omitted for {compacted} matches to fit the output.");
             lines.insert(usize::from(total_matched > items.len()), note);
         }
 

@@ -392,7 +392,8 @@ impl FffServer {
         let parser = QueryParser::new(AiGrepConfig);
         let path_scope = path_scope(params.path.as_deref(), picker)?;
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
-        let patterns = params.scope.patterns(picker)?;
+        let root = path_scope.as_ref().map(|scope| scope.root.as_str());
+        let patterns = params.scope.patterns(picker, root)?;
         let verbatim = params.scope.is_explicit()
             || matches!(params.mode, Some(PatternMode::Regex | PatternMode::Literal));
         let mut original = if verbatim {
@@ -414,7 +415,7 @@ impl FffServer {
         original
             .constraints
             .extend(crate::scope::constraints(&patterns));
-        if params.scope.is_explicit() {
+        if params.scope.is_explicit() || !patterns.is_empty() {
             original.raw_query = "";
         }
         if let Some(shorter) = &broadened_query {
@@ -509,17 +510,22 @@ impl FffServer {
             }
             break result;
         };
-        if !prefer_definitions
+        if cursor.stage == GrepStage::Normal
             && result.matches.is_empty()
             && result.next_file_offset == 0
-            && let Some(scope) = scope
-            && original.constraints.len() > 1
+            && !verbatim
+            && original.raw_query.is_empty()
+            && original.constraints.len() > usize::from(scope.is_some()) + patterns.len()
             && !query.trim().is_empty()
         {
             // Core's literal retry would drop the path scope, so retry inside it here.
             let literal = FFFQuery {
                 raw_query: "",
-                constraints: std::iter::once(Constraint::Glob(scope)).collect(),
+                constraints: scope
+                    .map(Constraint::Glob)
+                    .into_iter()
+                    .chain(crate::scope::constraints(&patterns))
+                    .collect(),
                 fuzzy_query: fff_query_parser::FuzzyQuery::Text(query.trim()),
                 location: None,
             };
@@ -789,7 +795,8 @@ impl FffServer {
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
         let notice = path_scope.as_ref().and_then(|scope| scope.notice.clone());
         let mut fff_query = parser.parse(query);
-        let mut patterns = params.scope.patterns(picker)?;
+        let root = path_scope.as_ref().map(|scope| scope.root.as_str());
+        let mut patterns = params.scope.patterns(picker, root)?;
         if let Some(scope) = scope {
             patterns.push((scope.to_owned(), false));
         }
@@ -1246,6 +1253,7 @@ fn strong_suggestion(m: &fff::GrepMatch, needle_len: usize) -> bool {
 #[derive(Debug, PartialEq)]
 struct PathScope {
     glob: String,
+    root: String,
     notice: Option<String>,
 }
 
@@ -1289,6 +1297,7 @@ fn path_scope(
     let escaped = crate::scope::escape_glob(path);
     let scope = |glob: String, found: bool| PathScope {
         glob,
+        root: path.to_owned(),
         notice: (!found).then(|| format!("Path '{raw}' matches no indexed file or directory.")),
     };
     let found = lookup_path(picker, path);
@@ -1597,7 +1606,7 @@ mod tests {
         }))
         .unwrap();
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-        assert!(text.contains("Details omitted for the last"), "{text}");
+        assert!(text.contains("Definition bodies omitted for"), "{text}");
         assert!(
             text.contains("  2|     first_field_with_a_long_name"),
             "{text}"
@@ -2582,6 +2591,56 @@ mod tests {
         .unwrap();
         let text = response_text(server.grep(Parameters(params)).unwrap());
         assert!(!text.contains("fn Needle"), "{text}");
+    }
+
+    #[test]
+    fn hidden_false_survives_literal_retries_and_named_hidden_paths_override_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (_dir, server) = definition_server_at(
+            dir,
+            &[
+                (".github/workflows/ci.yml".into(), "runs-on: ubuntu-latest"),
+                ("src/main.rs".into(), "fn main() {}"),
+            ],
+        );
+        let grep = |request: serde_json::Value| {
+            response_text(
+                server
+                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            )
+        };
+        let text = grep(serde_json::json!({"query": "ubuntu-latest", "hidden": false}));
+        assert!(!text.contains(".github"), "{text}");
+        let text = grep(serde_json::json!({"query": "ubuntu-latest"}));
+        assert!(text.contains(".github/workflows/ci.yml"), "{text}");
+        let text = grep(serde_json::json!({
+            "query": "ubuntu-latest", "path": ".github", "hidden": false,
+        }));
+        assert!(text.contains(".github/workflows/ci.yml"), "{text}");
+    }
+
+    #[test]
+    fn matching_lines_only_do_not_claim_omitted_details() {
+        let body: String = (0..300)
+            .map(|i| format!("let needle_{i} = {i};\n"))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "needle_", "context": 0, "maxResults": 300,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("needle_299"), "{}", text.len());
+        assert!(!text.contains("omitted"), "{}", &text[..200]);
     }
 
     #[test]
