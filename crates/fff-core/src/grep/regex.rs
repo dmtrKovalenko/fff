@@ -43,10 +43,21 @@ impl Matcher for RegexMatcher<'_> {
 
     #[inline]
     fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<Match>, NoError> {
-        Ok(self
-            .regex
-            .find_at(haystack, at)
-            .map(|m| Match::new(m.start(), m.end())))
+        let mut at = at;
+        while let Some(m) = self.regex.find_at(haystack, at) {
+            if !self.is_multiline
+                && let Some(newline) = memchr::memchr(b'\n', &haystack[m.start()..m.end()])
+            {
+                let end = m.start() + newline;
+                if let Some(line_match) = self.regex.find_at(&haystack[..end], at) {
+                    return Ok(Some(Match::new(line_match.start(), line_match.end())));
+                }
+                at = end + 1;
+                continue;
+            }
+            return Ok(Some(Match::new(m.start(), m.end())));
+        }
+        Ok(None)
     }
 
     #[inline]
@@ -56,6 +67,41 @@ impl Matcher for RegexMatcher<'_> {
         } else {
             Some(fff_grep::LineTerminator::byte(b'\n'))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitespace_classes_do_not_consume_previous_lines() {
+        let source = b"\n\n    def example():\n";
+        let regex = build_regex(r"^\s*def example", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(source).unwrap().unwrap();
+        assert_eq!(found.start(), 2);
+        assert_eq!(&source[found.start()..found.end()], b"    def example");
+        let multiline = RegexMatcher {
+            regex: &regex,
+            is_multiline: true,
+        };
+        assert_eq!(multiline.find(source).unwrap().unwrap().start(), 0);
+    }
+
+    #[test]
+    fn line_bounded_regex_retains_shorter_alternatives() {
+        let source = b"foo\nbar\n";
+        let regex = build_regex(r"foo\s+bar|foo$", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(source).unwrap().unwrap();
+        assert_eq!(&source[found.start()..found.end()], b"foo");
     }
 }
 

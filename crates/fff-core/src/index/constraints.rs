@@ -205,6 +205,16 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         base_arena: ArenaPtr,
         overflow_arena: ArenaPtr,
     ) -> Self {
+        Self::build_with_prefilter(constraints, items, base_arena, overflow_arena, false)
+    }
+
+    pub(crate) fn build_with_prefilter<T: Constrainable>(
+        constraints: &'c [Constraint<'q>],
+        items: &[T],
+        base_arena: ArenaPtr,
+        overflow_arena: ArenaPtr,
+        prefiltered: bool,
+    ) -> Self {
         let mut extensions = SmallVec::new();
         let mut rest: SmallVec<[&'c Constraint<'q>; 8]> = SmallVec::new();
         for c in constraints {
@@ -213,7 +223,8 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
                 _ => rest.push(c),
             }
         }
-        let has_pre_filter = !extensions.is_empty() || rest.iter().any(|&c| !is_glob_node(c));
+        let has_pre_filter =
+            prefiltered || !extensions.is_empty() || rest.iter().any(|&c| !is_glob_node(c));
         let glob = build_glob_strategy(&rest, has_pre_filter, items, base_arena, overflow_arena);
 
         Self {
@@ -990,6 +1001,15 @@ mod tests {
         assert!(glob_paths.contains(&"src/main.rs"));
         assert!(glob_paths.contains(&"src/lib.ts"));
         assert_eq!(glob_paths.len(), 2);
+        let sparse_plan =
+            ConstraintPlan::build_with_prefilter(&pure_glob, &items, arena_ptr, arena_ptr, true);
+        assert!(matches!(sparse_plan.glob, GlobStrategy::Inline(_)));
+        let sparse_paths: Vec<_> = sparse_plan
+            .run(&items, arena_ptr, arena_ptr)
+            .iter()
+            .map(|i| i.relative_path)
+            .collect();
+        assert_eq!(sparse_paths, glob_paths);
     }
 
     #[test]

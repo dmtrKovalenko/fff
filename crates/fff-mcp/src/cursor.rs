@@ -1,8 +1,3 @@
-//! Cursor store for grep pagination.
-//!
-//! Maintains an in-memory map of opaque cursor IDs to file offsets.
-//! Cursors are evicted LRU-style when the store exceeds capacity.
-
 use std::collections::{HashMap, VecDeque};
 
 const MAX_CURSORS: usize = 20;
@@ -10,9 +5,46 @@ const MAX_CURSORS: usize = 20;
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GrepCursor {
     pub file_offset: usize,
+    pub match_offset: usize,
     pub stage: GrepStage,
     pub found_matches: bool,
     pub missing_path: bool,
+}
+
+impl GrepCursor {
+    pub fn page_limit(self, requested: usize) -> usize {
+        self.match_offset
+            .saturating_add(requested)
+            .saturating_add(1)
+    }
+
+    pub fn paginate(&mut self, result: &mut fff::GrepResult<'_>, requested: usize) {
+        let start = self.match_offset.min(result.matches.len());
+        let end = start.saturating_add(requested).min(result.matches.len());
+        if end < result.matches.len() {
+            let last_file = result.matches.last().unwrap().file_index;
+            self.file_offset = if result.next_file_offset > 0 {
+                result.next_file_offset - 1
+            } else {
+                result.filtered_file_count.saturating_sub(1)
+            };
+            self.match_offset = result.matches[..end]
+                .iter()
+                .rev()
+                .take_while(|m| m.file_index == last_file)
+                .count();
+        } else {
+            self.file_offset = result.next_file_offset;
+            self.match_offset = 0;
+        }
+        result.matches.truncate(end);
+        result.matches.drain(..start);
+        self.found_matches |= !result.matches.is_empty();
+    }
+
+    pub fn has_more(self) -> bool {
+        self.file_offset > 0 || self.match_offset > 0
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]

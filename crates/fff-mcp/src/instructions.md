@@ -1,9 +1,9 @@
-FFF searches the indexed checkout. Use grep for code and find_files for filenames. Read a known file directly when no search is needed.
+FFF searches the indexed checkout. Use grep for code and find_files for filenames. Read a known file directly when needed.
 
-Set path from the directory or module named in the request. Keep the content pattern or filename in query. A module phrase such as "billing client" can use path="**/*billing*client*/**". Literal directories work without a trailing slash. For example: grep({"query":"Invoice","path":"**/*billing*client*/**","definitions_only":true}). Use an empty find_files query to list a directory.
+For content questions, call grep with the module scope. The path field accepts a complete directory name anywhere in the checkout. Use a glob such as **/*transport*/** for a partial module name. Combine related content patterns with | in regex mode. Small result sets include surrounding source automatically. Set context when you need a specific number of lines.
 
-Set definitions_only=true for declarations. Returned source lines verify declaration locations. Do not re-read identical lines just to verify a location. Read more when behavior needs additional context. Ranking includes recency, not semantic relevance. Narrow unrelated results or broaden a guessed scope when necessary.
+Results contain source text with one-based line numbers. These lines verify declaration locations. Read additional source only when required evidence is missing. Set definitions_only=true when the query matches a declaration name. Search behavior, comments, and fields without that filter.
 
-Regex searches one line. Use multi_grep for literal alternatives, with its constraints field for the shared file scope. Inline query constraints are also supported.
+Use paths for exact checkout-relative files or directories. Use globs for rg -g patterns. Regex and literal modes preserve the query and default to case-sensitive matching. Set case="insensitive" for rg -i. The default page contains up to 100 matches. Keep search arguments unchanged when continuing a cursor.
 
-Definition search reports fallback to references or fuzzy matches when no declarations match. If all stages find nothing, it suggests files from a broader search, preserving exclusions. Suggestions are not declaration results. Multi-grep stays literal. Keep query, path, and other constraints unchanged when continuing a cursor.
+find_files accepts path fragments, glob mode, or regex mode. Path fragments treat hyphens and underscores alike. Fallback suggestions are labeled and may lie outside the requested scope. Exclusions still apply. Files absent from the index remain unavailable.

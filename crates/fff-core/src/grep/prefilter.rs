@@ -66,11 +66,15 @@ pub(crate) fn prefilter_files<'a>(
     let plan = if constraints.is_empty() {
         None
     } else {
-        Some(ConstraintPlan::build(
+        // Sparse content candidates need only inline glob checks, not a full-index path pass.
+        let sparse = bigram_candidates
+            .is_some_and(|bits| BigramFilter::count_candidates(bits) < files.len() / 2);
+        Some(ConstraintPlan::build_with_prefilter(
             constraints,
             files,
             arena,
             overflow_arena,
+            sparse,
         ))
     };
 

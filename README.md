@@ -102,7 +102,7 @@ command = "/opt/homebrew/bin/fff-mcp"
 
 Use the actual installed path for your system, then restart Codex or start a new task so it loads the server.
 
-Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
+Once the server is connected, ask the agent to "use fff". The MCP tools are `grep`, `find_files`, and `multi_grep`.
 
 ### Recommended agent prompt
 
@@ -110,18 +110,37 @@ Drop this into your project's `CLAUDE.md` or equivalent:
 
 ```markdown
 For any file search or grep in the current git-indexed directory, use fff tools.
+Include the known directory or module in the first search. Use definitions_only
+for declarations. Read more source only when the returned lines need context.
 ```
 
 ### Definition search
 
-MCP and Pi expose only the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi's `ffgrep` uses `pattern` instead of `query`. Single-query grep tries these stages in order:
+MCP and Pi expose the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `{ "pattern": "AudioMap", "path": "src/audio/", "definitions_only": true }`. Use the directory, module glob, or filename from the request to narrow the search. MCP's optional `path` also works with `find_files`, and existing inline query constraints still work.
+
+MCP also accepts ripgrep-style searches without putting scope tokens in the pattern:
+
+```json
+{"query":"retry|backoff","mode":"regex","paths":["src","lib"],"globs":["*.rs","!**/tests/**"],"context":3}
+```
+
+`mode: "regex"` and `mode: "literal"` preserve the query, including whitespace. Both default to case-sensitive matching; `case` also accepts `"insensitive"` and `"smart"`. Without a mode, the existing smart-case and inline-constraint behavior remains available. `paths` contains checkout-relative files or directories. Positive `globs` are alternatives; exclusions take priority. `hidden: false` skips hidden paths unless explicitly included by a path or glob. Searches stay within the index: unlike ripgrep's `-g`, globs cannot restore files excluded by the index's ignore rules. Ripgrep-specific `.rgignore` files can also make its file inventory differ.
+
+Grep returns up to 100 matching lines per page by default. Use `maxResults` and the returned cursor to continue, including within a file. `max_matches_per_file` explicitly limits matches per file. Small content result sets include bounded surrounding source automatically. `context`, `before_context`, and `after_context` request explicit context; overlapping windows are merged. Set `context: 0` for matching lines only.
+
+`find_files` matches path fragments before approximate filenames. Its default mode treats hyphens and underscores alike. Set `mode: "glob"` or `mode: "regex"` for exact path filtering, with the same `paths`, `globs`, and `hidden` options. Its optional `filters` array applies additional path regexes, like `rg --files | rg pattern1 | rg pattern2`.
+
+Single-query definition search tries these stages in order:
 
 1. Matching declarations.
 2. Ordinary exact matches, with a notice that no matching declarations were found.
 3. Fuzzy declarations, labeled “Maybe you meant these definitions”.
 4. Fuzzy ordinary matches, labeled “Maybe you meant these other matches”.
+5. If all four stages found nothing, suggest files from a broader search. Exclusions remain active. Filename-only suggestions are labeled as unverified.
 
-A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage, and all stages keep the original file constraints. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
+A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage. The first four stages keep the original file constraints; the final suggestions can come from elsewhere in the indexed project and include a notice. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
+
+MCP's broader suggestions can include up to eight matching source lines. MCP tries partial module names before searching the whole index. Pi returns suggested filenames.
 
 ### What changes
 
