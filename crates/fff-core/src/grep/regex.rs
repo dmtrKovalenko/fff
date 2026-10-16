@@ -43,21 +43,25 @@ impl Matcher for RegexMatcher<'_> {
 
     #[inline]
     fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<Match>, NoError> {
-        let mut at = at;
-        while let Some(m) = self.regex.find_at(haystack, at) {
-            if !self.is_multiline
-                && let Some(newline) = memchr::memchr(b'\n', &haystack[m.start()..m.end()])
-            {
-                let end = m.start() + newline;
-                if let Some(line_match) = self.regex.find_at(&haystack[..end], at) {
-                    return Ok(Some(Match::new(line_match.start(), line_match.end())));
-                }
-                at = end + 1;
-                continue;
-            }
+        let Some(m) = self.regex.find_at(haystack, at) else {
+            return Ok(None);
+        };
+        if self.is_multiline || memchr::memchr(b'\n', &haystack[m.start()..m.end()]).is_none() {
             return Ok(Some(Match::new(m.start(), m.end())));
         }
-        Ok(None)
+        let mut at = at;
+        // After a cross-line match, scan each line once instead of retrying the whole suffix.
+        for newline in memchr::memchr_iter(b'\n', &haystack[m.start()..]) {
+            let end = m.start() + newline;
+            if let Some(line_match) = self.regex.find_at(&haystack[..end], at) {
+                return Ok(Some(Match::new(line_match.start(), line_match.end())));
+            }
+            at = end + 1;
+        }
+        Ok(self
+            .regex
+            .find_at(haystack, at)
+            .map(|m| Match::new(m.start(), m.end())))
     }
 
     #[inline]
@@ -102,6 +106,33 @@ mod tests {
         };
         let found = matcher.find(source).unwrap().unwrap();
         assert_eq!(&source[found.start()..found.end()], b"foo");
+    }
+
+    #[test]
+    fn line_bounded_regex_finds_alternatives_inside_a_cross_line_match() {
+        let source = b"start\nNeedle\nend\n";
+        let regex = build_regex(r"start[\s\S]*end|Needle", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(source).unwrap().unwrap();
+        assert_eq!(found.start(), 6);
+        assert_eq!(&source[found.start()..found.end()], b"Needle");
+    }
+
+    #[test]
+    fn line_bounded_regex_handles_long_blank_runs_and_unterminated_lines() {
+        let mut source = vec![b'\n'; 80_000];
+        source.extend_from_slice(b"    def example():");
+        let regex = build_regex(r"^\s*def example", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(&source).unwrap().unwrap();
+        assert_eq!(found.start(), 80_000);
+        assert_eq!(&source[found.start()..found.end()], b"    def example");
     }
 }
 
