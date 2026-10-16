@@ -1425,6 +1425,36 @@ test("grep cursors keep the original finder when path changes or is omitted", as
   await shutdown(setup);
 });
 
+test("definition search resolves excludes against an outside-workspace finder", async () => {
+  const root = fs.mkdtempSync(path.join(agentDir, "outside-definitions-"));
+  fs.mkdirSync(path.join(root, "vendor"));
+  const queries: string[] = [];
+  grepImpl = (query) => {
+    queries.push(query);
+    return grepPage();
+  };
+  const setup = await start("tools-and-ui");
+  const tool = setup.pi.registerTool.mock.calls
+    .map(([tool]) => tool)
+    .find((tool) => tool.name === "ffgrep");
+  const result = await tool.execute(
+    "outside",
+    {
+      pattern: "Needle",
+      path: root,
+      exclude: path.join(root, "vendor"),
+      definitions_only: true,
+    },
+    abortOptions().signal,
+  );
+  expect(result.content[0].text).toContain(
+    "No matching definitions or other matches found",
+  );
+  expect(queries.length).toBeGreaterThan(0);
+  expect(queries.every((query) => query.includes("!vendor/"))).toBe(true);
+  await shutdown(setup);
+});
+
 test("grep rejects cursors whose finder was destroyed", async () => {
   grepImpl = () => grepPage("Needle();", { _offset: 1 });
   const setup = await start("tools-and-ui");
