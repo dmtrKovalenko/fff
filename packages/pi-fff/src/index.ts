@@ -104,6 +104,7 @@ interface ToolGrepCursor {
   foundMatches: boolean;
   mode?: GrepMode;
   query?: string;
+  suggestion?: { query: string; pattern: string; mode: GrepMode };
 }
 
 const cursorCache = new Map<string, ToolGrepCursor>();
@@ -1022,9 +1023,11 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptGuidelines: (names) => [
       `${names.grep}: prefer bare identifiers as patterns. Literal queries are most efficient.`,
       `${names.grep}: use definitions_only: true to try declarations, exact matches, fuzzy declarations, then fuzzy matches. Each fallback starts only after a completed search with no matches and includes a notice.`,
-      `${names.grep}: use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').`,
+      `${names.grep}: if all stages find nothing, the tool suggests files from a broader search while preserving exclusions. Suggestions are not declaration results.`,
+      `${names.grep}: keep module words in path, e.g. '**/*billing*client*/**'. Use exclude for noise ('test/,*.min.js').`,
       `${names.grep}: caseSensitive: true when you need exact case (smart-case otherwise).`,
-      `${names.grep}: after 1-2 greps, read the top match instead of more greps.`,
+      `${names.grep}: returned source lines verify declaration locations. Do not re-read identical lines just to verify a location.`,
+      `${names.grep}: results include source lines. Read more only when you need context. Ranking includes recency, not semantic relevance.`,
     ],
     parameters: grepSchema,
 
@@ -1090,9 +1093,15 @@ export default function fffExtension(pi: ExtensionAPI) {
       // caseSensitive override flips smartCase off; omitting it keeps smart-case
       // (case-insensitive when pattern is all lowercase).
       const smartCase = params.caseSensitive !== true;
-
       let stage = resumed?.stage ?? (params.definitions_only ? "definitions" : "normal");
       const preferDefinitions = stage !== "normal";
+      const suggestion = preferDefinitions
+        ? (resumed?.suggestion ?? {
+            query: buildQuery(undefined, pattern, params.exclude, aux?.root ?? activeCwd),
+            pattern,
+            mode,
+          })
+        : undefined;
       const foundMatches = resumed?.foundMatches ?? false;
       const options = {
         smartCase,
@@ -1169,6 +1178,20 @@ export default function fffExtension(pi: ExtensionAPI) {
       }
 
       let output = formatGrepOutput(result);
+      if (
+        suggestion &&
+        !foundMatches &&
+        result.items.length === 0 &&
+        !result.nextCursor
+      ) {
+        const suggested = suggestOtherFiles(picker, suggestion, query, smartCase, signal);
+        if (suggested) {
+          return {
+            content: [{ type: "text", text: suggested }],
+            details: { totalMatched: 0, totalFiles: result.totalFiles },
+          };
+        }
+      }
       const notices: string[] = [];
       if (result.regexFallbackError) {
         notices.push(`Invalid regex: ${result.regexFallbackError}, used literal match`);
@@ -1181,6 +1204,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           foundMatches: foundMatches || result.items.length > 0,
           mode,
           query,
+          suggestion,
         });
         notices.push(`Continue with cursor="${cursor}"`);
       }
@@ -1631,6 +1655,50 @@ function sessionModes(entries: unknown): FffMode[] {
     }
   }
   return modes;
+}
+
+function suggestOtherFiles(
+  picker: FileFinderApi,
+  suggestion: { query: string; pattern: string; mode: GrepMode },
+  scopedQuery: string,
+  smartCase: boolean,
+  signal?: AbortSignal,
+): string | undefined {
+  if (signal?.aborted) throw new Error("Operation aborted");
+  if (suggestion.query !== scopedQuery) {
+    const result = picker.grep(suggestion.query, {
+      mode: suggestion.mode,
+      smartCase,
+      classifyDefinitions: "off",
+      pageSize: 3,
+      maxMatchesPerFile: 1,
+      timeBudgetMs: 100,
+      enforceTimeBudget: true,
+      beforeContext: 0,
+      afterContext: 0,
+    });
+    if (!result.ok) throw new Error(result.error);
+    const files = [...new Set(result.value.items.map((item) => item.relativePath))].slice(
+      0,
+      3,
+    );
+    if (files.length) {
+      return `No matches in the requested scope. These files elsewhere in the indexed project contain the pattern:\n${files.join("\n")}`;
+    }
+  }
+  if (signal?.aborted) throw new Error("Operation aborted");
+  if (!suggestion.pattern.trim()) return;
+  const result = picker.fileSearch(suggestion.query, { pageSize: 3 });
+  if (!result.ok) throw new Error(result.error);
+  const files = result.value.items
+    .filter(
+      (_, index) =>
+        (result.value.scores[index]?.baseScore ?? 0) > suggestion.pattern.length * 10,
+    )
+    .map((item) => item.relativePath);
+  if (files.length) {
+    return `No matching definitions or other matches found in the requested scope. These filenames may be relevant; their contents are unverified:\n${files.join("\n")}`;
+  }
 }
 
 function nextGrepStage(stage: GrepStage): GrepStage | undefined {

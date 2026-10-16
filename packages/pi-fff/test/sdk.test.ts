@@ -18,21 +18,35 @@ describe("literal SDK imports", () => {
 
 describe("loadFirst", () => {
   test("prefers the first candidate when both load", async () => {
+    const first = {
+      FileFinder: {
+        create: () => {
+          throw new Error("unused factory");
+        },
+      },
+    };
     const loaders = {
-      a: () => Promise.resolve({ FileFinder: { create: () => "a" } }),
+      a: () => Promise.resolve(first),
       b: () => Promise.resolve({ FileFinder: { create: () => "b" } }),
     };
     const mod = await loadFirst(["a", "b"], loaders);
-    expect(mod.FileFinder.create()).toBe("a");
+    expect(mod).toBe(first);
   });
 
   test("falls back to the second candidate when the first import fails", async () => {
+    const second = {
+      FileFinder: {
+        create: () => {
+          throw new Error("unused factory");
+        },
+      },
+    };
     const loaders = {
       a: () => Promise.reject(new Error("cannot find a")),
-      b: () => Promise.resolve({ FileFinder: { create: () => "b" } }),
+      b: () => Promise.resolve(second),
     };
     const mod = await loadFirst(["a", "b"], loaders);
-    expect(mod.FileFinder.create()).toBe("b");
+    expect(mod).toBe(second);
   });
 
   test("throws the last error when every candidate fails", async () => {

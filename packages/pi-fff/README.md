@@ -83,7 +83,7 @@ This extension registers FFF-powered tools (`fffind`, `ffgrep`, `fff-multi-grep`
 
 Search file contents. Smart case, plain text by default, regex optional.
 
-Set `definitions_only: true` to try matching declarations, ordinary exact matches, fuzzy declarations, then fuzzy ordinary matches. Each stage runs only if the previous stage completed with zero matches. Fallback results carry a notice; fuzzy results say “Maybe you meant”. Cursors keep the current stage and file constraints, including through empty partial pages. Once a stage returns matches, pagination stays in that stage. The optional `fff-multi-grep` tool accepts the same flag but only tries declarations and ordinary literal matches. Omitting the flag keeps ordinary search behavior.
+Set `definitions_only: true` to try matching declarations, ordinary exact matches, fuzzy declarations, then fuzzy ordinary matches. Each stage runs only if the previous stage completed with zero matches. Fallback results carry a notice; fuzzy results say “Maybe you meant”. Cursors keep the current stage and file constraints, including through empty partial pages. Once a stage returns matches, pagination stays in that stage. If all four stages find nothing, the tool suggests up to three files elsewhere in the same index, preserving exclusions. Filename-only suggestions are labeled as unverified. The optional `fff-multi-grep` tool accepts the same flag but only tries declarations and ordinary literal matches. Omitting the flag keeps ordinary search behavior.
 
 Parameters:
 - `pattern` — search text or regex
