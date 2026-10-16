@@ -1063,11 +1063,18 @@ fn strip_root(
     if let Ok(relative) = path.strip_prefix(base) {
         return Ok(relative.to_path_buf());
     }
-    // A symlinked spelling of the root still names the indexed checkout.
-    std::fs::canonicalize(path)
+    // Symlinked or short-name spellings of the root still name the checkout; missing tails are kept.
+    let (existing, real) = path
+        .ancestors()
+        .find_map(|dir| Some((dir, std::fs::canonicalize(dir).ok()?)))
+        .ok_or_else(|| {
+            ErrorData::invalid_params("path must be inside the indexed checkout", None)
+        })?;
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    real.strip_prefix(&base)
         .ok()
-        .zip(std::fs::canonicalize(base).ok())
-        .and_then(|(path, base)| path.strip_prefix(base).ok().map(|p| p.to_path_buf()))
+        .zip(path.strip_prefix(existing).ok())
+        .map(|(inside, missing)| inside.join(missing))
         .ok_or_else(|| ErrorData::invalid_params("path must be inside the indexed checkout", None))
 }
 
@@ -1104,13 +1111,15 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
     found
 }
 
+// Backslash escapes are path separators on Windows, so use classes; `?` stands in for brace syntax.
 fn escape_glob(path: &str) -> String {
     let mut escaped = String::with_capacity(path.len());
     for c in path.chars() {
-        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | ',' | '\\') {
-            escaped.push('\\');
+        match c {
+            '*' | '?' | '[' | ']' => escaped.extend(['[', c, ']']),
+            '{' | '}' | ',' | '\\' => escaped.push('?'),
+            _ => escaped.push(c),
         }
-        escaped.push(c);
     }
     escaped
 }
@@ -1654,6 +1663,14 @@ mod tests {
     }
 
     #[test]
+    fn path_globs_escape_without_backslashes() {
+        assert_eq!(
+            escape_glob("a/[id]/{x,y}*?.rs"),
+            "a/[[]id[]]/?x?y?[*][?].rs"
+        );
+    }
+
+    #[test]
     fn named_paths_stay_inside_the_checkout() {
         let (dir, server) = definition_server(&[("src/a.rs".into(), "fn Needle() {}")]);
         let guard = server.picker.read().unwrap();
@@ -1689,6 +1706,11 @@ mod tests {
                 path_scope(linked_root.join("src").to_str(), picker).unwrap(),
                 path_scope(Some("src"), picker).unwrap()
             );
+            // A missing tail under another spelling of the root stays inside the checkout.
+            let scope = path_scope(linked_root.join("missing").to_str(), picker).unwrap();
+            assert_eq!(scope.unwrap().glob, "{missing,missing/**}");
+            let outside = link.path().join("outside");
+            assert!(path_scope(outside.join("missing").to_str(), picker).is_err());
         }
         drop(guard);
 
