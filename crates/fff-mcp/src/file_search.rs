@@ -110,7 +110,7 @@ pub(crate) fn search<'a>(
     ))
 }
 
-// Tier, then ties: an uppercase pattern prefers its exact case, and `lsp/lsp.ts` beats `config/lsp.ts`.
+// Tier, then ties: an uppercase pattern prefers its exact case; exact names in `lsp/lsp.ts` beat `config/lsp.ts`.
 fn literal_rank(path: &str, pattern: &str) -> (u8, bool, bool) {
     let mut parts = path.rsplit('/');
     let name = parts.next().unwrap_or(path);
@@ -128,7 +128,7 @@ fn literal_rank(path: &str, pattern: &str) -> (u8, bool, bool) {
         3
     };
     let case_miss = pattern.bytes().any(|b| b.is_ascii_uppercase()) && !path.contains(pattern);
-    let parent_miss = !parts.next().is_some_and(|dir| equal_fragment(dir, stem));
+    let parent_miss = tier == 0 && !parts.next().is_some_and(|dir| equal_fragment(dir, stem));
     (tier, case_miss, parent_miss)
 }
 

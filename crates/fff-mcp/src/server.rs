@@ -394,7 +394,9 @@ impl FffServer {
         let parser = QueryParser::new(AiGrepConfig);
         let path_scope = path_scope(params.path.as_deref(), picker)?;
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
-        let root = path_scope.as_ref().map(|scope| scope.root.as_str());
+        let root = path_scope
+            .as_ref()
+            .map(|scope| (scope.root.as_str(), scope.nested));
         let patterns = params.scope.patterns(picker, root)?;
         let verbatim = params.scope.is_explicit()
             || matches!(params.mode, Some(PatternMode::Regex | PatternMode::Literal));
@@ -809,7 +811,9 @@ impl FffServer {
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
         let notice = path_scope.as_ref().and_then(|scope| scope.notice.clone());
         let mut fff_query = parser.parse(query);
-        let root = path_scope.as_ref().map(|scope| scope.root.as_str());
+        let root = path_scope
+            .as_ref()
+            .map(|scope| (scope.root.as_str(), scope.nested));
         let mut patterns = params.scope.patterns(picker, root)?;
         if let Some(scope) = scope {
             patterns.push((scope.to_owned(), false));
@@ -1287,6 +1291,8 @@ fn strong_suggestion(m: &fff::GrepMatch, needle_len: usize, query_len: usize) ->
 struct PathScope {
     glob: String,
     root: String,
+    // The name matches at any depth rather than from the checkout root.
+    nested: bool,
     notice: Option<String>,
 }
 
@@ -1328,9 +1334,10 @@ fn path_scope(
         return Ok(None);
     }
     let escaped = crate::scope::escape_glob(path);
-    let scope = |glob: String, found: bool| PathScope {
+    let scope = |glob: String, found: bool, nested: bool| PathScope {
         glob,
         root: path.to_owned(),
+        nested,
         notice: (!found).then(|| format!("Path '{raw}' matches no indexed file or directory.")),
     };
     let found = lookup_path(picker, path);
@@ -1338,6 +1345,7 @@ fn path_scope(
         return Ok(Some(scope(
             format!("{{{escaped},{escaped}/**}}"),
             found.anchored,
+            false,
         )));
     }
     // A literal name such as `src` or `[id]` at any depth wins over reading it as a glob.
@@ -1345,9 +1353,14 @@ fn path_scope(
         return Ok(Some(scope(
             format!("{{**/{escaped},**/{escaped}/**}}"),
             found.nested,
+            true,
         )));
     }
-    Ok(Some(scope(crate::scope::descendant_glob(path), true)))
+    Ok(Some(scope(
+        crate::scope::descendant_glob(path),
+        true,
+        false,
+    )))
 }
 
 pub(crate) fn strip_root(
@@ -2690,6 +2703,8 @@ mod tests {
             ("src/config/Config.zig".into(), ""),
             ("packages/core/src/config/lsp.ts".into(), ""),
             ("packages/opencode/src/lsp/lsp.ts".into(), ""),
+            ("pkg/README.md".into(), ""),
+            ("pkg/libintl/libintl.h".into(), ""),
         ]);
         let find = |query: &str| {
             let request = serde_json::json!({"query": query});
@@ -2716,6 +2731,9 @@ mod tests {
             text.starts_with("packages/opencode/src/lsp/lsp.ts"),
             "{text}"
         );
+        // The parent-directory tie-break applies to exact names only.
+        let text = find("pkg");
+        assert!(text.starts_with("pkg/README.md"), "{text}");
     }
 
     #[test]

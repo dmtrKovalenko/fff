@@ -16,12 +16,15 @@ impl SearchScope {
     pub fn patterns(
         &self,
         picker: &fff::FilePicker,
-        path_root: Option<&str>,
+        path_root: Option<(&str, bool)>,
     ) -> Result<Vec<(String, bool)>, ErrorData> {
         let base = picker.base_path();
         let mut result = Vec::new();
         // The singular `path` scope is an explicit root too, so it can opt into hidden paths.
-        let mut roots: Vec<String> = path_root.map(str::to_owned).into_iter().collect();
+        let mut roots: Vec<(String, bool)> = path_root
+            .map(|(root, nested)| (root.to_owned(), nested))
+            .into_iter()
+            .collect();
         if let Some(paths) = &self.paths {
             let mut patterns = Vec::new();
             let mut all = false;
@@ -53,7 +56,7 @@ impl SearchScope {
                     patterns.push(escaped.clone());
                     patterns.push(format!("{escaped}/**"));
                 }
-                roots.push(path);
+                roots.push((path, false));
             }
             if !all && !patterns.is_empty() {
                 result.push((alternatives(&patterns), false));
@@ -92,7 +95,7 @@ impl SearchScope {
         if self.hidden == Some(false) {
             let explicit_hidden = roots
                 .iter()
-                .any(|root| root.split('/').any(|part| part.starts_with('.')));
+                .any(|(root, _)| root.split('/').any(|part| part.starts_with('.')));
             if includes.is_empty() && !explicit_hidden {
                 result.push(("{**/.*,**/.*/**}".into(), true));
             } else {
@@ -101,8 +104,8 @@ impl SearchScope {
                     visible.extend(
                         roots
                             .iter()
-                            .filter(|root| !root.is_empty())
-                            .map(|root| escape_glob(root)),
+                            .filter(|(root, _)| !root.is_empty())
+                            .map(|(root, _)| escape_glob(root)),
                     );
                     result.push((alternatives(&visible), false));
                 }
@@ -129,7 +132,9 @@ impl SearchScope {
                         || includes
                             .iter()
                             .any(|pattern| names_hidden_dir(pattern, path))
-                        || roots.iter().any(|root| enters_root(root, path))
+                        || roots
+                            .iter()
+                            .any(|(root, nested)| enters_root(root, *nested, path))
                     {
                         overrides_hidden_directory = true;
                     } else {
@@ -217,15 +222,16 @@ fn names_hidden_dir(pattern: &str, dir: &str) -> bool {
         )
 }
 
-// True when hidden `dir` holds the root, read from the checkout root or at any depth.
-fn enters_root(root: &str, dir: &str) -> bool {
+// True when hidden `dir` holds the root, read from the checkout root or, if nested, at any depth.
+fn enters_root(root: &str, nested: bool, dir: &str) -> bool {
     let parts: Vec<&str> = root.split('/').collect();
     Path::new(root).starts_with(dir)
-        || (1..=parts.len()).any(|n| {
-            let prefix = parts[..n].join("/");
-            dir.strip_suffix(prefix.as_str())
-                .is_some_and(|rest| rest.ends_with('/'))
-        })
+        || nested
+            && (1..=parts.len()).any(|n| {
+                let prefix = parts[..n].join("/");
+                dir.strip_suffix(prefix.as_str())
+                    .is_some_and(|rest| rest.ends_with('/'))
+            })
 }
 
 pub(crate) fn descendant_glob(pattern: &str) -> String {
@@ -234,5 +240,20 @@ pub(crate) fn descendant_glob(pattern: &str) -> String {
         format!("{pattern}/?*")
     } else {
         pattern.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_nested_roots_open_same_named_hidden_directories_elsewhere() {
+        assert!(enters_root(".config", false, ".config"));
+        assert!(enters_root(".github/workflows", false, ".github"));
+        assert!(!enters_root(".config", false, "src/.config"));
+        assert!(enters_root(".config", true, "src/.config"));
+        assert!(enters_root(".github/workflows", true, "pkg/.github"));
+        assert!(!enters_root(".config", true, "src/x.config"));
     }
 }
