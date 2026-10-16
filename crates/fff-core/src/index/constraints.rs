@@ -149,7 +149,10 @@ pub(crate) fn apply_constraints<'a, T: Constrainable + Sync>(
 }
 
 #[cfg(feature = "zlob")]
-pub(crate) type GlobPattern = zlob::ZlobPattern;
+pub(crate) enum GlobPattern {
+    Zlob(zlob::ZlobPattern),
+    Globset(Box<globset::GlobMatcher>),
+}
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) type GlobPattern = globset::GlobMatcher;
 
@@ -379,7 +382,10 @@ fn matches_git_status(status: Option<git2::Status>, filter: &GitStatusFilter) ->
 #[inline]
 #[cfg(feature = "zlob")]
 pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
-    p.matches_default(path)
+    match p {
+        GlobPattern::Zlob(p) => p.matches_default(path),
+        GlobPattern::Globset(p) => p.is_match(path),
+    }
 }
 
 #[inline]
@@ -392,11 +398,16 @@ pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
 /// zlob backend: ONE FFI call for the whole batch.
 #[cfg(feature = "zlob")]
 pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<usize>) {
-    match p.match_indices(rels, p.flags()) {
-        Ok(ix) => out.extend_from_slice(ix.as_slice()),
-        Err(e) => {
-            tracing::warn!(?e, "zlob batch match failed, falling back to per-path");
-            out.extend((0..rels.len()).filter(|&i| p.matches_default(rels[i])));
+    match p {
+        GlobPattern::Zlob(p) => match p.match_indices(rels, p.flags()) {
+            Ok(ix) => out.extend_from_slice(ix.as_slice()),
+            Err(e) => {
+                tracing::warn!(?e, "zlob batch match failed, falling back to per-path");
+                out.extend((0..rels.len()).filter(|&i| p.matches_default(rels[i])));
+            }
+        },
+        GlobPattern::Globset(p) => {
+            out.extend((0..rels.len()).filter(|&i| p.is_match(rels[i])));
         }
     }
 }
@@ -511,7 +522,14 @@ fn walk_globs<F: FnMut(&str)>(c: &Constraint<'_>, f: &mut F) {
 
 #[cfg(feature = "zlob")]
 pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
-    zlob::ZlobPattern::compile(pattern, GLOB_FLAGS).ok()
+    if needs_globset(pattern) {
+        return globset::Glob::new(pattern)
+            .ok()
+            .map(|g| GlobPattern::Globset(Box::new(g.compile_matcher())));
+    }
+    zlob::ZlobPattern::compile(pattern, GLOB_FLAGS)
+        .ok()
+        .map(GlobPattern::Zlob)
 }
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
@@ -525,6 +543,9 @@ pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
 /// filter loop — no hashing, plain array indexing, sequential prefetcher-friendly.
 #[cfg(feature = "zlob")]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
+    if needs_globset(pattern) {
+        return match_globset_pattern(pattern, paths);
+    }
     let mut mask = vec![false; paths.len()];
     let Ok(hits) = zlob::zlob_match_paths_indices(pattern, paths, GLOB_FLAGS) else {
         return mask;
@@ -539,6 +560,10 @@ fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
+    match_globset_pattern(pattern, paths)
+}
+
+fn match_globset_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     let mut mask = vec![false; paths.len()];
     let Ok(glob) = globset::Glob::new(pattern) else {
         return mask;
@@ -555,6 +580,15 @@ fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
         }
     }
     mask
+}
+
+#[cfg(feature = "zlob")]
+fn needs_globset(pattern: &str) -> bool {
+    // zlob expands braces inside classes and rewrites class backslashes on Windows.
+    pattern
+        .as_bytes()
+        .windows(3)
+        .any(|class| matches!(class, b"[{]" | b"[}]" | b"[,]" | b"[\\]"))
 }
 
 #[cfg(test)]
@@ -877,6 +911,42 @@ mod tests {
             paths.contains(&"include/fff.h"),
             "h file should be included"
         );
+    }
+
+    #[test]
+    fn literal_punctuation_matches_in_every_glob_strategy() {
+        for (pattern, literal, neighbor) in [
+            ("{a[,]b.rs,a[,]b.rs/**}", "a,b.rs", "axb.rs"),
+            (
+                "{pkg/[{]a[,]b[}],pkg/[{]a[,]b[}]/**}",
+                "pkg/{a,b}/a.rs",
+                "pkg/XaXbY/a.rs",
+            ),
+            #[cfg(unix)]
+            (r"{a[\]b.rs,a[\]b.rs/**}", r"a\b.rs", "axb.rs"),
+        ] {
+            let paths = [literal, neighbor];
+            let compiled = compile_one(pattern).unwrap();
+            assert!(compiled_matches(&compiled, literal), "{pattern}");
+            assert!(!compiled_matches(&compiled, neighbor), "{pattern}");
+            let mut indices = Vec::new();
+            glob_matches_into(&compiled, &paths, &mut indices);
+            assert_eq!(indices, [0], "{pattern}");
+            let items = paths.map(|path| TestItem {
+                relative_path: path,
+                file_name: path.rsplit('/').next().unwrap(),
+            });
+            for constraints in [
+                vec![Constraint::Glob(pattern)],
+                vec![Constraint::Glob(pattern), Constraint::Extension("rs")],
+            ] {
+                let matches =
+                    apply_constraints(&items, &constraints, ArenaPtr::null(), ArenaPtr::null())
+                        .unwrap();
+                let found: Vec<_> = matches.iter().map(|item| item.relative_path).collect();
+                assert_eq!(found, [literal], "{pattern}");
+            }
+        }
     }
 
     #[test]

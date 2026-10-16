@@ -1111,13 +1111,12 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
     found
 }
 
-// Backslash escapes are path separators on Windows, so use classes; `?` stands in for brace syntax.
+// Character classes preserve literal names without Windows path-separator escapes.
 fn escape_glob(path: &str) -> String {
     let mut escaped = String::with_capacity(path.len());
     for c in path.chars() {
         match c {
-            '*' | '?' | '[' | ']' => escaped.extend(['[', c, ']']),
-            '{' | '}' | ',' | '\\' => escaped.push('?'),
+            '*' | '?' | '[' | ']' | '{' | '}' | ',' | '\\' => escaped.extend(['[', c, ']']),
             _ => escaped.push(c),
         }
     }
@@ -1663,11 +1662,36 @@ mod tests {
     }
 
     #[test]
-    fn path_globs_escape_without_backslashes() {
-        assert_eq!(
-            escape_glob("a/[id]/{x,y}*?.rs"),
-            "a/[[]id[]]/?x?y?[*][?].rs"
-        );
+    fn named_paths_preserve_literal_punctuation() {
+        for (path, included, excluded) in [
+            ("a,b.rs", "a,b.rs", "axb.rs"),
+            ("a,b.rs", "nested/a,b.rs", "nested/axb.rs"),
+            ("pkg/{client}", "pkg/{client}/a.rs", "pkg/XclientY/a.rs"),
+            ("pkg/{a,b}", "pkg/{a,b}/a.rs", "pkg/XaXbY/a.rs"),
+            ("[id]", "nested/[id]/a.rs", "nested/i/a.rs"),
+            #[cfg(unix)]
+            (r"a\b.rs", r"a\b.rs", "axb.rs"),
+        ] {
+            let (_dir, server) = definition_server(&[
+                (included.into(), "fn Needle() {}"),
+                (excluded.into(), "fn Needle() {}"),
+            ]);
+            for query in ["Needle", "Nedle"] {
+                let params = serde_json::from_value(serde_json::json!({
+                    "query": query, "path": path, "definitions_only": true,
+                }))
+                .unwrap();
+                let text =
+                    response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+                assert!(text.contains(included), "{path}: {text}");
+                assert!(!text.contains(excluded), "{path}: {text}");
+            }
+            let params =
+                serde_json::from_value(serde_json::json!({"query": "", "path": path})).unwrap();
+            let text = response_text(server.find_files(Parameters(params)).unwrap());
+            assert!(text.contains(included), "{path}: {text}");
+            assert!(!text.contains(excluded), "{path}: {text}");
+        }
     }
 
     #[test]
