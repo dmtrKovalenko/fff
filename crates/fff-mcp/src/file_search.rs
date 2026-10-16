@@ -43,7 +43,7 @@ pub(crate) fn search<'a>(
     };
     let mut globs = constraints
         .iter()
-        .map(|(p, exclude)| compile_glob(p).map(|g| (g, *exclude)))
+        .map(|(p, exclude)| crate::scope::compile_glob(p).map(|g| (g.compile_matcher(), *exclude)))
         .collect::<Result<Vec<_>, _>>()?;
     if matches!(mode, FilePatternMode::Glob) && !pattern.is_empty() {
         let pattern = if pattern.contains('/') {
@@ -51,7 +51,10 @@ pub(crate) fn search<'a>(
         } else {
             format!("**/{pattern}")
         };
-        globs.push((compile_glob(&pattern)?, false));
+        globs.push((
+            crate::scope::compile_glob(&pattern)?.compile_matcher(),
+            false,
+        ));
     }
     let files = picker.get_files();
     let mut matches = BinaryHeap::new();
@@ -114,15 +117,6 @@ fn literal_rank(path: &str, pattern: &str) -> u8 {
         return 2;
     }
     3
-}
-
-fn compile_glob(pattern: &str) -> Result<globset::GlobMatcher, ErrorData> {
-    globset::GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .backslash_escape(true)
-        .build()
-        .map(|glob| glob.compile_matcher())
-        .map_err(|e| ErrorData::invalid_params(format!("Invalid glob: {e}"), None))
 }
 
 fn fragment_pattern(pattern: &str) -> String {

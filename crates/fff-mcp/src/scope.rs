@@ -151,7 +151,7 @@ impl SearchScope {
     }
 }
 
-fn compile_glob(pattern: &str) -> Result<globset::Glob, ErrorData> {
+pub(crate) fn compile_glob(pattern: &str) -> Result<globset::Glob, ErrorData> {
     globset::GlobBuilder::new(pattern)
         .literal_separator(true)
         .backslash_escape(true)
