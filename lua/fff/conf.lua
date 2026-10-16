@@ -498,7 +498,7 @@ local function init()
       enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
       modes = { 'plain', 'regex', 'fuzzy', 'definition_only' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
-      classify_definitions = false, -- Classify matching definitions and show them before other matches
+      classify_definitions = false, -- Show matching definitions first within each page
       -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
       -- file-path filter, scoping the content search to matching files. When off, such
       -- tokens are searched as literal text. A token is a filename if it has a valid-looking

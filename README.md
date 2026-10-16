@@ -452,7 +452,7 @@ require('fff').setup({
     enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
     modes = { 'plain', 'regex', 'fuzzy', 'definition_only' },
     trim_whitespace = false,
-    classify_definitions = false, -- classify matching definitions and show them before other matches
+    classify_definitions = false, -- show matching definitions first within each page
     enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
@@ -491,7 +491,7 @@ require('fff').setup({
 
 `<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
 
-Set `grep.classify_definitions = true` to search matching definition lines first across pages, grouped under their file names, then show the remaining matches. It defaults to `false`, which skips definition classification and grouping. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
+Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
 
 Each core grep call uses one `classify_definitions` mode. Rust stores it in `GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript SDKs expose the same setting as `classifyDefinitions`.
 
@@ -502,7 +502,7 @@ Each core grep call uses one `classify_definitions` mode. Rust stores it in `Gre
 | `definition_only` | `DefinitionOnly` | `2` | Only matches on declared names |
 | `usage_only` | `UsageOnly` | `3` | Only other matches |
 
-JavaScript and Neovim also accept the existing booleans: `false` means `off`, and `true` means `classify`. Neovim groups `classify` results into definitions first, then usages. The SDK default is `off`. Use the same mode when continuing with a cursor. The C argument is a `uint8_t`, preserving the byte representation of existing boolean calls (`0` and `1`). Modes `2` and `3` require the updated native library; never send them to a library that still expects `bool`.
+JavaScript and Neovim also accept the existing booleans: `false` means `off`, and `true` means `classify`. Neovim groups each page of `classify` results into definitions first, then usages. The SDK default is `off`. Use the same mode when continuing with a cursor. The C argument is a `uint8_t`, preserving the byte representation of existing boolean calls (`0` and `1`). Modes `2` and `3` require the updated native library; never send them to a library that still expects `bool`.
 
 ```typescript
 finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });

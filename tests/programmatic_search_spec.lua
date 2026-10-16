@@ -221,10 +221,22 @@ describe('programmatic search APIs', function()
       -- Poll instead of asserting on the first grep: the index of the new root
       -- can lag a mkdir by a few ms on CI, which flaked on linux too.
       local result
-      vim.wait(2000, function()
+      vim.wait(10000, function()
         result = fff.content_search(marker, { cwd = sandbox_root })
         return #result.items > 0
       end, 50)
+      if #result.items == 0 then
+        -- Print the index state so a CI failure shows why the new root did not match.
+        local health_ok, health = pcall(fff_rust.health_check, sandbox_root)
+        local files = fff.file_search('grep_target', { cwd = sandbox_root })
+        print(vim.inspect({
+          health = health_ok and health or tostring(health),
+          file_hits = #files.items,
+          dir = vim.fn.readdir(sandbox_root),
+          base_path = require('fff.conf').get().base_path,
+          grep = result,
+        }))
+      end
       assert.is_true(#result.items > 0, 'cwd switch did not surface match from the new root')
     end)
   end)

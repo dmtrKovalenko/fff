@@ -18,15 +18,14 @@ local tresitter_highlight = require('fff.treesitter_hl')
 ---@field total_files_searched number Files actually searched in this call
 ---@field total_files number Total indexed files
 ---@field filtered_file_count number Total searchable files after filtering
----@field next_file_offset number Section cursor for the next page (0 = no more results)
+---@field next_file_offset number File offset for the next page (0 = no more results)
 ---@field regex_fallback_error string|nil Error message if regex compilation failed and search fell back to literal
 
 local last_result = nil
-local search_section
 
 --- Perform a grep search.
 ---@param query string The search query (may contain file constraints like *.rs)
----@param file_offset? number Section cursor returned by the previous search (default 0)
+---@param file_offset? number File offset returned by the previous search (default 0)
 ---@param page_size? number Max matches to collect (default 50)
 ---@param config? table Grep configuration overrides
 ---@param grep_mode? FffGrepMode Search mode (default: "plain")
@@ -51,38 +50,20 @@ function M.search(query, file_offset, page_size, config, grep_mode)
   then
     error('Invalid classify_definitions mode: ' .. classify_definitions)
   end
-  if classify_definitions ~= 'classify' then
-    last_result = fuzzy.live_grep(
-      query or '',
-      file_offset,
-      page_size,
-      config.max_file_size,
-      config.max_matches_per_file,
-      config.smart_case,
-      grep_mode or 'plain',
-      config.time_budget_ms,
-      config.trim_whitespace,
-      config.enforce_time_budget,
-      config.casing,
-      classify_definitions
-    )
-    return last_result
-  end
-  local definitions = file_offset >= 0
-  local offset = definitions and file_offset or -file_offset - 1
-  last_result = search_section(definitions, query, offset, page_size, config, grep_mode)
-  if definitions and last_result.next_file_offset == 0 and #last_result.items < page_size then
-    local remaining = search_section(false, query, 0, page_size - #last_result.items, config, grep_mode)
-    vim.list_extend(last_result.items, remaining.items)
-    last_result.next_file_offset = remaining.next_file_offset
-    last_result.total_files_searched = last_result.total_files_searched + remaining.total_files_searched
-    definitions = false
-  end
-  local next_offset = last_result.next_file_offset
-  -- Negative cursors resume ordinary matches; nonnegative cursors resume definitions.
-  last_result.next_file_offset = definitions and (next_offset > 0 and next_offset or -1)
-    or (next_offset > 0 and -next_offset - 1 or 0)
-  last_result.total_matched = #last_result.items
+  last_result = fuzzy.live_grep(
+    query or '',
+    file_offset,
+    page_size,
+    config.max_file_size,
+    config.max_matches_per_file,
+    config.smart_case,
+    grep_mode or 'plain',
+    config.time_budget_ms,
+    config.trim_whitespace,
+    config.enforce_time_budget,
+    config.casing,
+    classify_definitions
+  )
   return last_result
 end
 
@@ -336,29 +317,6 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
 
   ---@diagnostic disable-next-line: undefined-field
   if item._has_group_header then apply_group_header_highlights(item, ctx, buf, ns_id, row - 1) end
-end
-
-search_section = function(definitions, query, offset, page_size, config, grep_mode)
-  local conf = config or {}
-  local result
-  repeat
-    result = fuzzy.live_grep(
-      query or '',
-      offset,
-      page_size,
-      conf.max_file_size,
-      conf.max_matches_per_file,
-      conf.smart_case,
-      grep_mode or 'plain',
-      conf.time_budget_ms,
-      conf.trim_whitespace,
-      conf.enforce_time_budget,
-      conf.casing,
-      definitions and 'definition_only' or 'usage_only'
-    )
-    offset = result.next_file_offset
-  until #result.items > 0 or offset == 0 or conf.enforce_time_budget
-  return result
 end
 
 return M

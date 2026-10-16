@@ -51,7 +51,8 @@ local FIXTURE_FILES = {
 --- Create a fresh fixture: deterministic file tree, scoped DBs, fff config
 --- pointing at the temp DB paths.
 --- @return fff.snapshot.Fixture
-function M.create()
+--- @param extra_files? table<string, string> files added on top of the shared tree
+function M.create(extra_files)
   local raw_root = vim.fn.tempname() .. '_fff_snap_fixture'
   vim.fn.mkdir(raw_root, 'p')
   -- Resolve symlinks (on macOS /tmp → /private/tmp). Without this, picker_ui's
@@ -60,7 +61,7 @@ function M.create()
   -- against the original path.
   local root = vim.fn.resolve(raw_root)
 
-  for rel, content in pairs(FIXTURE_FILES) do
+  for rel, content in pairs(vim.tbl_extend('force', FIXTURE_FILES, extra_files or {})) do
     local path = root .. '/' .. rel
     vim.fn.mkdir(vim.fn.fnamemodify(path, ':h'), 'p')
     local f = assert(io.open(path, 'w'))
