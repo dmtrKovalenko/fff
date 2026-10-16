@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = { workspace = true }
 git2 = { workspace = true }
 regex = { workspace = true }
+rayon = { workspace = true }
 globset = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 

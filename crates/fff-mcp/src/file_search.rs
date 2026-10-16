@@ -1,5 +1,7 @@
 use fff::{FilePicker, types::FileItem};
+use rayon::prelude::*;
 use rmcp::{model::ErrorData, schemars};
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
@@ -57,47 +59,46 @@ pub(crate) fn search<'a>(
         ));
     }
     let files = picker.get_files();
-    let mut matches = BinaryHeap::new();
     let capacity = offset.saturating_add(limit);
-    let mut count = 0;
-    for (index, file) in files
-        .iter()
+    let fuzzy = matches!(mode, FilePatternMode::Fuzzy);
+    // Each thread keeps its best `capacity` paths; the merge keeps the global best.
+    let (count, matches) = files
+        .par_iter()
         .enumerate()
         .filter(|(_, file)| !file.is_deleted())
-    {
-        let path = file.relative_path(picker);
-        if regex.as_ref().is_some_and(|regex| !regex.is_match(&path)) {
-            continue;
-        }
-        if filters.iter().any(|regex| !regex.is_match(&path)) {
-            continue;
-        }
-        if globs
-            .iter()
-            .any(|(glob, exclude)| glob.is_match(&path) == *exclude)
-        {
-            continue;
-        }
-        count += 1;
-        let rank = if matches!(mode, FilePatternMode::Fuzzy) {
-            literal_rank(&path, pattern)
-        } else {
-            0
-        };
-        let depth = path.bytes().filter(|&b| b == b'/').count();
-        let key = (
-            rank,
-            depth,
-            std::cmp::Reverse(file.total_frecency_score()),
-            path,
-            index,
+        .fold(
+            || (0usize, BinaryHeap::new()),
+            |(mut count, mut best), (index, file)| {
+                let path = file.relative_path(picker);
+                if regex.as_ref().is_some_and(|regex| !regex.is_match(&path))
+                    || filters.iter().any(|regex| !regex.is_match(&path))
+                    || globs
+                        .iter()
+                        .any(|(glob, exclude)| glob.is_match(&path) == *exclude)
+                {
+                    return (count, best);
+                }
+                count += 1;
+                let rank = if fuzzy {
+                    literal_rank(&path, pattern)
+                } else {
+                    0
+                };
+                let depth = path.bytes().filter(|&b| b == b'/').count();
+                let frecency = Reverse(file.total_frecency_score());
+                keep_best(&mut best, (rank, depth, frecency, path, index), capacity);
+                (count, best)
+            },
+        )
+        .reduce(
+            || (0, BinaryHeap::new()),
+            |(left_count, mut left), (right_count, right)| {
+                for key in right {
+                    keep_best(&mut left, key, capacity);
+                }
+                (left_count + right_count, left)
+            },
         );
-        if matches.len() < capacity {
-            matches.push(key);
-        } else if matches.peek().is_some_and(|worst| key < *worst) {
-            *matches.peek_mut().unwrap() = key;
-        }
-    }
     Ok((
         matches
             .into_sorted_vec()
@@ -118,7 +119,13 @@ fn literal_rank(path: &str, pattern: &str) -> u8 {
     if path.split('/').any(|part| equal_fragment(part, pattern)) {
         return 1;
     }
-    2
+    if name
+        .get(..pattern.len())
+        .is_some_and(|prefix| equal_fragment(prefix, pattern))
+    {
+        return 2;
+    }
+    3
 }
 
 fn fragment_pattern(pattern: &str) -> String {
@@ -137,4 +144,12 @@ fn equal_fragment(left: &str, right: &str) -> bool {
         && left.bytes().zip(right.bytes()).all(|(a, b)| {
             a.eq_ignore_ascii_case(&b) || (matches!(a, b'-' | b'_') && matches!(b, b'-' | b'_'))
         })
+}
+
+fn keep_best<T: Ord>(best: &mut BinaryHeap<T>, key: T, capacity: usize) {
+    if best.len() < capacity {
+        best.push(key);
+    } else if best.peek().is_some_and(|worst| key < *worst) {
+        *best.peek_mut().unwrap() = key;
+    }
 }

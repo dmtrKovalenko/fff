@@ -659,6 +659,7 @@ dependencies = [
  "git2",
  "globset",
  "mimalloc",
+ "rayon",
  "regex",
  "rmcp",
  "schemars",

@@ -2662,6 +2662,27 @@ mod tests {
     }
 
     #[test]
+    fn filename_fragments_rank_name_prefixes_before_inner_matches() {
+        let (_dir, server) = definition_server(&[
+            ("a/avf_showcqt.c".into(), ""),
+            ("b/vf_scale.c".into(), ""),
+            ("b/VF-blend.c".into(), ""),
+        ]);
+        let request = serde_json::json!({"query": "vf_"});
+        let text = response_text(
+            server
+                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..3],
+            ["b/VF-blend.c", "b/vf_scale.c", "a/avf_showcqt.c"],
+            "{text}"
+        );
+    }
+
+    #[test]
     fn broader_suggestions_try_module_fragments_and_preserve_exclusions() {
         let (_dir, server) = definition_server(&[
             (
