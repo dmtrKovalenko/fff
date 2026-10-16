@@ -48,8 +48,22 @@ where
                 self.group(b'(', b')')?;
             }
         }
-        let name = self.named()?;
+        let mut name = self.named()?;
         if C_TYPE {
+            // `class BASE_EXPORT Name` and `struct COMPONENT_EXPORT(NET) Name` put a macro first.
+            while is_macro_case(&self.line[name.clone()]) {
+                let start = self.pos;
+                if self.peek() == Some(b'(') {
+                    self.group(b'(', b')')?;
+                }
+                match self.identifier() {
+                    Some(next) if &self.line[next.clone()] != b"final" => name = next,
+                    _ => {
+                        self.pos = start;
+                        break;
+                    }
+                }
+            }
             let defines = matches!(self.peek(), None | Some(b'{' | b':' | b'<'))
                 || self
                     .identifier()
@@ -238,14 +252,27 @@ where
             }
         }
         let name = last?;
-        if names < 2 && !modifiers && !constructor {
+        if names < 2 && !modifiers && !constructor
+            || matches!(
+                &self.line[name.clone()],
+                b"sizeof" | b"alignof" | b"decltype" | b"typeof"
+            )
+        {
             return None;
         }
         // An unfinished parameter list can continue on the following line.
         if self.group(b'(', b')').is_some() {
             match self.peek() {
                 Some(b',' | b')' | b'.') => return None,
-                Some(b';') if Self::LANGUAGE == Language::C => return None,
+                // Prototypes sit at the top level or follow a modifier; indented calls do neither.
+                Some(b';')
+                    if Self::LANGUAGE == Language::C
+                        && (!(modifiers
+                            || self.line.first().is_some_and(|b| !b.is_ascii_whitespace()))
+                            || is_macro_case(&self.line[name.clone()])) =>
+                {
+                    return None;
+                }
                 Some(b'=') if !self.line[self.pos..].starts_with(b"=>") => return None,
                 _ => {}
             }
@@ -258,12 +285,22 @@ where
             self.pos += pointer + 2;
             return self.identifier();
         }
-        let mut last = None;
+        let start = self.pos;
+        let tag = self
+            .identifier()
+            .filter(|word| matches!(&self.line[word.clone()], b"struct" | b"union" | b"enum"))
+            .and_then(|_| self.identifier());
+        if tag.is_none() {
+            self.pos = start;
+        }
+        let mut last = tag.clone();
         while self.peek().is_some() {
             match self.peek()? {
                 b';' => break,
                 b'[' => self.group(b'[', b']')?,
-                b'{' => self.group(b'{', b'}')?,
+                // A body that continues on later lines leaves the tag as the name.
+                b'{' if self.group(b'{', b'}').is_none() => return tag,
+                b'{' => {}
                 _ => {
                     if let Some(name) = self.identifier() {
                         last = Some(name);
@@ -428,4 +465,11 @@ where
             self.pos += 1;
         }
     }
+}
+
+fn is_macro_case(word: &[u8]) -> bool {
+    word.iter().any(u8::is_ascii_uppercase)
+        && word
+            .iter()
+            .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
