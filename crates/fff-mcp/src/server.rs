@@ -3,7 +3,7 @@ use crate::file_search::FilePatternMode;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use crate::scope::SearchScope;
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
-use fff::types::{FileItem, PaginationArgs};
+use fff::types::PaginationArgs;
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
 use fff_query_parser::{AiGrepConfig, Constraint, FFFQuery, glob_detect::has_wildcards};
 use rmcp::handler::server::wrapper::Parameters;
@@ -1050,8 +1050,6 @@ impl FffServer {
             options.classify_definitions = fff::DefinitionMode::Classify;
             result = picker.multi_grep(&patterns_refs, &constraints, &options);
         }
-        let file_refs: Vec<&FileItem> = result.files.to_vec();
-
         if result.matches.is_empty() && result.next_file_offset == 0 {
             return Ok(grep_response("0 matches.".into(), definitions_fallback));
         }
@@ -1064,7 +1062,7 @@ impl FffServer {
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
             matches: &result.matches,
-            files: &file_refs,
+            files: &result.files,
             total_matched: result.matches.len(),
             cursor,
             output_mode,
@@ -2397,6 +2395,38 @@ mod tests {
         let text = grep("!important", "styles");
         assert!(text.contains("styles/a.css"), "{text}");
         assert!(!text.contains("other/a.css"), "{text}");
+    }
+
+    #[test]
+    fn multi_grep_keeps_matches_under_their_files_after_reordering() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "pub struct ArgValueCompletion {}\n"),
+            ("b.rs".into(), "pub enum Value {\n    Int,\n}\n"),
+        ]);
+        for mode in ["content", "files_with_matches"] {
+            let request = serde_json::json!({
+                "patterns": ["Value"], "definitions_only": true, "output_mode": mode,
+            });
+            let text = response_text(
+                server
+                    .multi_grep_inner(serde_json::from_value(request).unwrap())
+                    .unwrap(),
+            );
+            let lines: Vec<_> = text.lines().collect();
+            let header = |file: &str| lines.iter().position(|l| l.starts_with(file)).unwrap();
+            let line = |text: &str| lines.iter().position(|l| l.contains(text)).unwrap();
+            assert_eq!(
+                line("pub enum Value {"),
+                header("b.rs") + 1,
+                "{mode}: {text}"
+            );
+            assert_eq!(
+                line("ArgValueCompletion"),
+                header("a.rs") + 1,
+                "{mode}: {text}"
+            );
+            assert!(header("b.rs") < header("a.rs"), "{mode}: {text}");
+        }
     }
 
     #[test]
