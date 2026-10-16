@@ -534,7 +534,7 @@ require('fff').setup({
 
 ### Live grep modes
 
-`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
+`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`). `regex` matches stay within one line unless the pattern contains `\n`.
 
 Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
 
