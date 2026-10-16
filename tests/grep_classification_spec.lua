@@ -53,7 +53,8 @@ describe('native grep page classification', function()
         root .. '/' .. i .. '.rs'
       )
     end
-    vim.g.fff = {}
+    -- Parallel spec processes share the default databases, so keep this spec off them.
+    vim.g.fff = { frecency = { enabled = false }, history = { enabled = false } }
     require('fff.file_picker').setup()
     rust.cleanup_file_picker()
     rust.init_file_picker(root)

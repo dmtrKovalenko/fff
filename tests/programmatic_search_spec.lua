@@ -221,7 +221,7 @@ describe('programmatic search APIs', function()
       -- Poll instead of asserting on the first grep: the index of the new root
       -- can lag a mkdir by a few ms on CI, which flaked on linux too.
       local result
-      vim.wait(2000, function()
+      vim.wait(10000, function()
         result = fff.content_search(marker, { cwd = sandbox_root })
         return #result.items > 0
       end, 50)
