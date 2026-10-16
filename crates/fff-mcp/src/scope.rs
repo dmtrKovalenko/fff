@@ -28,11 +28,9 @@ impl SearchScope {
             for path in paths {
                 let path = Path::new(path);
                 let path = if path.is_absolute() {
-                    path.strip_prefix(base).map_err(|_| {
-                        ErrorData::invalid_params("paths must be inside the indexed checkout", None)
-                    })?
+                    crate::server::strip_root(path, base)?
                 } else {
-                    path
+                    path.to_path_buf()
                 };
                 if path.components().any(|c| c == Component::ParentDir) {
                     return Err(ErrorData::invalid_params(
@@ -131,7 +129,7 @@ impl SearchScope {
                         || includes
                             .iter()
                             .any(|pattern| names_hidden_dir(pattern, path))
-                        || roots.iter().any(|root| Path::new(root).starts_with(path))
+                        || roots.iter().any(|root| enters_root(root, path))
                     {
                         overrides_hidden_directory = true;
                     } else {
@@ -217,6 +215,17 @@ fn names_hidden_dir(pattern: &str, dir: &str) -> bool {
             &pattern.split('/').collect::<Vec<_>>(),
             &dir.split('/').collect::<Vec<_>>(),
         )
+}
+
+// True when hidden `dir` holds the root, read from the checkout root or at any depth.
+fn enters_root(root: &str, dir: &str) -> bool {
+    let parts: Vec<&str> = root.split('/').collect();
+    Path::new(root).starts_with(dir)
+        || (1..=parts.len()).any(|n| {
+            let prefix = parts[..n].join("/");
+            dir.strip_suffix(prefix.as_str())
+                .is_some_and(|rest| rest.ends_with('/'))
+        })
 }
 
 pub(crate) fn descendant_glob(pattern: &str) -> String {

@@ -693,6 +693,7 @@ impl FffServer {
                     options.effective_casing(),
                     params.path.as_deref(),
                     false,
+                    params.scope.hidden == Some(false),
                 )
                 .unwrap_or_else(|| "0 matches.".into()),
                 false,
@@ -709,6 +710,7 @@ impl FffServer {
                     options.effective_casing(),
                     params.path.as_deref(),
                     true,
+                    params.scope.hidden == Some(false),
                 )
             {
                 return Ok(respond(suggestions, false));
@@ -1152,13 +1154,20 @@ fn suggest_other_files(
     casing: fff::grep::Casing,
     path: Option<&str>,
     definitions: bool,
+    hide_dotfiles: bool,
 ) -> Option<String> {
     let mut broader = query.clone();
     broader.raw_query = "";
     broader
         .constraints
         .retain(|c| matches!(c, Constraint::Exclude(_) | Constraint::Not(_)));
-    if broader.constraints.len() < query.constraints.len() {
+    let explicit = broader.constraints.len();
+    if hide_dotfiles {
+        // A named hidden root does not open other hidden paths to suggestions.
+        let hidden = Constraint::Glob("{**/.*,**/.*/**}");
+        broader.constraints.push(Constraint::Not(Box::new(hidden)));
+    }
+    if explicit < query.constraints.len() {
         let started = std::time::Instant::now();
         let mut options = GrepSearchOptions {
             mode,
@@ -1341,7 +1350,7 @@ fn path_scope(
     Ok(Some(scope(crate::scope::descendant_glob(path), true)))
 }
 
-fn strip_root(
+pub(crate) fn strip_root(
     path: &std::path::Path,
     base: &std::path::Path,
 ) -> Result<std::path::PathBuf, ErrorData> {
@@ -2835,6 +2844,8 @@ mod tests {
             &[
                 (".github/workflows/ci.yml".into(), "runs-on: ubuntu-latest"),
                 ("src/main.rs".into(), "fn main() {}"),
+                ("pkg/.config/app.toml".into(), "key = \"nested_value\""),
+                ("v/sub/.secret.rs".into(), "fn secret_needle() {}"),
             ],
         );
         let grep = |request: serde_json::Value| {
@@ -2852,6 +2863,39 @@ mod tests {
             "query": "ubuntu-latest", "path": ".github", "hidden": false,
         }));
         assert!(text.contains(".github/workflows/ci.yml"), "{text}");
+
+        // A hidden name that exists only below the root still opens that directory.
+        let text = grep(serde_json::json!({
+            "query": "nested_value", "path": ".config", "hidden": false,
+        }));
+        assert!(text.contains("pkg/.config/app.toml"), "{text}");
+        // Suggestions outside a named hidden root keep other hidden paths out.
+        let text = grep(serde_json::json!({
+            "query": "secret_needle", "path": ".config", "hidden": false,
+        }));
+        assert!(!text.contains(".secret.rs"), "{text}");
+        let text = grep(serde_json::json!({"query": "secret_needle", "path": ".config"}));
+        assert!(text.contains("v/sub/.secret.rs"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_paths_accept_a_symlinked_root() {
+        let (dir, server) = definition_server(&[
+            ("src/a.rs".into(), "fn Needle() {}"),
+            ("other/b.rs".into(), "fn Needle() {}"),
+        ]);
+        let link = tempfile::tempdir().unwrap();
+        let linked = link.path().join("root");
+        std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+        let request = serde_json::json!({"query": "Needle", "paths": [linked.join("src")]});
+        let text = response_text(
+            server
+                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        assert!(text.contains("src/a.rs"), "{text}");
+        assert!(!text.contains("other/b.rs"), "{text}");
     }
 
     #[test]
