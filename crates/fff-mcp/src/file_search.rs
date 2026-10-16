@@ -84,7 +84,14 @@ pub(crate) fn search<'a>(
         } else {
             0
         };
-        let key = (rank, path, index);
+        let depth = path.bytes().filter(|&b| b == b'/').count();
+        let key = (
+            rank,
+            depth,
+            std::cmp::Reverse(file.total_frecency_score()),
+            path,
+            index,
+        );
         if matches.len() < capacity {
             matches.push(key);
         } else if matches.peek().is_some_and(|worst| key < *worst) {
@@ -96,7 +103,7 @@ pub(crate) fn search<'a>(
             .into_sorted_vec()
             .into_iter()
             .skip(offset)
-            .map(|(_, _, index)| &files[index])
+            .map(|(.., index)| &files[index])
             .collect(),
         count,
     ))
@@ -104,19 +111,14 @@ pub(crate) fn search<'a>(
 
 fn literal_rank(path: &str, pattern: &str) -> u8 {
     let name = path.rsplit('/').next().unwrap_or(path);
-    if equal_fragment(name, pattern) {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    if equal_fragment(name, pattern) || equal_fragment(stem, pattern) {
         return 0;
     }
-    if name
-        .rsplit_once('.')
-        .is_some_and(|(stem, _)| equal_fragment(stem, pattern))
-    {
+    if path.split('/').any(|part| equal_fragment(part, pattern)) {
         return 1;
     }
-    if path.split('/').any(|part| equal_fragment(part, pattern)) {
-        return 2;
-    }
-    3
+    2
 }
 
 fn fragment_pattern(pattern: &str) -> String {

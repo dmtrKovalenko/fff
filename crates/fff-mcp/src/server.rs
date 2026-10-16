@@ -2469,6 +2469,33 @@ mod tests {
     }
 
     #[test]
+    fn filename_fragments_rank_exact_names_by_depth() {
+        let (_dir, server) = definition_server(&[
+            ("android/docs/README".into(), ""),
+            ("README.md".into(), ""),
+            ("lib/readme_parser.rs".into(), ""),
+            ("docs/readme/index.md".into(), ""),
+        ]);
+        let request = serde_json::json!({"query": "readme"});
+        let text = response_text(
+            server
+                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..4],
+            [
+                "README.md",
+                "android/docs/README",
+                "docs/readme/index.md",
+                "lib/readme_parser.rs"
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
     fn broader_suggestions_try_module_fragments_and_preserve_exclusions() {
         let (_dir, server) = definition_server(&[
             (
