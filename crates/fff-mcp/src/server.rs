@@ -294,7 +294,14 @@ impl FffServer {
                 },
                 ..Default::default()
             });
-        let prefer_definitions = cursor.stage != GrepStage::Normal;
+        let prefer_definitions = !matches!(cursor.stage, GrepStage::Normal | GrepStage::Broadened);
+        let broadened_query = (cursor.stage == GrepStage::Broadened).then(|| {
+            query
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
 
         let (mut options, auto_expand) =
             make_grep_options(output_mode, mode, cursor.file_offset, context);
@@ -309,7 +316,16 @@ impl FffServer {
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
 
         let parser = QueryParser::new(AiGrepConfig);
-        let original = parser.parse(query);
+        let mut original = parser.parse(query);
+        if let Some(shorter) = &broadened_query {
+            original.fuzzy_query = parser.parse(shorter).fuzzy_query;
+            original.raw_query = "";
+        }
+        let mode = if broadened_query.is_some() && has_regex_metacharacters(&original.grep_text()) {
+            GrepMode::Regex
+        } else {
+            mode
+        };
         let fuzzy_query = prefer_definitions.then(|| cleanup_fuzzy_query(&original.grep_text()));
         let mut fuzzy = None;
         let result = loop {
@@ -342,7 +358,7 @@ impl FffServer {
             break result;
         };
 
-        if !prefer_definitions
+        if cursor.stage == GrepStage::Normal
             && result.matches.is_empty()
             && result.next_file_offset == 0
             && options.file_offset == 0
@@ -366,12 +382,13 @@ impl FffServer {
                         mode
                     };
 
-                    let (mut retry_options, _) =
-                        make_grep_options(output_mode, retry_mode, 0, context);
-                    retry_options.classify_definitions = options.classify_definitions;
+                    let mut retry_options = options.clone();
+                    retry_options.mode = retry_mode;
+                    retry_options.file_offset = 0;
                     let retry_result = picker.grep(&rest_parsed, &retry_options);
 
                     if !retry_result.matches.is_empty() && retry_result.matches.len() <= 10 {
+                        cursor.stage = GrepStage::Broadened;
                         let mut cs = self.lock_cursors()?;
                         let text = &GrepFormatter {
                             matches: &retry_result.matches,
@@ -491,9 +508,12 @@ impl FffServer {
         }
         .format(&mut cs);
 
-        let text = match notice {
-            Some(notice) => format!("{notice}\n{text}"),
-            None => text,
+        let text = match (broadened_query, notice) {
+            (Some(shorter), _) => {
+                format!("0 matches for '{query}'. Auto-broadened to '{shorter}':\n{text}")
+            }
+            (_, Some(notice)) => format!("{notice}\n{text}"),
+            _ => text,
         };
         Ok(grep_response(text, false))
     }
@@ -1137,6 +1157,33 @@ mod tests {
             let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
             assert!(text.contains(notice), "{stage:?}: {text}");
             assert!(text.contains(source), "{stage:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn broadened_cursors_resume_the_shortened_query() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "before\nuse Needle1;\nafter\n"),
+            ("b.rs".into(), "before\nuse Needle2;\nafter\n"),
+            ("excluded.txt".into(), "Needle outside scope"),
+        ]);
+        for query in ["unused Needle *.rs", "unused Needle[0-9] *.rs"] {
+            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
+                file_offset: 1,
+                stage: GrepStage::Broadened,
+                found_matches: true,
+            });
+            let params = serde_json::from_value(serde_json::json!({
+                "query": query, "cursor": id, "context": 1,
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.starts_with("0 matches for 'unused"), "{text}");
+            assert!(text.contains("Auto-broadened to"), "{text}");
+            assert!(text.contains("use Needle"), "{text}");
+            assert!(text.contains("before"), "{text}");
+            assert!(text.contains("after"), "{text}");
+            assert!(!text.contains("excluded.txt"), "{text}");
         }
     }
 

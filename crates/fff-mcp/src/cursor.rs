@@ -18,6 +18,7 @@ pub(crate) struct GrepCursor {
 pub(crate) enum GrepStage {
     #[default]
     Normal,
+    Broadened,
     Definitions,
     References,
     FuzzyDefinitions,
@@ -42,7 +43,7 @@ impl GrepStage {
         match self {
             Self::Definitions | Self::FuzzyDefinitions => fff::DefinitionMode::DefinitionOnly,
             Self::References | Self::FuzzyMatches => fff::DefinitionMode::UsageOnly,
-            Self::Normal => fff::DefinitionMode::Classify,
+            Self::Normal | Self::Broadened => fff::DefinitionMode::Classify,
         }
     }
 
