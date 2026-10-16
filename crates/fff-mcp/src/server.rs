@@ -6,6 +6,7 @@ use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
 use fff::types::PaginationArgs;
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
 use fff_query_parser::{AiGrepConfig, Constraint, FFFQuery, glob_detect::has_wildcards};
+use rayon::prelude::*;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
@@ -1362,7 +1363,7 @@ fn path_scope(
         )));
     }
     if !found.nested
-        && let Some((spelled, anchored)) = found.respelled
+        && let Some((spelled, anchored, _)) = found.respelled
     {
         let escaped = crate::scope::escape_glob(&spelled);
         return Ok(Some(PathScope {
@@ -1419,48 +1420,44 @@ pub(crate) fn strip_root(
 struct PathLookup {
     anchored: bool,
     nested: bool,
-    // Indexed spelling that differs only in case or `-`/`_`, and whether it is a checkout path.
-    respelled: Option<(String, bool)>,
+    // Spelling that differs in case or `-`/`_`: (path, at the checkout root, index order).
+    respelled: Option<(String, bool, usize)>,
 }
 
-// One pass over the index: an exact checkout path wins, otherwise note a match at any depth.
+// Parallel pass over the index: an exact checkout path wins, otherwise note a match at any depth.
 fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
-    let mut found = PathLookup::default();
-    let dirs = picker
-        .get_dirs()
-        .iter()
-        .map(|dir| dir.relative_path(picker));
-    let files = picker
-        .get_files()
-        .iter()
-        .filter(|file| !file.is_deleted())
-        .map(|file| file.relative_path(picker));
-    for candidate in dirs.chain(files) {
+    let visit = |order: usize, candidate: String| {
+        let mut found = PathLookup::default();
         #[cfg(windows)]
         let candidate = candidate.replace('\\', "/");
         let candidate = candidate.trim_end_matches('/');
         match candidate.strip_suffix(path) {
-            Some("") => {
-                found.anchored = true;
-                break;
-            }
+            Some("") => found.anchored = true,
             Some(rest) if rest.ends_with('/') => found.nested = true,
-            _ if !found.nested && found.respelled.as_ref().is_none_or(|(_, a)| !a) => {
-                let Some(start) = candidate.len().checked_sub(path.len()) else {
-                    continue;
-                };
-                let anchored = start == 0;
-                if (anchored || candidate.as_bytes()[start - 1] == b'/')
+            _ => {
+                if let Some(start) = candidate.len().checked_sub(path.len())
+                    && (start == 0 || candidate.as_bytes()[start - 1] == b'/')
                     && let Some(tail) = candidate.get(start..)
                     && same_spelling(tail, path)
                 {
-                    found.respelled = Some((tail.to_owned(), anchored));
+                    found.respelled = Some((tail.to_owned(), start == 0, order));
                 }
             }
-            _ => {}
         }
-    }
-    found
+        found
+    };
+    let dirs = picker.get_dirs();
+    let files = picker
+        .get_files()
+        .par_iter()
+        .enumerate()
+        .filter(|(_, file)| !file.is_deleted())
+        .map(|(index, file)| visit(dirs.len() + index, file.relative_path(picker)));
+    dirs.par_iter()
+        .enumerate()
+        .map(|(index, dir)| visit(index, dir.relative_path(picker)))
+        .chain(files)
+        .reduce(PathLookup::default, merge_lookups)
 }
 
 fn deserialize_filters<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
@@ -1472,6 +1469,17 @@ fn same_spelling(indexed: &str, given: &str) -> bool {
         && indexed.bytes().zip(given.bytes()).all(|(a, b)| {
             a.eq_ignore_ascii_case(&b) || (matches!(a, b'-' | b'_') && matches!(b, b'-' | b'_'))
         })
+}
+
+// Prefer a checkout-level respelling, then the earliest indexed one, so parallel runs agree.
+fn merge_lookups(mut left: PathLookup, right: PathLookup) -> PathLookup {
+    left.anchored |= right.anchored;
+    left.nested |= right.nested;
+    left.respelled = match (left.respelled, right.respelled) {
+        (Some(a), Some(b)) => Some(if (!b.1, b.2) < (!a.1, a.2) { b } else { a }),
+        (a, b) => a.or(b),
+    };
+    left
 }
 
 #[cfg(test)]
@@ -2556,6 +2564,58 @@ mod tests {
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("searched 'crates/nu-cli' instead."), "{text}");
         assert!(!text.contains("nu-cmd"), "{text}");
+    }
+
+    #[test]
+    fn respelling_merge_ignores_the_order_parallel_parts_finish_in() {
+        let hit = |spelled: &str, root: bool, order: usize| PathLookup {
+            respelled: Some((spelled.to_owned(), root, order)),
+            ..Default::default()
+        };
+        let parts = || {
+            vec![
+                hit("x/foo-bar", false, 7),
+                hit("y/Foo_Bar", false, 3),
+                PathLookup::default(),
+                hit("Foo-Bar", true, 9),
+            ]
+        };
+        let forward = parts()
+            .into_iter()
+            .fold(PathLookup::default(), merge_lookups);
+        let backward = parts()
+            .into_iter()
+            .rev()
+            .fold(PathLookup::default(), merge_lookups);
+        assert_eq!(forward.respelled, Some(("Foo-Bar".to_owned(), true, 9)));
+        assert_eq!(forward.respelled, backward.respelled);
+        let nested = || parts().into_iter().take(3);
+        let forward = nested().fold(PathLookup::default(), merge_lookups);
+        let backward = nested()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .fold(PathLookup::default(), merge_lookups);
+        assert_eq!(forward.respelled, Some(("y/Foo_Bar".to_owned(), false, 3)));
+        assert_eq!(forward.respelled, backward.respelled);
+    }
+
+    #[test]
+    fn equal_respellings_resolve_the_same_way_every_time() {
+        let (_dir, server) = definition_server(&[
+            ("x/foo-bar/a.rs".into(), "fn needle() {}"),
+            ("y/Foo_Bar/b.rs".into(), "fn needle() {}"),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "needle", "path": "foo_bar",
+        }))
+        .unwrap();
+        let first = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(first.contains("instead."), "{first}");
+        for _ in 0..20 {
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert_eq!(text, first);
+        }
     }
 
     #[test]

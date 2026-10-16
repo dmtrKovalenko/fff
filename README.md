@@ -129,7 +129,7 @@ for declarations. Read more source only when the returned lines need context.
 
 ### Definition search
 
-MCP and Pi expose the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `{ "pattern": "AudioMap", "path": "src/audio/", "definitions_only": true }`. Use the directory, module glob, or filename from the request to narrow the search. MCP's optional `path` also works with `find_files`, and existing inline query constraints still work. A `path` naming an indexed file or directory is matched from the checkout root; otherwise it matches that name at any depth, and a path that matches nothing is reported. A filename constraint in a definition query that matches no indexed file is reported and dropped.
+MCP and Pi expose the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `{ "pattern": "AudioMap", "path": "src/audio/", "definitions_only": true }`. Use the directory, module glob, or filename from the request to narrow the search. MCP's optional `path` also works with `find_files`, and existing inline query constraints still work. A `path` naming an indexed file or directory is matched from the checkout root; otherwise it matches that name at any depth. A path that differs from an indexed one only in case or `-`/`_` (`nu_cli` for `nu-cli`) searches the indexed spelling with a notice, and a path that matches nothing is reported. A filename constraint in a definition query that matches no indexed file is reported and dropped.
 
 MCP also accepts ripgrep-style searches without putting scope tokens in the pattern:
 
