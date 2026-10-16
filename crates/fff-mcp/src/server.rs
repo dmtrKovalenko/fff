@@ -1576,7 +1576,6 @@ mod tests {
         for path in ["scope_a", "scope_a/", "**/scope_a/**", "scope_a/defs.rs"] {
             for definitions_only in [false, true] {
                 for query in ["Needle", "Nedle"] {
-                    // spellchecker:disable-line
                     let params = serde_json::from_value(serde_json::json!({
                         "query": query, "path": path, "definitions_only": definitions_only,
                     }))

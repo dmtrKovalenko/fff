@@ -13,6 +13,7 @@ comparsion = "comparsion"
 modfiers = "modfiers"
 shcema = "shcema"
 contrller = "contrller"
+nedle = "nedle"
 
 [default]
 extend-ignore-re = [
