@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-field, missing-fields
 local grep = require('fff.picker_ui.grep_renderer')
 local fuzzy = require('fff.fuzzy')
 local rust = require('fff.rust')
