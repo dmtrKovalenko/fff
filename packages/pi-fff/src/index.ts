@@ -53,6 +53,7 @@ const MENTION_MAX_RESULTS = 20;
 
 // If we exceed 10 seconds for indexed grep - something is definitely off
 const GREP_TIME_BUDGET_MS = 10_000;
+const FUZZY_STAGE_BUDGET_MS = 2_000;
 
 const HOME_SCAN_STATUS_KEY = "fff";
 const HOME_SCAN_POLL_MS = 1_000;
@@ -1113,12 +1114,16 @@ export default function fffExtension(pi: ExtensionAPI) {
           classifyDefinitions:
             stage === "definitions" || stage === "fuzzy_definitions"
               ? "definition_only"
-              : stage === "normal"
-                ? "classify"
-                : "usage_only",
+              : "classify",
+          // Fuzzy stages read every candidate file, so bound each one on large indexes.
+          ...(isFuzzyGrepStage(stage)
+            ? { timeBudgetMs: FUZZY_STAGE_BUDGET_MS, enforceTimeBudget: true }
+            : {}),
         });
         if (!page.ok) throw new Error(page.error);
         result = page.value;
+        if (isFuzzyGrepStage(stage) && result.items.length === 0)
+          result.nextCursor = null;
         const next = nextGrepStage(stage);
         if (result.items.length > 0 || result.nextCursor || foundMatches || !next) break;
         stage = next;

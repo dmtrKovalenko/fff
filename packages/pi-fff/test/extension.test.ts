@@ -1007,7 +1007,7 @@ describe("ffgrep per-file cap (#825)", () => {
 for (const name of ["ffgrep", "fff-multi-grep"]) {
   describe(`${name} definitions_only`, () => {
     const normal = name === "ffgrep" ? "classify" : "off";
-    const fallbackMode = name === "ffgrep" ? "usage_only" : "off";
+    const fallbackMode = name === "ffgrep" ? "classify" : "off";
     const params =
       name === "ffgrep"
         ? { pattern: "Needle", path: "src/" }
@@ -1194,9 +1194,9 @@ for (const fuzzyDefinitions of [true, false]) {
     ]);
     expect(calls.map((call) => call.options.classifyDefinitions)).toEqual([
       "definition_only",
-      "usage_only",
+      "classify",
       "definition_only",
-      ...(fuzzyDefinitions ? ["definition_only"] : ["usage_only", "usage_only"]),
+      ...(fuzzyDefinitions ? ["definition_only"] : ["classify", "classify"]),
     ]);
     expect(new Set(calls.map((call) => call.query))).toEqual(
       new Set(["src/ !test/ " + params.pattern]),
@@ -1207,8 +1207,8 @@ for (const fuzzyDefinitions of [true, false]) {
   });
 }
 
-for (const stage of [1, 2, 3, 4]) {
-  test(`definition fallback waits for an empty partial page at stage ${stage}`, async () => {
+for (const stage of [3, 4]) {
+  test(`definition fallback moves past a fuzzy stage that spent its budget at stage ${stage}`, async () => {
     const calls: any[] = [];
     grepImpl = (_query, options) => {
       calls.push(options);
@@ -1219,25 +1219,53 @@ for (const stage of [1, 2, 3, 4]) {
     const tool = setup.pi.registerTool.mock.calls
       .map(([tool]) => tool)
       .find((tool) => tool.name === "ffgrep");
-    const params = { pattern: "Needle", definitions_only: true };
-    const first = await tool.execute("partial", params, abortOptions().signal);
-    expect(calls).toHaveLength(stage);
-    const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
-    const last = await tool.execute(
-      "finish",
-      { pattern: params.pattern, cursor },
+    const result = await tool.execute(
+      "budget",
+      { pattern: "Needle", definitions_only: true },
       abortOptions().signal,
     );
-    expect(calls).toHaveLength(5);
-    expect(calls[stage].cursor).toEqual({ _offset: 7 });
-    expect(calls[stage].mode).toBe(calls[stage - 1].mode);
-    expect(calls[stage].classifyDefinitions).toBe(calls[stage - 1].classifyDefinitions);
-    for (const call of calls.slice(stage + 1)) expect(call.cursor).toBeNull();
-    expect(last.content[0].text).toContain(
+    expect(calls).toHaveLength(4);
+    expect(calls[stage - 1]).toMatchObject({ mode: "fuzzy", enforceTimeBudget: true });
+    expect(result.content[0].text).toContain(
       "No matching definitions or other matches found.",
     );
+    expect(result.content[0].text).not.toContain("cursor=");
     await shutdown(setup);
   });
+}
+
+for (const stage of [1, 2, 3, 4]) {
+  if (stage <= 2)
+    test(`definition fallback waits for an empty partial page at stage ${stage}`, async () => {
+      const calls: any[] = [];
+      grepImpl = (_query, options) => {
+        calls.push(options);
+        if (calls.length === stage) return grepPage(undefined, { _offset: 7 });
+        return grepPage();
+      };
+      const setup = await start("tools-and-ui");
+      const tool = setup.pi.registerTool.mock.calls
+        .map(([tool]) => tool)
+        .find((tool) => tool.name === "ffgrep");
+      const params = { pattern: "Needle", definitions_only: true };
+      const first = await tool.execute("partial", params, abortOptions().signal);
+      expect(calls).toHaveLength(stage);
+      const cursor = first.content[0].text.match(/cursor="([^"]+)"/)[1];
+      const last = await tool.execute(
+        "finish",
+        { pattern: params.pattern, cursor },
+        abortOptions().signal,
+      );
+      expect(calls).toHaveLength(5);
+      expect(calls[stage].cursor).toEqual({ _offset: 7 });
+      expect(calls[stage].mode).toBe(calls[stage - 1].mode);
+      expect(calls[stage].classifyDefinitions).toBe(calls[stage - 1].classifyDefinitions);
+      for (const call of calls.slice(stage + 1)) expect(call.cursor).toBeNull();
+      expect(last.content[0].text).toContain(
+        "No matching definitions or other matches found.",
+      );
+      await shutdown(setup);
+    });
 
   test(`definition fallback stops after matches were returned at stage ${stage}`, async () => {
     const calls: any[] = [];

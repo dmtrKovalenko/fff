@@ -43,8 +43,10 @@ impl GrepStage {
     pub fn definition_mode(self) -> fff::DefinitionMode {
         match self {
             Self::Definitions | Self::FuzzyDefinitions => fff::DefinitionMode::DefinitionOnly,
-            Self::References | Self::FuzzyMatches => fff::DefinitionMode::UsageOnly,
-            Self::Normal | Self::Broadened => fff::DefinitionMode::Classify,
+            // A file-path retry can widen these stages, so keep definitions found elsewhere.
+            Self::References | Self::FuzzyMatches | Self::Normal | Self::Broadened => {
+                fff::DefinitionMode::Classify
+            }
         }
     }
 

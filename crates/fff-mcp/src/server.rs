@@ -15,6 +15,8 @@ const SCAN_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 
 const MAX_CONTEXT_LINES: usize = 100;
 
+const FUZZY_STAGE_BUDGET_MS: u64 = 2_000;
+
 fn normalize_max_results(raw: Option<f64>, default: usize) -> usize {
     match raw {
         None => default,
@@ -345,6 +347,12 @@ impl FffServer {
             } else {
                 mode
             };
+            // Fuzzy stages read every candidate file, so bound each one on large indexes.
+            (options.time_budget_ms, options.enforce_time_budget) = if cursor.stage.is_fuzzy() {
+                (FUZZY_STAGE_BUDGET_MS, true)
+            } else {
+                (0, false)
+            };
             let parsed = if cursor.stage.is_fuzzy() {
                 fuzzy.get_or_insert_with(|| {
                     let mut parsed = parser.parse(fuzzy_query.as_deref().unwrap_or(query));
@@ -361,6 +369,10 @@ impl FffServer {
                 result.files.clear();
                 result.next_file_offset = 0;
                 result.literal_fallback = false;
+            }
+            if cursor.stage.is_fuzzy() && result.matches.is_empty() {
+                // A budget spent without matches ends the stage like an empty full search.
+                result.next_file_offset = 0;
             }
             if result.matches.is_empty()
                 && result.next_file_offset == 0
@@ -844,10 +856,14 @@ fn file_path_constraint<'a>(query: &FFFQuery<'a>) -> Option<&'a str> {
     })
 }
 
+// Case-insensitive like core's file-path constraint, so `readme.md` finds README.md.
 fn indexes_file_path(picker: &fff::FilePicker, suffix: &str) -> bool {
-    let suffix = suffix.replace('\\', "/");
+    let suffix = suffix.replace('\\', "/").to_ascii_lowercase();
     picker.get_files().iter().any(|file| {
-        let path = file.relative_path(picker).replace('\\', "/");
+        let path = file
+            .relative_path(picker)
+            .replace('\\', "/")
+            .to_ascii_lowercase();
         !file.is_deleted()
             && path
                 .strip_suffix(suffix.as_str())
@@ -1276,6 +1292,70 @@ mod tests {
             assert!(text.contains("after"), "{text}");
             assert!(!text.contains("excluded.txt"), "{text}");
         }
+    }
+
+    #[test]
+    fn widened_reference_stage_keeps_definitions_found_elsewhere() {
+        let (_dir, server) = indexed_server(&[
+            ("a.rs", "fn other() {}\n"),
+            (
+                "src/b.rs",
+                "pub struct NeedleWidget {}\nimpl NeedleWidget {}\n",
+            ),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "a.rs NeedleWidget", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("pub struct NeedleWidget {}"), "{text}");
+    }
+
+    #[test]
+    fn file_guesses_match_indexed_paths_case_insensitively() {
+        let (_dir, server) = definition_server(&[("README.md".into(), "fn Needle() {}\n")]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "readme.md Needle", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(!text.contains("No indexed file matches"), "{text}");
+    }
+
+    fn indexed_server(files: &[(&str, &str)]) -> (tempfile::TempDir, FffServer) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let shared = SharedFilePicker::default();
+        fff::FilePicker::new_with_shared_state(
+            shared.clone(),
+            fff::SharedFrecency::default(),
+            fff::FilePickerOptions {
+                base_path: dir.path().to_string_lossy().into_owned(),
+                enable_mmap_cache: false,
+                enable_content_indexing: true,
+                watch: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !shared
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| !p.is_scan_active() && p.bigram_index().is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bigram index was not built"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        (dir, FffServer::new(shared))
     }
 
     fn definition_server(files: &[(String, &str)]) -> (tempfile::TempDir, FffServer) {
