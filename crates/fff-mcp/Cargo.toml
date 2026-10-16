@@ -31,7 +31,7 @@ tracing = { workspace = true }
 git2 = { workspace = true }
 regex = { workspace = true }
 rayon = { workspace = true }
-globset = "0.4"
+globset = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 
 [target.'cfg(windows)'.dependencies]

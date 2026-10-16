@@ -82,7 +82,7 @@ pub(crate) fn search<'a>(
                 let rank = if fuzzy {
                     literal_rank(&path, pattern)
                 } else {
-                    0
+                    (0, false, false)
                 };
                 let depth = path.bytes().filter(|&b| b == b'/').count();
                 let frecency = Reverse(file.total_frecency_score());
@@ -110,22 +110,26 @@ pub(crate) fn search<'a>(
     ))
 }
 
-fn literal_rank(path: &str, pattern: &str) -> u8 {
-    let name = path.rsplit('/').next().unwrap_or(path);
+// Tier, then ties: an uppercase pattern prefers its exact case, and `lsp/lsp.ts` beats `config/lsp.ts`.
+fn literal_rank(path: &str, pattern: &str) -> (u8, bool, bool) {
+    let mut parts = path.rsplit('/');
+    let name = parts.next().unwrap_or(path);
     let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
-    if equal_fragment(name, pattern) || equal_fragment(stem, pattern) {
-        return 0;
-    }
-    if path.split('/').any(|part| equal_fragment(part, pattern)) {
-        return 1;
-    }
-    if name
+    let tier = if equal_fragment(name, pattern) || equal_fragment(stem, pattern) {
+        0
+    } else if path.split('/').any(|part| equal_fragment(part, pattern)) {
+        1
+    } else if name
         .get(..pattern.len())
         .is_some_and(|prefix| equal_fragment(prefix, pattern))
     {
-        return 2;
-    }
-    3
+        2
+    } else {
+        3
+    };
+    let case_miss = pattern.bytes().any(|b| b.is_ascii_uppercase()) && !path.contains(pattern);
+    let parent_miss = !parts.next().is_some_and(|dir| equal_fragment(dir, stem));
+    (tier, case_miss, parent_miss)
 }
 
 fn fragment_pattern(pattern: &str) -> String {

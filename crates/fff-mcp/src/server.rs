@@ -104,7 +104,7 @@ pub struct FindFilesParams {
     /// fuzzy (default): path fragments, treating hyphens and underscores alike, then typo matches. glob or regex: exact path filtering.
     pub(crate) mode: Option<FilePatternMode>,
     /// Additional regex filters on relative paths (AND), like rg --files piped through rg.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_filters")]
     pub filters: Vec<String>,
     /// Max results (default 20).
     #[serde(rename = "maxResults")]
@@ -1396,6 +1396,10 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
     found
 }
 
+fn deserialize_filters<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(<Option<Vec<String>> as serde::Deserialize>::deserialize(d)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1459,6 +1463,13 @@ mod tests {
         let params: GrepParams =
             serde_json::from_str(r#"{"query":"foo","context":3}"#).expect("context field");
         assert_eq!(params.context, Some(3.0));
+    }
+
+    #[test]
+    fn find_files_params_accept_null_filters() {
+        let params: FindFilesParams =
+            serde_json::from_value(serde_json::json!({"query": "x", "filters": null})).unwrap();
+        assert!(params.filters.is_empty());
     }
 
     #[test]
@@ -2657,6 +2668,43 @@ mod tests {
                 "docs/readme/index.md",
                 "lib/readme_parser.rs"
             ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn filename_fragments_prefer_exact_case_and_matching_parent_directories() {
+        let (_dir, server) = definition_server(&[
+            ("pkg/fontconfig/config.zig".into(), ""),
+            ("src/config.zig".into(), ""),
+            ("src/build/Config.zig".into(), ""),
+            ("src/config/Config.zig".into(), ""),
+            ("packages/core/src/config/lsp.ts".into(), ""),
+            ("packages/opencode/src/lsp/lsp.ts".into(), ""),
+        ]);
+        let find = |query: &str| {
+            let request = serde_json::json!({"query": query});
+            response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            )
+        };
+        let text = find("Config.zig");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..4],
+            [
+                "src/config/Config.zig",
+                "src/build/Config.zig",
+                "src/config.zig",
+                "pkg/fontconfig/config.zig"
+            ],
+            "{text}"
+        );
+        let text = find("lsp.ts");
+        assert!(
+            text.starts_with("packages/opencode/src/lsp/lsp.ts"),
             "{text}"
         );
     }
