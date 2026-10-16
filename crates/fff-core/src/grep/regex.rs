@@ -97,6 +97,22 @@ mod tests {
     }
 
     #[test]
+    fn line_bounded_regex_stays_linear_when_matches_cross_lines() {
+        let mut source = b"import a\n".repeat(20_000);
+        source.extend_from_slice(b"import b;\nimport c\n");
+        let regex = build_regex(r"import[^;]*;", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let started = std::time::Instant::now();
+        let found = matcher.find(&source).unwrap().unwrap();
+        assert_eq!(&source[found.start()..found.end()], b"import b;");
+        assert!(matcher.find_at(&source, found.end()).unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
     fn line_bounded_regex_retains_shorter_alternatives() {
         let source = b"foo\nbar\n";
         let regex = build_regex(r"foo\s+bar|foo$", Casing::Sensitive).unwrap();
