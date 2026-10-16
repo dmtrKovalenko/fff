@@ -2400,7 +2400,7 @@ mod tests {
     #[test]
     fn multi_grep_keeps_matches_under_their_files_after_reordering() {
         let (_dir, server) = definition_server(&[
-            ("a.rs".into(), "pub struct ArgValueCompletion {}\n"),
+            ("a.rs".into(), "pub struct ValueCompletion {}\n"),
             ("b.rs".into(), "pub enum Value {\n    Int,\n}\n"),
         ]);
         for mode in ["content", "files_with_matches"] {
@@ -2421,7 +2421,7 @@ mod tests {
                 "{mode}: {text}"
             );
             assert_eq!(
-                line("ArgValueCompletion"),
+                line("ValueCompletion"),
                 header("a.rs") + 1,
                 "{mode}: {text}"
             );
@@ -2432,8 +2432,8 @@ mod tests {
     #[test]
     fn definition_pages_list_exact_names_before_partial_names() {
         let (_dir, server) = definition_server(&[
-            ("a.rs".into(), "pub struct ArgValueCompletion {}\n"),
-            ("b.rs".into(), "pub struct DebuggableValue(pub Value);\n"),
+            ("a.rs".into(), "pub struct ValueCompletion {}\n"),
+            ("b.rs".into(), "pub struct ValueRef(pub Value);\n"),
             ("c.rs".into(), "pub enum Value {\n    Int,\n}\n"),
             (
                 "e.rs".into(),

@@ -1059,21 +1059,25 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
     });
 
     test("lists files that define the exact name first on a page", async () => {
-      const definition = (relativePath: string, lineContent: string, start: number) => ({
+      const definition = (
+        relativePath: string,
+        lineContent: string,
+        starts: number[],
+      ) => ({
         relativePath,
         fileName: relativePath.split("/").pop(),
         lineNumber: 1,
         lineContent,
-        matchRanges: [[start, start + 5]],
+        matchRanges: starts.map((start) => [start, start + 5]),
         isDefinition: true,
         totalFrecencyScore: 0,
       });
       const { setup, tool } = await prepare(() => {
         const page = grepPage();
         page.value.items = [
-          definition("src/a.rs", "pub struct ArgValueCompletion {}", 14),
-          definition("src/c.rs", "pub struct DebuggableValue(pub Value);", 31),
-          definition("src/b.rs", "pub enum Value {", 9),
+          definition("src/a.rs", "pub struct ValueCompletion {}", [11]),
+          definition("src/c.rs", "pub struct ValueRef(pub Value);", [11, 24]),
+          definition("src/b.rs", "pub enum Value {", [9]),
         ] as any;
         return page;
       });
