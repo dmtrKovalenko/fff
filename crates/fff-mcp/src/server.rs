@@ -18,6 +18,8 @@ const SCAN_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 const MAX_CONTEXT_LINES: usize = 100;
 
 const FUZZY_STAGE_BUDGET_MS: u64 = 2_000;
+// Grep pages print every match, so a huge maxResults would flood the caller.
+const MAX_GREP_PAGE: usize = 200;
 
 fn normalize_max_results(raw: Option<f64>, default: usize) -> usize {
     match raw {
@@ -142,7 +144,7 @@ pub struct GrepParams {
     /// Context lines after each match; overrides context (rg -A).
     pub after_context: Option<f64>,
     /// Stop after this many matches per file (rg -m). Omit to keep all matches pageable.
-    pub max_matches_per_file: Option<usize>,
+    pub max_matches_per_file: Option<f64>,
     /// Filter matches to declaration names. Leave false when searching behavior, comments, or fields.
     #[serde(default)]
     pub definitions_only: bool,
@@ -322,7 +324,7 @@ impl FffServer {
         mode: GrepMode,
     ) -> Result<CallToolResult, ErrorData> {
         let query = params.query.as_str();
-        let max_results = normalize_max_results(params.max_results, 100);
+        let max_results = normalize_max_results(params.max_results, 100).min(MAX_GREP_PAGE);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
         let context = normalize_context(params.context);
         let mut cursor = params
@@ -354,8 +356,8 @@ impl FffServer {
         } else {
             params
                 .max_matches_per_file
-                .filter(|n| *n > 0)
-                .unwrap_or(usize::MAX)
+                .filter(|n| n.is_finite() && *n >= 1.0)
+                .map_or(usize::MAX, |n| n as usize)
                 .min(options.page_limit)
         };
         options.casing = params
@@ -478,6 +480,13 @@ impl FffServer {
                 &original
             };
             let mut result = picker.grep(parsed, &options);
+            let skip = cursor.resume_skip(&result, picker);
+            if skip < cursor.match_offset {
+                // The resumed file shrank, so search again with the offset that still applies.
+                cursor.match_offset = skip;
+                options.page_limit = cursor.page_limit(max_results);
+                result = picker.grep(parsed, &options);
+            }
             if matches!(params.mode, Some(PatternMode::Regex))
                 && let Some(error) = &result.regex_fallback_error
             {
@@ -959,7 +968,7 @@ impl FffServer {
 
 impl FffServer {
     fn multi_grep_inner(&self, params: MultiGrepParams) -> Result<CallToolResult, ErrorData> {
-        let max_results = normalize_max_results(params.max_results, 20);
+        let max_results = normalize_max_results(params.max_results, 20).min(MAX_GREP_PAGE);
         let context = normalize_context(params.context);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
 
@@ -1006,6 +1015,12 @@ impl FffServer {
         let constraints = parser.parse_constraints(constraint_query);
 
         let mut result = picker.multi_grep(&patterns_refs, &constraints, &options);
+        let skip = cursor.resume_skip(&result, picker);
+        if skip < cursor.match_offset {
+            cursor.match_offset = skip;
+            options.page_limit = cursor.page_limit(max_results);
+            result = picker.multi_grep(&patterns_refs, &constraints, &options);
+        }
         let definitions_fallback = cursor.stage == GrepStage::Definitions
             && !cursor.found_matches
             && result.matches.is_empty()
@@ -1559,6 +1574,86 @@ mod tests {
         let second = grep(Some(&cursor));
         assert!(second.contains(&format!("Needle({other}, 0)")), "{second}");
         assert!(!second.contains(&format!("Needle({shown},")), "{second}");
+    }
+
+    #[test]
+    fn grep_pages_are_capped_and_accept_float_per_file_limits() {
+        let body: String = (0..300).map(|i| format!("needle_{i}();\n")).collect();
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), body.as_str()),
+            ("b.rs".into(), "needle_x();\n"),
+        ]);
+        let grep = |args: serde_json::Value| {
+            let params = serde_json::from_value(args).unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let text = grep(serde_json::json!({"query": "needle_", "maxResults": 1000, "context": 0}));
+        assert_eq!(
+            text.lines().filter(|l| l.contains(": needle_")).count(),
+            MAX_GREP_PAGE,
+            "{}",
+            &text[..200]
+        );
+        assert!(text.contains("cursor:"), "{}", &text[..200]);
+        let text = grep(
+            serde_json::json!({"query": "needle_", "max_matches_per_file": 5.0, "context": 0}),
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.contains(": needle_")).count(),
+            6,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn shrunken_in_file_cursor_keeps_every_later_match() {
+        let lines = |name: &str, count: usize| -> String {
+            (0..count)
+                .map(|i| format!("Needle({name}, {i});\n"))
+                .collect()
+        };
+        let (a, b, c) = (lines("a", 150), lines("b", 150), lines("c", 150));
+        let (dir, server) = definition_server(&[
+            ("a.rs".into(), a.as_str()),
+            ("b.rs".into(), b.as_str()),
+            ("c.rs".into(), c.as_str()),
+        ]);
+        let grep = |cursor: Option<&str>| {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Needle", "maxResults": 100, "context": 0, "cursor": cursor,
+            }))
+            .unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let mut text = grep(None);
+        let first = ["a", "b", "c"]
+            .into_iter()
+            .find(|f| text.contains(&format!("Needle({f}, 0)")))
+            .unwrap();
+        std::fs::write(dir.path().join(format!("{first}.rs")), lines(first, 20)).unwrap();
+        let mut seen = std::collections::HashMap::<String, usize>::new();
+        while let Some(cursor) = text
+            .rsplit("cursor: ")
+            .next()
+            .filter(|_| text.contains("cursor: "))
+        {
+            let cursor = cursor.trim().to_owned();
+            text = grep(Some(&cursor));
+            for line in text.lines().filter(|l| l.contains(": Needle(")) {
+                *seen
+                    .entry(line.split(": ").nth(1).unwrap().to_owned())
+                    .or_default() += 1;
+            }
+        }
+        for other in ["a", "b", "c"].into_iter().filter(|f| *f != first) {
+            for i in 0..150 {
+                assert_eq!(
+                    seen.get(&format!("Needle({other}, {i});")),
+                    Some(&1),
+                    "{other} {i}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2718,11 +2813,11 @@ mod tests {
             .collect();
         let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
         let params = serde_json::from_value(serde_json::json!({
-            "query": "needle_", "context": 0, "maxResults": 300,
+            "query": "needle_", "context": 0, "maxResults": 200,
         }))
         .unwrap();
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-        assert!(text.contains("needle_299"), "{}", text.len());
+        assert!(text.contains("needle_199"), "{}", text.len());
         assert!(!text.contains("omitted"), "{}", &text[..200]);
     }
 

@@ -20,21 +20,12 @@ impl GrepCursor {
             .saturating_add(1)
     }
 
-    pub fn paginate(
-        &mut self,
-        result: &mut fff::GrepResult<'_>,
-        requested: usize,
-        picker: &fff::FilePicker,
-    ) {
-        let file_id = |index: usize| {
-            let mut hasher = std::hash::DefaultHasher::new();
-            result.files[index].relative_path(picker).hash(&mut hasher);
-            hasher.finish()
-        };
-        // Skip only matches already shown from the file where the last page stopped.
-        let start = match result.matches.first() {
+    // Matches already shown from the file where the last page stopped.
+    pub fn resume_skip(&self, result: &fff::GrepResult<'_>, picker: &fff::FilePicker) -> usize {
+        match result.matches.first() {
             Some(first)
-                if self.match_offset > 0 && file_id(first.file_index) == self.match_file =>
+                if self.match_offset > 0
+                    && file_id(result, first.file_index, picker) == self.match_file =>
             {
                 result
                     .matches
@@ -44,7 +35,16 @@ impl GrepCursor {
                     .count()
             }
             _ => 0,
-        };
+        }
+    }
+
+    pub fn paginate(
+        &mut self,
+        result: &mut fff::GrepResult<'_>,
+        requested: usize,
+        picker: &fff::FilePicker,
+    ) {
+        let start = self.resume_skip(result, picker);
         let end = start.saturating_add(requested).min(result.matches.len());
         if end < result.matches.len() {
             let last_file = result.matches.last().unwrap().file_index;
@@ -58,7 +58,7 @@ impl GrepCursor {
                 .rev()
                 .take_while(|m| m.file_index == last_file)
                 .count();
-            self.match_file = file_id(last_file);
+            self.match_file = file_id(result, last_file, picker);
         } else {
             self.file_offset = result.next_file_offset;
             self.match_offset = 0;
@@ -175,4 +175,10 @@ impl CursorStore {
     pub(crate) fn get_grep(&self, id: &str) -> Option<GrepCursor> {
         self.cursors.get(id).copied()
     }
+}
+
+fn file_id(result: &fff::GrepResult<'_>, index: usize, picker: &fff::FilePicker) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    result.files[index].relative_path(picker).hash(&mut hasher);
+    hasher.finish()
 }
