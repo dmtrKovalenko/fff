@@ -129,7 +129,7 @@ for declarations. Read more source only when the returned lines need context.
 
 ### Definition search
 
-MCP and Pi expose the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `{ "pattern": "AudioMap", "path": "src/audio/", "definitions_only": true }`. Use the directory, module glob, or filename from the request to narrow the search. MCP's optional `path` also works with `find_files`, and existing inline query constraints still work.
+MCP and Pi expose the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `{ "pattern": "AudioMap", "path": "src/audio/", "definitions_only": true }`. Use the directory, module glob, or filename from the request to narrow the search. MCP's optional `path` also works with `find_files`, and existing inline query constraints still work. A `path` naming an indexed file or directory is matched from the checkout root; otherwise it matches that name at any depth, and a path that matches nothing is reported. A filename constraint in a definition query that matches no indexed file is reported and dropped.
 
 MCP also accepts ripgrep-style searches without putting scope tokens in the pattern:
 
@@ -137,7 +137,7 @@ MCP also accepts ripgrep-style searches without putting scope tokens in the patt
 {"query":"retry|backoff","mode":"regex","paths":["src","lib"],"globs":["*.rs","!**/tests/**"],"context":3}
 ```
 
-`mode: "regex"` and `mode: "literal"` preserve the query, including whitespace. Both default to case-sensitive matching; `case` also accepts `"insensitive"` and `"smart"`. Without a mode, the existing smart-case and inline-constraint behavior remains available. `paths` contains checkout-relative files or directories. Positive `globs` are alternatives; exclusions take priority. `hidden: false` skips hidden paths unless explicitly included by a path or glob. Searches stay within the index: unlike ripgrep's `-g`, globs cannot restore files excluded by the index's ignore rules. Ripgrep-specific `.rgignore` files can also make its file inventory differ.
+`mode: "regex"` and `mode: "literal"` preserve the query, including whitespace. Both default to case-sensitive matching; `case` also accepts `"insensitive"` and `"smart"`. Without a mode, the existing smart-case and inline-constraint behavior remains available. Any `paths` or `globs` value also keeps the query verbatim, so inline constraint tokens become part of the pattern. Regex matches stay within one line unless the pattern contains `\n`. `paths` contains checkout-relative files or directories. Positive `globs` are alternatives; exclusions take priority. `hidden: false` skips hidden paths unless explicitly included by a path or glob. Searches stay within the index: unlike ripgrep's `-g`, globs cannot restore files excluded by the index's ignore rules. Ripgrep-specific `.rgignore` files can also make its file inventory differ.
 
 Grep returns up to 100 matching lines per page by default. Use `maxResults` and the returned cursor to continue, including within a file. `max_matches_per_file` explicitly limits matches per file. Small content result sets include bounded surrounding source automatically. `context`, `before_context`, and `after_context` request explicit context; overlapping windows are merged. Set `context: 0` for matching lines only.
 
