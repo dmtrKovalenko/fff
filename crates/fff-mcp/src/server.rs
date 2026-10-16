@@ -1039,18 +1039,21 @@ fn path_scope(
         glob,
         notice: (!found).then(|| format!("Path '{raw}' matches no indexed file or directory.")),
     };
-    if absolute || index_contains(picker, path, true) {
-        let found = !absolute || index_contains(picker, path, true);
-        return Ok(Some(scope(format!("{{{escaped},{escaped}/**}}"), found)));
+    let found = lookup_path(picker, path);
+    if absolute || found.anchored {
+        return Ok(Some(scope(
+            format!("{{{escaped},{escaped}/**}}"),
+            found.anchored,
+        )));
     }
-    if has_wildcards(path) {
-        return Ok(Some(scope(path.to_owned(), true)));
+    // A literal name such as `src` or `[id]` at any depth wins over reading it as a glob.
+    if found.nested || !has_wildcards(path) {
+        return Ok(Some(scope(
+            format!("{{**/{escaped},**/{escaped}/**}}"),
+            found.nested,
+        )));
     }
-    let found = index_contains(picker, path, false);
-    Ok(Some(scope(
-        format!("{{**/{escaped},**/{escaped}/**}}"),
-        found,
-    )))
+    Ok(Some(scope(path.to_owned(), true)))
 }
 
 fn strip_root(
@@ -1068,23 +1071,37 @@ fn strip_root(
         .ok_or_else(|| ErrorData::invalid_params("path must be inside the indexed checkout", None))
 }
 
-fn index_contains(picker: &fff::FilePicker, path: &str, anchored: bool) -> bool {
-    let matches = |candidate: String| {
-        #[cfg(windows)]
-        let candidate = candidate.replace('\\', "/");
-        let candidate = candidate.trim_end_matches('/');
-        candidate
-            .strip_suffix(path)
-            .is_some_and(|rest| rest.is_empty() || (!anchored && rest.ends_with('/')))
-    };
-    picker
+#[derive(Default)]
+struct PathLookup {
+    anchored: bool,
+    nested: bool,
+}
+
+// One pass over the index: an exact checkout path wins, otherwise note a match at any depth.
+fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
+    let mut found = PathLookup::default();
+    let dirs = picker
         .get_dirs()
         .iter()
-        .any(|dir| matches(dir.relative_path(picker)))
-        || picker
-            .get_files()
-            .iter()
-            .any(|file| !file.is_deleted() && matches(file.relative_path(picker)))
+        .map(|dir| dir.relative_path(picker));
+    let files = picker
+        .get_files()
+        .iter()
+        .filter(|file| !file.is_deleted())
+        .map(|file| file.relative_path(picker));
+    for candidate in dirs.chain(files) {
+        #[cfg(windows)]
+        let candidate = candidate.replace('\\', "/");
+        match candidate.trim_end_matches('/').strip_suffix(path) {
+            Some("") => {
+                found.anchored = true;
+                break;
+            }
+            Some(rest) if rest.ends_with('/') => found.nested = true,
+            _ => {}
+        }
+    }
+    found
 }
 
 fn escape_glob(path: &str) -> String {
@@ -1697,6 +1714,7 @@ mod tests {
         let (dir, server) = definition_server(&[
             ("app/blog/[slug]/page.tsx".into(), "Needle"),
             ("app/blog/{a,b}.ts".into(), "Needle"),
+            ("app/[id]/page.tsx".into(), "Needle"),
             ("src/lib.rs".into(), "Needle"),
             ("packages/x/src/lib.rs".into(), "Needle"),
             ("styles/a.css".into(), "color: red !important;"),
@@ -1712,6 +1730,9 @@ mod tests {
             assert!(text.contains("app/blog/[slug]/page.tsx"), "{path}: {text}");
             assert!(!text.contains("lib.rs"), "{path}: {text}");
         }
+        let text = grep("Needle", "[id]");
+        assert!(text.contains("app/[id]/page.tsx"), "{text}");
+        assert!(!text.contains("lib.rs"), "{text}");
         let text = grep("Needle", "app/blog/{a,b}.ts");
         assert!(text.contains("app/blog/{a,b}.ts"), "{text}");
 
