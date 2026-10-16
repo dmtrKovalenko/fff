@@ -2186,21 +2186,78 @@ mod tests {
                 (included.into(), "fn Needle() {}"),
                 (excluded.into(), "fn Needle() {}"),
             ]);
-            for query in ["Needle", "Nedle"] {
-                let params = serde_json::from_value(serde_json::json!({
-                    "query": query, "path": path, "definitions_only": true,
-                }))
-                .unwrap();
-                let text =
-                    response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-                assert!(text.contains(included), "{path}: {text}");
-                assert!(!text.contains(excluded), "{path}: {text}");
+            let anchored = if included.starts_with("nested/") {
+                format!("nested/{path}")
+            } else {
+                path.to_string()
+            };
+            for scope in [
+                serde_json::json!({"path": path}),
+                serde_json::json!({"paths": [anchored]}),
+            ] {
+                for query in ["Needle", "Nedle"] {
+                    let mut request = scope.clone();
+                    request["query"] = query.into();
+                    request["definitions_only"] = true.into();
+                    let params = serde_json::from_value(request).unwrap();
+                    let text =
+                        response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+                    assert!(text.contains(included), "{scope}: {text}");
+                    assert!(!text.contains(excluded), "{scope}: {text}");
+                }
+                for mode in ["fuzzy", "glob", "regex"] {
+                    let mut request = scope.clone();
+                    request["query"] = "".into();
+                    request["mode"] = mode.into();
+                    let params = serde_json::from_value(request).unwrap();
+                    let text = response_text(server.find_files(Parameters(params)).unwrap());
+                    assert!(text.contains(included), "{scope}: {text}");
+                    assert!(!text.contains(excluded), "{scope}: {text}");
+                }
             }
-            let params =
-                serde_json::from_value(serde_json::json!({"query": "", "path": path})).unwrap();
-            let text = response_text(server.find_files(Parameters(params)).unwrap());
-            assert!(text.contains(included), "{path}: {text}");
-            assert!(!text.contains(excluded), "{path}: {text}");
+        }
+    }
+
+    #[test]
+    fn hidden_directory_exclusions_preserve_literal_punctuation() {
+        for (hidden, allowed) in [
+            (".a,b", ".axb"),
+            (".{client}", ".XclientY"),
+            (".{a,b}", ".XaXbY"),
+        ] {
+            let excluded = format!("src/{hidden}/needle.rs");
+            let included = format!("src/{allowed}/needle.rs");
+            let dir = tempfile::tempdir().unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let (_dir, server) = definition_server_at(
+                dir,
+                &[
+                    (excluded.clone(), "fn Needle() {}"),
+                    (included.clone(), "fn Needle() {}"),
+                ],
+            );
+            for grep in [false, true] {
+                let request = serde_json::json!({
+                    "query": if grep { "Needle" } else { "" },
+                    "globs": [format!("src/{allowed}/**"), "*.rs"],
+                    "hidden": false,
+                });
+                let response = if grep {
+                    server.grep(Parameters(serde_json::from_value(request).unwrap()))
+                } else {
+                    server.find_files(Parameters(serde_json::from_value(request).unwrap()))
+                };
+                let text = response_text(response.unwrap());
+                assert!(text.contains(&included), "{text}");
+                assert!(!text.contains(&excluded), "{text}");
+            }
         }
     }
 
