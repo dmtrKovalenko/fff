@@ -4,6 +4,6 @@ For content questions, call grep with the module scope. The path field accepts a
 
 Results contain source text with one-based line numbers. These lines verify declaration locations. Read additional source only when required evidence is missing. Set definitions_only=true when the query matches a declaration name. Search behavior, comments, and fields without that filter.
 
-Use paths for exact checkout-relative files or directories. Use globs for rg -g patterns. Regex and literal modes preserve the query and default to case-sensitive matching. Set case="insensitive" for rg -i. The default page contains up to 100 matches. Keep search arguments unchanged when continuing a cursor.
+Use paths for exact checkout-relative files or directories. Use globs for rg -g patterns. Regex and literal modes preserve the query and default to case-sensitive matching. Set case="insensitive" for rg -i. The default page contains up to 100 matches, or 30 with definitions_only. Keep search arguments unchanged when continuing a cursor.
 
 find_files accepts path fragments, glob mode, or regex mode. Path fragments treat hyphens and underscores alike. Fallback suggestions are labeled and may lie outside the requested scope. Exclusions still apply. Files absent from the index remain unavailable.

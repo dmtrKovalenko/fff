@@ -20,6 +20,8 @@ const MAX_CONTEXT_LINES: usize = 100;
 const FUZZY_STAGE_BUDGET_MS: u64 = 2_000;
 // Grep pages print every match, so a huge maxResults would flood the caller.
 const MAX_GREP_PAGE: usize = 200;
+// Declarations must start at the name, so each page reads more files; keep the default short.
+const DEFINITION_PAGE: usize = 30;
 
 fn normalize_max_results(raw: Option<f64>, default: usize) -> usize {
     match raw {
@@ -130,7 +132,7 @@ pub struct GrepParams {
     pub(crate) mode: Option<PatternMode>,
     /// sensitive, insensitive, or smart. Explicit pattern modes default to sensitive; auto uses smart.
     pub(crate) case: Option<CaseMode>,
-    /// Max matching lines per page (default 100). More matches remain available through cursor.
+    /// Max matching lines per page (default 100, or 30 with definitions_only). More matches remain available through cursor.
     #[serde(rename = "maxResults")]
     pub max_results: Option<f64>, // this has to be float because llms are stupid
     /// Cursor from previous result. Only use if previous results weren't sufficient.
@@ -324,7 +326,13 @@ impl FffServer {
         mode: GrepMode,
     ) -> Result<CallToolResult, ErrorData> {
         let query = params.query.as_str();
-        let max_results = normalize_max_results(params.max_results, 100).min(MAX_GREP_PAGE);
+        let default_page = if params.definitions_only {
+            DEFINITION_PAGE
+        } else {
+            100
+        };
+        let max_results =
+            normalize_max_results(params.max_results, default_page).min(MAX_GREP_PAGE);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
         let context = normalize_context(params.context);
         let mut cursor = params
@@ -1839,6 +1847,28 @@ mod tests {
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("Needle();"), "{text}");
         assert!(!text.contains("No matching definitions"), "{text}");
+    }
+
+    #[test]
+    fn definition_pages_default_to_thirty_matches() {
+        let files: Vec<_> = (0..40)
+            .map(|i| (format!("f{i:02}.rs"), "fn needle_x() {}\n"))
+            .collect();
+        let (_dir, server) = definition_server(&files);
+        let count = |extra: serde_json::Value| {
+            let mut request = serde_json::json!({"query": "needle", "definitions_only": true});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let params = serde_json::from_value(request).unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+                .matches(": fn needle_x")
+                .count()
+        };
+        assert_eq!(count(serde_json::json!({})), 30);
+        assert_eq!(count(serde_json::json!({"maxResults": 35})), 35);
+        assert_eq!(count(serde_json::json!({"definitions_only": false})), 40);
     }
 
     #[test]
