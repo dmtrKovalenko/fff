@@ -2397,8 +2397,8 @@ fn is_binary_extension_str(ext: &str) -> bool {
         // ML/Data Science
         "npy" | "npz" | "h5" | "hdf5" | "pt" | "onnx" |
         "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib" |
-        // 3D/Game assets
-        "glb" | "blend" | "blp" |
+        // 3D/Game assets (`.blp` is also GTK Blueprint text, so content detection decides)
+        "glb" | "blend" |
         // Gzipped-XML / binary maps
         "dia" | "bcmap" |
         // Protobuf wire format
@@ -2480,6 +2480,48 @@ pub(crate) fn hint_allocator_collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blueprint_files_are_text_until_their_content_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("window.blp"),
+            "template $Window : Gtk.Window {\n  tooltip-text: \"Needle\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("texture.blp"), b"BLP2\0\0\0Needle\0").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: dir.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            enable_mmap_cache: false,
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let query =
+            fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig).parse("Needle");
+        let options = crate::grep::GrepSearchOptions {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        let result = picker.grep(&query, &options);
+        let files: Vec<_> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path(&picker))
+            .collect();
+        assert!(files.contains(&"window.blp".to_string()), "{files:?}");
+
+        let texture = dir.path().join("texture.blp");
+        let (item, _) = crate::types::FileItem::new(texture.clone(), dir.path(), None);
+        assert!(!item.is_binary());
+        item.detect_binary_per_byte(
+            &texture,
+            &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
+        );
+        assert!(item.is_binary());
+    }
 
     #[test]
     fn refuses_home_dir_with_trailing_separator() {
