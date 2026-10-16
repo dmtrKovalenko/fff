@@ -101,6 +101,76 @@ mod tests {
     }
 
     #[test]
+    fn matches_must_start_at_the_declared_name() {
+        for (filename, line, needle, expected) in [
+            ("x.rs", "pub enum Value {", "Value", true),
+            ("x.rs", "pub enum ValueKind {", "Value", true),
+            ("x.rs", "pub enum Value {", "enum Value", true),
+            (
+                "x.rs",
+                "pub struct ArgValueCompletion<'a> {",
+                "Value",
+                false,
+            ),
+            ("x.rs", "pub trait FromValue: Sized {", "Value", false),
+            ("x.rs", "fn value_of(v: Value) -> i64 {", "Value", false),
+            ("x.rs", "pub fn r#type() {}", "r#type", true),
+            (
+                "x.ts",
+                "export class UserController {",
+                "UserController",
+                true,
+            ),
+            (
+                "x.ts",
+                "export class AdminUserController {",
+                "UserController",
+                false,
+            ),
+            (
+                "x.ts",
+                "function handle(ctrl: UserController) {",
+                "UserController",
+                false,
+            ),
+            ("x.ts", "  #load() {", "#load", true),
+            ("x.lua", "function M.setup(opts)", "M.setup", true),
+            ("x.lua", "function M.setup(opts)", "setup", true),
+            ("x.zig", "pub const PageList = @This();", "Page", true),
+            ("x.zig", "fn getTabPage(self: *Self) void {", "Page", false),
+            ("x.h", "typedef struct AVFrame {", "AVFrame", true),
+            ("x.h", "struct _xmlDict {", "xmlDict", true),
+            ("x.h", "struct _xmlDict {", "_xmlDict", true),
+            ("x.h", "struct _xmlDict {", "Dict", false),
+            ("x.py", "def __init__(self):", "init", true),
+            ("x.h", "typedef struct MyAVPacketList {", "AVPacket", false),
+            (
+                "x.h",
+                "class BASE_EXPORT CommandLine {",
+                "BASE_EXPORT CommandLine",
+                true,
+            ),
+        ] {
+            let start = line.find(needle).unwrap() as u32;
+            let ranges = [(start, start + needle.len() as u32)];
+            let language = Language::from_filename(filename) as u8;
+            assert_eq!(
+                is_definition_match(language, line.as_bytes(), &ranges, false),
+                expected,
+                "{filename}: {needle} in {line}"
+            );
+        }
+        // Typo matching still accepts characters anywhere inside the name.
+        let line = b"pub struct ArgValueCompletion<'a> {";
+        assert!(is_definition_match(
+            Language::Rust as u8,
+            line,
+            &[(14, 19)],
+            true
+        ));
+    }
+
+    #[test]
     fn generic_bounds_and_swift_class_properties_keep_the_declared_name() {
         for (filename, line, expected) in [
             (
