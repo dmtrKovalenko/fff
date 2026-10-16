@@ -153,7 +153,7 @@ Single-query definition search tries these stages in order:
 
 A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage. The first four stages keep the original file constraints; the final suggestions can come from elsewhere in the indexed project and include a notice. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
 
-On each page of declarations, files that declare the whole query word come first. `Value` lists `enum Value` before `ArgValueCompletion`. This ordering does not add a search.
+On each page, files that declare the query as a whole name come first, and that declaration leads its file. `Value` lists `enum Value` before `ArgValueCompletion` and `DebuggableValue(pub Value)`. MCP confirms the declared name with the definition classifier; Pi approximates it. This ordering does not add a search.
 
 MCP's broader suggestions can include up to eight matching source lines. MCP tries partial module names before searching the whole index. Pi returns suggested filenames.
 

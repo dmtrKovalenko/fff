@@ -589,6 +589,7 @@ impl FffServer {
                     if !retry_result.matches.is_empty() && retry_result.matches.len() <= 10 {
                         cursor.stage = GrepStage::Broadened;
                         cursor.paginate(&mut retry_result, max_results, picker);
+                        crate::output::declarations_first(&mut retry_result);
                         let mut cs = self.lock_cursors()?;
                         let text = &GrepFormatter {
                             matches: &retry_result.matches,
@@ -737,6 +738,7 @@ impl FffServer {
             None
         };
         cursor.paginate(&mut result, max_results, picker);
+        crate::output::declarations_first(&mut result);
         if result.matches.is_empty() && !cursor.has_more() {
             return Ok(respond("0 matches.".into(), false));
         }
@@ -1055,6 +1057,7 @@ impl FffServer {
         }
 
         cursor.paginate(&mut result, max_results, picker);
+        crate::output::declarations_first(&mut result);
         if result.matches.is_empty() && !cursor.has_more() {
             return Ok(grep_response("0 matches.".into(), false));
         }
@@ -2400,28 +2403,55 @@ mod tests {
     fn definition_pages_list_exact_names_before_partial_names() {
         let (_dir, server) = definition_server(&[
             ("a.rs".into(), "pub struct ArgValueCompletion {}\n"),
-            ("b.rs".into(), "pub enum Value {\n    Int,\n}\n"),
-            ("c.rs".into(), "fn value_of(v: Value) -> i64 { 0 }\n"),
+            ("b.rs".into(), "pub struct DebuggableValue(pub Value);\n"),
+            ("c.rs".into(), "pub enum Value {\n    Int,\n}\n"),
+            (
+                "e.rs".into(),
+                "pub enum ValueKind {\n    Int,\n}\npub struct Value {\n    int: i64,\n}\n",
+            ),
+            ("d.rs".into(), "fn value_of(v: Value) -> i64 { 0 }\n"),
             (
                 "dict.h".into(),
                 "struct _xmlDict {\n    int ref;\n};\ntypedef struct _xmlDict xmlDict;\n",
             ),
         ]);
-        let grep = |query: &str| {
-            let params = serde_json::from_value(serde_json::json!({
-                "query": query, "definitions_only": true,
-            }))
-            .unwrap();
+        let grep = |extra: serde_json::Value| {
+            let mut request = serde_json::json!({"query": "Value", "definitions_only": true});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let params = serde_json::from_value(request).unwrap();
             response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
         };
-        let text = grep("Value");
-        let exact = text.find("pub enum Value {").expect(&text);
-        let partial = text.find("ArgValueCompletion").expect(&text);
-        assert!(exact < partial, "{text}");
-        assert!(!text.contains("value_of"), "{text}");
+        // A whole word in a field type does not count as declaring it.
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"context": 1}),
+            serde_json::json!({"output_mode": "files_with_matches"}),
+        ] {
+            let text = grep(extra.clone());
+            let order: Vec<_> = ["c.rs", "a.rs", "b.rs"]
+                .iter()
+                .map(|file| {
+                    text.find(file)
+                        .unwrap_or_else(|| panic!("{file} {extra}: {text}"))
+                })
+                .collect();
+            assert!(order.is_sorted(), "{extra}: {text}");
+            assert!(!text.contains("value_of"), "{text}");
+        }
+        // The exact declaration leads its file, so it gets the expanded body.
+        let text = grep(serde_json::json!({}));
+        let exact = text.find("pub struct Value {").expect(&text);
+        assert!(exact < text.find("pub enum ValueKind {").unwrap(), "{text}");
 
         // A typedef alias leads, but the struct body it names stays on the page.
-        let text = grep("xmlDict");
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "xmlDict", "definitions_only": true,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("typedef struct _xmlDict xmlDict;"), "{text}");
         assert!(text.contains("struct _xmlDict {"), "{text}");
     }

@@ -241,21 +241,21 @@ impl GrepFormatter<'_> {
         let mut char_count = 0usize;
         let mut current_file = String::new();
 
-        // Definitions first, led by files that define the whole word; then usages, then imports.
+        // Definitions first, each file's exact declaration leading its body; then usages, then imports.
         let sorted_items: Vec<usize> = if auto_expand_defs {
-            let exact_files: std::collections::HashSet<usize> = items
-                .iter()
-                .filter(|m| m.is_definition && matches_whole_word(m))
-                .map(|m| m.file_index)
-                .collect();
             let mut indices: Vec<usize> = (0..items.len()).collect();
-            indices.sort_by_key(|&i| {
-                if items[i].is_definition {
-                    usize::from(!exact_files.contains(&items[i].file_index))
-                } else if is_import_line(&items[i].line_content) {
-                    3
+            indices.sort_by_cached_key(|&i| {
+                let m = &items[i];
+                if m.is_definition {
+                    (
+                        0,
+                        m.file_index,
+                        !declares_whole_word(m, files[m.file_index]),
+                    )
+                } else if is_import_line(&m.line_content) {
+                    (2, 0, false)
                 } else {
-                    2
+                    (1, 0, false)
                 }
             });
 
@@ -548,15 +548,42 @@ fn collect_file_preview<'a>(
     file_preview
 }
 
-fn matches_whole_word(m: &GrepMatch) -> bool {
+// Files whose declaration is named by a whole matched word move ahead; the cursor is already set.
+pub(crate) fn declarations_first(result: &mut fff::GrepResult<'_>) {
+    let mut exact = vec![false; result.files.len()];
+    for m in &result.matches {
+        exact[m.file_index] |=
+            m.is_definition && declares_whole_word(m, result.files[m.file_index]);
+    }
+    if !exact.contains(&true) {
+        return;
+    }
+    let mut order: Vec<usize> = (0..result.files.len()).collect();
+    order.sort_by_key(|&i| !exact[i]);
+    let mut position = vec![0; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        position[old] = new;
+    }
+    result.files = order.iter().map(|&old| result.files[old]).collect();
+    for m in &mut result.matches {
+        m.file_index = position[m.file_index];
+    }
+    result.matches.sort_by_key(|m| !exact[order[m.file_index]]);
+}
+
+// The classifier confirms that the whole-word range is the declared name, not a parameter type.
+fn declares_whole_word(m: &GrepMatch, file: &FileItem) -> bool {
     let line = m.line_content.as_bytes();
     let word = |i: usize| {
         line.get(i)
             .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
     };
     m.match_byte_offsets.iter().any(|&(start, end)| {
-        let (start, end) = (start as usize, end as usize);
-        start < end && (start == 0 || !word(start - 1)) && !word(end)
+        let (s, e) = (start as usize, end as usize);
+        s < e
+            && (s == 0 || !word(s - 1))
+            && !word(e)
+            && file.is_definition_match(&m.line_content, &[(start, end)])
     })
 }
 

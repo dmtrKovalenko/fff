@@ -1072,6 +1072,7 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
         const page = grepPage();
         page.value.items = [
           definition("src/a.rs", "pub struct ArgValueCompletion {}", 14),
+          definition("src/c.rs", "pub struct DebuggableValue(pub Value);", 31),
           definition("src/b.rs", "pub enum Value {", 9),
         ] as any;
         return page;
@@ -1084,6 +1085,8 @@ for (const name of ["ffgrep", "fff-multi-grep"]) {
       const text = result.content[0].text;
       expect(text.indexOf("src/b.rs")).toBeGreaterThanOrEqual(0);
       expect(text.indexOf("src/b.rs")).toBeLessThan(text.indexOf("src/a.rs"));
+      // A whole word inside a field type does not count as the declared name.
+      expect(text.indexOf("src/a.rs")).toBeLessThan(text.indexOf("src/c.rs"));
       await shutdown(setup);
     });
 

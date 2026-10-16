@@ -1716,17 +1716,14 @@ function nextGrepStage(stage: GrepStage): GrepStage | undefined {
   }
 }
 
-// Files that define the whole matched word lead the page; the native order is kept otherwise.
+// Files that declare the whole matched word lead the page; the native order is kept otherwise.
 function exactDefinitionsFirst(items: GrepResult["items"]): GrepResult["items"] {
   const encoder = new TextEncoder();
   const exact = new Set(
     items
       .filter((item) => {
         const line = encoder.encode(item.lineContent);
-        return item.matchRanges.some(
-          ([start, end]) =>
-            start < end && !isWordByte(line[start - 1]) && !isWordByte(line[end]),
-        );
+        return item.matchRanges.some(([start, end]) => declaresWord(line, start, end));
       })
       .map((item) => item.relativePath),
   );
@@ -1750,6 +1747,17 @@ function grepStageNotice(stage: GrepStage): string | undefined {
     default:
       return undefined;
   }
+}
+
+// A whole word before any parameter, type or value list approximates the declared name.
+function declaresWord(line: Uint8Array, start: number, end: number): boolean {
+  if (start >= end || isWordByte(line[start - 1]) || isWordByte(line[end])) return false;
+  for (let i = 0; i < start; i++) {
+    const byte = line[i];
+    if (byte === 0x28 || byte === 0x3c || byte === 0x3d) return false;
+    if (byte === 0x3a && line[i - 1] !== 0x3a && line[i + 1] !== 0x3a) return false;
+  }
+  return true;
 }
 
 function isWordByte(byte: number | undefined): boolean {
