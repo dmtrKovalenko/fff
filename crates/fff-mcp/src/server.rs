@@ -676,6 +676,7 @@ impl FffServer {
                     mode,
                     options.effective_casing(),
                     params.path.as_deref(),
+                    false,
                 )
                 .unwrap_or_else(|| "0 matches.".into()),
                 false,
@@ -691,6 +692,7 @@ impl FffServer {
                     mode,
                     options.effective_casing(),
                     params.path.as_deref(),
+                    true,
                 )
             {
                 return Ok(respond(suggestions, false));
@@ -1120,6 +1122,7 @@ fn suggest_other_files(
     mode: GrepMode,
     casing: fff::grep::Casing,
     path: Option<&str>,
+    definitions: bool,
 ) -> Option<String> {
     let mut broader = query.clone();
     broader.raw_query = "";
@@ -1196,7 +1199,12 @@ fn suggest_other_files(
         .filter(|(_, score)| score.base_score > text.len() as i32 * 10)
         .map(|(file, _)| file.relative_path(picker))
         .collect::<Vec<_>>();
-    (!files.is_empty()).then(|| format!("No matching definitions or other matches found in the requested scope. These filenames may be relevant; their contents are unverified:\n{}", files.join("\n")))
+    let empty = if definitions {
+        "No matching definitions or other matches found"
+    } else {
+        "No matches found"
+    };
+    (!files.is_empty()).then(|| format!("{empty} in the requested scope. These filenames may be relevant; their contents are unverified:\n{}", files.join("\n")))
 }
 
 fn format_broader_matches(
@@ -2150,6 +2158,17 @@ mod tests {
         .unwrap();
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("contents are unverified"), "{text}");
+        assert!(text.contains("NeedleGuide.md"), "{text}");
+
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "!other/ !excluded/ NeedleGuide",
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(
+            text.starts_with("No matches found in the requested scope."),
+            "{text}"
+        );
         assert!(text.contains("NeedleGuide.md"), "{text}");
     }
 
