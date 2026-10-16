@@ -2526,9 +2526,16 @@ mod tests {
                 ("src/.hidden/a.rs".into(), "Needle"),
                 ("src/.hidden/.nested/b.rs".into(), "Needle"),
                 ("other/.hidden/c.rs".into(), "Needle"),
+                (".github/workflows/ci.rs".into(), "Needle"),
             ],
         );
         for (globs, expected) in [
+            (vec![".github/**"], vec![".github/workflows/ci.rs"]),
+            (
+                vec![".github/workflows/*.rs"],
+                vec![".github/workflows/ci.rs"],
+            ),
+            (vec!["**/.github/**"], vec![".github/workflows/ci.rs"]),
             (
                 vec!["src/**"],
                 vec![

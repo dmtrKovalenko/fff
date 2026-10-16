@@ -123,6 +123,9 @@ impl SearchScope {
                         continue;
                     }
                     if whitelist.is_match(path)
+                        || includes
+                            .iter()
+                            .any(|pattern| names_hidden_dir(pattern, path))
                         || roots.iter().any(|root| Path::new(root).starts_with(path))
                     {
                         overrides_hidden_directory = true;
@@ -185,6 +188,30 @@ pub(crate) fn escape_glob(path: &str) -> String {
         }
     }
     escaped
+}
+
+// True when a pattern spells out the hidden directory's own name, like `.github/**`.
+fn names_hidden_dir(pattern: &str, dir: &str) -> bool {
+    fn walk(pattern: &[&str], dir: &[&str]) -> bool {
+        let (Some((&part, rest)), Some(&name)) = (pattern.split_first(), dir.first()) else {
+            return false;
+        };
+        if part == "**" {
+            return (dir.len() > 1 && walk(pattern, &dir[1..])) || walk(rest, dir);
+        }
+        let matches = globset::Glob::new(part)
+            .map(|glob| glob.compile_matcher().is_match(name))
+            .unwrap_or(false);
+        match dir {
+            [_] => matches && part.starts_with('.') && !rest.is_empty(),
+            _ => matches && walk(rest, &dir[1..]),
+        }
+    }
+    !pattern.contains('{')
+        && walk(
+            &pattern.split('/').collect::<Vec<_>>(),
+            &dir.split('/').collect::<Vec<_>>(),
+        )
 }
 
 pub(crate) fn descendant_glob(pattern: &str) -> String {
