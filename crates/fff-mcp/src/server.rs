@@ -893,7 +893,7 @@ impl FffServer {
     )]
     fn grep(
         &self,
-        Parameters(params): Parameters<GrepParams>,
+        Parameters(mut params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.bump_activity();
         self.wait_for_scan(SCAN_READY_TIMEOUT)?;
@@ -903,6 +903,11 @@ impl FffServer {
 
         let mode = match params.mode {
             Some(PatternMode::Regex) => GrepMode::Regex,
+            // Plain grep reads `\n` as a newline, so keep literal backslashes in a regex.
+            Some(PatternMode::Literal) if params.query.contains("\\n") => {
+                params.query = literal_regex(&params.query);
+                GrepMode::Regex
+            }
             Some(PatternMode::Literal) => GrepMode::PlainText,
             _ if has_regex_metacharacters(&grep_text) => GrepMode::Regex,
             _ => GrepMode::PlainText,
@@ -1052,6 +1057,16 @@ fn grep_response(text: String, definitions_fallback: bool) -> CallToolResult {
         text
     };
     CallToolResult::success(vec![Content::text(text)])
+}
+
+fn literal_regex(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            // `[\\]` matches a backslash without spelling the `\n` escape core rewrites.
+            '\\' => "[\\\\]".to_string(),
+            c => regex::escape(c.encode_utf8(&mut [0; 4])),
+        })
+        .collect()
 }
 
 fn with_notice(mut response: CallToolResult, notice: Option<String>) -> CallToolResult {
@@ -1470,6 +1485,22 @@ mod tests {
         );
         assert!(text.contains("references.txt"), "{text}");
         assert!(!text.contains("definition.rs"), "{text}");
+    }
+
+    #[test]
+    fn literal_mode_keeps_backslash_n_verbatim() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "let parts = text.split(\"\\n\");\n"),
+            ("b.rs".into(), "let parts = text.split(\"\n\");\n"),
+        ]);
+        let request = serde_json::json!({"query": "split(\"\\n\")", "mode": "literal"});
+        let text = response_text(
+            server
+                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        assert!(text.contains("a.rs"), "{text}");
+        assert!(!text.contains("b.rs"), "{text}");
     }
 
     #[test]
