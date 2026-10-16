@@ -234,6 +234,21 @@ mod tests {
                     true,
                 ),
                 ("typedef struct {", "struct", false),
+                (
+                    "typedef struct API_AVAILABLE(macos(10.11), ios(8.0)) YADIFVTContext {",
+                    "YADIFVTContext",
+                    true,
+                ),
+                (
+                    "typedef struct API_AVAILABLE(macos(10.11), ios(8.0)) YADIFVTContext {",
+                    "API_AVAILABLE",
+                    false,
+                ),
+                (
+                    "typedef struct __attribute__((packed)) Header {",
+                    "Header",
+                    true,
+                ),
                 ("typedef struct Foo { int x; } Bar;", "Bar", true),
                 ("typedef struct Foo { int x; } Bar;", "Foo", false),
                 ("typedef struct Foo Bar;", "Bar", true),
@@ -334,6 +349,20 @@ mod tests {
                 ("    Foo bar(other.value(), ptr->size);", "bar", false),
                 ("    Foo bar(Baz(x));", "bar", false),
                 ("      MAX_COUNTER * sizeof(int64_t);", "sizeof", false),
+                ("  constexpr ByteSize b(2);", "b", false),
+                (
+                    "  static NoDestructor<std::string> awesome(\"awesome\");",
+                    "awesome",
+                    false,
+                ),
+                ("  constexpr span<const int> span(kArray);", "span", false),
+                ("  friend void Swap(Foo& a, Foo& b);", "Swap", false),
+                (
+                    "extern T __part_index_begin[] __attribute__((weak_import));",
+                    "__attribute__",
+                    false,
+                ),
+                ("asm volatile(\"nop\");", "volatile", false),
                 ("    count * sizeof(TSFieldMapEntry)", "sizeof", false),
                 (
                     "    std::string name(base::StringPrintf(\"%d items\", count));",
