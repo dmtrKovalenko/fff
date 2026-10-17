@@ -176,6 +176,20 @@ macro_rules! action {
         return Some($name);
     }};
     (Typedef, $p:ident, $name:ident, $modifiers:ident) => {{ return $p.typedef_name() }};
+    (Alias, $p:ident, $name:ident, $modifiers:ident) => {{
+        // `export * as Name from "module"` binds Name; anything else is an ordinary `as`.
+        let start = $p.pos;
+        if $modifiers
+            && let Some(alias) = $p.identifier()
+            && $p
+                .identifier()
+                .is_some_and(|from| &$p.line[from] == b"from")
+        {
+            return Some(alias);
+        }
+        $p.pos = start;
+        return $p.fallback($name, $modifiers);
+    }};
 }
 
 macro_rules! declaration_prefix {

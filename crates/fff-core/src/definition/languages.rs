@@ -117,7 +117,7 @@ languages! {
         rules: {
             b"function" => Function,
             b"class" | b"interface" | b"type" | b"enum" | b"namespace" | b"module" => Name,
-            b"const" => ConstBinding, b"let" | b"var" => FunctionBinding
+            b"const" => ConstBinding, b"let" | b"var" => FunctionBinding, b"as" => Alias
         }
     },
     Lua {

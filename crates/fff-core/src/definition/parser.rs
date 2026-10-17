@@ -48,8 +48,22 @@ where
                 self.group(b'(', b')')?;
             }
         }
-        let name = self.named()?;
+        let mut name = self.named()?;
         if C_TYPE {
+            // `class BASE_EXPORT Name` and `struct COMPONENT_EXPORT(NET) Name` put a macro first.
+            while is_macro_case(&self.line[name.clone()]) {
+                let start = self.pos;
+                if self.peek() == Some(b'(') {
+                    self.group(b'(', b')')?;
+                }
+                match self.identifier() {
+                    Some(next) if &self.line[next.clone()] != b"final" => name = next,
+                    _ => {
+                        self.pos = start;
+                        break;
+                    }
+                }
+            }
             let defines = matches!(self.peek(), None | Some(b'{' | b':' | b'<'))
                 || self
                     .identifier()
@@ -238,14 +252,36 @@ where
             }
         }
         let name = last?;
-        if names < 2 && !modifiers && !constructor {
+        if names < 2 && !modifiers && !constructor
+            || matches!(
+                &self.line[name.clone()],
+                b"sizeof"
+                    | b"alignof"
+                    | b"decltype"
+                    | b"typeof"
+                    | b"__attribute__"
+                    | b"__declspec"
+                    | b"alignas"
+                    | b"asm"
+                    | b"volatile"
+            )
+        {
             return None;
         }
         // An unfinished parameter list can continue on the following line.
         if self.group(b'(', b')').is_some() {
             match self.peek() {
                 Some(b',' | b')' | b'.') => return None,
-                Some(b';') if Self::LANGUAGE == Language::C => return None,
+                // Prototypes sit at the top level or start with `virtual`/`explicit`; indented
+                // `static T x(args);` constructs a local instead.
+                Some(b';')
+                    if Self::LANGUAGE == Language::C
+                        && (!(self.line.first().is_some_and(|b| !b.is_ascii_whitespace())
+                            || matches!(first_word(self.line), b"virtual" | b"explicit"))
+                            || is_macro_case(&self.line[name.clone()])) =>
+                {
+                    return None;
+                }
                 Some(b'=') if !self.line[self.pos..].starts_with(b"=>") => return None,
                 _ => {}
             }
@@ -258,12 +294,30 @@ where
             self.pos += pointer + 2;
             return self.identifier();
         }
-        let mut last = None;
+        let start = self.pos;
+        let tag = self
+            .identifier()
+            .filter(|word| matches!(&self.line[word.clone()], b"struct" | b"union" | b"enum"))
+            .and_then(|_| {
+                let mut tag = self.identifier()?;
+                // `typedef struct API_AVAILABLE(macos(10.11)) Name {` puts an attribute first.
+                while self.peek() == Some(b'(') {
+                    self.group(b'(', b')')?;
+                    tag = self.identifier()?;
+                }
+                Some(tag)
+            });
+        if tag.is_none() {
+            self.pos = start;
+        }
+        let mut last = tag.clone();
         while self.peek().is_some() {
             match self.peek()? {
                 b';' => break,
                 b'[' => self.group(b'[', b']')?,
-                b'{' => self.group(b'{', b'}')?,
+                // A body that continues on later lines leaves the tag as the name.
+                b'{' if self.group(b'{', b'}').is_none() => return tag,
+                b'{' => {}
                 _ => {
                     if let Some(name) = self.identifier() {
                         last = Some(name);
@@ -428,4 +482,19 @@ where
             self.pos += 1;
         }
     }
+}
+
+fn is_macro_case(word: &[u8]) -> bool {
+    word.iter().any(u8::is_ascii_uppercase)
+        && word
+            .iter()
+            .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn first_word(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    &line[start..super::scan::identifier_end(line, start)]
 }
