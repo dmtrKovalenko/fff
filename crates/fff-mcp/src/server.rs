@@ -3010,6 +3010,82 @@ mod tests {
     }
 
     #[test]
+    fn path_globs_keep_directory_boundaries_across_tools_and_pages() {
+        let paths = [
+            "src/a.rs",
+            "src/foo.rs",
+            "src/nested/foo.rs",
+            "src/deep/nested/foo.rs",
+            "lib/foo.rs",
+            "lib/nested/foo.rs",
+            "src/a,b.rs",
+            "src/nested/a,b.rs",
+        ];
+        let files: Vec<_> = paths
+            .iter()
+            .map(|path| ((*path).into(), "fn Needle() {}\n"))
+            .collect();
+        let (_dir, server) = definition_server(&files);
+        for (globs, expected) in [
+            (vec!["src/*.rs"], vec![0, 1, 6]),
+            (vec!["src/?.rs"], vec![0]),
+            (vec!["src/*/foo.rs"], vec![2]),
+            (vec!["src/**/*.rs"], vec![0, 1, 2, 3, 6, 7]),
+            (vec!["src/*a[,]b.rs"], vec![6]),
+            (vec!["src/*.rs", "lib/**"], vec![0, 1, 4, 5, 6]),
+            (vec!["{src,lib}/*.rs"], vec![0, 1, 4, 6]),
+            (vec!["src/**", "!src/*.rs"], vec![2, 3, 7]),
+        ] {
+            let expected: std::collections::BTreeSet<_> =
+                expected.into_iter().map(|index| paths[index]).collect();
+            let request = serde_json::json!({"query":"", "mode":"glob", "globs":globs});
+            let text = response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert_eq!(
+                text.lines().collect::<std::collections::BTreeSet<_>>(),
+                expected,
+                "{globs:?}"
+            );
+            for (mode, definitions_only) in
+                [("literal", false), ("regex", false), ("literal", true)]
+            {
+                let mut request = serde_json::json!({
+                    "query":"Needle", "mode":mode,
+                    "globs":globs, "definitions_only":definitions_only,
+                    "maxResults":2, "context":0,
+                });
+                let mut found = std::collections::BTreeSet::new();
+                for _ in 0..paths.len() {
+                    let response =
+                        server.grep(Parameters(serde_json::from_value(request.clone()).unwrap()));
+                    let text = response_text(response.unwrap());
+                    let page: Vec<_> = text.lines().filter(|line| paths.contains(line)).collect();
+                    assert!((1..=2).contains(&page.len()), "{text}");
+                    for path in page {
+                        assert!(found.insert(path.to_owned()), "duplicate {path}");
+                    }
+                    let Some(cursor) = text.lines().find_map(|line| line.strip_prefix("cursor: "))
+                    else {
+                        break;
+                    };
+                    request["cursor"] = cursor.into();
+                }
+                assert_eq!(
+                    found
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    expected,
+                    "{globs:?}, {mode}, definitions={definitions_only}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn include_globs_allow_hidden_matches_without_entering_other_hidden_directories() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
