@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                          For Neovim >= 0.10.0    Last change: 2026 October 15
+                          For Neovim >= 0.10.0    Last change: 2026 October 17
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -164,6 +164,7 @@ first call to either function lazily initialises the picker at
 - If `cwd` differs, the picker is re-indexed at the new root and the call **blocks** (default up to 10 s) until the new picker is installed and its initial scan completes — so callers always get results from the right tree.
 - If the index is still warming up after a `change_indexing_directory`, you can pass `wait_for_index_ms = N` to block for up to `N` ms regardless of whether `cwd` triggered the swap. Pass `0` to skip waiting entirely (useful for fire-and-forget calls where partial results are acceptable).
 - Invalid or non-existent `cwd` paths return an empty result and emit an error via `vim.notify`.
+- A `cwd` inside a linked git worktree shares frecency and query history with the main checkout, so new worktrees don’t start cold.
 
 
 AUTOCMDS ~
