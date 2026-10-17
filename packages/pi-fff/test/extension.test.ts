@@ -213,8 +213,8 @@ async function start(mode?: string, cwd?: string, flags: Record<string, unknown>
   return { ...setup, ctx };
 }
 
-async function shutdown(setup: { events: Map<string, EventHandler> }) {
-  await setup.events.get("session_shutdown")?.({}, undefined);
+async function shutdown(setup: { events: Map<string, EventHandler>; ctx?: unknown }) {
+  await setup.events.get("session_shutdown")?.({}, setup.ctx);
 }
 
 function currentProvider(
@@ -646,6 +646,23 @@ describe("pi-fff $HOME scan warning", () => {
     // session_shutdown must stop the poller and clear the footer.
     await shutdown(setup);
     expect(setup.ctx.ui.setStatus).toHaveBeenLastCalledWith("fff", undefined);
+  });
+
+  // #948: after session replacement the session_start ctx throws on access.
+  test("session_shutdown uses its own ctx and still destroys the finder", async () => {
+    const setup = await start();
+    Object.defineProperty(setup.ctx, "ui", {
+      get: () => {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      },
+    });
+    const next = createContext();
+
+    await shutdown({ events: setup.events, ctx: next });
+    expect(finders[0].destroy).toHaveBeenCalledTimes(1);
+    expect(next.ui.setStatus).toHaveBeenLastCalledWith("fff", undefined);
   });
 
   // #857: the opt-out must skip the picker, not surface the native refusal as an

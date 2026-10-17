@@ -555,7 +555,6 @@ export default function fffExtension(pi: ExtensionAPI) {
   }
 
   function destroyFinder() {
-    stopHomeScanStatus();
     if (mainFinder && !mainFinder.isDestroyed) {
       mainFinder.destroy();
       mainFinder = null;
@@ -565,6 +564,8 @@ export default function fffExtension(pi: ExtensionAPI) {
     auxPool?.destroy();
     auxPool = null;
     pickers = null;
+    // UI teardown last: a throwing ctx must not leak the native finders (#948).
+    stopHomeScanStatus();
   }
 
   async function resolveFinderForPath(
@@ -863,8 +864,11 @@ export default function fffExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", async () => {
+  // A ctx captured from a replaced session is stale and throws on access (#948).
+  pi.on("session_shutdown", async (_event, ctx) => {
+    uiCtx = ctx;
     destroyFinder();
+    uiCtx = null;
   });
 
   // --- Shared render helpers ---
