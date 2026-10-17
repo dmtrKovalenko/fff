@@ -335,7 +335,7 @@ end
 --- @field time_budget_ms? number Max wall-clock time, 0 = unlimited (default: config.grep.time_budget_ms).
 --- @field enforce_time_budget? boolean Apply the budget even with zero matches (default: config.grep.enforce_time_budget).
 --- @field trim_whitespace? boolean Strip leading whitespace from matched lines (default: config.grep.trim_whitespace).
---- @field classify_definitions? boolean|FffDefinitionMode Classify matches or return definitions/usages only (default: config.grep.classify_definitions).
+--- @field classify_definitions? boolean|FffDefinitionMode Classify matches or return definitions/usages only (default: grep.classify_definitions from the user config, otherwise off).
 --- @field cwd? string Switch indexed root before grepping (same semantics as `file_search`).
 --- @field wait_for_index_ms? number Block up to this many ms for the index to be ready.
 
@@ -387,7 +387,9 @@ function M.content_search(query, opts)
     classify_definitions = opts.classify_definitions,
   }
   if merged_grep_cfg.classify_definitions == nil then
-    merged_grep_cfg.classify_definitions = grep_cfg.classify_definitions
+    -- Programmatic results keep file order unless the user's own config enables grouping.
+    local user_grep = type(vim.g.fff) == 'table' and vim.g.fff.grep or nil
+    merged_grep_cfg.classify_definitions = type(user_grep) == 'table' and user_grep.classify_definitions or false
   end
 
   local ok, result = pcall(grep.search, query, opts.file_offset or 0, opts.page_size or 50, merged_grep_cfg, mode)
