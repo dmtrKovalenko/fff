@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::git_recency;
+use crate::git_status_worker::GitStatusWorker;
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
 use crate::rescan_throttle::RescanThrottle;
@@ -82,6 +84,7 @@ pub struct SharedPickerInner {
     watchers: Arc<WatchRegistry>,
     rescans: RescanCounters,
     rescan_throttle: RescanThrottle,
+    git_status_paused: Arc<AtomicBool>,
 }
 
 impl Default for SharedPickerInner {
@@ -91,6 +94,7 @@ impl Default for SharedPickerInner {
             watchers: Arc::new(WatchRegistry::default()),
             rescans: RescanCounters::default(),
             rescan_throttle: RescanThrottle::default(),
+            git_status_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -345,6 +349,50 @@ impl SharedFilePicker {
 
     pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
         &self.0.watchers
+    }
+
+    /// Stop background git status updates; the file index and watches keep updating.
+    /// Manual [`Self::refresh_git_status`] still works. The pause survives re-indexing, and
+    /// pausing before [`FilePicker::new_with_shared_state`] skips the initial status read.
+    pub fn pause_git_status(&self) {
+        self.0.git_status_paused.store(true, Ordering::Release);
+        if let Some(worker) = self.git_status_worker() {
+            worker.drop_pending();
+        }
+    }
+
+    /// Resume background git status updates and queue one full refresh.
+    /// Use [`Self::wait_for_git_status`] to know when it has been applied.
+    pub fn resume_git_status(&self) {
+        self.0.git_status_paused.store(false, Ordering::Release);
+        if let Some(worker) = self.git_status_worker() {
+            worker.request_full_rescan();
+        }
+    }
+
+    pub fn is_git_status_paused(&self) -> bool {
+        self.0.git_status_paused.load(Ordering::Acquire)
+    }
+
+    /// Block until queued background git status work is applied.
+    /// Returns `false` on timeout. A zero timeout makes it a non-blocking check.
+    pub fn wait_for_git_status(&self, timeout: Duration) -> bool {
+        let Some(worker) = self.git_status_worker() else {
+            return true;
+        };
+
+        poll_until(timeout, || worker.is_idle())
+    }
+
+    pub(crate) fn git_status_pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0.git_status_paused)
+    }
+
+    fn git_status_worker(&self) -> Option<Arc<GitStatusWorker>> {
+        let guard = self.0.picker.read();
+        guard
+            .as_ref()
+            .map(|picker| Arc::clone(&picker.git_status_worker))
     }
 
     /// Refresh git statuses for all indexed files

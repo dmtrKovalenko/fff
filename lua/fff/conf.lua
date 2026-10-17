@@ -55,6 +55,8 @@ local M = {}
 --- @field enabled boolean
 --- @field db_path string
 
+--- @alias FffGitStatusUpdates 'while_open'|'always'|'manual'
+
 --- @class FffHistoryConfig
 --- @field enabled boolean
 --- @field db_path string
@@ -445,6 +447,9 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      -- 'while_open': pause git status while the picker is closed, refresh it on open
+      -- 'always': track every change in the background, 'manual': only on :FFFRefreshGit
+      status_updates = 'while_open',
       -- Boost files that participated in recent commits of the current branch:
       -- +1 score point per commit the file appeared in (max = max_commits)
       recency = {

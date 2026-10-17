@@ -975,7 +975,10 @@ impl FilePicker {
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let picker = Self::new(options)?;
+        let mut picker = Self::new(options)?;
+        picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
+            shared_picker.git_status_pause_flag(),
+        );
 
         info!(
             "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",

@@ -433,6 +433,9 @@ require('fff').setup({
   },
   git = {
     status_text_color = false, -- true to color filenames by git status
+    -- 'while_open' pauses git status while the picker is closed and refreshes it on open,
+    -- 'always' tracks every change in the background, 'manual' updates only on :FFFRefreshGit
+    status_updates = 'while_open',
     -- files that participated in the last N configured commits will get scoring bonus
     recency = {
       enabled = true, -- boost files from recent commits of the current branch

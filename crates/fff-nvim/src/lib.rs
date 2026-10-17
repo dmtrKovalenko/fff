@@ -660,6 +660,20 @@ pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<usize> {
     FILE_PICKER.refresh_git_status(&FRECENCY).into_lua_result()
 }
 
+pub fn pause_git_status(_: &Lua, _: ()) -> LuaResult<()> {
+    FILE_PICKER.pause_git_status();
+    Ok(())
+}
+
+pub fn resume_git_status(_: &Lua, _: ()) -> LuaResult<()> {
+    FILE_PICKER.resume_git_status();
+    Ok(())
+}
+
+pub fn is_git_status_refreshing(_: &Lua, _: ()) -> LuaResult<bool> {
+    Ok(!FILE_PICKER.wait_for_git_status(Duration::ZERO))
+}
+
 pub fn get_file_access_count(_: &Lua, file_path: String) -> LuaResult<u64> {
     let path = PathBuf::from(&file_path);
     let shared_path = FILE_PICKER
@@ -1059,6 +1073,12 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     exports.set(
         "refresh_git_status",
         lua.create_function(refresh_git_status)?,
+    )?;
+    exports.set("pause_git_status", lua.create_function(pause_git_status)?)?;
+    exports.set("resume_git_status", lua.create_function(resume_git_status)?)?;
+    exports.set(
+        "is_git_status_refreshing",
+        lua.create_function(is_git_status_refreshing)?,
     )?;
     exports.set("get_git_root", lua.create_function(get_git_root)?)?;
     exports.set(
