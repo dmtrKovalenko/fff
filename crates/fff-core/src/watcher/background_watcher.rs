@@ -883,13 +883,17 @@ fn index_new_directory(
     let added = indexed_files.len();
 
     let watch_registry = shared_picker.watch_registry();
-    // Capacity rejection cannot fall back to incremental processing if a rescan is throttled.
+    // Throttled like every watcher rescan: an unthrottled one per new dir is a rescan storm
+    // in generated-data trees. When throttled, only the accepted prefix is indexed.
     let rescan_started = if index_update_rejected {
-        match shared_picker.trigger_full_rescan_async(shared_frecency) {
-            Ok(()) => {
+        match shared_picker
+            .trigger_full_rescan_with_reason(shared_frecency, RescanReason::IndexUpdateRejected)
+        {
+            Ok(true) => {
                 watch_registry.dispatch_rescan(&base_path);
                 true
             }
+            Ok(false) => false,
             Err(e) => {
                 error!(?e, dir = %dir.display(), "Failed to rescan after new-directory overflow");
                 false
@@ -1300,6 +1304,70 @@ mod tests {
             );
         }
         assert_eq!(picker.get_overflow_files().len(), 0);
+    }
+
+    #[test]
+    fn new_directory_overflow_inside_rescan_cooldown_is_throttled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let shared_picker = SharedFilePicker::default();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        *shared_picker.write().unwrap() = Some(picker);
+        shared_picker.rebase_watches(&base);
+
+        // a just-finished scan arms the cooldown
+        shared_picker
+            .trigger_full_rescan_async(&SharedFrecency::noop())
+            .unwrap();
+        assert!(shared_picker.wait_for_indexing_complete(Duration::from_secs(10)));
+
+        let (sender, receiver) = mpsc::channel::<Vec<WatchEvent>>();
+        shared_picker
+            .watch_registry()
+            .subscribe(
+                &base,
+                "**",
+                WatchOptions::default(),
+                Box::new(move |_, events| {
+                    let _ = sender.send(events.to_vec());
+                }),
+            )
+            .unwrap();
+
+        let dir = base.join("new-directory");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            std::fs::write(dir.join(format!("file-{i}.txt")), "content").unwrap();
+        }
+        index_new_directory(
+            &dir,
+            &shared_picker,
+            &SharedFrecency::noop(),
+            &None,
+            &GitStatusWorker::new(),
+        );
+
+        {
+            let guard = shared_picker.read().unwrap();
+            let picker = guard.as_ref().unwrap();
+            assert!(!picker.is_scan_active());
+            assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+        }
+
+        let mut created = 0;
+        while let Ok(events) = receiver.recv_timeout(Duration::from_millis(500)) {
+            for event in events {
+                assert_eq!(event.kind, WatchEventKind::Created);
+                created += 1;
+            }
+        }
+        assert_eq!(created, MAX_OVERFLOW_FILES);
     }
 
     #[test]
