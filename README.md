@@ -48,9 +48,20 @@ Pick what you are interested in:
 <h2>MCP server</h2>
 </summary>
 
-Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. Fewer grep roundtrips, less wasted context, faster answers.
+Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. A resident Rust index supports file discovery and content search across tool calls.
 
-![Benchmark chart comparing FFF against the built-in AI file-search tools](./chart.png)
+![Measured search time and tokens for FFF MCP versus normal shell search](./chart.png)
+
+The chart compares warm FFF MCP with shell search in the small and big repos. Startup and indexing are excluded.
+
+Six additional tasks were held out from tuning in the small repo. The big repo appears in the main comparison above, but did not have a separate held-out run.
+
+| Held-out model | Shell time | FFF time | Shell tokens | FFF tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Opus 5.5 | 10.7 s | 9.0 s | 58.3k | 49.2k |
+| GPT-6 Astra | 8.1 s | 9.0 s | 43.9k | 49.3k |
+
+[Held-out chart](scripts/search-benchmark-heldout.png). Both models returned all six expected answers in each recorded search mode. Tokens include cached input.
 
 ### One-line install
 
@@ -102,7 +113,9 @@ command = "/opt/homebrew/bin/fff-mcp"
 
 Use the actual installed path for your system, then restart Codex or start a new task so it loads the server.
 
-Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
+On Codex versions that support `omit_tools_from`, add `omit_tools_from = ["deferred"]` to this server's configuration to expose FFF's tools immediately. This avoids a separate tool-discovery round trip. The measurements above use this setting.
+
+Once the server is connected, ask the agent to "use fff". The MCP tools are `grep`, `find_files`, and `multi_grep`.
 
 ### Recommended agent prompt
 
@@ -110,18 +123,37 @@ Drop this into your project's `CLAUDE.md` or equivalent:
 
 ```markdown
 For any file search or grep in the current git-indexed directory, use fff tools.
+Include the known directory or module in the first search. Use definitions_only
+for declarations. Read more source only when the returned lines need context.
 ```
 
 ### Definition search
 
-MCP and Pi expose only the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "definitions_only": true }`; Pi's `ffgrep` uses `pattern` instead of `query`. Single-query grep tries these stages in order:
+MCP and Pi expose the optional `definitions_only` boolean to the model. MCP accepts `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `{ "pattern": "AudioMap", "path": "src/audio/", "definitions_only": true }`. Use the directory, module glob, or filename from the request to narrow the search. MCP's optional `path` also works with `find_files`, and existing inline query constraints still work. A `path` naming an indexed file or directory is matched from the checkout root; otherwise it matches that name at any depth, and a path that matches nothing is reported. A filename constraint in a definition query that matches no indexed file is reported and dropped.
+
+MCP also accepts ripgrep-style searches without putting scope tokens in the pattern:
+
+```json
+{"query":"retry|backoff","mode":"regex","paths":["src","lib"],"globs":["*.rs","!**/tests/**"],"context":3}
+```
+
+`mode: "regex"` and `mode: "literal"` preserve the query, including whitespace. Both default to case-sensitive matching; `case` also accepts `"insensitive"` and `"smart"`. Without a mode, the existing smart-case and inline-constraint behavior remains available. Any `paths` or `globs` value also keeps the query verbatim, so inline constraint tokens become part of the pattern. Regex matches stay within one line unless the pattern contains `\n`. `paths` contains checkout-relative files or directories. Positive `globs` are alternatives; exclusions take priority. `hidden: false` skips hidden paths unless explicitly included by a path or glob. Searches stay within the index: unlike ripgrep's `-g`, globs cannot restore files excluded by the index's ignore rules. Ripgrep-specific `.rgignore` files can also make its file inventory differ.
+
+Grep returns up to 100 matching lines per page by default and at most 200. Use `maxResults` and the returned cursor to continue, including within a file. `max_matches_per_file` explicitly limits matches per file. Small content result sets include bounded surrounding source automatically. `context`, `before_context`, and `after_context` request explicit context; overlapping windows are merged. Set `context: 0` for matching lines only.
+
+`find_files` matches path fragments before approximate filenames. Its default mode treats hyphens and underscores alike. Set `mode: "glob"` or `mode: "regex"` for exact path filtering, with the same `paths`, `globs`, and `hidden` options. Its optional `filters` array applies additional path regexes, like `rg --files | rg pattern1 | rg pattern2`.
+
+Single-query definition search tries these stages in order:
 
 1. Matching declarations.
 2. Ordinary exact matches, with a notice that no matching declarations were found.
 3. Fuzzy declarations, labeled “Maybe you meant these definitions”.
 4. Fuzzy ordinary matches, labeled “Maybe you meant these other matches”.
+5. If all four stages found nothing, suggest files from a broader search. Exclusions remain active. Filename-only suggestions are labeled as unverified.
 
-A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage, and all stages keep the original file constraints. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
+A stage advances only after its complete search returns no matches. A partial page keeps its current stage, and a stage that returned matches never broadens when pagination ends. Cursors preserve the stage. The first four stages keep the original file constraints; the final suggestions can come from elsewhere in the indexed project and include a notice. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
+
+MCP's broader suggestions can include up to eight matching source lines. MCP tries partial module names before searching the whole index. Pi returns suggested filenames.
 
 ### What changes
 
@@ -134,7 +166,7 @@ Source: [`crates/fff-mcp/`](./crates/fff-mcp/).
 
 </details>
 
-The MCP server gives any agent a file search tool that is faster and more token-efficient than the built-in one.
+The MCP server keeps the file and content indexes available across agent tool calls.
 
 <details id="pi-extension">
 <summary>
@@ -502,7 +534,7 @@ require('fff').setup({
 
 ### Live grep modes
 
-`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
+`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`). `regex` matches stay within one line unless the pattern contains `\n`.
 
 Set `grep.classify_definitions = true` to show matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `false`, which skips definition classification and grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
 

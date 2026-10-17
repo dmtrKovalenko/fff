@@ -1,5 +1,7 @@
 use crate::cursor::{CursorStore, GrepCursor, GrepStage};
+use crate::file_search::FilePatternMode;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
+use crate::scope::SearchScope;
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
 use fff::types::{FileItem, PaginationArgs};
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
@@ -16,12 +18,14 @@ const SCAN_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 const MAX_CONTEXT_LINES: usize = 100;
 
 const FUZZY_STAGE_BUDGET_MS: u64 = 2_000;
+// Grep pages print every match, so a huge maxResults would flood the caller.
+const MAX_GREP_PAGE: usize = 200;
 
 fn normalize_max_results(raw: Option<f64>, default: usize) -> usize {
     match raw {
         None => default,
         Some(v) if v <= 0.0 || !v.is_finite() => default,
-        Some(v) => (v.round() as usize).max(1),
+        Some(v) => (v.round() as usize).clamp(1, 10_000),
     }
 }
 
@@ -61,7 +65,7 @@ fn make_grep_options(
     } else {
         context.unwrap_or(0)
     };
-    let auto_expand = !is_usage && ctx_lines == 0;
+    let auto_expand = !is_usage && context.is_none();
     let after_ctx = if auto_expand { 8 } else { ctx_lines };
 
     (
@@ -75,10 +79,10 @@ fn make_grep_options(
             mode,
             time_budget_ms: 0,
             enforce_time_budget: false,
-            before_context: ctx_lines,
+            before_context: if auto_expand { 8 } else { ctx_lines },
             after_context: after_ctx,
             classify_definitions: true.into(),
-            trim_whitespace: true,
+            trim_whitespace: false,
             abort_signal: None,
         },
         auto_expand,
@@ -95,6 +99,13 @@ pub struct FindFilesParams {
     /// Directory, filename, or one glob to search. Set this from the request's module context.
     /// Examples: "src/net", "client.py", "**/*billing*client*/**".
     pub path: Option<String>,
+    #[serde(flatten)]
+    pub(crate) scope: SearchScope,
+    /// fuzzy (default): path fragments, treating hyphens and underscores alike, then typo matches. glob or regex: exact path filtering.
+    pub(crate) mode: Option<FilePatternMode>,
+    /// Additional regex filters on relative paths (AND), like rg --files piped through rg.
+    #[serde(default, deserialize_with = "deserialize_filters")]
+    pub filters: Vec<String>,
     /// Max results (default 20).
     #[serde(rename = "maxResults")]
     // this has to be float because llms are stupid
@@ -105,28 +116,54 @@ pub struct FindFilesParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GrepParams {
-    /// Content text or regex. Put known module constraints in path.
-    /// Inline path constraints are also supported.
+    /// Content pattern. Use mode="regex" for alternatives such as deadline|timeout.
     // `pattern` alias: LLMs that have seen multi_grep (which uses `patterns`)
     // routinely call grep with `pattern`; accept it instead of erroring out
     // with an unhelpful "missing field `query`" (#311).
     #[serde(alias = "pattern")]
     pub query: String,
-    /// Directory, filename, or one glob to search. Set this from the request's module context.
-    /// Examples: "src/net", "client.py", "**/*billing*client*/**".
+    /// Complete directory name, filename, or glob. Use **/*transport*/** for a partial module name.
     pub path: Option<String>,
-    /// Max matching lines (default 20).
+    #[serde(flatten)]
+    pub(crate) scope: SearchScope,
+    /// Pattern syntax: auto (default), regex, or literal. Explicit modes preserve query verbatim.
+    pub(crate) mode: Option<PatternMode>,
+    /// sensitive, insensitive, or smart. Explicit pattern modes default to sensitive; auto uses smart.
+    pub(crate) case: Option<CaseMode>,
+    /// Max matching lines per page (default 100). More matches remain available through cursor.
     #[serde(rename = "maxResults")]
     pub max_results: Option<f64>, // this has to be float because llms are stupid
     /// Cursor from previous result. Only use if previous results weren't sufficient.
     pub cursor: Option<String>,
     /// Output format (default 'content').
     pub output_mode: Option<String>,
-    /// Context lines before/after each match.
+    /// Lines before and after each match. Omit for bounded automatic context, or use 0 for matching lines only.
     pub context: Option<f64>,
-    /// Find declarations. If none match, return references or fuzzy matches with a fallback notice.
+    /// Context lines before each match; overrides context (rg -B).
+    pub before_context: Option<f64>,
+    /// Context lines after each match; overrides context (rg -A).
+    pub after_context: Option<f64>,
+    /// Stop after this many matches per file (rg -m). Omit to keep all matches pageable.
+    pub max_matches_per_file: Option<f64>,
+    /// Filter matches to declaration names. Leave false when searching behavior, comments, or fields.
     #[serde(default)]
     pub definitions_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PatternMode {
+    Auto,
+    Regex,
+    Literal,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CaseMode {
+    Smart,
+    Sensitive,
+    Insensitive,
 }
 
 fn deserialize_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -287,7 +324,7 @@ impl FffServer {
         mode: GrepMode,
     ) -> Result<CallToolResult, ErrorData> {
         let query = params.query.as_str();
-        let max_results = normalize_max_results(params.max_results, 20);
+        let max_results = normalize_max_results(params.max_results, 100).min(MAX_GREP_PAGE);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
         let context = normalize_context(params.context);
         let mut cursor = params
@@ -311,9 +348,40 @@ impl FffServer {
                 .join(" ")
         });
 
-        let (mut options, auto_expand) =
+        let (mut options, mut auto_expand) =
             make_grep_options(output_mode, mode, cursor.file_offset, context);
+        options.page_limit = cursor.page_limit(max_results);
+        options.max_matches_per_file = if output_mode == OutputMode::FilesWithMatches {
+            1
+        } else {
+            params
+                .max_matches_per_file
+                .filter(|n| n.is_finite() && *n >= 1.0)
+                .map_or(usize::MAX, |n| n as usize)
+                .min(options.page_limit)
+        };
+        options.casing = params
+            .case
+            .or_else(|| {
+                matches!(params.mode, Some(PatternMode::Regex | PatternMode::Literal))
+                    .then_some(CaseMode::Sensitive)
+            })
+            .map(|case| match case {
+                CaseMode::Smart => fff::grep::Casing::Smart,
+                CaseMode::Sensitive => fff::grep::Casing::Sensitive,
+                CaseMode::Insensitive => fff::grep::Casing::Insensitive,
+            });
+        if params.before_context.is_some() || params.after_context.is_some() {
+            options.before_context = normalize_context(params.before_context)
+                .or(context)
+                .unwrap_or(0);
+            options.after_context = normalize_context(params.after_context)
+                .or(context)
+                .unwrap_or(0);
+            auto_expand = false;
+        }
         let ctx_lines = options.before_context;
+        let show_context = !auto_expand && (ctx_lines > 0 || options.after_context > 0);
 
         // Acquire picker lock once for the entire operation.
         let guard = self.picker.read().map_err(|e| {
@@ -326,7 +394,34 @@ impl FffServer {
         let parser = QueryParser::new(AiGrepConfig);
         let path_scope = path_scope(params.path.as_deref(), picker)?;
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
-        let mut original = parse_scoped_grep(&parser, query, scope);
+        let root = path_scope
+            .as_ref()
+            .map(|scope| (scope.root.as_str(), scope.nested));
+        let patterns = params.scope.patterns(picker, root)?;
+        let verbatim = params.scope.is_explicit()
+            || matches!(params.mode, Some(PatternMode::Regex | PatternMode::Literal));
+        let mut original = if verbatim {
+            FFFQuery {
+                raw_query: "",
+                fuzzy_query: fff_query_parser::FuzzyQuery::Text(
+                    if query.is_empty() && mode == GrepMode::Regex {
+                        "^"
+                    } else {
+                        query
+                    },
+                ),
+                constraints: scope.map(Constraint::Glob).into_iter().collect(),
+                location: None,
+            }
+        } else {
+            parse_scoped_grep(&parser, query, scope)
+        };
+        original
+            .constraints
+            .extend(crate::scope::constraints(&patterns));
+        if params.scope.is_explicit() || !patterns.is_empty() {
+            original.raw_query = "";
+        }
         if let Some(shorter) = &broadened_query {
             original.fuzzy_query = parser.parse(shorter).fuzzy_query;
             original.raw_query = "";
@@ -380,12 +475,30 @@ impl FffServer {
                     let mut parsed =
                         parse_scoped_grep(&parser, fuzzy_query.as_deref().unwrap_or(query), scope);
                     parsed.constraints = original.constraints.clone();
+                    parsed.raw_query = "";
                     parsed
                 })
             } else {
                 &original
             };
             let mut result = picker.grep(parsed, &options);
+            let skip = cursor.resume_skip(&result, picker);
+            if skip < cursor.match_offset {
+                // The resumed file shrank, so search again with the offset that still applies.
+                cursor.match_offset = skip;
+                options.page_limit = cursor.page_limit(max_results);
+                result = picker.grep(parsed, &options);
+            }
+            if matches!(params.mode, Some(PatternMode::Regex))
+                && let Some(error) = &result.regex_fallback_error
+            {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "Invalid regex: {error}. Use mode=literal to search this text literally."
+                    ),
+                    None,
+                ));
+            }
             if prefer_definitions && result.literal_fallback {
                 // A literal retry drops exclusions, so treat it as an empty stage.
                 result.matches.clear();
@@ -408,17 +521,22 @@ impl FffServer {
             }
             break result;
         };
-        if !prefer_definitions
+        if cursor.stage == GrepStage::Normal
             && result.matches.is_empty()
             && result.next_file_offset == 0
-            && let Some(scope) = scope
-            && original.constraints.len() > 1
+            && !verbatim
+            && original.raw_query.is_empty()
+            && original.constraints.len() > usize::from(scope.is_some()) + patterns.len()
             && !query.trim().is_empty()
         {
             // Core's literal retry would drop the path scope, so retry inside it here.
             let literal = FFFQuery {
                 raw_query: "",
-                constraints: std::iter::once(Constraint::Glob(scope)).collect(),
+                constraints: scope
+                    .map(Constraint::Glob)
+                    .into_iter()
+                    .chain(crate::scope::constraints(&patterns))
+                    .collect(),
                 fuzzy_query: fff_query_parser::FuzzyQuery::Text(query.trim()),
                 location: None,
             };
@@ -436,7 +554,7 @@ impl FffServer {
         {
             // Auto-retry: try broadening multi-word queries by dropping first non-constraint word
             let parts: Vec<&str> = query.split_whitespace().collect();
-            if parts.len() >= 2 {
+            if !verbatim && parts.len() >= 2 {
                 let first_word = parts[0];
                 let is_valid_constraint = first_word.starts_with('!')
                     || first_word.starts_with('*')
@@ -446,6 +564,7 @@ impl FffServer {
                     let rest_query = parts[1..].join(" ");
                     let mut rest_parsed = parse_scoped_grep(&parser, &rest_query, scope);
                     rest_parsed.constraints = original.constraints.clone();
+                    rest_parsed.raw_query = "";
 
                     let rest_text = rest_parsed.grep_text();
                     let retry_mode = if has_regex_metacharacters(&rest_text) {
@@ -457,23 +576,22 @@ impl FffServer {
                     let mut retry_options = options.clone();
                     retry_options.mode = retry_mode;
                     retry_options.file_offset = 0;
-                    let retry_result = picker.grep(&rest_parsed, &retry_options);
+                    let mut retry_result = picker.grep(&rest_parsed, &retry_options);
 
                     if !retry_result.matches.is_empty() && retry_result.matches.len() <= 10 {
                         cursor.stage = GrepStage::Broadened;
+                        cursor.paginate(&mut retry_result, max_results, picker);
                         let mut cs = self.lock_cursors()?;
                         let text = &GrepFormatter {
                             matches: &retry_result.matches,
                             files: &retry_result.files,
                             total_matched: retry_result.matches.len(),
-                            cursor: GrepCursor {
-                                file_offset: retry_result.next_file_offset,
-                                ..cursor
-                            },
+                            cursor,
                             output_mode,
                             max_results,
-                            show_context: ctx_lines > 0,
+                            show_context,
                             auto_expand_defs: auto_expand,
+                            auto_context: auto_expand && params.max_results.is_none(),
                             picker,
                         }
                         .format(&mut cs);
@@ -493,9 +611,25 @@ impl FffServer {
             let (mut fuzzy_options, _) =
                 make_grep_options(output_mode, GrepMode::Fuzzy, 0, Some(0));
             fuzzy_options.classify_definitions = options.classify_definitions;
+            fuzzy_options.casing = options.casing;
             let mut fuzzy_parsed = parse_scoped_grep(&parser, &fuzzy_query, scope);
             fuzzy_parsed.constraints = original.constraints.clone();
-            let fuzzy_result = picker.grep(&fuzzy_parsed, &fuzzy_options);
+            fuzzy_parsed.raw_query = "";
+            let mut fuzzy_result = if original
+                .grep_text()
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '-'))
+            {
+                picker.grep(&fuzzy_parsed, &fuzzy_options)
+            } else {
+                fff::GrepResult::default()
+            };
+            fuzzy_result
+                .matches
+                .retain(|m| strong_suggestion(m, fuzzy_query.len(), original.grep_text().len()));
+            fuzzy_result
+                .matches
+                .sort_by_key(|m| std::cmp::Reverse(m.fuzzy_score));
 
             if !fuzzy_result.matches.is_empty() {
                 let mut lines: Vec<String> = Vec::new();
@@ -521,6 +655,9 @@ impl FffServer {
                 let file_parser = QueryParser::default();
                 let mut file_query = file_parser.parse(query);
                 file_query.constraints.extend(scope.map(Constraint::Glob));
+                file_query
+                    .constraints
+                    .extend(crate::scope::constraints(&patterns));
                 let file_opts = FuzzySearchOptions {
                     max_threads: 0,
                     current_file: None,
@@ -550,13 +687,33 @@ impl FffServer {
                 }
             }
 
-            return Ok(respond("0 matches.".into(), false));
+            return Ok(respond(
+                suggest_other_files(
+                    picker,
+                    &original,
+                    mode,
+                    options.effective_casing(),
+                    params.path.as_deref(),
+                    false,
+                    params.scope.hidden == Some(false),
+                )
+                .unwrap_or_else(|| "0 matches.".into()),
+                false,
+            ));
         }
 
         if result.matches.is_empty() && result.next_file_offset == 0 {
             if prefer_definitions
                 && !cursor.found_matches
-                && let Some(suggestions) = suggest_other_files(picker, &original, mode)
+                && let Some(suggestions) = suggest_other_files(
+                    picker,
+                    &original,
+                    mode,
+                    options.effective_casing(),
+                    params.path.as_deref(),
+                    true,
+                    params.scope.hidden == Some(false),
+                )
             {
                 return Ok(respond(suggestions, false));
             }
@@ -571,8 +728,10 @@ impl FffServer {
         } else {
             None
         };
-        cursor.file_offset = result.next_file_offset;
-        cursor.found_matches |= !result.matches.is_empty();
+        cursor.paginate(&mut result, max_results, picker);
+        if result.matches.is_empty() && !cursor.has_more() {
+            return Ok(respond("0 matches.".into(), false));
+        }
 
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
@@ -582,8 +741,10 @@ impl FffServer {
             cursor,
             output_mode,
             max_results,
-            show_context: ctx_lines > 0,
+            show_context,
             auto_expand_defs: auto_expand,
+            // An explicit page size asks for matching lines, not surrounding source.
+            auto_context: auto_expand && params.max_results.is_none(),
             picker,
         }
         .format(&mut cs);
@@ -603,7 +764,7 @@ impl FffServer {
 impl FffServer {
     #[tool(
         name = "find_files",
-        description = "Find files by fuzzy name. Put directory or module scope in path and the filename in query. An empty query lists files in path.",
+        description = "Find indexed files by path fragment, glob, or regex. Fragments treat hyphens and underscores alike before fuzzy suggestions. Put a known directory in path. An empty query lists files in scope.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -648,8 +809,48 @@ impl FffServer {
         let parser = QueryParser::default();
         let path_scope = path_scope(params.path.as_deref(), picker)?;
         let scope = path_scope.as_ref().map(|scope| scope.glob.as_str());
+        let notice = path_scope.as_ref().and_then(|scope| scope.notice.clone());
         let mut fff_query = parser.parse(query);
-        fff_query.constraints.extend(scope.map(Constraint::Glob));
+        let root = path_scope
+            .as_ref()
+            .map(|scope| (scope.root.as_str(), scope.nested));
+        let mut patterns = params.scope.patterns(picker, root)?;
+        if let Some(scope) = scope {
+            patterns.push((scope.to_owned(), false));
+        }
+        let explicit_mode = matches!(
+            params.mode,
+            Some(FilePatternMode::Glob | FilePatternMode::Regex)
+        );
+        if explicit_mode || !params.filters.is_empty() || fff_query.constraints.is_empty() {
+            let (items, total) = crate::file_search::search(
+                picker,
+                query,
+                params.mode.unwrap_or(FilePatternMode::Fuzzy),
+                &patterns,
+                &params.filters,
+                page_offset,
+                max_results,
+            )?;
+            if explicit_mode || !params.filters.is_empty() || total > 0 {
+                let mut lines = items
+                    .iter()
+                    .map(|file| file.relative_path(picker))
+                    .collect::<Vec<_>>();
+                if total == 0 {
+                    lines.push(format!("0 matching paths ({} indexed). Globs cannot include files outside the index. Try a broader path or mode=fuzzy for filename suggestions.", picker.live_file_count()));
+                } else if page_offset + items.len() < total {
+                    lines.insert(0, format!("{}/{} paths", items.len(), total));
+                    let id = self.lock_cursors()?.store(page_offset + items.len());
+                    lines.push(format!("cursor: {id}"));
+                }
+                let result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
+                return Ok(with_notice(result, notice));
+            }
+        }
+        fff_query
+            .constraints
+            .extend(crate::scope::constraints(&patterns));
         let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
         let total_files = result.total_files;
 
@@ -657,22 +858,21 @@ impl FffServer {
         let words: Vec<&str> = query.split_whitespace().collect();
         let shorter = words.get(..2).map(|w| w.join(" "));
 
-        let (items, scores, total_matched) =
+        let (items, total_matched) =
             if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
                 if let Some(shorter) = &shorter {
                     let mut shorter_query = parser.parse(shorter);
                     shorter_query.constraints = fff_query.constraints.clone();
                     let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
 
-                    (retry.items, retry.scores, retry.total_matched)
+                    (retry.items, retry.total_matched)
                 } else {
-                    (result.items, result.scores, result.total_matched)
+                    (result.items, result.total_matched)
                 }
             } else {
-                (result.items, result.scores, result.total_matched)
+                (result.items, result.total_matched)
             };
 
-        let notice = path_scope.and_then(|scope| scope.notice);
         if items.is_empty() {
             let text = format!("0 results ({} indexed)", total_files);
             return Ok(with_notice(
@@ -682,21 +882,8 @@ impl FffServer {
         }
 
         let mut lines: Vec<String> = Vec::new();
-        let top_item = items[0];
-        let is_exact_match = scores[0].exact_match;
-
-        if page_offset == 0 {
-            if is_exact_match {
-                lines.push(format!(
-                    "→ Read {} (exact match!)",
-                    top_item.relative_path(picker)
-                ));
-            } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
-                lines.push(format!(
-                    "→ Read {} (best match — Read this file directly)",
-                    top_item.relative_path(picker)
-                ));
-            }
+        if !fff_query.grep_text().trim().is_empty() {
+            lines.push("Approximate filename matches:".into());
         }
 
         let next_offset = page_offset + items.len();
@@ -727,7 +914,7 @@ impl FffServer {
 
     #[tool(
         name = "grep",
-        description = "Search source text or regex. Put directory or module scope in path and the content pattern in query. Use definitions_only=true for declarations. Returned source lines verify locations without another read.",
+        description = "Search source code with line numbers and surrounding context. For content questions, search directly with a module scope in path. Returned source verifies locations when it contains the required evidence.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -736,7 +923,7 @@ impl FffServer {
     )]
     fn grep(
         &self,
-        Parameters(params): Parameters<GrepParams>,
+        Parameters(mut params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.bump_activity();
         self.wait_for_scan(SCAN_READY_TIMEOUT)?;
@@ -744,10 +931,16 @@ impl FffServer {
         let parsed = QueryParser::new(AiGrepConfig).parse(&params.query);
         let grep_text = parsed.grep_text();
 
-        let mode = if has_regex_metacharacters(&grep_text) {
-            GrepMode::Regex
-        } else {
-            GrepMode::PlainText
+        let mode = match params.mode {
+            Some(PatternMode::Regex) => GrepMode::Regex,
+            // Plain grep reads `\n` as a newline, so keep literal backslashes in a regex.
+            Some(PatternMode::Literal) if params.query.contains("\\n") => {
+                params.query = literal_regex(&params.query);
+                GrepMode::Regex
+            }
+            Some(PatternMode::Literal) => GrepMode::PlainText,
+            _ if has_regex_metacharacters(&grep_text) => GrepMode::Regex,
+            _ => GrepMode::PlainText,
         };
 
         let mut result = self.perform_grep(&params, mode)?;
@@ -781,7 +974,7 @@ impl FffServer {
 
 impl FffServer {
     fn multi_grep_inner(&self, params: MultiGrepParams) -> Result<CallToolResult, ErrorData> {
-        let max_results = normalize_max_results(params.max_results, 20);
+        let max_results = normalize_max_results(params.max_results, 20).min(MAX_GREP_PAGE);
         let context = normalize_context(params.context);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
 
@@ -804,6 +997,12 @@ impl FffServer {
             cursor.file_offset,
             context,
         );
+        options.page_limit = cursor.page_limit(max_results);
+        options.max_matches_per_file = if output_mode == OutputMode::FilesWithMatches {
+            1
+        } else {
+            options.page_limit
+        };
         if cursor.stage == GrepStage::Definitions {
             options.classify_definitions = fff::DefinitionMode::DefinitionOnly;
         }
@@ -822,6 +1021,12 @@ impl FffServer {
         let constraints = parser.parse_constraints(constraint_query);
 
         let mut result = picker.multi_grep(&patterns_refs, &constraints, &options);
+        let skip = cursor.resume_skip(&result, picker);
+        if skip < cursor.match_offset {
+            cursor.match_offset = skip;
+            options.page_limit = cursor.page_limit(max_results);
+            result = picker.multi_grep(&patterns_refs, &constraints, &options);
+        }
         let definitions_fallback = cursor.stage == GrepStage::Definitions
             && !cursor.found_matches
             && result.matches.is_empty()
@@ -841,8 +1046,10 @@ impl FffServer {
             return Ok(grep_response("0 matches.".into(), definitions_fallback));
         }
 
-        cursor.file_offset = result.next_file_offset;
-        cursor.found_matches |= !result.matches.is_empty();
+        cursor.paginate(&mut result, max_results, picker);
+        if result.matches.is_empty() && !cursor.has_more() {
+            return Ok(grep_response("0 matches.".into(), false));
+        }
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
             matches: &result.matches,
@@ -851,8 +1058,9 @@ impl FffServer {
             cursor,
             output_mode,
             max_results,
-            show_context: ctx_lines > 0,
+            show_context: !auto_expand && ctx_lines > 0,
             auto_expand_defs: auto_expand,
+            auto_context: auto_expand && params.max_results.is_none(),
             picker,
         }
         .format(&mut cs);
@@ -886,6 +1094,16 @@ fn grep_response(text: String, definitions_fallback: bool) -> CallToolResult {
         text
     };
     CallToolResult::success(vec![Content::text(text)])
+}
+
+fn literal_regex(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            // `[\\]` matches a backslash without spelling the `\n` escape core rewrites.
+            '\\' => "[\\\\]".to_string(),
+            c => regex::escape(c.encode_utf8(&mut [0; 4])),
+        })
+        .collect()
 }
 
 fn with_notice(mut response: CallToolResult, notice: Option<String>) -> CallToolResult {
@@ -937,35 +1155,67 @@ fn suggest_other_files(
     picker: &fff::FilePicker,
     query: &FFFQuery<'_>,
     mode: GrepMode,
+    casing: fff::grep::Casing,
+    path: Option<&str>,
+    definitions: bool,
+    hide_dotfiles: bool,
 ) -> Option<String> {
     let mut broader = query.clone();
     broader.raw_query = "";
     broader
         .constraints
         .retain(|c| matches!(c, Constraint::Exclude(_) | Constraint::Not(_)));
-    if broader.constraints.len() < query.constraints.len() {
-        let result = picker.grep(
-            &broader,
-            &GrepSearchOptions {
-                mode,
-                max_matches_per_file: 1,
-                page_limit: 3,
-                time_budget_ms: 100,
-                enforce_time_budget: true,
-                ..Default::default()
-            },
-        );
-        if !result.files.is_empty() {
-            let files = result
-                .files
-                .iter()
-                .take(3)
-                .map(|file| file.relative_path(picker))
-                .collect::<Vec<_>>();
-            return Some(format!(
-                "No matches in the requested scope. These files elsewhere in the indexed project contain the pattern:\n{}",
-                files.join("\n")
-            ));
+    let explicit = broader.constraints.len();
+    if hide_dotfiles {
+        // A named hidden root does not open other hidden paths to suggestions.
+        let hidden = Constraint::Glob("{**/.*,**/.*/**}");
+        broader.constraints.push(Constraint::Not(Box::new(hidden)));
+    }
+    if explicit < query.constraints.len() {
+        let started = std::time::Instant::now();
+        let mut options = GrepSearchOptions {
+            mode,
+            casing: Some(casing),
+            max_matches_per_file: 3,
+            page_limit: 8,
+            before_context: 8,
+            after_context: 8,
+            classify_definitions: true.into(),
+            trim_whitespace: false,
+            time_budget_ms: 100,
+            enforce_time_budget: true,
+            ..Default::default()
+        };
+        if let Some(fragment) = path.map(str::trim).filter(|path| {
+            !path.is_empty()
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        }) {
+            let glob = format!("{{**/*{fragment}*,**/*{fragment}*/**}}");
+            let mut nearby = broader.clone();
+            nearby.constraints.push(Constraint::Glob(&glob));
+            let result = picker.grep(&nearby, &options);
+            if !result.matches.is_empty() {
+                return Some(format_broader_matches(
+                    picker,
+                    &result,
+                    &format!(
+                        "No matches in the requested scope. Suggestions from paths containing '{fragment}' (broader scope):"
+                    ),
+                ));
+            }
+        }
+        options.time_budget_ms = 100_u64.saturating_sub(started.elapsed().as_millis() as u64);
+        if options.time_budget_ms > 0 {
+            let result = picker.grep(&broader, &options);
+            if !result.matches.is_empty() {
+                return Some(format_broader_matches(
+                    picker,
+                    &result,
+                    "No matches in the requested scope. Suggestions elsewhere in the indexed project:",
+                ));
+            }
         }
     }
     let text = cleanup_fuzzy_query(&query.grep_text());
@@ -991,12 +1241,58 @@ fn suggest_other_files(
         .filter(|(_, score)| score.base_score > text.len() as i32 * 10)
         .map(|(file, _)| file.relative_path(picker))
         .collect::<Vec<_>>();
-    (!files.is_empty()).then(|| format!("No matching definitions or other matches found in the requested scope. These filenames may be relevant; their contents are unverified:\n{}", files.join("\n")))
+    let empty = if definitions {
+        "No matching definitions or other matches found"
+    } else {
+        "No matches found"
+    };
+    (!files.is_empty()).then(|| format!("{empty} in the requested scope. These filenames may be relevant; their contents are unverified:\n{}", files.join("\n")))
+}
+
+fn format_broader_matches(
+    picker: &fff::FilePicker,
+    result: &fff::GrepResult<'_>,
+    notice: &str,
+) -> String {
+    let text = GrepFormatter {
+        matches: &result.matches,
+        files: &result.files,
+        total_matched: result.matches.len(),
+        cursor: GrepCursor::default(),
+        output_mode: OutputMode::Content,
+        max_results: 8,
+        show_context: false,
+        auto_expand_defs: true,
+        auto_context: true,
+        picker,
+    }
+    .format(&mut CursorStore::new());
+    format!("{notice}\n{text}\nSuggestions are limited; search a suggested path for more matches.")
+}
+
+// The span allows the separators the cleaned fuzzy query dropped (`get_ful_help`).
+fn strong_suggestion(m: &fff::GrepMatch, needle_len: usize, query_len: usize) -> bool {
+    let Some((start, _)) = m.match_byte_offsets.first() else {
+        return false;
+    };
+    let Some((_, end)) = m.match_byte_offsets.last() else {
+        return false;
+    };
+    let matched: usize = m
+        .match_byte_offsets
+        .iter()
+        .map(|(start, end)| (end - start) as usize)
+        .sum();
+    let typos = if needle_len < 9 { 1 } else { 2 };
+    matched + typos >= needle_len && (*end - *start) as usize <= needle_len.max(query_len) + 2
 }
 
 #[derive(Debug, PartialEq)]
 struct PathScope {
     glob: String,
+    root: String,
+    // The name matches at any depth rather than from the checkout root.
+    nested: bool,
     notice: Option<String>,
 }
 
@@ -1030,13 +1326,18 @@ fn path_scope(
     let normalized = path.replace('\\', "/");
     #[cfg(windows)]
     let path = normalized.as_str();
-    let path = path.trim_start_matches("./").trim_end_matches('/');
+    let path = path
+        .strip_prefix("./")
+        .unwrap_or(path)
+        .trim_end_matches('/');
     if path.is_empty() || path == "." {
         return Ok(None);
     }
-    let escaped = escape_glob(path);
-    let scope = |glob: String, found: bool| PathScope {
+    let escaped = crate::scope::escape_glob(path);
+    let scope = |glob: String, found: bool, nested: bool| PathScope {
         glob,
+        root: path.to_owned(),
+        nested,
         notice: (!found).then(|| format!("Path '{raw}' matches no indexed file or directory.")),
     };
     let found = lookup_path(picker, path);
@@ -1044,6 +1345,7 @@ fn path_scope(
         return Ok(Some(scope(
             format!("{{{escaped},{escaped}/**}}"),
             found.anchored,
+            false,
         )));
     }
     // A literal name such as `src` or `[id]` at any depth wins over reading it as a glob.
@@ -1051,12 +1353,17 @@ fn path_scope(
         return Ok(Some(scope(
             format!("{{**/{escaped},**/{escaped}/**}}"),
             found.nested,
+            true,
         )));
     }
-    Ok(Some(scope(path.to_owned(), true)))
+    Ok(Some(scope(
+        crate::scope::descendant_glob(path),
+        true,
+        false,
+    )))
 }
 
-fn strip_root(
+pub(crate) fn strip_root(
     path: &std::path::Path,
     base: &std::path::Path,
 ) -> Result<std::path::PathBuf, ErrorData> {
@@ -1111,16 +1418,8 @@ fn lookup_path(picker: &fff::FilePicker, path: &str) -> PathLookup {
     found
 }
 
-// Character classes preserve literal names without Windows path-separator escapes.
-fn escape_glob(path: &str) -> String {
-    let mut escaped = String::with_capacity(path.len());
-    for c in path.chars() {
-        match c {
-            '*' | '?' | '[' | ']' | '{' | '}' | ',' | '\\' => escaped.extend(['[', c, ']']),
-            _ => escaped.push(c),
-        }
-    }
-    escaped
+fn deserialize_filters<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(<Option<Vec<String>> as serde::Deserialize>::deserialize(d)?.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -1156,6 +1455,7 @@ mod tests {
         assert_eq!(normalize_max_results(Some(0.4), 20), 1);
         assert_eq!(normalize_max_results(Some(10.0), 20), 10);
         assert_eq!(normalize_max_results(Some(10.7), 20), 11);
+        assert_eq!(normalize_max_results(Some(1e308), 20), 10_000);
     }
 
     #[test]
@@ -1185,6 +1485,13 @@ mod tests {
         let params: GrepParams =
             serde_json::from_str(r#"{"query":"foo","context":3}"#).expect("context field");
         assert_eq!(params.context, Some(3.0));
+    }
+
+    #[test]
+    fn find_files_params_accept_null_filters() {
+        let params: FindFilesParams =
+            serde_json::from_value(serde_json::json!({"query": "x", "filters": null})).unwrap();
+        assert!(params.filters.is_empty());
     }
 
     #[test]
@@ -1255,6 +1562,222 @@ mod tests {
     }
 
     #[test]
+    fn literal_mode_keeps_backslash_n_verbatim() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "let parts = text.split(\"\\n\");\n"),
+            ("b.rs".into(), "let parts = text.split(\"\n\");\n"),
+        ]);
+        let request = serde_json::json!({"query": "split(\"\\n\")", "mode": "literal"});
+        let text = response_text(
+            server
+                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        assert!(text.contains("a.rs"), "{text}");
+        assert!(!text.contains("b.rs"), "{text}");
+    }
+
+    #[test]
+    fn stale_in_file_cursor_does_not_skip_other_files() {
+        let lines = |name: &str, count: usize| -> String {
+            (0..count)
+                .map(|i| format!("Needle({name}, {i});\n"))
+                .collect()
+        };
+        let (a, b) = (lines("a", 150), lines("b", 150));
+        let (dir, server) =
+            definition_server(&[("a.rs".into(), a.as_str()), ("b.rs".into(), b.as_str())]);
+        let grep = |cursor: Option<&str>| {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Needle", "maxResults": 100, "context": 0, "cursor": cursor,
+            }))
+            .unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let first = grep(None);
+        let (shown, other) = if first.contains("Needle(a, 0)") {
+            ("a", "b")
+        } else {
+            ("b", "a")
+        };
+        assert!(first.contains(&format!("Needle({shown}, 99)")), "{first}");
+        let cursor = first.rsplit("cursor: ").next().unwrap().trim().to_owned();
+        std::fs::write(dir.path().join(format!("{shown}.rs")), lines(shown, 20)).unwrap();
+
+        let second = grep(Some(&cursor));
+        assert!(second.contains(&format!("Needle({other}, 0)")), "{second}");
+        assert!(!second.contains(&format!("Needle({shown},")), "{second}");
+    }
+
+    #[test]
+    fn grep_pages_are_capped_and_accept_float_per_file_limits() {
+        let body: String = (0..300).map(|i| format!("needle_{i}();\n")).collect();
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), body.as_str()),
+            ("b.rs".into(), "needle_x();\n"),
+        ]);
+        let grep = |args: serde_json::Value| {
+            let params = serde_json::from_value(args).unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let text = grep(serde_json::json!({"query": "needle_", "maxResults": 1000, "context": 0}));
+        assert_eq!(
+            text.lines().filter(|l| l.contains(": needle_")).count(),
+            MAX_GREP_PAGE,
+            "{}",
+            &text[..200]
+        );
+        assert!(text.contains("cursor:"), "{}", &text[..200]);
+        let text = grep(
+            serde_json::json!({"query": "needle_", "max_matches_per_file": 5.0, "context": 0}),
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.contains(": needle_")).count(),
+            6,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn shrunken_in_file_cursor_keeps_every_later_match() {
+        let lines = |name: &str, count: usize| -> String {
+            (0..count)
+                .map(|i| format!("Needle({name}, {i});\n"))
+                .collect()
+        };
+        let (a, b, c) = (lines("a", 150), lines("b", 150), lines("c", 150));
+        let (dir, server) = definition_server(&[
+            ("a.rs".into(), a.as_str()),
+            ("b.rs".into(), b.as_str()),
+            ("c.rs".into(), c.as_str()),
+        ]);
+        let grep = |cursor: Option<&str>| {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "Needle", "maxResults": 100, "context": 0, "cursor": cursor,
+            }))
+            .unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        let mut text = grep(None);
+        let first = ["a", "b", "c"]
+            .into_iter()
+            .find(|f| text.contains(&format!("Needle({f}, 0)")))
+            .unwrap();
+        std::fs::write(dir.path().join(format!("{first}.rs")), lines(first, 20)).unwrap();
+        let mut seen = std::collections::HashMap::<String, usize>::new();
+        while let Some(cursor) = text
+            .rsplit("cursor: ")
+            .next()
+            .filter(|_| text.contains("cursor: "))
+        {
+            let cursor = cursor.trim().to_owned();
+            text = grep(Some(&cursor));
+            for line in text.lines().filter(|l| l.contains(": Needle(")) {
+                *seen
+                    .entry(line.split(": ").nth(1).unwrap().to_owned())
+                    .or_default() += 1;
+            }
+        }
+        for other in ["a", "b", "c"].into_iter().filter(|f| *f != first) {
+            for i in 0..150 {
+                assert_eq!(
+                    seen.get(&format!("Needle({other}, {i});")),
+                    Some(&1),
+                    "{other} {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typo_suggestions_keep_identifiers_with_separators() {
+        let (_dir, server) = definition_server(&[
+            (
+                "src/help.rs".into(),
+                "pub fn get_full_help(cmd: &str) -> String {\n    String::new()\n}\n",
+            ),
+            (
+                "src/idx.rs".into(),
+                "let get = 1;\nlet full = get + help_index;\n",
+            ),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({"query": "get_ful_help"})).unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        let first = text
+            .lines()
+            .find(|line| line.starts_with(' '))
+            .unwrap_or_default();
+        assert!(first.contains("pub fn get_full_help("), "{text}");
+    }
+
+    #[test]
+    fn explicit_page_size_skips_automatic_context() {
+        let body: String = (0..3)
+            .map(|i| format!("call_needle({i});\n{}", "let filler = 0;\n".repeat(20)))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let grep = |args: serde_json::Value| {
+            let params = serde_json::from_value(args).unwrap();
+            response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap())
+        };
+        assert!(grep(serde_json::json!({"query": "call_needle"})).contains("filler"));
+        let text = grep(serde_json::json!({"query": "call_needle", "maxResults": 5}));
+        assert!(text.contains("call_needle(2)"), "{text}");
+        assert!(!text.contains("filler"), "{text}");
+    }
+
+    #[test]
+    fn glob_file_searches_are_not_labelled_approximate() {
+        let (_dir, server) = definition_server(&[
+            ("a.nu".into(), ""),
+            ("b.nu".into(), ""),
+            ("c.rs".into(), ""),
+        ]);
+        let find = |query: &str| {
+            let params = serde_json::from_value(serde_json::json!({"query": query})).unwrap();
+            response_text(server.find_files(Parameters(params)).unwrap())
+        };
+        let text = find("*.nu");
+        assert!(text.contains("a.nu") && text.contains("b.nu"), "{text}");
+        assert!(!text.contains("Approximate"), "{text}");
+    }
+
+    #[test]
+    fn default_multi_grep_does_not_print_collected_context() {
+        let body: String = (0..20)
+            .map(|i| format!("call_needle({i});\n{}", "let filler = 0;\n".repeat(20)))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let params =
+            serde_json::from_value(serde_json::json!({"patterns": ["call_needle"]})).unwrap();
+        let text = response_text(server.multi_grep_inner(params).unwrap());
+        assert!(text.contains("call_needle(19)"), "{text}");
+        assert!(!text.contains("filler"), "{text}");
+        assert!(text.len() < 5000, "{}", text.len());
+    }
+
+    #[test]
+    fn explicit_context_is_budgeted_without_hiding_matches() {
+        let body: String = (0..400)
+            .map(|i| format!("needle_{i}();\n{}", "let filler = 0;\n".repeat(10)))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "needle_", "context": 5, "maxResults": 400,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.starts_with("Context shown for "), "{}", &text[..200]);
+        assert!(text.contains(" 2- let filler = 0;"), "{}", &text[..400]);
+        let last = text
+            .lines()
+            .filter(|line| line.contains(": needle_"))
+            .count();
+        assert_eq!(last, text.matches("needle_").count());
+        assert!(text.len() < 25_000, "{}", text.len());
+    }
+
+    #[test]
     fn definition_context_budget_does_not_hide_matches() {
         let content: Vec<_> = (0..20)
             .map(|i| {
@@ -1273,7 +1796,11 @@ mod tests {
         }))
         .unwrap();
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-        assert!(text.contains("Context omitted"), "{text}");
+        assert!(text.contains("Definition bodies omitted for"), "{text}");
+        assert!(
+            text.contains("  2|     first_field_with_a_long_name"),
+            "{text}"
+        );
         for i in 0..20 {
             assert!(text.contains(&format!("struct Needle{i} {{")), "{text}");
         }
@@ -1447,8 +1974,8 @@ mod tests {
                     text.contains("elsewhere in the indexed project"),
                     "{query}: {text}"
                 );
-                assert!(text.ends_with("a.rs"), "{query}: {text}");
-                assert!(!text.contains("fn Needle"), "{query}: {text}");
+                assert!(text.contains("a.rs\n 1: fn Needle"), "{query}: {text}");
+                assert!(!text.contains("cursor:"), "{query}: {text}");
             }
         }
     }
@@ -1564,34 +2091,6 @@ mod tests {
     }
 
     #[test]
-    fn broadened_cursors_resume_the_shortened_query() {
-        let (_dir, server) = definition_server(&[
-            ("a.rs".into(), "before\nuse Needle1;\nafter\n"),
-            ("b.rs".into(), "before\nuse Needle2;\nafter\n"),
-            ("excluded.txt".into(), "Needle outside scope"),
-        ]);
-        for query in ["unused Needle *.rs", "unused Needle[0-9] *.rs"] {
-            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
-                file_offset: 1,
-                stage: GrepStage::Broadened,
-                found_matches: true,
-                ..Default::default()
-            });
-            let params = serde_json::from_value(serde_json::json!({
-                "query": query, "cursor": id, "context": 1,
-            }))
-            .unwrap();
-            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-            assert!(text.starts_with("0 matches for 'unused"), "{text}");
-            assert!(text.contains("Auto-broadened to"), "{text}");
-            assert!(text.contains("use Needle"), "{text}");
-            assert!(text.contains("before"), "{text}");
-            assert!(text.contains("after"), "{text}");
-            assert!(!text.contains("excluded.txt"), "{text}");
-        }
-    }
-
-    #[test]
     fn named_path_keeps_grep_fallbacks_scoped() {
         let (_dir, server) = definition_server(&[
             ("scope_a/defs.rs".into(), "fn Needle() {}"),
@@ -1616,8 +2115,19 @@ mod tests {
             let params =
                 serde_json::from_value(serde_json::json!({"query": query, "path": path})).unwrap();
             let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-            assert!(!text.contains("scope_b"), "{text}");
-            assert_eq!(text.contains("scope_a"), path == "scope_a", "{text}");
+            if path == "scope_a" {
+                assert!(!text.contains("scope_b"), "{text}");
+                assert!(text.contains("scope_a"), "{text}");
+            } else {
+                assert!(text.contains("elsewhere in the indexed project"), "{text}");
+                assert!(text.contains("1: fn Needle"), "{text}");
+                assert!(
+                    text.starts_with(&format!(
+                        "Path '{path}' matches no indexed file or directory.\nNo matches in the requested scope."
+                    )),
+                    "{text}"
+                );
+            }
         }
         let params = serde_json::from_value(serde_json::json!({
             "query": "*.txt Needle", "path": "scope_a", "definitions_only": true,
@@ -1676,21 +2186,78 @@ mod tests {
                 (included.into(), "fn Needle() {}"),
                 (excluded.into(), "fn Needle() {}"),
             ]);
-            for query in ["Needle", "Nedle"] {
-                let params = serde_json::from_value(serde_json::json!({
-                    "query": query, "path": path, "definitions_only": true,
-                }))
-                .unwrap();
-                let text =
-                    response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
-                assert!(text.contains(included), "{path}: {text}");
-                assert!(!text.contains(excluded), "{path}: {text}");
+            let anchored = if included.starts_with("nested/") {
+                format!("nested/{path}")
+            } else {
+                path.to_string()
+            };
+            for scope in [
+                serde_json::json!({"path": path}),
+                serde_json::json!({"paths": [anchored]}),
+            ] {
+                for query in ["Needle", "Nedle"] {
+                    let mut request = scope.clone();
+                    request["query"] = query.into();
+                    request["definitions_only"] = true.into();
+                    let params = serde_json::from_value(request).unwrap();
+                    let text =
+                        response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+                    assert!(text.contains(included), "{scope}: {text}");
+                    assert!(!text.contains(excluded), "{scope}: {text}");
+                }
+                for mode in ["fuzzy", "glob", "regex"] {
+                    let mut request = scope.clone();
+                    request["query"] = "".into();
+                    request["mode"] = mode.into();
+                    let params = serde_json::from_value(request).unwrap();
+                    let text = response_text(server.find_files(Parameters(params)).unwrap());
+                    assert!(text.contains(included), "{scope}: {text}");
+                    assert!(!text.contains(excluded), "{scope}: {text}");
+                }
             }
-            let params =
-                serde_json::from_value(serde_json::json!({"query": "", "path": path})).unwrap();
-            let text = response_text(server.find_files(Parameters(params)).unwrap());
-            assert!(text.contains(included), "{path}: {text}");
-            assert!(!text.contains(excluded), "{path}: {text}");
+        }
+    }
+
+    #[test]
+    fn hidden_directory_exclusions_preserve_literal_punctuation() {
+        for (hidden, allowed) in [
+            (".a,b", ".axb"),
+            (".{client}", ".XclientY"),
+            (".{a,b}", ".XaXbY"),
+        ] {
+            let excluded = format!("src/{hidden}/needle.rs");
+            let included = format!("src/{allowed}/needle.rs");
+            let dir = tempfile::tempdir().unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let (_dir, server) = definition_server_at(
+                dir,
+                &[
+                    (excluded.clone(), "fn Needle() {}"),
+                    (included.clone(), "fn Needle() {}"),
+                ],
+            );
+            for grep in [false, true] {
+                let request = serde_json::json!({
+                    "query": if grep { "Needle" } else { "" },
+                    "globs": [format!("src/{allowed}/**"), "*.rs"],
+                    "hidden": false,
+                });
+                let response = if grep {
+                    server.grep(Parameters(serde_json::from_value(request).unwrap()))
+                } else {
+                    server.find_files(Parameters(serde_json::from_value(request).unwrap()))
+                };
+                let text = response_text(response.unwrap());
+                assert!(text.contains(&included), "{text}");
+                assert!(!text.contains(&excluded), "{text}");
+            }
         }
     }
 
@@ -1818,7 +2385,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_definition_search_suggests_files_without_claiming_declarations() {
+    fn empty_definition_search_labels_broader_source_and_unverified_filenames() {
         let (_dir, server) = definition_server(&[
             ("other/target.rs".into(), "fn Needle() {}"),
             ("excluded/target.rs".into(), "fn Needle() {}"),
@@ -1832,7 +2399,13 @@ mod tests {
         assert!(text.contains("elsewhere in the indexed project"), "{text}");
         assert!(text.contains("other/target.rs"), "{text}");
         assert!(!text.contains("excluded/target.rs"), "{text}");
-        assert!(!text.contains("fn Needle"), "{text}");
+        assert!(text.contains("1: fn Needle"), "{text}");
+        assert!(
+            text.starts_with(
+                "Path 'missing' matches no indexed file or directory.\nNo matches in the requested scope."
+            ),
+            "{text}"
+        );
         assert!(!text.contains("cursor:"), "{text}");
 
         let params = serde_json::from_value(serde_json::json!({
@@ -1842,6 +2415,800 @@ mod tests {
         let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
         assert!(text.contains("contents are unverified"), "{text}");
         assert!(text.contains("NeedleGuide.md"), "{text}");
+
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "!other/ !excluded/ NeedleGuide",
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(
+            text.starts_with("No matches found in the requested scope."),
+            "{text}"
+        );
+        assert!(text.contains("NeedleGuide.md"), "{text}");
+    }
+
+    #[test]
+    fn grep_pages_preserve_every_matching_line_and_import() {
+        let content: Vec<_> = (0..7)
+            .map(|file| {
+                let text = (0..37)
+                    .map(|line| format!("use Needle{file}_{line};\n"))
+                    .collect::<String>();
+                (format!("file{file}.rs"), text)
+            })
+            .collect();
+        let files = content
+            .iter()
+            .map(|(p, text)| (p.clone(), text.as_str()))
+            .collect::<Vec<_>>();
+        let (_dir, server) = definition_server(&files);
+        for multi in [false, true] {
+            let mut request = serde_json::json!({"query":"Needle", "patterns":["Needle"], "maxResults": 13, "context":0});
+            let mut found = std::collections::HashSet::new();
+            for _ in 0..100 {
+                let result = if multi {
+                    server
+                        .multi_grep_inner(serde_json::from_value(request.clone()).unwrap())
+                        .unwrap()
+                } else {
+                    server
+                        .grep(Parameters(serde_json::from_value(request.clone()).unwrap()))
+                        .unwrap()
+                };
+                let text = response_text(result);
+                let mut page_count = 0;
+                for line in text.lines().filter(|line| line.contains("use Needle")) {
+                    assert!(found.insert(line.to_string()), "duplicate {line}");
+                    page_count += 1;
+                }
+                assert!(page_count <= 13, "{text}");
+                let Some(cursor) = text.lines().find_map(|line| line.strip_prefix("cursor: "))
+                else {
+                    break;
+                };
+                assert!(page_count > 0, "empty page with cursor: {text}");
+                request["cursor"] = cursor.into();
+            }
+            assert_eq!(found.len(), 7 * 37, "multi={multi}");
+        }
+    }
+
+    #[test]
+    fn broadened_grep_cursors_preserve_query_scope_and_every_match() {
+        for (file_count, matches_per_file) in [(5, 1), (1, 12), (5, 7)] {
+            for regex in [false, true] {
+                let mut content = (0..file_count)
+                    .map(|file| {
+                        let text = (0..matches_per_file)
+                            .map(|line| format!("before\nuse Needle{file}_{line};\nafter\n"))
+                            .collect::<String>();
+                        (format!("src/file{file}.rs"), text)
+                    })
+                    .collect::<Vec<_>>();
+                content.push(("src/excluded/a.rs".into(), "Needle excluded".into()));
+                content.push(("other/a.rs".into(), "Needle outside scope".into()));
+                let files = content
+                    .iter()
+                    .map(|(path, text)| (path.clone(), text.as_str()))
+                    .collect::<Vec<_>>();
+                let (_dir, server) = definition_server(&files);
+                let query = if regex {
+                    "unused Needle[0-9] !excluded/"
+                } else {
+                    "unused Needle !excluded/"
+                };
+                let mut request = serde_json::json!({
+                    "query": query, "path": "src", "maxResults": 2,
+                    "before_context": 1, "after_context": 0,
+                });
+                let mut found = std::collections::HashSet::new();
+                for _ in 0..50 {
+                    let text = response_text(
+                        server
+                            .grep(Parameters(serde_json::from_value(request.clone()).unwrap()))
+                            .unwrap(),
+                    );
+                    assert!(text.starts_with("0 matches for 'unused"), "{text}");
+                    assert!(text.contains("Auto-broadened to"), "{text}");
+                    assert!(text.contains("before"), "{text}");
+                    assert!(!text.contains("after"), "{text}");
+                    assert!(!text.contains("excluded/a.rs"), "{text}");
+                    assert!(!text.contains("other/a.rs"), "{text}");
+                    let mut page_count = 0;
+                    for line in text.lines().filter(|line| line.contains("use Needle")) {
+                        assert!(found.insert(line.to_string()), "duplicate {line}");
+                        page_count += 1;
+                    }
+                    assert!((1..=2).contains(&page_count), "{text}");
+                    let Some(cursor) = text.lines().find_map(|line| line.strip_prefix("cursor: "))
+                    else {
+                        break;
+                    };
+                    request["cursor"] = cursor.into();
+                }
+                assert_eq!(found.len(), file_count * matches_per_file);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_patterns_preserve_whitespace_and_filename_tokens() {
+        let (_dir, server) = definition_server(&[
+            (
+                "src/a.rs".into(),
+                "    pub fn Needle() {}\nlet x = \"config.rs  literal\";\nneedle\nNeedle",
+            ),
+            ("src/b.py".into(), "config.rs  literal\nNeedle"),
+            ("tests/test.rs".into(), "Needle"),
+            ("config.rs".into(), "unrelated"),
+        ]);
+        for (query, mode, expected) in [
+            ("^    pub fn Needle", "regex", "    pub fn Needle"),
+            ("config.rs  literal", "literal", "config.rs  literal"),
+        ] {
+            let params = serde_json::from_value(
+                serde_json::json!({"query":query,"mode":mode,"context":0,"path":"src/a.rs"}),
+            )
+            .unwrap();
+            let text = response_text(server.grep(Parameters(params)).unwrap());
+            assert!(text.contains(expected), "{text}");
+        }
+        let params = serde_json::from_value(serde_json::json!({
+            "query":"Needle", "mode":"regex", "case":"sensitive", "context":0,
+            "paths":["src", "tests"], "globs":["*.rs","*.py","!tests/**"],
+        }))
+        .unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        assert!(
+            text.contains("src/a.rs") && text.contains("src/b.py"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("tests/test.rs") && !text.contains("needle"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn explicit_context_is_retained_and_invalid_regex_is_reported() {
+        let (_dir, server) = definition_server(&[("a.rs".into(), "before\nneedle\nafter\nlast")]);
+        let params = serde_json::from_value(
+            serde_json::json!({"query":"needle", "before_context":1, "after_context":2}),
+        )
+        .unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        for line in ["before", "needle", "after", "last"] {
+            assert!(text.contains(line), "{text}");
+        }
+        let params =
+            serde_json::from_value(serde_json::json!({"query":"[", "mode":"regex"})).unwrap();
+        assert!(
+            server
+                .grep(Parameters(params))
+                .unwrap_err()
+                .message
+                .contains("Invalid regex")
+        );
+    }
+
+    #[test]
+    fn filename_search_distinguishes_literal_regex_glob_and_fuzzy() {
+        let (_dir, server) = definition_server(&[
+            ("utils/image.rs".into(), "x"),
+            ("tests/image.py".into(), "x"),
+            ("irrelevant_mangled.rs".into(), "x"),
+            ("nested/utils/image.rs".into(), "x"),
+        ]);
+        for request in [
+            serde_json::json!({"query":"image", "paths":["utils"]}),
+            serde_json::json!({"query":"image\\.rs$", "mode":"regex", "paths":["utils"]}),
+            serde_json::json!({"query":"*.rs", "mode":"glob", "paths":["utils"]}),
+            serde_json::json!({"query":"", "globs":["*.rs","*.py","!tests/**"], "paths":["utils"]}),
+        ] {
+            let text = response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert_eq!(text, "utils/image.rs");
+        }
+        let request = serde_json::json!({"query":"image"});
+        let text = response_text(
+            server
+                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        assert!(!text.contains("irrelevant"), "{text}");
+        assert!(
+            text.contains("utils/image.rs") && text.contains("tests/image.py"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn context_windows_merge_without_hiding_matching_lines() {
+        let (_dir, server) =
+            definition_server(&[("a.rs".into(), "before\nNeedle one\nNeedle two\nafter")]);
+        let params =
+            serde_json::from_value(serde_json::json!({"query":"Needle", "context":1})).unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        for source in ["before", "Needle one", "Needle two", "after"] {
+            assert_eq!(text.matches(source).count(), 1, "{text}");
+        }
+        assert!(
+            text.contains("2: Needle one") && text.contains("3: Needle two"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn small_content_results_include_source_context_unless_disabled() {
+        let (_dir, server) = definition_server(&[(
+            "src/lib.rs".into(),
+            "/// Internal outcome.\npub struct Outcome {\n    pub success: Option<bool>,\n}",
+        )]);
+        for (context, includes_declaration) in [(None, true), (Some(0), false)] {
+            let mut request = serde_json::json!({"query":"success", "mode":"literal"});
+            if let Some(context) = context {
+                request["context"] = context.into();
+            }
+            let text = response_text(
+                server
+                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert_eq!(
+                text.contains("2- pub struct Outcome"),
+                includes_declaration,
+                "{text}"
+            );
+            assert!(text.contains("3:     pub success"), "{text}");
+        }
+    }
+
+    #[test]
+    fn module_globs_require_a_descendant_file() {
+        let (_dir, server) = definition_server(&[
+            ("core/image_tests.rs".into(), "Needle"),
+            ("utils/image/lib.rs".into(), "Needle"),
+            ("utils/image/tests/deep.rs".into(), "Needle"),
+        ]);
+        for scope in [
+            serde_json::json!({"path":"**/*image*/**"}),
+            serde_json::json!({"globs":["**/*image*/**"]}),
+        ] {
+            let mut request = serde_json::json!({"query":"Needle", "mode":"literal", "context":0});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(scope.as_object().unwrap().clone());
+            let text = response_text(
+                server
+                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert!(!text.contains("core/image_tests.rs"), "{text}");
+            assert!(text.contains("utils/image/lib.rs"), "{text}");
+            assert!(text.contains("utils/image/tests/deep.rs"), "{text}");
+        }
+    }
+
+    #[test]
+    fn filename_fragments_match_separator_variants_but_exact_modes_do_not() {
+        let (_dir, server) = definition_server(&[
+            ("src/network_client.rs".into(), ""),
+            ("network-client/src/lib.rs".into(), ""),
+            ("network-client/src/hosts.rs".into(), ""),
+            ("other/client.rs".into(), ""),
+        ]);
+        for mode in ["fuzzy", "regex", "glob"] {
+            let query = if mode == "glob" {
+                "*network_client*"
+            } else {
+                "network_client"
+            };
+            let request = serde_json::json!({"query":query,"mode":mode});
+            let text = response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert!(text.contains("src/network_client.rs"), "{mode}: {text}");
+            assert_eq!(
+                text.contains("network-client/src/lib.rs"),
+                mode == "fuzzy",
+                "{mode}: {text}"
+            );
+            assert!(!text.contains("other/client.rs"), "{mode}: {text}");
+        }
+    }
+
+    #[test]
+    fn filename_fragments_rank_exact_names_by_depth() {
+        let (_dir, server) = definition_server(&[
+            ("android/docs/README".into(), ""),
+            ("README.md".into(), ""),
+            ("lib/readme_parser.rs".into(), ""),
+            ("docs/readme/index.md".into(), ""),
+        ]);
+        let request = serde_json::json!({"query": "readme"});
+        let text = response_text(
+            server
+                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..4],
+            [
+                "README.md",
+                "android/docs/README",
+                "docs/readme/index.md",
+                "lib/readme_parser.rs"
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn filename_fragments_prefer_exact_case_and_matching_parent_directories() {
+        let (_dir, server) = definition_server(&[
+            ("pkg/fontconfig/config.zig".into(), ""),
+            ("src/config.zig".into(), ""),
+            ("src/build/Config.zig".into(), ""),
+            ("src/config/Config.zig".into(), ""),
+            ("packages/core/src/config/lsp.ts".into(), ""),
+            ("packages/opencode/src/lsp/lsp.ts".into(), ""),
+            ("pkg/README.md".into(), ""),
+            ("pkg/libintl/libintl.h".into(), ""),
+        ]);
+        let find = |query: &str| {
+            let request = serde_json::json!({"query": query});
+            response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            )
+        };
+        let text = find("Config.zig");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..4],
+            [
+                "src/config/Config.zig",
+                "src/build/Config.zig",
+                "src/config.zig",
+                "pkg/fontconfig/config.zig"
+            ],
+            "{text}"
+        );
+        let text = find("lsp.ts");
+        assert!(
+            text.starts_with("packages/opencode/src/lsp/lsp.ts"),
+            "{text}"
+        );
+        // The parent-directory tie-break applies to exact names only.
+        let text = find("pkg");
+        assert!(text.starts_with("pkg/README.md"), "{text}");
+    }
+
+    #[test]
+    fn filename_fragments_rank_name_prefixes_before_inner_matches() {
+        let (_dir, server) = definition_server(&[
+            ("a/avf_showcqt.c".into(), ""),
+            ("b/vf_scale.c".into(), ""),
+            ("b/VF-blend.c".into(), ""),
+        ]);
+        let request = serde_json::json!({"query": "vf_"});
+        let text = response_text(
+            server
+                .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..3],
+            ["b/VF-blend.c", "b/vf_scale.c", "a/avf_showcqt.c"],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn broader_suggestions_try_module_fragments_and_preserve_exclusions() {
+        let (_dir, server) = definition_server(&[
+            (
+                "network-client/src/lib.rs".into(),
+                "fn delay() {\n    jitter();\n}",
+            ),
+            ("network-client/generated.rs".into(), "jitter();"),
+            ("other/lib.rs".into(), "jitter();"),
+        ]);
+        let request = serde_json::json!({
+            "query":"jitter", "mode":"literal", "path":"network",
+            "globs":["!**/generated.rs"],
+        });
+        let text = response_text(
+            server
+                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        assert!(text.contains("broader scope"), "{text}");
+        assert!(text.contains("network-client/src/lib.rs"), "{text}");
+        assert!(text.contains("1- fn delay()"), "{text}");
+        assert!(
+            !text.contains("generated.rs") && !text.contains("other/lib.rs"),
+            "{text}"
+        );
+        assert!(!text.contains("cursor:"), "{text}");
+    }
+
+    #[test]
+    fn excluded_directory_globs_and_chained_filename_filters() {
+        let (_dir, server) = definition_server(&[
+            ("src/image.rs".into(), "Needle"),
+            ("src/image.py".into(), "Needle"),
+            ("src/other.rs".into(), "Needle"),
+            ("node_modules/image.rs".into(), "Needle"),
+        ]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query":"Needle", "mode":"literal", "globs":["!node_modules"], "context":0,
+        }))
+        .unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        assert!(!text.contains("node_modules"), "{text}");
+        assert!(text.contains("src/image.rs"), "{text}");
+        let params = serde_json::from_value(serde_json::json!({
+            "query":"", "mode":"glob", "filters":["image", "\\.rs$"], "globs":["!node_modules"],
+        }))
+        .unwrap();
+        assert_eq!(
+            response_text(server.find_files(Parameters(params)).unwrap()),
+            "src/image.rs"
+        );
+    }
+
+    #[test]
+    fn structured_scopes_survive_fuzzy_retry_and_suggestions_reject_scattered_matches() {
+        let (_dir, server) = definition_server(&[
+            (
+                "src/noise.rs".into(),
+                "internal_chat_message_metadata_passthrough: None,",
+            ),
+            ("other/backoff.rs".into(), "fn jitter() {}"),
+            ("src/typo.rs".into(), "fn Needle() {}"),
+        ]);
+        let params = serde_json::from_value(
+            serde_json::json!({"query":"jitter", "mode":"literal", "paths":["src"]}),
+        )
+        .unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        assert!(text.contains("elsewhere in the indexed project"), "{text}");
+        assert!(text.contains("other/backoff.rs"), "{text}");
+        assert!(!text.contains("noise.rs"), "{text}");
+        let params = serde_json::from_value(
+            serde_json::json!({"query":"Nedle", "mode":"literal", "paths":["src"]}),
+        )
+        .unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        assert!(
+            text.contains("approximate") && text.contains("src/typo.rs"),
+            "{text}"
+        );
+        let params = serde_json::from_value(
+            serde_json::json!({"query":"Nedle", "mode":"literal", "paths":["missing"]}),
+        )
+        .unwrap();
+        let text = response_text(server.grep(Parameters(params)).unwrap());
+        assert!(!text.contains("fn Needle"), "{text}");
+    }
+
+    #[test]
+    fn hidden_false_survives_literal_retries_and_named_hidden_paths_override_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (_dir, server) = definition_server_at(
+            dir,
+            &[
+                (".github/workflows/ci.yml".into(), "runs-on: ubuntu-latest"),
+                ("src/main.rs".into(), "fn main() {}"),
+                ("pkg/.config/app.toml".into(), "key = \"nested_value\""),
+                ("v/sub/.secret.rs".into(), "fn secret_needle() {}"),
+            ],
+        );
+        let grep = |request: serde_json::Value| {
+            response_text(
+                server
+                    .grep(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            )
+        };
+        let text = grep(serde_json::json!({"query": "ubuntu-latest", "hidden": false}));
+        assert!(!text.contains(".github"), "{text}");
+        let text = grep(serde_json::json!({"query": "ubuntu-latest"}));
+        assert!(text.contains(".github/workflows/ci.yml"), "{text}");
+        let text = grep(serde_json::json!({
+            "query": "ubuntu-latest", "path": ".github", "hidden": false,
+        }));
+        assert!(text.contains(".github/workflows/ci.yml"), "{text}");
+
+        // A hidden name that exists only below the root still opens that directory.
+        let text = grep(serde_json::json!({
+            "query": "nested_value", "path": ".config", "hidden": false,
+        }));
+        assert!(text.contains("pkg/.config/app.toml"), "{text}");
+        // Suggestions outside a named hidden root keep other hidden paths out.
+        let text = grep(serde_json::json!({
+            "query": "secret_needle", "path": ".config", "hidden": false,
+        }));
+        assert!(!text.contains(".secret.rs"), "{text}");
+        let text = grep(serde_json::json!({"query": "secret_needle", "path": ".config"}));
+        assert!(text.contains("v/sub/.secret.rs"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_paths_accept_a_symlinked_root() {
+        let (dir, server) = definition_server(&[
+            ("src/a.rs".into(), "fn Needle() {}"),
+            ("other/b.rs".into(), "fn Needle() {}"),
+        ]);
+        let link = tempfile::tempdir().unwrap();
+        let linked = link.path().join("root");
+        std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+        let request = serde_json::json!({"query": "Needle", "paths": [linked.join("src")]});
+        let text = response_text(
+            server
+                .grep(Parameters(serde_json::from_value(request).unwrap()))
+                .unwrap(),
+        );
+        assert!(text.contains("src/a.rs"), "{text}");
+        assert!(!text.contains("other/b.rs"), "{text}");
+    }
+
+    #[test]
+    fn matches_inside_an_expanded_definition_body_print_once() {
+        let (_dir, server) = definition_server(&[(
+            "a.rs".into(),
+            "fn needle() {\n    needle_helper();\n}\nfn other() {\n    needle_helper();\n}\n",
+        )]);
+        let params = serde_json::from_value(serde_json::json!({"query": "needle"})).unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains(" 1: fn needle() {"), "{text}");
+        for line in ["2", "5"] {
+            let printed = text
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| {
+                    l.starts_with(&format!("{line}:")) || l.starts_with(&format!("{line}|"))
+                })
+                .count();
+            assert_eq!(printed, 1, "{line}: {text}");
+        }
+    }
+
+    #[test]
+    fn matching_lines_only_do_not_claim_omitted_details() {
+        let body: String = (0..300)
+            .map(|i| format!("let needle_{i} = {i};\n"))
+            .collect();
+        let (_dir, server) = definition_server(&[("a.rs".into(), body.as_str())]);
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "needle_", "context": 0, "maxResults": 200,
+        }))
+        .unwrap();
+        let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+        assert!(text.contains("needle_199"), "{}", text.len());
+        assert!(!text.contains("omitted"), "{}", &text[..200]);
+    }
+
+    #[test]
+    fn path_globs_keep_directory_boundaries_across_tools_and_pages() {
+        let paths = [
+            "src/a.rs",
+            "src/foo.rs",
+            "src/nested/foo.rs",
+            "src/deep/nested/foo.rs",
+            "lib/foo.rs",
+            "lib/nested/foo.rs",
+            "src/a,b.rs",
+            "src/nested/a,b.rs",
+        ];
+        let files: Vec<_> = paths
+            .iter()
+            .map(|path| ((*path).into(), "fn Needle() {}\n"))
+            .collect();
+        let (_dir, server) = definition_server(&files);
+        for (globs, expected) in [
+            (vec!["src/*.rs"], vec![0, 1, 6]),
+            (vec!["src/?.rs"], vec![0]),
+            (vec!["src/*/foo.rs"], vec![2]),
+            (vec!["src/**/*.rs"], vec![0, 1, 2, 3, 6, 7]),
+            (vec!["src/*a[,]b.rs"], vec![6]),
+            (vec!["src/*.rs", "lib/**"], vec![0, 1, 4, 5, 6]),
+            (vec!["{src,lib}/*.rs"], vec![0, 1, 4, 6]),
+            (vec!["src/**", "!src/*.rs"], vec![2, 3, 7]),
+        ] {
+            let expected: std::collections::BTreeSet<_> =
+                expected.into_iter().map(|index| paths[index]).collect();
+            let request = serde_json::json!({"query":"", "mode":"glob", "globs":globs});
+            let text = response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert_eq!(
+                text.lines().collect::<std::collections::BTreeSet<_>>(),
+                expected,
+                "{globs:?}"
+            );
+            for (mode, definitions_only) in
+                [("literal", false), ("regex", false), ("literal", true)]
+            {
+                let mut request = serde_json::json!({
+                    "query":"Needle", "mode":mode,
+                    "globs":globs, "definitions_only":definitions_only,
+                    "maxResults":2, "context":0,
+                });
+                let mut found = std::collections::BTreeSet::new();
+                for _ in 0..paths.len() {
+                    let response =
+                        server.grep(Parameters(serde_json::from_value(request.clone()).unwrap()));
+                    let text = response_text(response.unwrap());
+                    let page: Vec<_> = text.lines().filter(|line| paths.contains(line)).collect();
+                    assert!((1..=2).contains(&page.len()), "{text}");
+                    for path in page {
+                        assert!(found.insert(path.to_owned()), "duplicate {path}");
+                    }
+                    let Some(cursor) = text.lines().find_map(|line| line.strip_prefix("cursor: "))
+                    else {
+                        break;
+                    };
+                    request["cursor"] = cursor.into();
+                }
+                assert_eq!(
+                    found
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    expected,
+                    "{globs:?}, {mode}, definitions={definitions_only}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn include_globs_allow_hidden_matches_without_entering_other_hidden_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (_dir, server) = definition_server_at(
+            dir,
+            &[
+                ("src/visible.rs".into(), "Needle"),
+                ("src/.dot.rs".into(), "Needle"),
+                ("src/.hidden/a.rs".into(), "Needle"),
+                ("src/.hidden/.nested/b.rs".into(), "Needle"),
+                ("other/.hidden/c.rs".into(), "Needle"),
+                (".github/workflows/ci.rs".into(), "Needle"),
+            ],
+        );
+        for (globs, expected) in [
+            (vec![".github/**"], vec![".github/workflows/ci.rs"]),
+            (
+                vec![".github/workflows/*.rs"],
+                vec![".github/workflows/ci.rs"],
+            ),
+            (vec!["**/.github/**"], vec![".github/workflows/ci.rs"]),
+            (
+                vec!["src/**"],
+                vec![
+                    "src/visible.rs",
+                    "src/.dot.rs",
+                    "src/.hidden/a.rs",
+                    "src/.hidden/.nested/b.rs",
+                ],
+            ),
+            (vec!["*.rs"], vec!["src/visible.rs", "src/.dot.rs"]),
+            (
+                vec!["src/.hidden", "*.rs"],
+                vec!["src/visible.rs", "src/.dot.rs", "src/.hidden/a.rs"],
+            ),
+            (vec![], vec!["src/visible.rs"]),
+        ] {
+            for grep in [false, true] {
+                let request = serde_json::json!({
+                    "query": if grep { "Needle" } else { "" },
+                    "mode": if grep { "literal" } else { "glob" },
+                    "globs":globs, "hidden":false, "context":0,
+                });
+                let response = if grep {
+                    server.grep(Parameters(serde_json::from_value(request).unwrap()))
+                } else {
+                    server.find_files(Parameters(serde_json::from_value(request).unwrap()))
+                };
+                let text = response_text(response.unwrap());
+                let actual = text
+                    .lines()
+                    .filter(|line| line.ends_with(".rs"))
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    actual,
+                    expected.iter().copied().collect(),
+                    "{globs:?}: {text}"
+                );
+            }
+        }
+        for (paths, expected) in [
+            (vec!["src/.hidden"], vec!["src/.hidden/a.rs"]),
+            (
+                vec!["src", "src/.hidden"],
+                vec!["src/visible.rs", "src/.hidden/a.rs"],
+            ),
+            (
+                vec!["src", "src/.dot.rs"],
+                vec!["src/visible.rs", "src/.dot.rs"],
+            ),
+            (
+                vec!["src/.hidden/.nested/b.rs"],
+                vec!["src/.hidden/.nested/b.rs"],
+            ),
+        ] {
+            let request =
+                serde_json::json!({"query":"", "mode":"glob", "paths":paths, "hidden":false});
+            let text = response_text(
+                server
+                    .find_files(Parameters(serde_json::from_value(request).unwrap()))
+                    .unwrap(),
+            );
+            assert_eq!(
+                text.lines().collect::<std::collections::BTreeSet<_>>(),
+                expected.iter().copied().collect(),
+                "{paths:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadened_cursors_resume_the_shortened_query() {
+        let (_dir, server) = definition_server(&[
+            ("a.rs".into(), "before\nuse Needle1;\nafter\n"),
+            ("b.rs".into(), "before\nuse Needle2;\nafter\n"),
+            ("excluded.txt".into(), "Needle outside scope"),
+        ]);
+        for query in ["unused Needle *.rs", "unused Needle[0-9] *.rs"] {
+            let id = server.cursor_store.lock().unwrap().store_grep(GrepCursor {
+                file_offset: 1,
+                stage: GrepStage::Broadened,
+                found_matches: true,
+                ..Default::default()
+            });
+            let params = serde_json::from_value(serde_json::json!({
+                "query": query, "cursor": id, "context": 1,
+            }))
+            .unwrap();
+            let text = response_text(server.perform_grep(&params, GrepMode::PlainText).unwrap());
+            assert!(text.starts_with("0 matches for 'unused"), "{text}");
+            assert!(text.contains("Auto-broadened to"), "{text}");
+            assert!(text.contains("use Needle"), "{text}");
+            assert!(text.contains("before"), "{text}");
+            assert!(text.contains("after"), "{text}");
+            assert!(!text.contains("excluded.txt"), "{text}");
+        }
     }
 
     #[test]
@@ -1910,6 +3277,13 @@ mod tests {
 
     fn definition_server(files: &[(String, &str)]) -> (tempfile::TempDir, FffServer) {
         let dir = tempfile::tempdir().unwrap();
+        definition_server_at(dir, files)
+    }
+
+    fn definition_server_at(
+        dir: tempfile::TempDir,
+        files: &[(String, &str)],
+    ) -> (tempfile::TempDir, FffServer) {
         for (name, content) in files {
             let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

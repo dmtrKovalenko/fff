@@ -43,6 +43,21 @@ impl Matcher for RegexMatcher<'_> {
 
     #[inline]
     fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<Match>, NoError> {
+        let Some(m) = self.regex.find_at(haystack, at) else {
+            return Ok(None);
+        };
+        if self.is_multiline || memchr::memchr(b'\n', &haystack[m.start()..m.end()]).is_none() {
+            return Ok(Some(Match::new(m.start(), m.end())));
+        }
+        let mut at = at;
+        // After a cross-line match, scan each line once instead of retrying the whole suffix.
+        for newline in memchr::memchr_iter(b'\n', &haystack[m.start()..]) {
+            let end = m.start() + newline;
+            if let Some(line_match) = self.regex.find_at(&haystack[..end], at) {
+                return Ok(Some(Match::new(line_match.start(), line_match.end())));
+            }
+            at = end + 1;
+        }
         Ok(self
             .regex
             .find_at(haystack, at)
@@ -56,6 +71,84 @@ impl Matcher for RegexMatcher<'_> {
         } else {
             Some(fff_grep::LineTerminator::byte(b'\n'))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitespace_classes_do_not_consume_previous_lines() {
+        let source = b"\n\n    def example():\n";
+        let regex = build_regex(r"^\s*def example", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(source).unwrap().unwrap();
+        assert_eq!(found.start(), 2);
+        assert_eq!(&source[found.start()..found.end()], b"    def example");
+        let multiline = RegexMatcher {
+            regex: &regex,
+            is_multiline: true,
+        };
+        assert_eq!(multiline.find(source).unwrap().unwrap().start(), 0);
+    }
+
+    #[test]
+    fn line_bounded_regex_stays_linear_when_matches_cross_lines() {
+        let mut source = b"import a\n".repeat(20_000);
+        source.extend_from_slice(b"import b;\nimport c\n");
+        let regex = build_regex(r"import[^;]*;", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let started = std::time::Instant::now();
+        let found = matcher.find(&source).unwrap().unwrap();
+        assert_eq!(&source[found.start()..found.end()], b"import b;");
+        assert!(matcher.find_at(&source, found.end()).unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn line_bounded_regex_retains_shorter_alternatives() {
+        let source = b"foo\nbar\n";
+        let regex = build_regex(r"foo\s+bar|foo$", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(source).unwrap().unwrap();
+        assert_eq!(&source[found.start()..found.end()], b"foo");
+    }
+
+    #[test]
+    fn line_bounded_regex_finds_alternatives_inside_a_cross_line_match() {
+        let source = b"start\nNeedle\nend\n";
+        let regex = build_regex(r"start[\s\S]*end|Needle", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(source).unwrap().unwrap();
+        assert_eq!(found.start(), 6);
+        assert_eq!(&source[found.start()..found.end()], b"Needle");
+    }
+
+    #[test]
+    fn line_bounded_regex_handles_long_blank_runs_and_unterminated_lines() {
+        let mut source = vec![b'\n'; 80_000];
+        source.extend_from_slice(b"    def example():");
+        let regex = build_regex(r"^\s*def example", Casing::Sensitive).unwrap();
+        let matcher = RegexMatcher {
+            regex: &regex,
+            is_multiline: false,
+        };
+        let found = matcher.find(&source).unwrap().unwrap();
+        assert_eq!(found.start(), 80_000);
+        assert_eq!(&source[found.start()..found.end()], b"    def example");
     }
 }
 

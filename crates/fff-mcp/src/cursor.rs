@@ -1,18 +1,76 @@
-//! Cursor store for grep pagination.
-//!
-//! Maintains an in-memory map of opaque cursor IDs to file offsets.
-//! Cursors are evicted LRU-style when the store exceeds capacity.
-
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 const MAX_CURSORS: usize = 20;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GrepCursor {
     pub file_offset: usize,
+    pub match_offset: usize,
+    pub match_file: u64,
     pub stage: GrepStage,
     pub found_matches: bool,
     pub missing_path: bool,
+}
+
+impl GrepCursor {
+    pub fn page_limit(self, requested: usize) -> usize {
+        self.match_offset
+            .saturating_add(requested)
+            .saturating_add(1)
+    }
+
+    // Matches already shown from the file where the last page stopped.
+    pub fn resume_skip(&self, result: &fff::GrepResult<'_>, picker: &fff::FilePicker) -> usize {
+        match result.matches.first() {
+            Some(first)
+                if self.match_offset > 0
+                    && file_id(result, first.file_index, picker) == self.match_file =>
+            {
+                result
+                    .matches
+                    .iter()
+                    .take(self.match_offset)
+                    .take_while(|m| m.file_index == first.file_index)
+                    .count()
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn paginate(
+        &mut self,
+        result: &mut fff::GrepResult<'_>,
+        requested: usize,
+        picker: &fff::FilePicker,
+    ) {
+        let start = self.resume_skip(result, picker);
+        let end = start.saturating_add(requested).min(result.matches.len());
+        if end < result.matches.len() {
+            let last_file = result.matches.last().unwrap().file_index;
+            self.file_offset = if result.next_file_offset > 0 {
+                result.next_file_offset - 1
+            } else {
+                result.filtered_file_count.saturating_sub(1)
+            };
+            self.match_offset = result.matches[..end]
+                .iter()
+                .rev()
+                .take_while(|m| m.file_index == last_file)
+                .count();
+            self.match_file = file_id(result, last_file, picker);
+        } else {
+            self.file_offset = result.next_file_offset;
+            self.match_offset = 0;
+        }
+        result.matches.truncate(end);
+        result.matches.drain(..start);
+        self.found_matches |= !result.matches.is_empty();
+    }
+
+    pub fn has_more(self) -> bool {
+        self.file_offset > 0 || self.match_offset > 0
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -117,4 +175,10 @@ impl CursorStore {
     pub(crate) fn get_grep(&self, id: &str) -> Option<GrepCursor> {
         self.cursors.get(id).copied()
     }
+}
+
+fn file_id(result: &fff::GrepResult<'_>, index: usize, picker: &fff::FilePicker) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    result.files[index].relative_path(picker).hash(&mut hasher);
+    hasher.finish()
 }

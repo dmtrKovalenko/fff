@@ -1,5 +1,3 @@
-//! Output formatting for MCP grep/search results.
-
 use fff::GrepMatch;
 use fff::file_picker::FilePicker;
 use fff::git::format_git_status_opt;
@@ -69,14 +67,14 @@ const MAX_LINE_LEN: usize = 180;
 const MAX_DEF_EXPAND_FIRST: usize = 8;
 const MAX_DEF_EXPAND: usize = 5;
 const MAX_FIRST_MATCH_EXPAND: usize = 8;
+const AUTO_CONTEXT_CHARS: usize = 5000;
+const EXPLICIT_CONTEXT_CHARS: usize = 8000;
 
 fn trauncate_line_for_ai(
     line: &str,
     match_ranges: Option<&[(u32, u32)]>,
     max_len: usize,
 ) -> String {
-    // Leading whitespace is already stripped by core (trim_whitespace option).
-    // Only strip trailing whitespace here.
     let trimmed = line.trim_end();
     if trimmed.is_empty() {
         return String::new();
@@ -160,6 +158,7 @@ pub struct GrepFormatter<'a> {
     pub max_results: usize,
     pub show_context: bool,
     pub auto_expand_defs: bool,
+    pub auto_context: bool,
     pub picker: &'a FilePicker,
 }
 
@@ -174,6 +173,7 @@ impl GrepFormatter<'_> {
             max_results,
             show_context,
             auto_expand_defs,
+            auto_context,
             picker,
         } = *self;
 
@@ -196,6 +196,20 @@ impl GrepFormatter<'_> {
 
         if output_mode == OutputMode::Count {
             return format_count(items, files, cursor, cursor_store, picker);
+        }
+        if show_context
+            && let Some(text) =
+                self.format_with_context(items, cursor_store, EXPLICIT_CONTEXT_CHARS, false)
+        {
+            return text;
+        }
+        if auto_context
+            && items.len() <= 8
+            && !items.iter().any(|m| m.is_definition)
+            && let Some(text) =
+                self.format_with_context(items, cursor_store, AUTO_CONTEXT_CHARS, true)
+        {
+            return text;
         }
 
         // output_mode == usage
@@ -225,13 +239,12 @@ impl GrepFormatter<'_> {
 
         // Detailed content (subject to budget)
         let mut char_count = 0usize;
-        let mut shown_count = 0usize;
         let mut current_file = String::new();
 
         // Reorder: definitions first, then usages, then imports (when auto-expanding)
         let sorted_items: Vec<usize> = if auto_expand_defs {
             let mut indices: Vec<usize> = (0..items.len()).collect();
-            indices.sort_unstable_by_key(|&i| {
+            indices.sort_by_key(|&i| {
                 if items[i].is_definition {
                     0
                 } else if is_import_line(&items[i].line_content) {
@@ -246,33 +259,22 @@ impl GrepFormatter<'_> {
             (0..items.len()).collect()
         };
 
-        for &idx in &sorted_items {
+        let mut compacted = 0usize;
+        let mut body_lines = std::collections::HashSet::new();
+        for (shown_count, &idx) in sorted_items.iter().enumerate() {
             let m = &items[idx];
+            // Already printed inside an expanded definition body.
+            if body_lines.contains(&(m.file_index, m.line_number)) {
+                continue;
+            }
             let file = files[m.file_index];
             let mut match_lines: Vec<String> = Vec::new();
+            let over_budget = shown_count > 0 && char_count >= max_output_chars;
 
             let file_rel_path = file.relative_path(picker);
             if file_rel_path != current_file {
                 current_file = file_rel_path;
                 match_lines.push(current_file.to_string());
-            }
-
-            // Skip import-only lines when we already have definitions
-            if auto_expand_defs && is_import_line(&m.line_content) && !def_expanded_files.is_empty()
-            {
-                continue;
-            }
-
-            // Context before (only when explicitly requested)
-            if show_context && !m.context_before.is_empty() {
-                let start_line = m.line_number.saturating_sub(m.context_before.len() as u64);
-                for (i, ctx) in m.context_before.iter().enumerate() {
-                    match_lines.push(format!(
-                        " {}-{}",
-                        start_line + i as u64,
-                        trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)
-                    ));
-                }
             }
 
             // Match line
@@ -286,27 +288,15 @@ impl GrepFormatter<'_> {
                 )
             ));
 
-            // Context after (only when explicitly requested via context parameter)
-            if show_context && !m.context_after.is_empty() {
-                let start_line = m.line_number + 1;
-                for (i, ctx) in m.context_after.iter().enumerate() {
-                    match_lines.push(format!(
-                        " {}-{}",
-                        start_line + i as u64,
-                        trauncate_line_for_ai(ctx, None, MAX_LINE_LEN)
-                    ));
-                }
-                match_lines.push("--".to_string());
-            }
-
             // Auto-expand definitions with body context
             let file_rel_for_expand = file.relative_path(picker);
-            if auto_expand_defs
-                && !show_context
+            let expands = auto_expand_defs
                 && m.is_definition
                 && !m.context_after.is_empty()
-                && !def_expanded_files.contains(&file_rel_for_expand)
-            {
+                && !def_expanded_files.contains(&file_rel_for_expand);
+            if expands && over_budget {
+                compacted += 1;
+            } else if expands {
                 let expand_limit = if def_expanded_files.is_empty() {
                     MAX_DEF_EXPAND_FIRST
                 } else {
@@ -318,6 +308,7 @@ impl GrepFormatter<'_> {
                     if ctx.trim().is_empty() {
                         break;
                     }
+                    body_lines.insert((m.file_index, start_line + i as u64));
                     match_lines.push(format!(
                         "  {}| {}",
                         start_line + i as u64,
@@ -327,16 +318,16 @@ impl GrepFormatter<'_> {
             }
 
             let chunk = match_lines.join("\n");
-            if char_count + chunk.len() > max_output_chars && shown_count > 0 {
-                return self.format_compact(items, &sorted_items, cursor_store);
-            }
-
             char_count += chunk.len();
             lines.push(chunk);
-            shown_count += 1;
+        }
+        if compacted > 0 {
+            let note =
+                format!("Definition bodies omitted for {compacted} matches to fit the output.");
+            lines.insert(usize::from(total_matched > items.len()), note);
         }
 
-        if cursor.file_offset > 0 {
+        if cursor.has_more() {
             let cursor_id = cursor_store.store_grep(cursor);
             lines.push(format!("\ncursor: {}", cursor_id));
         }
@@ -344,36 +335,76 @@ impl GrepFormatter<'_> {
         lines.join("\n")
     }
 
-    fn format_compact(
+    fn format_with_context(
         &self,
         items: &[GrepMatch],
-        order: &[usize],
         cursor_store: &mut CursorStore,
-    ) -> String {
-        let mut lines = vec![format!(
-            "{}/{} page matches shown. Context omitted to show matching lines.",
-            items.len(),
-            self.total_matched
-        )];
-        let mut current_file = String::new();
-        for &idx in order {
-            let m = &items[idx];
-            let path = self.files[m.file_index].relative_path(self.picker);
-            if path != current_file {
-                current_file = path;
-                lines.push(current_file.clone());
+        max_chars: usize,
+        all_or_nothing: bool,
+    ) -> Option<String> {
+        let mut rows = std::collections::BTreeMap::new();
+        let mut chars = 0;
+        let mut with_context = 0;
+        for m in items {
+            let line =
+                trauncate_line_for_ai(&m.line_content, Some(&m.match_byte_offsets), MAX_LINE_LEN);
+            // Explicit context budgets only context rows; matching lines are always shown.
+            if all_or_nothing {
+                chars += line.len() + 8;
             }
+            rows.insert((m.file_index, m.line_number), (line, true));
+        }
+        for m in items {
+            let start = m.line_number.saturating_sub(m.context_before.len() as u64);
+            let context = m
+                .context_before
+                .iter()
+                .enumerate()
+                .map(|(i, text)| (start + i as u64, text))
+                .chain(
+                    m.context_after
+                        .iter()
+                        .enumerate()
+                        .map(|(i, text)| (m.line_number + 1 + i as u64, text)),
+                )
+                .filter(|(line, _)| !rows.contains_key(&(m.file_index, *line)))
+                .map(|(line, text)| (line, trauncate_line_for_ai(text, None, MAX_LINE_LEN)))
+                .collect::<Vec<_>>();
+            let cost: usize = context.iter().map(|(_, text)| text.len() + 8).sum();
+            if chars + cost > max_chars {
+                if all_or_nothing {
+                    return None;
+                }
+                break;
+            }
+            chars += cost;
+            with_context += 1;
+            for (line, text) in context {
+                rows.insert((m.file_index, line), (text, false));
+            }
+        }
+        let mut lines = Vec::new();
+        if with_context < items.len() {
             lines.push(format!(
-                " {}: {}",
-                m.line_number,
-                trauncate_line_for_ai(&m.line_content, Some(&m.match_byte_offsets), MAX_LINE_LEN)
+                "Context shown for {with_context}/{} matches to fit the output.",
+                items.len()
             ));
         }
-        if self.cursor.file_offset > 0 {
-            let cursor_id = cursor_store.store_grep(self.cursor);
-            lines.push(format!("\ncursor: {}", cursor_id));
+        let mut previous = None;
+        for ((file_index, line), (text, matched)) in rows {
+            if previous.is_none_or(|(file, _)| file != file_index) {
+                lines.push(self.files[file_index].relative_path(self.picker));
+            } else if previous.is_some_and(|(_, last)| line > last + 1) {
+                lines.push("--".into());
+            }
+            lines.push(format!(" {line}{} {text}", if matched { ':' } else { '-' }));
+            previous = Some((file_index, line));
         }
-        lines.join("\n")
+        if self.cursor.has_more() {
+            let id = cursor_store.store_grep(self.cursor);
+            lines.push(format!("\ncursor: {id}"));
+        }
+        Some(lines.join("\n"))
     }
 }
 
@@ -451,7 +482,7 @@ fn format_files_with_matches(
         }
     }
 
-    if cursor.file_offset > 0 {
+    if cursor.has_more() {
         let cursor_id = cursor_store.store_grep(cursor);
         lines.push(format!("\ncursor: {}", cursor_id));
     }
@@ -482,7 +513,7 @@ fn format_count(
     for path in &order {
         lines.push(format!("{}: {}", path, counts[path.as_str()]));
     }
-    if cursor.file_offset > 0 {
+    if cursor.has_more() {
         let cursor_id = cursor_store.store_grep(cursor);
         lines.push(format!("\ncursor: {}", cursor_id));
     }

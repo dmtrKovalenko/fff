@@ -1,8 +1,10 @@
 mod cursor;
+mod file_search;
 mod handshake;
 mod healthcheck;
 mod output;
 mod parent;
+mod scope;
 mod server;
 mod update_check;
 
