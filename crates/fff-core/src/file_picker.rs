@@ -582,6 +582,9 @@ pub struct FilePickerOptions {
     /// Ranking boost for files that participated in recent commits of the
     /// current branch. Enabled with default limits unless overridden.
     pub git_recency: GitRecencyConfig,
+    /// Extra `.gitignore`-syntax lines, relative to `base_path`, taking precedence
+    /// over every ignore file. `!pattern` force-includes ignored paths (zlob walker only).
+    pub extra_ignore: Vec<String>,
 }
 
 impl Default for FilePickerOptions {
@@ -597,6 +600,7 @@ impl Default for FilePickerOptions {
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
             git_recency: GitRecencyConfig::default(),
+            extra_ignore: Vec::new(),
         }
     }
 }
@@ -621,6 +625,7 @@ pub struct FilePicker {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     git_recency_config: GitRecencyConfig,
+    extra_ignore: Arc<[String]>,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -706,6 +711,14 @@ impl FilePicker {
 
     pub fn git_recency_config(&self) -> GitRecencyConfig {
         self.git_recency_config
+    }
+
+    pub fn extra_ignore(&self) -> &[String] {
+        &self.extra_ignore
+    }
+
+    pub(crate) fn extra_ignore_shared(&self) -> Arc<[String]> {
+        Arc::clone(&self.extra_ignore)
     }
 
     pub fn trace_id(&self) -> &str {
@@ -963,6 +976,7 @@ impl FilePicker {
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             git_recency_config: options.git_recency,
+            extra_ignore: options.extra_ignore.into(),
             trace_span,
             trace_id,
         })
@@ -992,6 +1006,7 @@ impl FilePicker {
         let follow_symlinks = picker.follow_symlinks;
         let enable_fs_root_scanning = picker.enable_fs_root_scanning;
         let enable_home_dir_scanning = picker.enable_home_dir_scanning;
+        let extra_ignore = picker.extra_ignore_shared();
 
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -1025,6 +1040,7 @@ impl FilePicker {
             signals,
             scanned_files_counter,
             trace_span,
+            extra_ignore,
             ScanConfig {
                 warmup,
                 content_indexing,
@@ -1066,6 +1082,7 @@ impl FilePicker {
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
+            &self.extra_ignore,
         )?;
 
         self.sync_data = sync;
@@ -2134,6 +2151,7 @@ impl FileSync {
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
+        extra_ignore: &[String],
     ) -> Result<FileSync, Error> {
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
@@ -2157,6 +2175,7 @@ impl FileSync {
             base_path,
             is_git_repo,
             follow_symlinks,
+            extra_ignore,
             bg_threads,
             synced_files_count,
         )?;

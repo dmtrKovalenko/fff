@@ -82,6 +82,7 @@ struct PickerInitOpts {
     enable_home_dir_scanning: bool,
     enable_filename_constraint: bool,
     git_recency: Option<GitRecencyConfig>,
+    extra_ignore: Option<Vec<String>>,
 }
 
 impl PickerInitOpts {
@@ -109,6 +110,7 @@ impl PickerInitOpts {
                 git_recency: Self::git_recency_from_lua(
                     t.get::<Option<mlua::Value>>("git_recency")?,
                 )?,
+                extra_ignore: t.get::<Option<Vec<String>>>("extra_ignore")?,
             }),
             other => Err(LuaError::RuntimeError(format!(
                 "init opts must be a table, boolean, or nil — got {}",
@@ -185,6 +187,7 @@ pub fn init_file_picker(
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
             git_recency: opts.git_recency.unwrap_or_default(),
+            extra_ignore: opts.extra_ignore.unwrap_or_default(),
             ..Default::default()
         },
     )
@@ -232,7 +235,7 @@ pub fn restart_index_in_path(
         // Inherit current picker's scanning flags when caller didn't pass
         // explicit opts — otherwise a `:cd ~` after init would silently lose
         // the user's `enable_home_dir_scanning = true` setting.
-        let (follow_symlinks, fs_root, home_dir, git_recency) = {
+        let (follow_symlinks, fs_root, home_dir, git_recency, extra_ignore) = {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -251,12 +254,16 @@ pub fn restart_index_in_path(
                     p.fs_root_scanning_enabled() || opts.enable_fs_root_scanning,
                     p.home_dir_scanning_enabled() || opts.enable_home_dir_scanning,
                     opts.git_recency.unwrap_or_else(|| p.git_recency_config()),
+                    opts.extra_ignore
+                        .clone()
+                        .unwrap_or_else(|| p.extra_ignore().to_vec()),
                 ),
                 None => (
                     opts.follow_symlinks,
                     opts.enable_fs_root_scanning,
                     opts.enable_home_dir_scanning,
                     opts.git_recency.unwrap_or_default(),
+                    opts.extra_ignore.clone().unwrap_or_default(),
                 ),
             }
         };
@@ -280,6 +287,7 @@ pub fn restart_index_in_path(
                 enable_fs_root_scanning: fs_root,
                 enable_home_dir_scanning: home_dir,
                 git_recency,
+                extra_ignore,
                 ..Default::default()
             },
         ) {
