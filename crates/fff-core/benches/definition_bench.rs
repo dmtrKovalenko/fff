@@ -140,7 +140,7 @@ fn bench_definition(c: &mut Criterion) {
         });
         group.throughput(Throughput::Elements(1));
         for length in [16, 32, 96] {
-            let name = format!("{}user_file", "x".repeat(length - 9));
+            let name = format!("user_file{}", "x".repeat(length - 9));
             let line = examples[0].1.replace("user_file", &name);
             let start = line.find("user_file").unwrap() as u32;
             let ranges = [(start, start + 9)];
