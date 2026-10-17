@@ -1,4 +1,6 @@
-use crate::file_picker::is_known_binary_extension_basename;
+use crate::file_picker::{
+    is_ambiguous_binary_name, is_known_binary_extension_basename, starts_with_binary_content,
+};
 use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
 use crate::walk::{WalkIgnoreRules, WalkOutput};
@@ -87,7 +89,8 @@ pub(crate) fn walk_collect_files(
             None => entry.basename().unwrap_or(""),
             Some(_) => &relative_path[basename_offset..],
         };
-        let is_binary = is_known_binary_extension_basename(basename);
+        let is_binary = is_known_binary_extension_basename(basename)
+            && (!is_ambiguous_binary_name(basename) || starts_with_binary_content(entry.path()));
 
         let (size, modified) = match target {
             Some(meta) => (

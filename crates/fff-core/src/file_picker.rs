@@ -429,7 +429,7 @@ impl FileItem {
             None => (0, 0),
         };
 
-        let is_binary = is_known_binary_extension(&path);
+        let is_binary = is_binary_file(&path);
 
         let filename_start = relative_path
             .rfind(std::path::is_separator)
@@ -478,7 +478,7 @@ impl FileItem {
         size: u64,
         modified: u64,
     ) -> (Self, String) {
-        let is_binary = is_known_binary_extension(path);
+        let is_binary = is_binary_file(path);
 
         let rel = pathdiff::diff_paths(path, base_path).unwrap_or_else(|| path.to_path_buf());
         // The index is '/'-canonical on every platform; fold native separators.
@@ -510,7 +510,7 @@ impl FileItem {
         size: u64,
         modified: u64,
     ) -> (Self, String) {
-        let is_binary = is_known_binary_extension(path);
+        let is_binary = is_binary_file(path);
         // SAFETY-ish: paths on macOS/Linux are bytes; lossy conversion mirrors
         // the existing `to_string_lossy()` behavior on non-UTF8 names.
         let decoded = String::from_utf8_lossy(relative_path).into_owned();
@@ -2344,6 +2344,31 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
     is_binary_extension_str(ext)
 }
 
+// Extension check, then a content sniff for extensions shared by text and binary formats.
+pub(crate) fn is_binary_file(path: &Path) -> bool {
+    is_known_binary_extension(path)
+        && (!path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_ambiguous_binary_name)
+            || starts_with_binary_content(path))
+}
+
+// `.blp` names both GTK Blueprint text and a binary texture format.
+#[inline]
+pub(crate) fn is_ambiguous_binary_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".blp")
+}
+
+pub(crate) fn starts_with_binary_content(path: &Path) -> bool {
+    use std::io::Read;
+    let mut chunk = [0u8; 4096];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut chunk))
+        .is_ok_and(|read| crate::types::detect_binary_content(&chunk[..read]))
+}
+
 /// Like [`is_known_binary_extension`] but takes a basename string directly,
 /// avoiding `Path::extension()` overhead. Mirrors `Path::extension()`
 /// semantics: dotfiles with no other dots → no extension. Used by the zlob
@@ -2397,7 +2422,7 @@ fn is_binary_extension_str(ext: &str) -> bool {
         // ML/Data Science
         "npy" | "npz" | "h5" | "hdf5" | "pt" | "onnx" |
         "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib" |
-        // 3D/Game assets
+        // 3D/Game assets (indexing also sniffs `.blp`, see `is_ambiguous_binary_name`)
         "glb" | "blend" | "blp" |
         // Gzipped-XML / binary maps
         "dia" | "bcmap" |
@@ -2480,6 +2505,46 @@ pub(crate) fn hint_allocator_collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blueprint_text_is_searchable_while_blp_textures_stay_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("window.blp"),
+            "template $Window : Gtk.Window {\n  tooltip-text: \"Needle\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("texture.blp"), b"BLP2\0\0\0Needle\0").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: dir.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            enable_mmap_cache: false,
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let query =
+            fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig).parse("Needle");
+        let options = crate::grep::GrepSearchOptions {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        let result = picker.grep(&query, &options);
+        let files: Vec<_> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path(&picker))
+            .collect();
+        assert_eq!(files, ["window.blp"]);
+
+        // The public extension helper keeps reporting `.blp` as binary.
+        assert!(is_known_binary_extension(Path::new("window.blp")));
+        for (name, binary) in [("texture.blp", true), ("window.blp", false)] {
+            let (item, _) = crate::types::FileItem::new(dir.path().join(name), dir.path(), None);
+            assert_eq!(item.is_binary(), binary, "{name}");
+        }
+    }
 
     #[test]
     fn refuses_home_dir_with_trailing_separator() {
