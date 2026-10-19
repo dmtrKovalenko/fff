@@ -12,7 +12,7 @@
 /**
  * Current used version of [`FffCreateOptions`].
  */
-#define FFF_CREATE_OPTIONS_VERSION 2
+#define FFF_CREATE_OPTIONS_VERSION 3
 
 /**
  * Current version of [`FffWatchOptions`].
@@ -139,6 +139,11 @@ typedef struct FffCreateOptions {
    * external loop protection cyclic symlinks can wedge the watcher.
    */
   bool follow_symlinks;
+  /**
+   * Newline-separated `.gitignore`-syntax lines relative to `base_path`,
+   * taking precedence over every ignore file (`!pattern` force-includes). NULL/empty for none.
+   */
+  const char *extra_ignore;
 } FffCreateOptions;
 
 /**

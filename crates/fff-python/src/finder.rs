@@ -184,6 +184,7 @@ impl FileFinder {
         enable_fs_root_scanning=false,
         enable_home_dir_scanning=false,
         follow_symlinks=false,
+        extra_ignore=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -203,6 +204,7 @@ impl FileFinder {
         enable_fs_root_scanning: bool,
         enable_home_dir_scanning: bool,
         follow_symlinks: bool,
+        extra_ignore: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let shared_picker = SharedFilePicker::default();
         let shared_frecency = SharedFrecency::default();
@@ -256,6 +258,7 @@ impl FileFinder {
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
                     git_recency: Default::default(),
+                    extra_ignore: extra_ignore.unwrap_or_default(),
                 },
             )
             .map_err(py_err)
@@ -832,6 +835,7 @@ impl FileFinder {
                 home_dir,
                 follow_symlinks,
                 git_recency,
+                extra_ignore,
             ) = {
                 let guard = picker.read().map_err(py_err)?;
                 if let Some(ref picker) = *guard {
@@ -844,6 +848,7 @@ impl FileFinder {
                         picker.home_dir_scanning_enabled(),
                         picker.follows_symlinks(),
                         picker.git_recency_config(),
+                        picker.extra_ignore().to_vec(),
                     )
                 } else {
                     (
@@ -856,6 +861,7 @@ impl FileFinder {
                         false,
                         false,
                         Default::default(),
+                        Vec::new(),
                     )
                 }
             };
@@ -878,6 +884,7 @@ impl FileFinder {
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
                     git_recency,
+                    extra_ignore,
                 },
             )
             .map_err(py_err)
