@@ -7,7 +7,7 @@ local grep
 
 describe('go_to_definition', function()
   local root, original_cwd, fallback
-  local live_grep, search, get_scan_progress
+  local live_grep, search, get_scan_progress, health_check, realpath
 
   before_each(function()
     original_cwd = vim.fn.getcwd()
@@ -42,11 +42,13 @@ describe('go_to_definition', function()
     vim.api.nvim_win_set_cursor(0, { 1, 0 })
     fallback = nil
     live_grep, search, get_scan_progress = fff.live_grep, grep.search, fuzzy.get_scan_progress
+    health_check, realpath = fuzzy.health_check, vim.uv.fs_realpath
     fff.live_grep = function(opts) fallback = opts end
   end)
 
   after_each(function()
     fff.live_grep, grep.search, fuzzy.get_scan_progress = live_grep, search, get_scan_progress
+    fuzzy.health_check, vim.uv.fs_realpath = health_check, realpath
     vim.wo.winfixbuf = false
     vim.cmd('only!')
     vim.cmd('noautocmd %bwipeout!')
@@ -75,6 +77,19 @@ describe('go_to_definition', function()
     assert.is_true(fff.go_to_definition({ query = 'UniqueTarget' }))
     assert.is_true(vim.bo.modified)
     assert.are.equal('// unsaved', vim.api.nvim_buf_get_lines(0, -2, -1, false)[1])
+    assert.are.same({ 2, 7 }, vim.api.nvim_win_get_cursor(0))
+  end)
+
+  it('reuses the active index without resolving roots or running health checks', function()
+    local other = root .. '/other'
+    local expected = realpath(root) .. '/definitions.rs'
+    vim.fn.mkdir(other, 'p')
+    vim.cmd('noautocmd lcd ' .. vim.fn.fnameescape(other))
+    fuzzy.health_check = function() error('navigation must not run health checks') end
+    vim.uv.fs_realpath = function(_path, _callback) error('default navigation must not resolve roots') end
+    assert.is_true(fff.go_to_definition())
+    assert.is_true(fff.go_to_definition({ query = 'UniqueTarget' }))
+    assert.are.equal(expected, vim.api.nvim_buf_get_name(0))
     assert.are.same({ 2, 7 }, vim.api.nvim_win_get_cursor(0))
   end)
 
@@ -128,6 +143,21 @@ describe('go_to_definition', function()
     assert.are.equal('UniqueTarget', fallback.query)
   end)
 
+  it('does not jump if the searched index was incomplete despite the earlier readiness check', function()
+    grep.search = function(...)
+      local result = search(...)
+      result.is_index_ready = false
+      return result
+    end
+    assert.is_false(fff.go_to_definition())
+    assert.are.equal('usage.rs', vim.fn.expand('%:t'))
+  end)
+
+  it('jumps for an explicit cwd that matches the active index', function()
+    assert.is_true(fff.go_to_definition({ cwd = root }))
+    assert.are.equal('definitions.rs', vim.fn.expand('%:t'))
+  end)
+
   it('opens the picker for a different root without searching the old index', function()
     local other = root .. '/other'
     vim.fn.mkdir(other, 'p')
@@ -140,6 +170,15 @@ describe('go_to_definition', function()
   it('opens an empty definition picker when there is no word under the cursor', function()
     assert.is_false(fff.go_to_definition({ query = '' }))
     assert.are.equal('', fallback.query)
+  end)
+
+  it('does not jump to the old index while a cwd change is pending', function()
+    local other = root .. '/other'
+    vim.fn.mkdir(other, 'p')
+    require('fff.conf').get().base_path = other
+    assert.is_false(fff.go_to_definition({ cwd = other }))
+    assert.are.equal(vim.uv.fs_realpath(other), fallback.cwd)
+    assert.are.equal('usage.rs', vim.fn.expand('%:t'))
   end)
 
   it('validates the public arguments', function()

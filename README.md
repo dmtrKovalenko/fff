@@ -305,7 +305,7 @@ require('fff').content_search(query, opts)         -- programmatic grep
 
 #### `go_to_definition(opts)`
 
-Searches saved files for declarations that match the word under the cursor. If the search completes with exactly one match, it jumps there. Otherwise, it opens the definition-only picker with the query filled in. An incomplete index or search opens the picker too.
+Searches saved files in the active FFF index for declarations that match the word under the cursor. Pass `cwd` to search another directory. If the search completes with exactly one match, it jumps there. Otherwise, it opens the definition-only picker with the query filled in. An incomplete index or search opens the picker too.
 
 Uses FFF's declaration matcher without an LSP server. Matches can include part of a name, so `user_file` can find `fn test_user_file`. Returns `true` for a direct jump and `false` otherwise.
 

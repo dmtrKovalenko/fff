@@ -1185,9 +1185,16 @@ fn live_grep_with_options(
         return Err(error::to_lua_error(Error::FilePickerMissing));
     };
     let parsed_query = FFFQuery::parse(query, NvimGrepConfig);
+    let is_index_ready = picker.has_content_indexing()
+        && picker.bigram_index().is_some()
+        && !picker.is_scan_active();
     let mut result = picker.grep(&parsed_query, options);
     if options.classify_definitions == fff::DefinitionMode::Classify {
         result.matches.sort_by_key(|m| !m.is_definition);
     }
-    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
+    let result = lua_types::GrepResultLua::new(result, picker).into_lua(lua)?;
+    if let LuaValue::Table(table) = &result {
+        table.set("is_index_ready", is_index_ready)?;
+    }
+    Ok(result)
 }
