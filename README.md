@@ -292,6 +292,7 @@ vim.keymap.set('n', 'ff', function() require('fff').find_files() end, { desc = '
 require('fff').find_files()                        -- find files in current repo
 require('fff').live_grep()                         -- live content grep
 require('fff').live_grep_under_cursor()            -- grep <cword> in normal, selection in visual
+require('fff').go_to_definition()                  -- jump to one declaration, or open the picker
 require('fff').scan_files()                        -- force rescan
 require('fff').refresh_git_status()                -- refresh git status
 require('fff').find_files_in_dir(path)             -- find in a specific dir
@@ -301,6 +302,21 @@ require('fff').change_indexing_directory(new_path) -- change root
 require('fff').file_search(query, opts)            -- fuzzy search files / dirs / mixed
 require('fff').content_search(query, opts)         -- programmatic grep
 ```
+
+#### `go_to_definition(opts)`
+
+Searches saved files in the active FFF index for declarations that match the word under the cursor. Pass `cwd` to search another directory. If the search completes with exactly one match, it jumps there. Otherwise, it opens the definition-only picker with the query filled in. An incomplete index or search opens the picker too.
+
+Uses FFF's declaration matcher without an LSP server. Matches can include part of a name, so `user_file` can find `fn test_user_file`. Returns `true` for a direct jump and `false` otherwise.
+
+```lua
+vim.keymap.set('n', '<D-g>', function() require('fff').go_to_definition() end, { desc = 'FFF go to definition' })
+
+-- Optional query, directory, and picker overrides:
+require('fff').go_to_definition({ query = 'UserFile', cwd = '/path/to/project' })
+```
+
+Also accepts `title`, `layout`, and `grep` options. This API always searches definitions, even when `grep.classify_definitions` is disabled.
 
 #### `file_search(query, opts)`
 
