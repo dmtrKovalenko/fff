@@ -38,7 +38,9 @@ use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search}
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+use crate::score::{
+    FuzzyMatchCache, fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page,
+};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
@@ -621,6 +623,8 @@ pub struct FilePicker {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     git_recency_config: GitRecencyConfig,
+    // Cleared whenever files are added, restored or replaced.
+    fuzzy_cache: parking_lot::Mutex<Option<FuzzyMatchCache>>,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -733,6 +737,7 @@ impl FilePicker {
     }
 
     pub fn get_file_mut(&mut self, index: usize) -> Option<(ArenaPtr, &mut FileItem)> {
+        *self.fuzzy_cache.get_mut() = None;
         self.sync_data.get_file_mut(index)
     }
 
@@ -963,6 +968,7 @@ impl FilePicker {
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             git_recency_config: options.git_recency,
+            fuzzy_cache: parking_lot::Mutex::new(None),
             trace_span,
             trace_id,
         })
@@ -1072,6 +1078,7 @@ impl FilePicker {
         )?;
 
         self.sync_data = sync;
+        *self.fuzzy_cache.get_mut() = None;
 
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
@@ -1181,13 +1188,16 @@ impl FilePicker {
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
 
+        let mut cache = self.fuzzy_cache.lock().take();
         let (items, scores, total_matched) = fuzzy_match_and_score_files(
             files,
             &context,
             self.sync_data.base_count,
             base_arena,
             overflow_arena,
+            &mut cache,
         );
+        *self.fuzzy_cache.lock() = cache;
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
 
@@ -1559,6 +1569,7 @@ impl FilePicker {
 
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
         self.sync_data = sync;
+        *self.fuzzy_cache.get_mut() = None;
         self.cache_budget.reset();
     }
 
@@ -1824,6 +1835,7 @@ impl FilePicker {
         if !self.sync_data.files.push(file_item) {
             return None;
         }
+        *self.fuzzy_cache.get_mut() = None;
 
         self.sync_data.live_count += 1;
         // Dir may have been tombstoned by an earlier removal; a new file
@@ -1859,6 +1871,7 @@ impl FilePicker {
         }
         file.set_deleted(false);
         let parent_dir = file.parent_dir_index;
+        *self.fuzzy_cache.get_mut() = None;
 
         self.sync_data.live_count += 1;
         // The path exists on disk again, so its parent dir does too.
