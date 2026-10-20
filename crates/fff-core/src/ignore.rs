@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Directories excluded when walking a non-git root. Entries are `cfg`-gated
 /// so a single iteration covers standard + platform-specific overrides.
@@ -63,6 +63,41 @@ pub(crate) const IGNORED_DIRS: &[&str] = &[
     #[cfg(target_os = "windows")]
     "AppData/Roaming",
 ];
+
+/// Resolves git's `core.excludesFile` through the repo's own config chain, so
+/// repo-local, global and system settings all win in git's precedence order.
+pub(crate) fn git_excludes_file(base_path: &Path) -> Option<PathBuf> {
+    let config = git2::Repository::discover(base_path)
+        .and_then(|repo| repo.config())
+        .or_else(|_| git2::Config::open_default())
+        .ok()?;
+
+    // `get_path` expands a leading `~` for us; a configured-but-absent file is
+    // legal in git and simply matches nothing.
+    let path = config.get_path("core.excludesFile").ok()?;
+    path.is_file().then_some(path)
+}
+
+/// `core.excludesFile` contents as gitignore patterns, comments stripped.
+#[cfg(feature = "zlob")]
+pub(crate) fn git_excludes_patterns(base_path: &Path) -> Vec<String> {
+    let Some(path) = git_excludes_file(base_path) else {
+        return Vec::new();
+    };
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(?e, ?path, "core.excludesFile unreadable; not applied");
+            Vec::new()
+        }
+    }
+}
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) fn non_git_repo_overrides(base_path: &Path) -> Option<ignore::overrides::Override> {
