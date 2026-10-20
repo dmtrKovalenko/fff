@@ -2,7 +2,7 @@ name: Build & Publish
 
 on:
   push:
-    branches: [main, fix/npm-pulish]
+    branches: [main]
     tags:
       - "v*"
   pull_request:
@@ -17,8 +17,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Per-sha group on main: a shared group drops queued runs, leaving commits with no release to download.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
@@ -695,6 +696,11 @@ jobs:
       - name: Move rolling nightly tag to current commit
         if: steps.version.outputs.is_release != 'true'
         run: |
+          # Runs on main can finish out of order; only the current tip moves the tag.
+          if [ "$(git ls-remote origin refs/heads/main | cut -f1)" != "${{ github.sha }}" ]; then
+            echo "Not the tip of main, leaving the nightly tag alone"
+            exit 0
+          fi
           git tag -f nightly "${{ github.sha }}"
           git push -f origin refs/tags/nightly
 
@@ -813,7 +819,7 @@ jobs:
     name: Publish npm packages
     needs: [build-c]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/npm-pulish' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' ||startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       id-token: write
