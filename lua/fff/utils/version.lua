@@ -131,10 +131,7 @@ function M.resolve(repo_root)
   local branch = git(repo_root, 'symbolic-ref', '--short', 'HEAD')
 
   local prerelease_label, npm_tag
-  if not branch then
-    prerelease_label = 'nightly'
-    npm_tag = 'nightly'
-  elseif branch == 'main' or branch == 'fix/download-version' then
+  if not branch or branch == 'main' then
     prerelease_label = 'nightly'
     npm_tag = 'nightly'
   else
