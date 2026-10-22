@@ -60,6 +60,8 @@ const HOME_SCAN_POLL_MS = 1_000;
 const HOME_SCAN_DISABLE_HINT =
   'You can prevent home dir indexing with --fff-enable-home-scan=false, FFF_ENABLE_HOME_SCAN=0, or "enableHomeDirScanning": false in pi-fff.json. ' +
   'To keep indexing but silence this warning use --fff-warn-home-scan=false, FFF_WARN_HOME_SCAN=0, or "warnOnHomeDirScan": false in pi-fff.json.';
+const SCAN_OPT_OUT_DISABLE_HINT =
+  'To keep the opt-out but silence this notice use --fff-warn-scan-opt-out=false, FFF_WARN_SCAN_OPT_OUT=0, or "warnOnScanOptOut": false in pi-fff.json.';
 
 interface ToolNames {
   grep: string;
@@ -374,6 +376,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   let enableFsRootScanning = false;
   let enableHomeDirScanning = true;
   let warnOnHomeDirScan = true;
+  let warnOnScanOptOut = true;
   let followSymlinks = true;
 
   function setMode(mode: FffMode): void {
@@ -421,6 +424,13 @@ export default function fffExtension(pi: ExtensionAPI) {
       "fff-warn-home-scan",
       "FFF_WARN_HOME_SCAN",
       config.warnOnHomeDirScan,
+      true,
+      parseBoolean,
+    );
+    warnOnScanOptOut = getConfigValue(
+      "fff-warn-scan-opt-out",
+      "FFF_WARN_SCAN_OPT_OUT",
+      config.warnOnScanOptOut,
       true,
       parseBoolean,
     );
@@ -490,9 +500,9 @@ export default function fffExtension(pi: ExtensionAPI) {
   // so the opt-out reads as "search off" instead of an init failure (issue #857).
   function scanOptOutReason(cwd: string): string | null {
     if (!enableHomeDirScanning && isHomeDir(cwd))
-      return `(fff): cwd is $HOME and "enableHomeDirScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableHomeDirScanning": true / --fff-enable-home-scan=true to index $HOME.`;
+      return `(fff): cwd is $HOME and "enableHomeDirScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableHomeDirScanning": true / --fff-enable-home-scan=true to index $HOME. ${SCAN_OPT_OUT_DISABLE_HINT}`;
     if (!enableFsRootScanning && isFsRoot(cwd))
-      return `(fff): cwd is the filesystem root and "enableFsRootScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableFsRootScanning": true / --fff-enable-root-scan=true to index it.`;
+      return `(fff): cwd is the filesystem root and "enableFsRootScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableFsRootScanning": true / --fff-enable-root-scan=true to index it. ${SCAN_OPT_OUT_DISABLE_HINT}`;
     return null;
   }
 
@@ -781,6 +791,12 @@ export default function fffExtension(pi: ExtensionAPI) {
     type: "boolean",
   });
 
+  pi.registerFlag("fff-warn-scan-opt-out", {
+    description:
+      "Warn when a session starts in an opted-out root such as $HOME with home scanning off (default true; silence with --fff-warn-scan-opt-out=false or FFF_WARN_SCAN_OPT_OUT=0)",
+    type: "boolean",
+  });
+
   function reportInitFailure(ctx: ExtensionContext, error: unknown): void {
     ctx.ui.notify(
       `FFF init failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -837,7 +853,7 @@ export default function fffExtension(pi: ExtensionAPI) {
       // instead of letting the native refusal surface as an error (issue #857).
       const optOut = scanOptOutReason(activeCwd);
       if (optOut) {
-        ctx.ui.notify(optOut, "warning");
+        if (warnOnScanOptOut) ctx.ui.notify(optOut, "warning");
         return;
       }
 

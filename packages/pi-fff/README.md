@@ -155,6 +155,7 @@ For persistent global configuration, create `pi-fff.json` in pi's agent director
   "enableFsRootScanning": false,
   "enableHomeDirScanning": true,
   "warnOnHomeDirScan": true,
+  "warnOnScanOptOut": true,
   "followSymlinks": true
 }
 ```
@@ -170,9 +171,10 @@ All fields are optional:
 | `enableFsRootScanning` | boolean | `false` |
 | `enableHomeDirScanning` | boolean | `true` |
 | `warnOnHomeDirScan` | boolean | `true` |
+| `warnOnScanOptOut` | boolean | `true` |
 | `followSymlinks` | boolean | `true` |
 
-Starting a session in a directory the config opts out of indexing (`$HOME` with `enableHomeDirScanning: false`, `/` with `enableFsRootScanning: false`) disables FFF workspace search for that session: the extension reports it once as a warning and keeps the `ffgrep`/`fffind` names even in `override` mode, so pi's built-in `grep`/`find` stay reachable.
+Starting a session in a directory the config opts out of indexing (`$HOME` with `enableHomeDirScanning: false`, `/` with `enableFsRootScanning: false`) disables FFF workspace search for that session: the extension reports it once as a warning and keeps the `ffgrep`/`fffind` names even in `override` mode, so pi's built-in `grep`/`find` stay reachable. The opt-out is a deliberate configuration choice, so the notice can be silenced without re-enabling indexing with `--fff-warn-scan-opt-out=false`, `FFF_WARN_SCAN_OPT_OUT=0`, or `"warnOnScanOptOut": false`.
 
 CLI flags take precedence over environment variables, which take precedence over this file. A missing file is ignored. Malformed JSON, unknown fields, and invalid values stop the extension from loading and report the file path and error. `/fff-mode` changes the current session; it does not edit this file.
 
@@ -186,6 +188,7 @@ The file is global only. Project-level config cannot safely control tool names b
 - `--fff-enable-root-scan` — allow indexing when launched from `/` (also: `FFF_ENABLE_ROOT_SCAN=1` env). FFF refuses to init at the filesystem root by default.
 - `--fff-enable-home-scan` — index the home directory when launched from `$HOME` (also: `FFF_ENABLE_HOME_SCAN` env). Enabled by default. Disable with `--fff-enable-home-scan=false` or `FFF_ENABLE_HOME_SCAN=0` if your `$HOME` contains huge trees (toolchains, kernel sources, build outputs) that make the background index run for a long time. When launched from `$HOME` with this enabled, pi shows a warning that the whole home tree is being indexed.
 - `--fff-warn-home-scan` — show the warning notification when `$HOME` is indexed (also: `FFF_WARN_HOME_SCAN` env). Enabled by default. Disable with `--fff-warn-home-scan=false`, `FFF_WARN_HOME_SCAN=0`, or `"warnOnHomeDirScan": false` in `pi-fff.json`. Indexing and the footer status are unaffected.
+- `--fff-warn-scan-opt-out` — show the notice when a session starts in a root the config opts out of indexing, e.g. `$HOME` with `"enableHomeDirScanning": false` (also: `FFF_WARN_SCAN_OPT_OUT` env). Enabled by default. Disable with `--fff-warn-scan-opt-out=false`, `FFF_WARN_SCAN_OPT_OUT=0`, or `"warnOnScanOptOut": false` in `pi-fff.json`. The opt-out itself is unaffected: workspace search stays disabled for that session.
 - `--fff-follow-symlinks` — index through directory symlinks (also: `FFF_FOLLOW_SYMLINKS` env, or `"followSymlinks"` in `pi-fff.json`). Enabled by default: trees that reach their real files through links — a git worktree whose `docs/` links back to the main checkout, or a stowed dotfiles layout — would otherwise be missing from `@`-mentions and from find/grep with no visible sign. Disable with `--fff-follow-symlinks=false` or `FFF_FOLLOW_SYMLINKS=0` to keep the walk inside the real tree, which is worth doing when a linked target pulls in a large tree outside the workspace. Symlink cycles are detected and broken by the walker.
 
 ## Data

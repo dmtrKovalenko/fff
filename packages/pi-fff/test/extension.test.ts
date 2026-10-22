@@ -249,6 +249,7 @@ const CONFIG_ENV_KEYS = [
   "FFF_ENABLE_ROOT_SCAN",
   "FFF_ENABLE_HOME_SCAN",
   "FFF_WARN_HOME_SCAN",
+  "FFF_WARN_SCAN_OPT_OUT",
   "FFF_FOLLOW_SYMLINKS",
 ] as const;
 
@@ -702,6 +703,41 @@ describe("pi-fff $HOME scan warning", () => {
     const [message, level] = setup.ctx.ui.notify.mock.calls[0];
     expect(level).toBe("warning");
     expect(message).toContain("enableFsRootScanning");
+    await shutdown(setup);
+  });
+
+  // The opt-out is a deliberate configuration choice (#857), so the notice must
+  // be silenceable instead of repeating on every session start.
+  test("includes the silence hint in the opt-out notice", async () => {
+    process.env.FFF_ENABLE_HOME_SCAN = "0";
+    const setup = await start(undefined, os.homedir());
+
+    const [message] = setup.ctx.ui.notify.mock.calls[0];
+    expect(message).toContain("warnOnScanOptOut");
+    await shutdown(setup);
+  });
+
+  test("stays silent when the scan opt-out warning is disabled", async () => {
+    process.env.FFF_ENABLE_HOME_SCAN = "0";
+    process.env.FFF_WARN_SCAN_OPT_OUT = "0";
+    const setup = await start("override", os.homedir());
+
+    expect(createCalls).toHaveLength(0);
+    expect(setup.ctx.ui.notify).not.toHaveBeenCalled();
+    expect(setup.ctx.ui.setStatus).not.toHaveBeenCalled();
+
+    // Opting out of the notice must not re-enable indexing.
+    const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
+    expect(toolNames).toEqual(["ffgrep", "fffind"]);
+    await shutdown(setup);
+  });
+
+  test("stays silent when warnOnScanOptOut is false in pi-fff.json", async () => {
+    writeConfig({ enableHomeDirScanning: false, warnOnScanOptOut: false });
+    const setup = await start("override", os.homedir());
+
+    expect(createCalls).toHaveLength(0);
+    expect(setup.ctx.ui.notify).not.toHaveBeenCalled();
     await shutdown(setup);
   });
 

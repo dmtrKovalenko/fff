@@ -15,6 +15,7 @@ export interface FffConfig {
   enableFsRootScanning?: boolean;
   enableHomeDirScanning?: boolean;
   warnOnHomeDirScan?: boolean;
+  warnOnScanOptOut?: boolean;
   followSymlinks?: boolean;
 }
 
@@ -26,8 +27,9 @@ const CONFIG_KEYS = new Set<keyof FffConfig>([
   "enableFsRootScanning",
   "enableHomeDirScanning",
   "warnOnHomeDirScan",
+  "warnOnScanOptOut",
   "followSymlinks",
-]);
+]);;
 
 export function loadConfig(agentDir = piDataDir()): FffConfig {
   const configPath = join(agentDir, CONFIG_FILE_NAME);
@@ -69,6 +71,7 @@ export function loadConfig(agentDir = piDataDir()): FffConfig {
   validateBoolean(configPath, parsed, "enableFsRootScanning");
   validateBoolean(configPath, parsed, "enableHomeDirScanning");
   validateBoolean(configPath, parsed, "warnOnHomeDirScan");
+  validateBoolean(configPath, parsed, "warnOnScanOptOut");
   validateBoolean(configPath, parsed, "followSymlinks");
 
   return parsed as FffConfig;
@@ -104,6 +107,7 @@ function validateBoolean(
     | "enableFsRootScanning"
     | "enableHomeDirScanning"
     | "warnOnHomeDirScan"
+    | "warnOnScanOptOut"
     | "followSymlinks",
 ): void {
   const value = config[key];
