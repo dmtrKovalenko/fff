@@ -166,7 +166,7 @@ function M.create_ui()
     list_separator.init(S.ns_id)
   end
 
-  local computed_layout = layout.compute(config, conf.preview_enabled(config))
+  local computed_layout = layout.compute(config, P.is_preview_enabled())
   local win_configs = computed_layout.win_configs
   local debug_enabled_in_preview = computed_layout.debug_enabled
 
@@ -386,6 +386,8 @@ function M.setup_keymaps()
   set_keymap({ 'i', 'n' }, keymaps.preview_scroll_up, P.scroll_preview_up, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.preview_scroll_down, P.scroll_preview_down, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.toggle_debug, P.toggle_debug, input_opts)
+  set_keymap({ 'i', 'n' }, keymaps.toggle_preview, P.toggle_preview, input_opts)
+  set_keymap({ 'i', 'n' }, keymaps.toggle_maximize, P.toggle_maximize, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.toggle_select, P.toggle_select, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.send_to_quickfix, P.send_to_quickfix, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.cycle_grep_modes, P.cycle_grep_modes, input_opts)
@@ -430,6 +432,8 @@ function M.setup_keymaps()
   set_keymap('n', keymaps.preview_scroll_up, P.scroll_preview_up, list_opts)
   set_keymap('n', keymaps.preview_scroll_down, P.scroll_preview_down, list_opts)
   set_keymap('n', keymaps.toggle_debug, P.toggle_debug, list_opts)
+  set_keymap('n', keymaps.toggle_preview, P.toggle_preview, list_opts)
+  set_keymap('n', keymaps.toggle_maximize, P.toggle_maximize, list_opts)
   set_keymap('n', keymaps.toggle_select, P.toggle_select, list_opts)
   set_keymap('n', keymaps.send_to_quickfix, P.send_to_quickfix, list_opts)
 
@@ -460,6 +464,8 @@ function M.setup_keymaps()
     set_keymap('n', keymaps.select_vsplit, function() P.select('vsplit') end, preview_opts)
     set_keymap('n', keymaps.select_tab, function() P.select('tab') end, preview_opts)
     set_keymap('n', keymaps.toggle_debug, P.toggle_debug, preview_opts)
+    set_keymap('n', keymaps.toggle_preview, P.toggle_preview, preview_opts)
+    set_keymap('n', keymaps.toggle_maximize, P.toggle_maximize, preview_opts)
     set_keymap('n', keymaps.toggle_select, P.toggle_select, preview_opts)
     set_keymap('n', keymaps.send_to_quickfix, P.send_to_quickfix, preview_opts)
   end

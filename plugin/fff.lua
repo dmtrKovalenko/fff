@@ -61,6 +61,14 @@ vim.api.nvim_create_user_command('FFFRefreshGit', function() require('fff').refr
   desc = 'Manually refresh git status for all files',
 })
 
+vim.api.nvim_create_user_command('FFFTogglePreview', function() require('fff').toggle_preview() end, {
+  desc = 'Toggle the FFF preview panel',
+})
+
+vim.api.nvim_create_user_command('FFFToggleMaximize', function() require('fff').toggle_maximize() end, {
+  desc = 'Toggle FFF maximize layout',
+})
+
 vim.api.nvim_create_user_command('FFFClearCache', function(opts) require('fff').clear_cache(opts.args) end, {
   nargs = '?',
   complete = function() return { 'all', 'frecency', 'files' } end,

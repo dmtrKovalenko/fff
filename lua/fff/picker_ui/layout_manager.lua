@@ -1,6 +1,5 @@
 local M = {}
 
-local conf = require('fff.conf')
 local layout = require('fff.layout')
 local list_separator = require('fff.list_separator')
 local scrollbar = require('fff.scrollbar')
@@ -25,7 +24,13 @@ function M.relayout()
   local config = S.config
   if not config then return end
 
-  local computed_layout = layout.compute(config, conf.preview_enabled(config))
+  if S.maximized then
+    config = vim.deepcopy(config)
+    config.layout.width = 1.0
+    config.layout.height = 1.0
+  end
+
+  local computed_layout = layout.compute(config, P.is_preview_enabled())
   local win_configs = computed_layout.win_configs
   S.layout = computed_layout.layout
   S.preview_visible = computed_layout.preview_visible
@@ -118,6 +123,8 @@ function M.close()
   S.file_info_buf = nil
   S.preview_buf = nil
   S.preview_visible = false
+  S.preview_enabled = nil
+  S.maximized = false
   S.items = {}
   S.filtered_items = {}
   S.line_to_item = {}

@@ -37,6 +37,8 @@ local M = {}
 --- @field preview_scroll_up string
 --- @field preview_scroll_down string
 --- @field toggle_debug string
+--- @field toggle_preview string
+--- @field toggle_maximize string
 --- @field cycle_grep_modes string
 --- @field insert_newline_escape string
 --- @field cycle_previous_query string
@@ -329,6 +331,8 @@ local function init()
       preview_scroll_up = '<C-u>',
       preview_scroll_down = '<C-d>',
       toggle_debug = '<F2>',
+      toggle_preview = '<A-p>',
+      toggle_maximize = '<A-m>',
       -- Cycle between configured grep modes.
       cycle_grep_modes = '<S-Tab>',
       -- grep mode only: insert a literal `\n` to search across lines
