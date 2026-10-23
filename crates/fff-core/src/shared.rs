@@ -421,7 +421,7 @@ impl SharedFilePicker {
         });
 
         let git_status = repo.as_ref().and_then(|repo| {
-            GitStatusCache::read_status(repo, &mut crate::git::default_status_options())
+            GitStatusCache::read_full_status(repo)
                 .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
                 .ok()
         });

@@ -201,16 +201,25 @@ impl FileSync {
 
     #[inline]
     fn find_file_index(&self, path: &Path, base_path: &Path) -> Option<usize> {
+        self.find_file_index_with(path, base_path, |dir| self.find_base_dir_index(dir))
+    }
+
+    fn find_file_index_with(
+        &self,
+        path: &Path,
+        base_path: &Path,
+        find_dir: impl FnOnce(&str) -> Option<usize>,
+    ) -> Option<usize> {
         // Strip base_path prefix to get the relative path. On Windows this
         // can fail for 8.3 short names or a different casing; fall back to
         // canonicalize-then-strip so watcher events still land on the right
         // `FileItem`.
-        let rel_path_owned: String = match path.strip_prefix(base_path) {
-            Ok(r) => r.to_string_lossy().into_owned(),
+        let rel_path = match path.strip_prefix(base_path) {
+            Ok(r) => r.to_string_lossy(),
             Err(_) => {
                 #[cfg(windows)]
                 {
-                    canonical_relative_path(path, base_path)?
+                    std::borrow::Cow::Owned(canonical_relative_path(path, base_path)?)
                 }
                 #[cfg(not(windows))]
                 {
@@ -220,14 +229,30 @@ impl FileSync {
         };
         // The dir table and stored file paths are '/'-canonical; fold the
         // native relative path so the byte-wise comparisons below match.
-        self.find_by_relative_path(&crate::path_utils::to_canonical_slashes(&rel_path_owned))
+        self.find_by_relative_path_with(
+            &crate::path_utils::to_canonical_slashes(&rel_path),
+            find_dir,
+        )
     }
 
-    // Lookup for a base-relative, '/'-canonical path — the form paths are
-    // stored in, so no normalization is needed.
-    fn find_by_relative_path(&self, rel_path: &str) -> Option<usize> {
+    fn find_base_dir_index(&self, dir: &str) -> Option<usize> {
         let arena = self.arena_base_ptr();
+        let mut buf = [0; PATH_BUF_SIZE];
+        self.dirs[..self.base_dirs_count]
+            .binary_search_by(|d| d.read_relative_path(arena, &mut buf).cmp(dir))
+            .ok()
+    }
 
+    fn find_by_relative_path(&self, rel_path: &str) -> Option<usize> {
+        self.find_by_relative_path_with(rel_path, |dir| self.find_base_dir_index(dir))
+    }
+
+    fn find_by_relative_path_with(
+        &self,
+        rel_path: &str,
+        find_dir: impl FnOnce(&str) -> Option<usize>,
+    ) -> Option<usize> {
+        let arena = self.arena_base_ptr();
         // Split into directory (with trailing '/') and filename.
         let parent_end = rel_path
             .rfind(std::path::is_separator)
@@ -236,15 +261,7 @@ impl FileSync {
         let dir_rel = &rel_path[..parent_end];
         let filename = &rel_path[parent_end..];
 
-        // Binary search dirs to find the parent directory index.
-        // Dir items store the relative path including trailing '/' (e.g. "src/components/").
-        // Only the scan-built region is sorted; watcher-appended dirs are not.
-        let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        let dir_idx = self.dirs[..self.base_dirs_count]
-            .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
-            .ok();
-
-        if let Some(dir_idx) = dir_idx {
+        if let Some(dir_idx) = find_dir(dir_rel) {
             let dir_idx = dir_idx as u32;
             let cmp_key = |f: &FileItem| {
                 f.parent_dir_index.cmp(&dir_idx).then_with(|| {
@@ -1584,10 +1601,24 @@ impl FilePicker {
         let frecency = shared_frecency.read()?;
         let reader = frecency.as_ref().map(FrecencyTracker::reader);
 
+        let mut directories =
+            (status_cache.statuses_len() >= 8192).then(AHashMap::<String, Option<usize>>::new);
         status_cache
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
-                if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
+                let index = if let Some(cache) = directories.as_mut() {
+                    self.sync_data.find_file_index_with(&path, &bp, |dir| {
+                        if let Some(&index) = cache.get(dir) {
+                            return index;
+                        }
+                        let index = self.sync_data.find_base_dir_index(dir);
+                        cache.insert(dir.to_owned(), index);
+                        index
+                    })
+                } else {
+                    self.sync_data.find_file_index(&path, &bp)
+                };
+                if let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) {
                     file.git_status = Some(status);
                     if let Some(reader) = reader.as_ref() {
                         file.update_frecency_scores(
