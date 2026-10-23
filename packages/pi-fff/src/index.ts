@@ -1259,7 +1259,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   const findSchema = Type.Object({
     pattern: Type.String({
       description:
-        "Fuzzy filename search and glob search. Frecency-ranked, git-aware. Multi-word = narrower (AND) not bound to order, use for multi word related concept search. Prefer this over ls/find/bash as the first exploration step whenever the user names a concept, feature, or symbol — it surfaces the relevant files in one call. Only use ls/read on a directory when you specifically need the alphabetical layout of an unknown repo, or when a concept search returned nothing.",
+        "Fuzzy multi-word path query or glob, matched against the whole repo-relative path, not just the filename. Example: 'auth handler' or '*.ts'.",
     }),
     path: Type.Optional(
       Type.String({
@@ -1288,8 +1288,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptSnippet: "Find files by path or glob",
     promptGuidelines: (names) => [
       `${names.find}: matches the WHOLE path, not just the filename — \`profile\` hits \`chrome/browser/profiles/x.cc\` too.`,
-      `${names.find}: keep queries to 1-2 terms; extra words narrow.`,
+      `${names.find}: keep queries to 1-2 terms.`,
       `${names.find}: use for paths, not content. Use ${names.grep} for content.`,
+      `${names.find}: prefer it over ls/find/bash when locating files by concept, feature, or file name; use ls/read on a directory only when you need its alphabetical layout, or when a concept search returned nothing.`,
       `${names.find}: for exact path matches use a glob in \`path\` — e.g. path: '**/profile.h' for exact filename, or path: 'src/**/profile.h' scoped to a subtree. Bare patterns are fuzzy.`,
       `${names.find}: to list everything inside a directory, pass path: 'dir/**' with an empty or wildcard pattern instead of using pattern alone.`,
       `${names.find}: use exclude: 'test/,*.min.js' to cut noise in large repos.`,
