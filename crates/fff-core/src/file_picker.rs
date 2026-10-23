@@ -2357,7 +2357,7 @@ fn populates_dirs_files_chunked_storage<'a>(
             prev_dir = dir_part;
         }
 
-        file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.path = chunk_storage.add_file_with_parent(rel, &dirs[current_dir_idx as usize].path);
         file.parent_dir_index = current_dir_idx;
     }
 
