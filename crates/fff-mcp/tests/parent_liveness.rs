@@ -18,7 +18,11 @@ fn stays_alive_while_parent_alive_despite_idle_timeout() {
             "--no-watch",
             "--idle-timeout-secs",
             "1",
+            "--indexing",
+            "eager",
         ])
+        .arg("--frecency-db")
+        .arg(dir.path().join("frecency"))
         .arg("--log-file")
         .arg(dir.path().join("test.log"))
         .env("FFF_MCP_TEST_WATCHDOG_INTERVAL_MS", "100")
@@ -31,6 +35,7 @@ fn stays_alive_while_parent_alive_despite_idle_timeout() {
     let mut stdin = child.stdin.take().unwrap();
     let stdout_lines = spawn_line_reader(child.stdout.take().unwrap());
     do_handshake(&mut stdin, &stdout_lines);
+    assert!(dir.path().join("frecency").exists());
 
     // Wait past the idle timeout and several watchdog ticks.
     std::thread::sleep(Duration::from_secs(2));
@@ -50,7 +55,15 @@ fn serves_stateless_requests_from_multiple_callers_and_exits_on_eof() {
     std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
     let mut child = Command::new(BIN)
         .arg(dir.path())
-        .args(["--no-update-check", "--no-warmup", "--no-watch"])
+        .args([
+            "--no-update-check",
+            "--no-warmup",
+            "--no-watch",
+            "--indexing",
+            "lazy",
+        ])
+        .arg("--frecency-db")
+        .arg(dir.path().join("frecency"))
         .arg("--log-file")
         .arg(dir.path().join("test.log"))
         .stdin(Stdio::piped())
@@ -87,18 +100,24 @@ fn serves_stateless_requests_from_multiple_callers_and_exits_on_eof() {
         discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "fff"
     );
+    assert!(!dir.path().join("frecency").exists());
 
     // Pipeline real searches from distinct callers over one stateless connection.
     for id in 1..=32 {
         let mut caller = meta.clone();
         caller["threadId"] = serde_json::json!(format!("child-{id}"));
         caller["x-codex-turn-metadata"] = serde_json::json!({"parent_thread_id": "root"});
+        let (name, arguments) = match id % 3 {
+            0 => ("find_files", serde_json::json!({"query": "a.txt"})),
+            1 => ("grep", serde_json::json!({"query": "hello"})),
+            _ => ("multi_grep", serde_json::json!({"patterns": ["hello"]})),
+        };
         writeln!(
             stdin,
             "{}",
             serde_json::json!({
                 "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": {"name": "find_files", "arguments": {"query": "a.txt"}, "_meta": caller}
+                "params": {"name": name, "arguments": arguments, "_meta": caller}
             })
         )
         .unwrap();
@@ -118,6 +137,24 @@ fn serves_stateless_requests_from_multiple_callers_and_exits_on_eof() {
         assert!(received.insert(response["id"].as_u64().unwrap()));
     }
     assert_eq!(received, (1..=32).collect());
+    assert!(dir.path().join("frecency").exists());
+
+    // Later calls reuse the initial scan, including when watching is disabled.
+    std::fs::write(dir.path().join("late-added.txt"), "late").unwrap();
+    writeln!(stdin, "{}", serde_json::json!({
+        "jsonrpc": "2.0", "id": 34, "method": "tools/call",
+        "params": {"name": "find_files", "arguments": {"query": "late-added.txt", "mode": "glob"}, "_meta": meta}
+    })).unwrap();
+    stdin.flush().unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("0 matching paths"),
+        "{response}"
+    );
 
     let mut unsupported = meta;
     unsupported["io.modelcontextprotocol/protocolVersion"] = serde_json::json!("2099-01-01");
@@ -144,7 +181,15 @@ fn discovery_does_not_prevent_a_legacy_handshake() {
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(BIN)
         .arg(dir.path())
-        .args(["--no-update-check", "--no-warmup", "--no-watch"])
+        .args([
+            "--no-update-check",
+            "--no-warmup",
+            "--no-watch",
+            "--indexing",
+            "lazy",
+        ])
+        .arg("--frecency-db")
+        .arg(dir.path().join("frecency"))
         .arg("--log-file")
         .arg(dir.path().join("test.log"))
         .stdin(Stdio::piped())
@@ -189,6 +234,54 @@ fn discovery_does_not_prevent_a_legacy_handshake() {
             .iter()
             .any(|tool| tool["name"] == "find_files")
     );
+    assert!(!dir.path().join("frecency").exists());
+    drop(stdin);
+    wait_for_exit(&mut child, Duration::from_secs(15));
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn lazy_index_failure_is_reported_without_hanging_or_retrying_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let mut child = Command::new(BIN)
+        .arg(&missing)
+        .args([
+            "--no-update-check",
+            "--no-warmup",
+            "--no-watch",
+            "--indexing",
+            "lazy",
+        ])
+        .arg("--log-file")
+        .arg(dir.path().join("test.log"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let lines = spawn_line_reader(child.stdout.take().unwrap());
+    do_handshake(&mut stdin, &lines);
+    for id in 2..=3 {
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "find_files", "arguments": {"query": "a.txt"}}
+            })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&lines.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], -32603, "{response}");
+        if id == 2 {
+            std::fs::create_dir(&missing).unwrap();
+            std::fs::write(missing.join("a.txt"), "hello").unwrap();
+        }
+    }
     drop(stdin);
     wait_for_exit(&mut child, Duration::from_secs(15));
     assert!(child.wait().unwrap().success());
@@ -210,7 +303,7 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
             // Preserve stdin before POSIX shells assign /dev/null to background jobs.
             r#"exec 3<&0
                 "$1" "$2" --no-update-check --no-warmup --no-watch \
-                --idle-timeout-secs 0 --log-file "$3" <&3 &
+                --idle-timeout-secs 0 --log-file "$3" --frecency-db "$2/frecency" <&3 &
                 while [ ! -e "$4" ]; do sleep 0.1; done"#,
         )
         .arg("sh")
@@ -228,6 +321,8 @@ fn exits_when_parent_dies_even_without_idle_timeout() {
     let mut stdin = sh.stdin.take().unwrap();
     let stdout_lines = spawn_line_reader(sh.stdout.take().unwrap());
     do_handshake(&mut stdin, &stdout_lines);
+    // A freshly spawned parent selects eager indexing in auto mode.
+    assert!(dir.path().join("frecency").exists());
 
     std::fs::write(exit_signal, "").unwrap();
     sh.wait().unwrap();
@@ -264,7 +359,7 @@ fn exits_when_parent_dies_after_discovery_without_initializing() {
         .arg(
             r#"exec 3<&0
             "$1" "$2" --no-update-check --no-warmup --no-watch \
-            --idle-timeout-secs 0 --log-file "$3" <&3 &
+            --idle-timeout-secs 0 --log-file "$3" --indexing lazy <&3 &
             while [ ! -e "$4" ]; do sleep 0.1; done"#,
         )
         .arg("sh")

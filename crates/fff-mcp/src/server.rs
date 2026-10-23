@@ -1,5 +1,6 @@
 use crate::cursor::{CursorStore, GrepCursor, GrepStage};
 use crate::file_search::FilePatternMode;
+use crate::indexing::IndexStartup;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use crate::scope::SearchScope;
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
@@ -239,6 +240,7 @@ pub struct MultiGrepParams {
 #[derive(Clone)]
 pub struct FffServer {
     picker: SharedFilePicker,
+    index_startup: Option<Arc<IndexStartup>>,
     cursor_store: Arc<Mutex<CursorStore>>,
     update_notice_sent: Arc<AtomicBool>,
     last_activity: Arc<AtomicU64>,
@@ -253,9 +255,10 @@ fn now_secs() -> u64 {
 }
 
 impl FffServer {
-    pub fn new(picker: SharedFilePicker) -> Self {
+    pub(crate) fn new(picker: SharedFilePicker, index_startup: Option<IndexStartup>) -> Self {
         Self {
             picker,
+            index_startup: index_startup.map(Arc::new),
             cursor_store: Arc::new(Mutex::new(CursorStore::new())),
             update_notice_sent: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
@@ -272,6 +275,11 @@ impl FffServer {
     }
 
     fn wait_for_scan(&self, timeout: std::time::Duration) -> Result<(), ErrorData> {
+        if let Some(startup) = &self.index_startup {
+            startup
+                .start()
+                .map_err(|e| ErrorData::internal_error(e, None))?;
+        }
         if self.scan_ready.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -3587,7 +3595,7 @@ mod tests {
             shared.wait_for_indexing_complete(std::time::Duration::from_secs(10)),
             "content indexing did not finish"
         );
-        (dir, FffServer::new(shared))
+        (dir, FffServer::new(shared, None))
     }
 
     fn definition_server(files: &[(String, &str)]) -> (tempfile::TempDir, FffServer) {
@@ -3615,7 +3623,7 @@ mod tests {
         picker.collect_files().unwrap();
         let shared = SharedFilePicker::default();
         *shared.write().unwrap() = Some(picker);
-        (dir, FffServer::new(shared))
+        (dir, FffServer::new(shared, None))
     }
 
     fn response_text(result: CallToolResult) -> String {

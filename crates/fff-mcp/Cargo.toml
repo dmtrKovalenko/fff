@@ -34,6 +34,9 @@ rayon = { workspace = true }
 globset = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",

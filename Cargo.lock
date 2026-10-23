@@ -647,6 +647,7 @@ dependencies = [
  "fff-search",
  "git2",
  "globset",
+ "libc",
  "mimalloc",
  "rayon",
  "regex",
