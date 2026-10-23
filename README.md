@@ -170,6 +170,10 @@ MCP's broader suggestions can include up to eight matching source lines. MCP tri
 
 Source: [`crates/fff-mcp/`](./crates/fff-mcp/).
 
+The MCP server defaults to `--indexing auto`: it starts indexing immediately when its parent process is less than 60 seconds old. With an older parent, or when the parent's age is unavailable, indexing starts on the first search. Discovery and tool listing do not start a lazy index. The first search waits for the scan using the existing 30-second timeout.
+
+Use `--indexing eager` to always index at startup, or `--indexing lazy` to always wait for a search. Parent age is a startup heuristic, not an agent-role signal: a new main conversation in a long-running host can be lazy, and a child launched soon after the host starts can be eager. Used instances still retain their indexes and watchers until shutdown.
+
 </details>
 
 The MCP server keeps the file and content indexes available across agent tool calls.

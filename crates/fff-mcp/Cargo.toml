@@ -22,7 +22,7 @@ zlob = ["fff/zlob", "fff-query-parser/zlob"]
 fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.11.0", features = ["definitions", "mimalloc-collect"] }
 fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.11.0" }
 mimalloc = { workspace = true }
-rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+rmcp = { version = "3.7.0", features = ["server", "transport-io"] }
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -33,6 +33,9 @@ regex = { workspace = true }
 rayon = { workspace = true }
 globset = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
