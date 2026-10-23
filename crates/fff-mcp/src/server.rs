@@ -318,7 +318,7 @@ impl FffServer {
             self.update_notice_sent.store(false, Ordering::Relaxed);
             return;
         }
-        result.content.push(Content::text(notice));
+        result.content.push(ContentBlock::text(notice));
     }
 
     fn perform_grep(
@@ -853,7 +853,7 @@ impl FffServer {
                     let id = self.lock_cursors()?.store(page_offset + items.len());
                     lines.push(format!("cursor: {id}"));
                 }
-                let result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
+                let result = CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))]);
                 return Ok(with_notice(result, notice));
             }
         }
@@ -885,7 +885,7 @@ impl FffServer {
         if items.is_empty() {
             let text = format!("0 results ({} indexed)", total_files);
             return Ok(with_notice(
-                CallToolResult::success(vec![Content::text(text)]),
+                CallToolResult::success(vec![ContentBlock::text(text)]),
                 notice,
             ));
         }
@@ -916,7 +916,7 @@ impl FffServer {
             lines.push(format!("cursor: {}", cursor_id));
         }
 
-        let mut result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
+        let mut result = CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))]);
         self.maybe_append_update_notice(&mut result);
         Ok(result)
     }
@@ -1081,7 +1081,7 @@ impl FffServer {
 
 #[tool_handler]
 impl ServerHandler for FffServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let notice = crate::update_check::get_update_notice();
         let instructions = if notice.is_empty() {
             crate::MCP_INSTRUCTIONS.to_string()
@@ -1089,7 +1089,7 @@ impl ServerHandler for FffServer {
             format!("{}{}", crate::MCP_INSTRUCTIONS, notice)
         };
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fff", env!("CARGO_PKG_VERSION")))
             .with_instructions(instructions)
     }
@@ -1103,7 +1103,7 @@ fn grep_response(text: String, definitions_fallback: bool) -> CallToolResult {
     } else {
         text
     };
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 fn literal_regex(text: &str) -> String {
@@ -1118,7 +1118,7 @@ fn literal_regex(text: &str) -> String {
 
 fn with_notice(mut response: CallToolResult, notice: Option<String>) -> CallToolResult {
     if let Some(notice) = notice
-        && let Some(RawContent::Text(text)) = response.content.first_mut().map(|c| &mut c.raw)
+        && let Some(ContentBlock::Text(text)) = response.content.first_mut()
     {
         text.text = format!("{notice}\n{}", text.text);
     }

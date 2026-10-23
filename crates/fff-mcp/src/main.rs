@@ -1,6 +1,6 @@
 mod cursor;
 mod file_search;
-mod handshake;
+mod harness;
 mod healthcheck;
 mod output;
 mod parent;
@@ -16,7 +16,7 @@ use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
 use fff::{FFFMode, SharedFilePicker, SharedFrecency};
 use git2::Repository;
-use handshake::ProbeTolerantTransport;
+use harness::HarnessTransport;
 use mimalloc::MiMalloc;
 use rmcp::ServiceExt;
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -326,16 +326,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
-    let transport = ProbeTolerantTransport::new(stdio);
-    let service = match tokio::time::timeout(STARTUP_TIMEOUT, server.serve(transport)).await {
-        Ok(res) => res.map_err(|e| format!("Failed to start MCP server: {}", e))?,
-        Err(_) => {
-            return Err("MCP initialize handshake did not complete within 60s".into());
-        }
-    };
-
     let parent_watcher = parent::ParentWatcher::new();
     match &parent_watcher {
         Some(watcher) => tracing::info!(
@@ -404,7 +394,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     });
 
-    service.waiting().await?;
+    // Discovery is optional and may precede the first tool request by any amount of time.
+    // Start lifecycle monitoring before the SDK waits for that request.
+    let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
+    match server.serve(HarnessTransport::new(stdio)).await {
+        Ok(service) => {
+            service.waiting().await?;
+        }
+        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => {}
+        Err(error) => return Err(format!("Failed to start MCP server: {error}").into()),
+    }
 
     if let Ok(mut guard) = shared_picker.write()
         && let Some(ref mut picker) = *guard
