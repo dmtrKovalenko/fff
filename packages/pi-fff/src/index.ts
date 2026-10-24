@@ -5,7 +5,6 @@
  * @-mention autocomplete suggestions to the interactive editor.
  */
 
-import nodePath from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -585,12 +584,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     const route = routePathConstraint(pathParam, activeCwd);
     if (!route) return null;
     if (!auxPool) throw new Error("FFF auxiliary finder pool is not initialized");
-    const aux = await auxPool.acquire(route.root);
-    // A broader covering picker may have been reused; rebase the suffix so the
-    // constraint stays relative to the picker's actual root.
-    const rebase = nodePath.relative(aux.root, route.root).replaceAll(nodePath.sep, "/");
-    const suffix = [rebase, route.suffix].filter(Boolean).join("/");
-    const query = buildQuery(suffix || undefined, pattern, exclude, aux.root);
+    // Exact root: a broader cached finder may have excluded the target subtree.
+    const aux = await auxPool.acquire(route.root, { exact: true });
+    const query = buildQuery(route.suffix || undefined, pattern, exclude, aux.root);
     return { finder: aux.finder, query, root: aux.root };
   }
 
