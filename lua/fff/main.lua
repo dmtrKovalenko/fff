@@ -145,6 +145,21 @@ function M.refresh_git_status()
   end
 end
 
+--- Toggle the preview panel on/off at runtime.
+--- When off, the list and prompt expand to fill the preview's space.
+function M.toggle_preview()
+  local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
+  if not picker_ok then return end
+  picker_ui.toggle_preview()
+end
+
+--- Toggle maximize mode. When maximized, the picker fills the entire editor.
+function M.toggle_maximize()
+  local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
+  if not picker_ok then return end
+  picker_ui.toggle_maximize()
+end
+
 --- Search files programmatically
 --- @param query string Search query
 --- @param max_results number Maximum number of results
