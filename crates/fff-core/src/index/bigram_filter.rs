@@ -3,11 +3,12 @@ use ahash::AHashMap;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSlice;
 use std::cell::UnsafeCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use crate::index::ColumnSlab;
 use crate::{FileItem, constants};
+use parking_lot::Mutex;
 
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
@@ -121,7 +122,7 @@ impl BigramIndexBuilder {
         if current != NO_COLUMN {
             return current;
         }
-        let mut next = self.next_column.lock().expect("bigram column lock");
+        let mut next = self.next_column.lock();
         let current = self.lookup[slot].load(Ordering::Relaxed);
         if current != NO_COLUMN {
             return current;
@@ -361,7 +362,7 @@ impl BigramIndexBuilder {
     }
 
     pub fn columns_used(&self) -> u16 {
-        *self.next_column.lock().expect("bigram column lock")
+        *self.next_column.lock()
     }
 
     /// Compress the dense builder into a compact `BigramFilter`.
