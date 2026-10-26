@@ -165,21 +165,20 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     // Process overflow files first: newly added files (created after the
     // initial scan) live in the overflow arena and are more likely to be
     // relevant to the current search. Exact ties are broken by index order.
-    let results = if files.len() > base_count {
-        let mut results = match_and_score_in_arena(&files[base_count..], context, overflow_arena);
+    let (results, total_matched) = if files.len() > base_count {
+        let (mut results, overflow_matched) =
+            match_and_score_in_arena(&files[base_count..], context, overflow_arena);
+        let (base_results, base_matched) =
+            match_and_score_in_arena(&files[..base_count], context, base_arena);
+        results.extend(base_results);
 
-        results.extend(match_and_score_in_arena(
-            &files[..base_count],
-            context,
-            base_arena,
-        ));
-
-        results
+        (results, overflow_matched + base_matched)
     } else {
         match_and_score_in_arena(files, context, base_arena)
     };
 
-    sort_and_paginate(results, context, |score| score.total)
+    let (items, scores, _) = sort_and_paginate(results, context, |score| score.total);
+    (items, scores, total_matched)
 }
 
 // Ranks on a 16-byte (file, total) pair and builds the full Score only for the page.
@@ -663,7 +662,7 @@ fn match_and_score_in_arena<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
-) -> Vec<(&'a FileItem, Score)> {
+) -> (Vec<(&'a FileItem, Score)>, usize) {
     if context.current_file.is_some() {
         match_and_score_in_arena_inner::<true>(files, context, arena)
     } else {
@@ -675,17 +674,19 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
-) -> Vec<(&'a FileItem, Score)> {
+) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.is_empty() {
-        return vec![];
+        return (vec![], 0);
     }
 
     let Some(working_files) = filter_by_constraints(files, context, arena) else {
-        return vec![];
+        return (vec![], 0);
     };
     let Some(fuzzy_parts) = fuzzy_parts(context.query) else {
         // Frecency-only queries are ranked by `rank_by_frecency` before reaching here.
-        return frecency_scores(&working_files, context, arena);
+        let results = frecency_scores(&working_files, context, arena);
+        let total_matched = results.len();
+        return (results, total_matched);
     };
     let has_uppercase = fuzzy_parts
         .iter()
@@ -947,9 +948,51 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             (file, score)
         };
 
-    // Scoring is a pure per-match function; only the scratch buffers are per-thread.
+    let total_matched = path_matches.len();
+    let items_needed = if context.pagination.limit == 0 {
+        usize::MAX
+    } else {
+        context
+            .pagination
+            .offset
+            .saturating_add(context.pagination.limit)
+    };
     let results: Vec<_> =
-        if path_matches.len() >= PARALLEL_SCORING_MIN_MATCHES && context.max_threads > 1 {
+        if total_matched >= PARALLEL_SCORING_MIN_MATCHES && items_needed < SCORING_CHUNK_SIZE / 2 {
+            // Every global top-k result must belong to its chunk's top-k.
+            let score_chunk =
+                |bufs: &mut ScoreBuffers, (chunk_idx, matches): (usize, &[neo_frizbee::Match])| {
+                    let start = chunk_idx * SCORING_CHUNK_SIZE;
+                    let mut results: Vec<_> = matches
+                        .iter()
+                        .enumerate()
+                        .map(|(index, matched)| score_match(bufs, (start + index, matched)))
+                        .collect();
+                    if results.len() > items_needed {
+                        results.select_nth_unstable_by(items_needed - 1, |a, b| {
+                            compare_file_scores(a.0, a.1.total, b.0, b.1.total)
+                        });
+                        results.truncate(items_needed);
+                    }
+                    results
+                };
+            if context.max_threads > 1 {
+                path_matches
+                    .par_chunks(SCORING_CHUNK_SIZE)
+                    .enumerate()
+                    .with_min_len((total_matched / SCORING_CHUNK_SIZE / context.max_threads).max(1))
+                    .map_init(ScoreBuffers::new, score_chunk)
+                    .flatten_iter()
+                    .collect()
+            } else {
+                let mut bufs = ScoreBuffers::new();
+                path_matches
+                    .chunks(SCORING_CHUNK_SIZE)
+                    .enumerate()
+                    .flat_map(|chunk| score_chunk(&mut bufs, chunk))
+                    .collect()
+            }
+        } else if total_matched >= PARALLEL_SCORING_MIN_MATCHES && context.max_threads > 1 {
             path_matches
                 .par_iter()
                 .enumerate()
@@ -965,10 +1008,11 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
                 .collect()
         };
 
-    results
+    (results, total_matched)
 }
 
 const PARALLEL_SCORING_MIN_MATCHES: usize = 8192;
+const SCORING_CHUNK_SIZE: usize = 4096;
 
 struct ScoreBuffers {
     dir_buf: String,
@@ -1135,11 +1179,7 @@ fn sort_and_paginate<'a, S>(
 
     let items_needed = offset.saturating_add(limit).min(total_matched);
     let compare = |a: &(&FileItem, S), b: &(&FileItem, S)| {
-        total(&b.1)
-            .cmp(&total(&a.1))
-            .then_with(|| b.0.modified.cmp(&a.0.modified))
-            // Total order: parallel matching yields scheduling-dependent input order.
-            .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
+        compare_file_scores(a.0, total(&a.1), b.0, total(&b.1))
     };
     // Use partial sort if we need less than half the results and dataset is large
     if items_needed < total_matched / 2 && total_matched > 100 {
@@ -1214,6 +1254,18 @@ where
         .into_iter()
         .flatten()
         .collect()
+}
+
+fn compare_file_scores(
+    a: &FileItem,
+    a_total: i32,
+    b: &FileItem,
+    b_total: i32,
+) -> std::cmp::Ordering {
+    b_total
+        .cmp(&a_total)
+        .then_with(|| b.modified.cmp(&a.modified))
+        .then_with(|| std::ptr::from_ref(a).cmp(&std::ptr::from_ref(b)))
 }
 
 #[cfg(test)]
@@ -1340,13 +1392,19 @@ mod tests {
                     last_same_query_match: None,
                     combo_boost_score_multiplier: 100,
                     min_combo_count: 3,
-                    pagination: PaginationArgs::default(),
+                    pagination: PaginationArgs {
+                        offset: 0,
+                        limit: 0,
+                    },
                 };
-                let mut parallel = match_and_score_in_arena(&files, &context, arena);
+                let (mut parallel, parallel_total) =
+                    match_and_score_in_arena(&files, &context, arena);
                 context.max_threads = 1;
-                let mut sequential = match_and_score_in_arena(&files, &context, arena);
+                let (mut sequential, sequential_total) =
+                    match_and_score_in_arena(&files, &context, arena);
                 parallel.sort_unstable_by_key(|(file, _)| file.modified);
                 sequential.sort_unstable_by_key(|(file, _)| file.modified);
+                assert_eq!(parallel_total, sequential_total);
                 assert_eq!(parallel.len(), sequential.len(), "{text}");
                 for ((a, a_score), (b, b_score)) in parallel.iter().zip(&sequential) {
                     assert!(std::ptr::eq(*a, *b));
@@ -1370,6 +1428,51 @@ mod tests {
                     format!("{parallel_scores:?}"),
                     format!("{sequential_scores:?}")
                 );
+                if text != "controller" {
+                    continue;
+                }
+                let (all_items, all_scores, all_total) =
+                    fuzzy_match_and_score_files(&files, &context, files.len() / 3, arena, arena);
+                assert_eq!(all_total, parallel_total);
+                let cases: &[(usize, usize, usize)] = if current_file.is_some() {
+                    &[(49, 50, 1), (49, 50, 4)]
+                } else {
+                    &[
+                        (0, 1, 1),
+                        (0, 1, 4),
+                        (49, 50, 1),
+                        (49, 50, 4),
+                        (0, usize::MAX, 4),
+                        (usize::MAX, 50, 4),
+                    ]
+                };
+                for &(offset, limit, max_threads) in cases {
+                    context.pagination = PaginationArgs { offset, limit };
+                    context.max_threads = max_threads;
+                    let expected_items: Vec<_> =
+                        all_items.iter().skip(offset).take(limit).collect();
+                    let expected_scores: Vec<_> =
+                        all_scores.iter().skip(offset).take(limit).collect();
+                    let (items, scores, total) = fuzzy_match_and_score_files(
+                        &files,
+                        &context,
+                        files.len() / 3,
+                        arena,
+                        arena,
+                    );
+                    assert_eq!(
+                        total, parallel_total,
+                        "{text}, offset={offset}, limit={limit}"
+                    );
+                    assert_eq!(items.len(), expected_items.len());
+                    assert!(
+                        items
+                            .iter()
+                            .zip(&expected_items)
+                            .all(|(a, b)| std::ptr::eq(*a, **b))
+                    );
+                    assert_eq!(format!("{scores:?}"), format!("{expected_scores:?}"));
+                }
             }
         }
     }
@@ -1521,9 +1624,19 @@ mod tests {
 
     #[test]
     fn tied_scores_paginate_deterministically() {
-        let files: Vec<_> = (0..3000)
-            .map(|_| FileItem::new_raw(0, 0, 1, None, false))
+        let paths: Vec<_> = (0..16_386)
+            .map(|index| format!("src/controller/{index:05}/contrller.rs"))
             .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .map(|path| FileItem::new_raw(path.rfind('/').unwrap() as u16 + 1, 0, 1, None, false))
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
         let parser = QueryParser::default();
         let query = parser.parse("");
         let page = |shuffle: usize, offset: usize| {
@@ -1552,6 +1665,76 @@ mod tests {
                         .zip(&expected)
                         .all(|(a, b)| std::ptr::eq(*a, *b)),
                     "offset={offset} shuffle={shuffle}"
+                );
+            }
+        }
+
+        let query = parser.parse("controller");
+        let mut context = ScoringContext {
+            query: &query,
+            max_threads: 1,
+            max_typos: 2,
+            project_path: None,
+            current_file: None,
+            last_same_query_match: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 0,
+            },
+        };
+        let path_matches = match_fuzzy_parts(
+            &["controller"],
+            &FileItems::All(&files),
+            &neo_frizbee::Config {
+                max_typos: Some(context.max_typos),
+                sort: neo_frizbee::SortStrategy::Unsorted,
+                scoring: Scoring {
+                    capitalization_bonus: 0,
+                    matching_case_bonus: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            context.max_threads,
+            arena,
+        );
+        assert_eq!(path_matches.len(), files.len());
+        assert!(path_matches.iter().all(|matched| {
+            (matched.end_col as usize)
+                < files[matched.index as usize].filename_offset_in_relative_path()
+        }));
+        let (expected, expected_scores, total) =
+            fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
+        assert_eq!(total, files.len());
+        assert!(
+            expected_scores.iter().all(|score| {
+                score.total == expected_scores[0].total
+                    && score.filename_bonus > 0
+                    && !score.exact_match
+                    && score.match_type == "fuzzy_filename"
+            }),
+            "first scores: {:?}",
+            &expected_scores[..3]
+        );
+        for offset in [0, 49, 500] {
+            context.pagination = PaginationArgs { offset, limit: 50 };
+            for max_threads in [1, 4] {
+                context.max_threads = max_threads;
+                let (items, scores, matched) =
+                    fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
+                assert_eq!(matched, total);
+                assert_eq!(items.len(), 50);
+                assert!(
+                    items
+                        .iter()
+                        .zip(&expected[offset..offset + 50])
+                        .all(|(a, b)| std::ptr::eq(*a, *b))
+                );
+                assert_eq!(
+                    format!("{scores:?}"),
+                    format!("{:?}", &expected_scores[offset..offset + 50])
                 );
             }
         }
@@ -1828,7 +2011,7 @@ mod filename_bonus_tests {
                 limit: 50,
             },
         };
-        let results = match_and_score_in_arena(&files, &context, arena);
+        let (results, _) = match_and_score_in_arena(&files, &context, arena);
         assert_eq!(results.len(), files.len());
         for (file, score) in results {
             assert_eq!(
