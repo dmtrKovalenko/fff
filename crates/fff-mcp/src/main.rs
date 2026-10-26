@@ -1,7 +1,8 @@
 mod cursor;
 mod file_search;
-mod handshake;
+mod harness;
 mod healthcheck;
+mod indexing;
 mod output;
 mod parent;
 mod scope;
@@ -12,11 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use clap::Parser;
-use fff::file_picker::FilePicker;
-use fff::frecency::FrecencyTracker;
-use fff::{FFFMode, SharedFilePicker, SharedFrecency};
+use fff::{FFFMode, SharedFilePicker};
 use git2::Repository;
-use handshake::ProbeTolerantTransport;
+use harness::HarnessTransport;
+use indexing::{IndexStartup, IndexingMode};
 use mimalloc::MiMalloc;
 use rmcp::ServiceExt;
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -92,6 +92,11 @@ pub(crate) struct Args {
     /// at startup but not monitored for changes.
     #[arg(long = "no-watch")]
     no_watch: bool,
+
+    /// Auto indexes eagerly if the parent is under 60 seconds old; otherwise
+    /// indexing starts on the first search. Unknown parent age uses lazy indexing.
+    #[arg(long, value_enum, default_value_t = IndexingMode::Auto)]
+    indexing: IndexingMode,
 
     /// Maximum number of files whose content is kept persistently in memory.
     /// Files beyond this limit are still searchable via temporary mmaps that
@@ -204,6 +209,8 @@ const FALLBACK_ROOT: &str = "C:\\Windows\\Temp";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parent_watcher = parent::ParentWatcher::new();
+    let parent_age = parent_watcher.as_ref().and_then(parent::ParentWatcher::age);
     let mut args = Args::parse();
     resolve_defaults(&mut args);
 
@@ -254,17 +261,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shared_picker = SharedFilePicker::default();
-    let shared_frecency = SharedFrecency::default();
-    if let Some(frecency_db_path) = args.frecency_db_path {
-        match FrecencyTracker::open(&frecency_db_path) {
-            Ok(tracker) => {
-                let _ = shared_frecency.init(tracker);
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to init frecency db: {}", e);
-            }
-        }
-    }
 
     // Content indexing follows warmup by default (backward compat), unless
     // the user explicitly opts in via --content-indexing or out via
@@ -277,10 +273,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         !args.no_warmup
     };
 
-    // Initialize file picker (spawns background scan + watcher)
-    FilePicker::new_with_shared_state(
+    let index_startup = IndexStartup::new(
         shared_picker.clone(),
-        shared_frecency,
         fff::FilePickerOptions {
             base_path,
             enable_mmap_cache: !args.no_warmup,
@@ -295,48 +289,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_fs_root_scanning: args.enable_root_scan,
             git_recency: Default::default(),
         },
-    )
-    .map_err(|e| format!("Failed to init file picker: {}", e))?;
+        args.frecency_db_path,
+    );
+    let eager = args.indexing.eager(parent_age);
+    tracing::info!(?parent_age, eager, "Selected indexing startup policy");
+    if eager {
+        index_startup.start()?;
+    }
 
     if !args.no_update_check {
         update_check::spawn_update_check();
     }
 
     // Create and start the MCP server
-    let server = FffServer::new(shared_picker.clone());
+    let server = FffServer::new(shared_picker.clone(), Some(index_startup));
     let last_activity = server.last_activity();
     let idle_timeout_secs = args.idle_timeout_secs;
 
-    // Wait for initial scan in background — don't block server startup
-    let picker_clone_for_scan = shared_picker.clone();
-    tokio::task::spawn_blocking(move || {
-        let start = std::time::Instant::now();
-        loop {
-            let is_scanning = picker_clone_for_scan
-                .read()
-                .ok()
-                .and_then(|g| g.as_ref().map(|p| p.is_scan_active()))
-                .unwrap_or(true);
-
-            if !is_scanning {
-                tracing::info!("Initial scan completed in {:?}", start.elapsed());
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    });
-
-    const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
-    let transport = ProbeTolerantTransport::new(stdio);
-    let service = match tokio::time::timeout(STARTUP_TIMEOUT, server.serve(transport)).await {
-        Ok(res) => res.map_err(|e| format!("Failed to start MCP server: {}", e))?,
-        Err(_) => {
-            return Err("MCP initialize handshake did not complete within 60s".into());
-        }
-    };
-
-    let parent_watcher = parent::ParentWatcher::new();
     match &parent_watcher {
         Some(watcher) => tracing::info!(
             "Watching parent process (pid {}); will exit when it dies",
@@ -404,7 +373,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     });
 
-    service.waiting().await?;
+    // Discovery is optional and may precede the first tool request by any amount of time.
+    // Start lifecycle monitoring before the SDK waits for that request.
+    let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
+    match server.serve(HarnessTransport::new(stdio)).await {
+        Ok(service) => {
+            service.waiting().await?;
+        }
+        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => {}
+        Err(error) => return Err(format!("Failed to start MCP server: {error}").into()),
+    }
 
     if let Ok(mut guard) = shared_picker.write()
         && let Some(ref mut picker) = *guard
