@@ -22,7 +22,7 @@ fn rank(a: &&FileItem, b: &&FileItem) -> Ordering {
 }
 
 fn rank_with_ties(a: &&FileItem, b: &&FileItem) -> Ordering {
-    // All references point into one input slice, whose order breaks ties.
+    // Every ranking path uses address order for ties so partial and full sorts agree.
     rank(a, b).then_with(|| std::ptr::from_ref(*a).cmp(&std::ptr::from_ref(*b)))
 }
 
@@ -37,7 +37,7 @@ impl<'a> RankedFiles<'a> {
             files[..prefix].sort_unstable_by(rank_with_ties);
             prefix
         } else {
-            sort_with_buffer(&mut files, rank);
+            sort_with_buffer(&mut files, rank_with_ties);
             files.len()
         };
         Self {
