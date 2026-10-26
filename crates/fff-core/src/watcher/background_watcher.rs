@@ -3,15 +3,17 @@ use crate::error::Error;
 use crate::file_picker::FFFMode;
 use crate::git::GitDiscovery;
 use crate::git_status_worker::GitStatusWorker;
+use crate::parallelism::indexing_pool;
 use crate::rescan_stats::RescanReason;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
+use rayon::slice::ParallelSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -249,39 +251,65 @@ impl BackgroundWatcher {
             let mut watched = 0usize;
             let mut consecutive_failures = 0usize;
 
-            // `inotify` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding this lock is free
+            let mut directories = Vec::new();
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
-                use std::ops::ControlFlow;
                 picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+                    directories.push(PathOp::watch_non_recursive(dir));
+                    std::ops::ControlFlow::Continue(())
+                });
+            }
+            // The debouncer keeps sorted roots; append in order and register off-lock.
+            indexing_pool(mode).install(|| {
+                directories.par_sort_unstable_by(|left, right| left.as_path().cmp(right.as_path()));
+            });
+            let mut directories = directories.into_iter();
+            'register: loop {
+                let mut batch = directories.by_ref().take(1024).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                loop {
+                    let batch_len = batch.len();
+                    match debouncer.update_paths(batch) {
                         Ok(()) => {
-                            watched += 1;
+                            watched += batch_len;
                             consecutive_failures = 0;
-                            ControlFlow::Continue(())
+                            break;
                         }
-                        Err(e) => {
+                        Err(error) => {
+                            let applied = batch_len.saturating_sub(
+                                error.remaining.len() + usize::from(error.origin.is_some()),
+                            );
+                            watched += applied;
+                            if applied > 0 {
+                                consecutive_failures = 0;
+                            }
                             consecutive_failures += 1;
                             if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
+                                warn!(
+                                    error = %error.source,
+                                    path = ?error.origin.as_ref().map(PathOp::as_path),
+                                    watched,
+                                    "Failed to register directory watch"
+                                );
                             }
-
                             if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
                                 warn!(
                                     consecutive_failures,
                                     watched,
                                     "Giving up setting file watcher for all the directories. Check if your system has enough fs watchers limit."
                                 );
-
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
+                                break 'register;
+                            }
+                            batch = error.remaining;
+                            if batch.is_empty() {
+                                break;
                             }
                         }
                     }
-                });
+                }
             }
 
             tracing::info!(

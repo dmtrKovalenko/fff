@@ -1,5 +1,7 @@
 use std::sync::LazyLock;
 
+use crate::file_picker::FFFMode;
+
 /// Dedicated thread pool for background work (scan, warmup, bigram build).
 pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let total = std::thread::available_parallelism()
@@ -132,6 +134,28 @@ fn sysctl_name(name: &std::ffi::CStr) -> Option<String> {
         .ok()
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
+}
+
+#[cfg(target_os = "linux")]
+static AI_INDEXING_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("fff-index-{i}"))
+        .build()
+        .expect("failed to create AI indexing rayon pool")
+});
+
+pub(crate) fn indexing_pool(mode: FFFMode) -> &'static LazyLock<rayon::ThreadPool> {
+    #[cfg(target_os = "linux")]
+    if mode.is_ai() {
+        return &AI_INDEXING_THREAD_POOL;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mode;
+    &BACKGROUND_THREAD_POOL
 }
 
 #[cfg(test)]
