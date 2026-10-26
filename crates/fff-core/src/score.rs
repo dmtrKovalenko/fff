@@ -190,6 +190,11 @@ fn rank_by_frecency<'a>(
     overflow_arena: ArenaPtr,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let base_count = base_count.min(files.len());
+    let keep = context
+        .pagination
+        .offset
+        .saturating_add(context.pagination.limit);
+    let mut total_matched = 0;
     let mut totals: Vec<(&FileItem, i32)> = Vec::new();
     for (slice, arena) in [
         (&files[base_count..], overflow_arena),
@@ -201,10 +206,58 @@ fn rank_by_frecency<'a>(
         let Some(working_files) = filter_by_constraints(slice, context, arena) else {
             continue;
         };
-        frecency_totals(&working_files, context, arena, &mut totals);
+        if let FileItems::All(files) = &working_files
+            && context.pagination.limit > 0
+            && keep <= 128
+            && files.len() >= 65_536
+        {
+            let chunk_top = |chunk: &'a [FileItem]| {
+                let mut best = Vec::with_capacity(keep * 2);
+                let mut cutoff: Option<(&FileItem, i32)> = None;
+                let mut count = 0;
+                let compare = |a: &(&FileItem, i32), b: &(&FileItem, i32)| {
+                    compare_file_scores(a.0, a.1, b.0, b.1)
+                };
+                for file in chunk.iter().filter(|file| !file.is_deleted()) {
+                    count += 1;
+                    let candidate = (file, frecency_total(file, context, arena));
+                    if cutoff.is_some_and(|worst| !compare(&candidate, &worst).is_lt()) {
+                        continue;
+                    }
+                    best.push(candidate);
+                    if best.len() == keep * 2 {
+                        best.select_nth_unstable_by(keep - 1, compare);
+                        best.truncate(keep);
+                        cutoff = best.last().copied();
+                    }
+                }
+                if best.len() > keep {
+                    best.select_nth_unstable_by(keep - 1, compare);
+                    best.truncate(keep);
+                }
+                (count, best)
+            };
+            let chunks: Vec<_> = if context.max_threads > 1 {
+                files
+                    .par_chunks(SCORING_CHUNK_SIZE)
+                    .with_min_len((files.len() / SCORING_CHUNK_SIZE / context.max_threads).max(1))
+                    .map(chunk_top)
+                    .collect()
+            } else {
+                files.chunks(SCORING_CHUNK_SIZE).map(chunk_top).collect()
+            };
+            for (count, best) in chunks {
+                total_matched += count;
+                totals.extend(best);
+            }
+        } else {
+            let previous = totals.len();
+            frecency_totals(&working_files, context, arena, &mut totals);
+            total_matched += totals.len() - previous;
+        }
     }
 
-    let (items, _, total_matched) = sort_and_paginate(totals, context, |total| *total);
+    let (items, _, _) = sort_and_paginate(totals, context, |total| *total);
     let scores = items
         .iter()
         .map(|file| {
@@ -1479,7 +1532,7 @@ mod tests {
 
     #[test]
     fn frecency_parallel_and_sequential_scores_match() {
-        let files: Vec<_> = (0..33_000)
+        let files: Vec<_> = (0..132_000)
             .map(|index| {
                 let mut file =
                     FileItem::new_raw(0, 0, index, Some(git2::Status::WT_MODIFIED), false);
@@ -1506,7 +1559,7 @@ mod tests {
                 limit: 50,
             },
         };
-        for count in [0, 1, 1000, 33_000] {
+        for count in [0, 1, 1000, 132_000] {
             let items = FileItems::All(&files[..count]);
             context.max_threads = 4;
             let parallel = frecency_scores(&items, &context, ArenaPtr::null());
