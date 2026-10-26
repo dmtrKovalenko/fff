@@ -152,7 +152,9 @@ impl GitStatusCache {
         if !cfg!(target_os = "linux")
             || index.len() < 16_384
             || index.has_conflicts()
-            || repo.config()?.get_bool("core.ignorecase").unwrap_or(false)
+            || repo.config().map_or(true, |config| {
+                config.get_bool("core.ignorecase").unwrap_or(false)
+            })
         {
             return full();
         }
