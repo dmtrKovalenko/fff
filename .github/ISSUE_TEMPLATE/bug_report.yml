@@ -31,11 +31,13 @@ body:
         | Frontend | Linux / macOS | Windows |
         |---|---|---|
         | Neovim plugin | `~/.local/state/nvim/log/fff+*.log` | `%LOCALAPPDATA%\nvim-data\log\fff+*.log` |
-        | MCP server (`fff-mcp`) | `~/.cache/fff_mcp+*.log` (override with `--log-file`) | `%LOCALAPPDATA%\fff_mcp+*.log` |
+        | MCP server (`fff-mcp`) | `~/.local/state/fff/fff_mcp+*.log` (`$XDG_STATE_HOME/fff/` if set, override with `--log-file`) | `%LOCALAPPDATA%\fff\fff_mcp+*.log` |
         | Node / Bun SDK | path you passed as `logFilePath` to `FileFinder.create({...})` | same |
         | C SDK | path you passed as `log_file_path` in `FffCreateOptions` | same |
 
         Neovim users: run `:FFFOpenLog` to open the current session's log directly.
+
+        MCP users: `fff-mcp --healthcheck` prints the resolved log path; session files sit next to it.
 
         Also some useful commands:
 
@@ -44,7 +46,7 @@ body:
         ls -t ~/.local/state/nvim/log/fff+*.log | head -1
 
         # MCP server
-        ls -t ~/.cache/fff_mcp+*.log | head -1
+        ls -t ~/.local/state/fff/fff_mcp+*.log | head -1
         ```
     validations:
       required: false
