@@ -42,6 +42,11 @@
       "default": true,
       "description": "Shows a warning notification when the home directory is indexed."
     },
+    "warnOnScanOptOut": {
+      "type": "boolean",
+      "default": true,
+      "description": "Shows a warning notification when a session starts in a root the config opted out of indexing (e.g. $HOME with enableHomeDirScanning false), which disables FFF workspace search for that session."
+    },
     "followSymlinks": {
       "type": "boolean",
       "default": true,
