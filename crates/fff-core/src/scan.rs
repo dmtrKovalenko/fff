@@ -54,6 +54,7 @@ pub(crate) struct ScanJob {
     mode: FFFMode,
     signals: ScanSignals,
     config: ScanConfig,
+    extra_ignore: Arc<[String]>,
     /// Walker-maintained counter backing `get_scan_progress` on the UI
     /// side. Reset to 0 at scan start, incremented per-file by the
     /// walker. Shared `Arc` so the UI polls the same atomic.
@@ -83,6 +84,7 @@ impl ScanJob {
         let scanned_files_counter = picker.scanned_files_counter();
         let base_path = picker.base_path().to_path_buf();
         let trace_span = picker.trace_span();
+        let extra_ignore = picker.extra_ignore_shared();
 
         let new_scan_config = ScanConfig {
             warmup: picker.has_mmap_cache(),
@@ -103,6 +105,7 @@ impl ScanJob {
             base_path,
             scanned_files_counter,
             config: new_scan_config,
+            extra_ignore,
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
             trace_span,
@@ -118,6 +121,7 @@ impl ScanJob {
         signals: ScanSignals,
         scanned_files_counter: Arc<AtomicUsize>,
         trace_span: tracing::Span,
+        extra_ignore: Arc<[String]>,
         config: ScanConfig,
     ) -> Self {
         Self {
@@ -128,6 +132,7 @@ impl ScanJob {
             signals,
             scanned_files_counter,
             config,
+            extra_ignore,
             trace_span,
         }
     }
@@ -158,6 +163,7 @@ impl ScanJob {
             signals,
             scanned_files_counter,
             config,
+            extra_ignore,
             trace_span: _,
         } = self;
 
@@ -173,6 +179,7 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            &extra_ignore,
         ) {
             Ok(sync) => sync,
             Err(e) => {
