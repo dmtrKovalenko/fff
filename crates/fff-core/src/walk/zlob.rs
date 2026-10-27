@@ -191,12 +191,11 @@ pub(crate) fn walk_collect_files(
     // Always report the exact final total regardless of the last step.
     synced_files_count.store(pairs.len(), Ordering::Relaxed);
 
-    // Retain the ignore rules only when the walk actually gathered some
-    // (git roots with .gitignore/.ignore). Otherwise callers fall back.
-    let ignore_rules = outcome
-        .rules()
-        .is_some()
-        .then(|| WalkIgnoreRules { inner: outcome });
+    let ignore_rules =
+        (use_non_git_defaults || outcome.rules().is_some()).then_some(WalkIgnoreRules {
+            inner: outcome,
+            skip_hidden: use_non_git_defaults,
+        });
 
     Ok(WalkOutput {
         pairs,
