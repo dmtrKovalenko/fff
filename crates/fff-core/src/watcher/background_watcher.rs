@@ -342,7 +342,7 @@ pub(crate) fn handle_debounced_events(
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
+    // Prefer the walker's own ignore rules; grab a cheap Arc clone once
     // per batch so we don't hold the picker lock during filtering.
     let walker_rules = shared_picker
         .read()
@@ -398,7 +398,7 @@ pub(crate) fn handle_debounced_events(
                     .paths
                     .iter()
                     // but we are smart enough and not falling into the paths
-                    .all(|p| !p.is_dir() && !filter.is_ignored(p));
+                    .all(|p| !p.is_dir() && !filter.is_ignored(p, false));
 
             if !small_and_known && try_trigger_full_rescan(RescanReason::KernelEventLoss) {
                 return Vec::new();
@@ -425,7 +425,7 @@ pub(crate) fn handle_debounced_events(
             ) {
                 if path
                     .parent()
-                    .is_some_and(|parent| filter.is_ignored(parent))
+                    .is_some_and(|parent| filter.is_ignored(parent, true))
                 {
                     continue;
                 }
@@ -483,7 +483,8 @@ pub(crate) fn handle_debounced_events(
             let (is_dir, is_ignored) = if is_removed {
                 (false, true)
             } else {
-                (path.is_dir(), filter.is_ignored(path))
+                let is_dir = path.is_dir();
+                (is_dir, filter.is_ignored(path, is_dir))
             };
 
             if is_folder_removal {
@@ -839,21 +840,21 @@ fn index_new_directory(
     // TODO: figure out a better optimized way for zlob to rerun the directory walk using existing
     // ignore rules, but currently we have to filter out ignored files on our own
     let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
-    let join_unless_ignored = |relative_path: &str| -> Option<PathBuf> {
+    let join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
         let path = dir.join(relative_path);
-        (!filter.is_ignored(&path)).then_some(path)
+        (!filter.is_ignored(&path, is_dir)).then_some(path)
     };
 
     let files_to_add: Vec<PathBuf> = walk
         .pairs
         .iter()
-        .filter_map(|(_, path)| join_unless_ignored(path))
+        .filter_map(|(_, path)| join_unless_ignored(path, false))
         .collect();
 
     let subdirs: Vec<PathBuf> = walk
         .dirs
         .iter()
-        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/')))
+        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/'), true))
         .collect();
 
     if files_to_add.is_empty() {
@@ -951,7 +952,7 @@ fn watch_dirs_nonrecursive<'a>(
 
 struct IgnoreFilter<'a> {
     base_path: &'a Path,
-    /// Reusable ignore rules from the last walk (zlob backend only).
+    /// Reusable ignore rules from the last walk.
     rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
     /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
     /// caller's repo (also used for git-status queries) to avoid re-opening.
@@ -972,7 +973,7 @@ impl<'a> IgnoreFilter<'a> {
     }
 
     /// Whether `path` (absolute) is ignored.
-    fn is_ignored(&self, path: &Path) -> bool {
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         if let Some(rules) = self.rules.as_ref() {
             let Ok(relative) = path.strip_prefix(self.base_path) else {
                 return false;
@@ -980,7 +981,7 @@ impl<'a> IgnoreFilter<'a> {
             // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
             // layer internally, so a leaf under an ignored directory (rule
             // `build/`, path `build/out.rs`) is caught in one call.
-            return rules.is_ignored(relative);
+            return rules.is_ignored(relative, is_dir);
         }
         match self.repo {
             Some(repo) => repo.is_path_ignored(path) == Ok(true),
