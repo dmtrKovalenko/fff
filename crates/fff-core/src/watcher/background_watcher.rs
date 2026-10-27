@@ -348,7 +348,12 @@ pub(crate) fn handle_debounced_events(
         .read()
         .ok()
         .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
-    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
+    let filter = IgnoreFilter::new(
+        base_path,
+        walker_rules,
+        repo.as_ref(),
+        git_workdir.is_none(),
+    );
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
     let mut paths_to_remove = Vec::new();
@@ -838,7 +843,12 @@ fn index_new_directory(
 
     // TODO: figure out a better optimized way for zlob to rerun the directory walk using existing
     // ignore rules, but currently we have to filter out ignored files on our own
-    let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
+    let filter = IgnoreFilter::new(
+        &base_path,
+        walker_rules,
+        repo.as_ref(),
+        git_workdir.is_none(),
+    );
     let join_unless_ignored = |relative_path: &str| -> Option<PathBuf> {
         let path = dir.join(relative_path);
         (!filter.is_ignored(&path)).then_some(path)
@@ -956,6 +966,8 @@ struct IgnoreFilter<'a> {
     /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
     /// caller's repo (also used for git-status queries) to avoid re-opening.
     repo: Option<&'a Repository>,
+    /// Non-git walks skip dot entries, so the watcher has to as well (#972).
+    skip_hidden: bool,
 }
 
 impl<'a> IgnoreFilter<'a> {
@@ -963,33 +975,34 @@ impl<'a> IgnoreFilter<'a> {
         base_path: &'a Path,
         rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
         repo: Option<&'a Repository>,
+        skip_hidden: bool,
     ) -> Self {
         Self {
             base_path,
             rules,
             repo,
+            skip_hidden,
         }
     }
 
     /// Whether `path` (absolute) is ignored.
     fn is_ignored(&self, path: &Path) -> bool {
+        let relative = path.strip_prefix(self.base_path).ok();
+        if self.skip_hidden && relative.is_some_and(has_hidden_component) {
+            return true;
+        }
         if let Some(rules) = self.rules.as_ref() {
-            let Ok(relative) = path.strip_prefix(self.base_path) else {
-                return false;
-            };
             // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
             // layer internally, so a leaf under an ignored directory (rule
             // `build/`, path `build/out.rs`) is caught in one call.
-            return rules.is_ignored(relative);
+            return relative.is_some_and(|relative| rules.is_ignored(relative));
         }
         match self.repo {
             Some(repo) => repo.is_path_ignored(path) == Ok(true),
             // No repo and no rules: the non-code-dir heuristic, applied to the
             // base-relative path so ancestors of the base (e.g. a temp dir
             // under AppData/Local on Windows) never match.
-            None => crate::ignore::is_non_code_directory(
-                path.strip_prefix(self.base_path).unwrap_or(path),
-            ),
+            None => crate::ignore::is_non_code_directory(relative.unwrap_or(path)),
         }
     }
 }
@@ -1190,6 +1203,14 @@ fn pair_renames_by_identity(
         .collect()
 }
 
+#[inline]
+fn has_hidden_component(relative: &Path) -> bool {
+    relative.components().any(|component| match component {
+        std::path::Component::Normal(name) => name.as_encoded_bytes().first() == Some(&b'.'),
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,6 +1385,71 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].path, path);
         assert_eq!(received[0].kind, WatchEventKind::Modified);
+    }
+
+    #[test]
+    fn non_git_watcher_skips_hidden_paths_like_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(base.join("src")).unwrap();
+        std::fs::write(base.join("src/a.txt"), "a").unwrap();
+
+        let shared_picker = SharedFilePicker::default();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        *shared_picker.write().unwrap() = Some(picker);
+
+        let created = [
+            ".hidden/marker.txt",
+            "nested/.cache/marker.txt",
+            ".marker.txt",
+            "visible/marker.txt",
+        ];
+        let now = Instant::now();
+        let mut events = Vec::new();
+        for rel in created {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+            events.push(DebouncedEvent::new(
+                Event::new(EventKind::Create(CreateKind::File)).add_path(path),
+                now,
+            ));
+        }
+        let new_dirs = handle_debounced_events(
+            FFFMode::Neovim,
+            events,
+            &base,
+            &None,
+            &shared_picker,
+            &SharedFrecency::noop(),
+            &GitStatusWorker::new(),
+        );
+        assert!(new_dirs.is_empty());
+
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        assert!(
+            picker
+                .get_file_by_path(base.join("visible/marker.txt"))
+                .is_some()
+        );
+        for rel in &created[..3] {
+            assert!(
+                picker.get_file_by_path(base.join(rel)).is_none(),
+                "{rel} is skipped by the non-git scan and must not be indexed by the watcher"
+            );
+        }
+
+        let filter = IgnoreFilter::new(&base, None, None, true);
+        assert!(filter.is_ignored(&base.join(".worktrees/x/.build/out.o")));
+        assert!(!filter.is_ignored(&base.join("src/a.txt")));
+        assert!(!IgnoreFilter::new(&base, None, None, false).is_ignored(&base.join(".hidden/a")));
     }
 
     fn identity(size: u64, mtime: u64) -> FileIdentity {
