@@ -150,6 +150,116 @@ local function move_list_cursor(direction)
   end
 end
 
+local insert_guard_ns = vim.api.nvim_create_namespace('fff_picker_insert_guard')
+-- vim.on_key can discard keys only since 0.11
+local can_hold_keys = vim.fn.has('nvim-0.11') == 1
+local insert_guard = nil
+
+-- Foreign autocmds running `windo` leave the prompt window, which makes neovim
+-- stop insert mode. Re-enter it unless a key was typed since those autocmds ran.
+local function setup_insert_mode_guard(group)
+  local guard = { key_tick = 0, held_keys = {}, generation = 0 }
+  insert_guard = guard
+
+  local function finish_restore(replay)
+    local keys = table.concat(guard.held_keys)
+    guard.restoring = false
+    guard.held_keys = {}
+    if replay and keys ~= '' then vim.api.nvim_feedkeys(keys, 'mt', false) end
+  end
+
+  local function restore_insert()
+    guard.scheduled = false
+    if not guard.restoring then return end
+    if not P.state.active or vim.api.nvim_get_current_win() ~= S.input_win then return finish_restore(false) end
+    if vim.api.nvim_get_mode().mode ~= 'n' then return end
+
+    -- '^ is the exact position where insert mode was stopped
+    guard.col = guard.col or vim.api.nvim_buf_get_mark(S.input_buf, '^')[2]
+    local line = vim.api.nvim_buf_get_lines(S.input_buf, 0, 1, false)[1] or ''
+    if guard.col >= #line then
+      vim.cmd('startinsert!')
+    else
+      vim.api.nvim_win_set_cursor(S.input_win, { 1, guard.col })
+      vim.cmd('startinsert')
+    end
+  end
+
+  -- startinsert is ignored while the mode change is still in progress
+  local function schedule_restore()
+    if guard.scheduled then return end
+    guard.scheduled = true
+    vim.schedule(restore_insert)
+  end
+
+  vim.on_key(function(_, typed)
+    if not P.state.active or insert_guard ~= guard then
+      if insert_guard == guard then vim.on_key(nil, insert_guard_ns) end
+      return
+    end
+    guard.key_tick = guard.key_tick + 1
+    if not guard.restoring then return end
+
+    if not can_hold_keys then return finish_restore(false) end
+    -- typed before insert mode is back, replayed once it is
+    if typed and typed ~= '' then
+      table.insert(guard.held_keys, typed)
+      return ''
+    end
+  end, insert_guard_ns)
+
+  -- keys that only edited the query are not the ones leaving insert mode
+  vim.api.nvim_buf_attach(S.input_buf, false, {
+    on_lines = function()
+      if guard.armed_tick then guard.armed_tick = guard.key_tick end
+    end,
+  })
+
+  local events = { 'FileType', 'Syntax', 'OptionSet', 'BufReadPost', 'BufWinEnter', 'BufWinLeave', 'BufEnter', 'BufLeave' }
+  vim.api.nvim_create_autocmd(events, {
+    group = group,
+    callback = function()
+      if not P.state.active then return end
+      local mode = vim.api.nvim_get_mode().mode
+      if mode:sub(1, 1) == 'i' then
+        guard.armed_tick = guard.key_tick
+      elseif mode == 'n' and guard.restoring then
+        -- the pending startinsert may have been swallowed as well
+        schedule_restore()
+      end
+    end,
+    desc = 'Track autocmds that may kick the prompt out of insert mode',
+  })
+
+  vim.api.nvim_create_autocmd('ModeChanged', {
+    group = group,
+    pattern = { 'i:n', 'n:i' },
+    callback = function()
+      if vim.v.event.new_mode == 'i' then
+        if guard.restoring then finish_restore(true) end
+        return
+      end
+
+      local tick = guard.key_tick
+      local dropped = guard.armed_tick == tick and guard.keep_normal_tick ~= tick
+      guard.armed_tick = nil
+      if not dropped or not P.state.active then return end
+
+      guard.restoring = true
+      guard.col = nil
+      guard.generation = guard.generation + 1
+      schedule_restore()
+
+      -- never keep holding keys if insert mode does not come back
+      local generation = guard.generation
+      vim.defer_fn(function()
+        if guard.restoring and guard.generation == generation then finish_restore(P.state.active) end
+      end, 500)
+    end,
+    desc = 'Restore insert mode dropped by foreign autocmds',
+  })
+end
+
 function M.create_ui()
   local config = S.config
   if not config then return false end
@@ -303,6 +413,8 @@ function M.setup_windows()
     end,
     desc = 'Close picker when focus leaves picker windows',
   })
+
+  setup_insert_mode_guard(picker_group)
 
   vim.api.nvim_create_autocmd('VimResized', {
     group = picker_group,
@@ -492,7 +604,7 @@ function M.focus_list_win()
   if not P.state.active then return end
   if not S.list_win or not vim.api.nvim_win_is_valid(S.list_win) then return end
 
-  vim.cmd('stopinsert')
+  M.stop_insert()
   vim.api.nvim_set_current_win(S.list_win)
 end
 
@@ -500,7 +612,7 @@ function M.focus_preview_win()
   if not P.state.active then return end
   if not S.preview_win or not vim.api.nvim_win_is_valid(S.preview_win) then return end
 
-  vim.cmd('stopinsert')
+  M.stop_insert()
   vim.api.nvim_set_current_win(S.preview_win)
 end
 
@@ -510,6 +622,12 @@ function M.focus_input_win()
 
   vim.api.nvim_set_current_win(S.input_win)
   vim.api.nvim_win_call(S.input_win, function() vim.cmd('startinsert!') end)
+end
+
+--- Leave insert mode on purpose, the insert mode guard will not undo it.
+function M.stop_insert()
+  if insert_guard then insert_guard.keep_normal_tick = insert_guard.key_tick end
+  vim.cmd('stopinsert')
 end
 
 -- Expose open/close preview for relayout in the main module
