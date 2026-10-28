@@ -362,13 +362,14 @@ impl LayerSnapshot {
         written += arena_bytes.len() as u64;
 
         // Encode the table in batches to keep write_to efficient for unbuffered writers.
-        let mut index_bytes = [0u8; 4096];
-        for batch in indices.chunks(index_bytes.len() / 4) {
-            for (slot, index) in index_bytes.chunks_exact_mut(4).zip(batch) {
-                slot.copy_from_slice(&index.to_le_bytes());
+        let mut words = [[0u8; 4]; 1024];
+        for batch in indices.chunks(words.len()) {
+            for (slot, index) in words.iter_mut().zip(batch) {
+                *slot = index.to_le_bytes();
             }
-            w.write_all(&index_bytes[..batch.len() * 4])?;
-            written += (batch.len() * 4) as u64;
+            let bytes = words[..batch.len()].as_flattened();
+            w.write_all(bytes)?;
+            written += bytes.len() as u64;
         }
 
         let mut buf = Vec::with_capacity(64);
@@ -452,10 +453,8 @@ impl LayerSnapshot {
             arena.set_len(chunk_count);
         }
 
-        let indices: Vec<u32> = index_bytes
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
-            .collect();
+        let (words, _) = index_bytes.as_chunks::<4>();
+        let indices: Vec<u32> = words.iter().copied().map(u32::from_le_bytes).collect();
         if indices.iter().any(|&idx| idx as usize >= chunk_count) {
             return Err(Error::LayerFormat("chunk index out of range"));
         }
@@ -881,7 +880,8 @@ mod tests {
         let arena_end = arena_start + snap.store.chunks().len() * SIMD_CHUNK_BYTES;
         for bad_prefix in [b"../", b"C:/", b"/x/", b"x//", b"x\\/"] {
             let mut bad = bytes.clone();
-            for chunk in bad[arena_start..arena_end].chunks_exact_mut(SIMD_CHUNK_BYTES) {
+            let (chunks, _) = bad[arena_start..arena_end].as_chunks_mut::<SIMD_CHUNK_BYTES>();
+            for chunk in chunks {
                 if chunk.starts_with(b"ab/") {
                     chunk[..3].copy_from_slice(bad_prefix);
                 }
