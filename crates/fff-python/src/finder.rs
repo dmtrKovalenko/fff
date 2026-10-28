@@ -96,6 +96,7 @@ fn grep_options(
         max_file_size: defaulted_u64(max_file_size, defaults.max_file_size),
         max_matches_per_file: max_matches_per_file as usize,
         smart_case,
+        casing: None,
         file_offset: cursor_offset,
         page_limit: defaulted_usize(page_limit, defaults.page_limit),
         mode,
@@ -103,7 +104,7 @@ fn grep_options(
         enforce_time_budget,
         before_context: before_context as usize,
         after_context: after_context as usize,
-        classify_definitions,
+        classify_definitions: classify_definitions.into(),
         trim_whitespace: false,
         abort_signal: None,
     }
@@ -254,6 +255,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
+                    git_recency: Default::default(),
                 },
             )
             .map_err(py_err)
@@ -371,7 +373,7 @@ impl FileFinder {
                 fuzzy_options(
                     max_threads,
                     current_file.as_deref(),
-                    picker.base_path(),
+                    picker.shared_base_path(),
                     page_index,
                     page_size,
                     defaulted_i32(combo_boost_score_multiplier, DEFAULT_COMBO_BOOST_MULTIPLIER),
@@ -423,7 +425,7 @@ impl FileFinder {
                 fuzzy_options(
                     max_threads,
                     current_file.as_deref(),
-                    picker.base_path(),
+                    picker.shared_base_path(),
                     page_index,
                     page_size,
                     0,
@@ -476,7 +478,7 @@ impl FileFinder {
                 fuzzy_options(
                     max_threads,
                     current_file.as_deref(),
-                    picker.base_path(),
+                    picker.shared_base_path(),
                     page_index,
                     page_size,
                     0,
@@ -538,7 +540,7 @@ impl FileFinder {
                     fuzzy_options(
                         max_threads,
                         current_file.as_deref(),
-                        picker.base_path(),
+                        picker.shared_base_path(),
                         page_index,
                         page_size,
                         defaulted_i32(combo_boost_score_multiplier, DEFAULT_COMBO_BOOST_MULTIPLIER),
@@ -750,7 +752,7 @@ impl FileFinder {
     /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
     /// tree, or existing directories. An empty pattern watches the whole tree.
     ///
-    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
     /// Gitignored and other ignored files are never triggering watcher.
     #[pyo3(signature = (pattern, callback, *, ignore = None))]
     fn watch(
@@ -787,6 +789,10 @@ impl FileFinder {
                             .map(|ev| WatchEvent {
                                 path: ev.path.to_string_lossy().to_string(),
                                 kind: ev.kind.as_str().to_string(),
+                                from_path: ev
+                                    .from
+                                    .as_ref()
+                                    .map(|p| p.to_string_lossy().to_string()),
                             })
                             .collect();
                         if let Err(e) = callback.call1(py, (batch,)) {
@@ -817,7 +823,16 @@ impl FileFinder {
             }
             let canonical = fff::path_utils::canonicalize(&new_path).map_err(py_err)?;
 
-            let (warmup_caches, content_indexing, watch, mode, fs_root, home_dir, follow_symlinks) = {
+            let (
+                warmup_caches,
+                content_indexing,
+                watch,
+                mode,
+                fs_root,
+                home_dir,
+                follow_symlinks,
+                git_recency,
+            ) = {
                 let guard = picker.read().map_err(py_err)?;
                 if let Some(ref picker) = *guard {
                     (
@@ -828,9 +843,20 @@ impl FileFinder {
                         picker.fs_root_scanning_enabled(),
                         picker.home_dir_scanning_enabled(),
                         picker.follows_symlinks(),
+                        picker.git_recency_config(),
                     )
                 } else {
-                    (false, true, true, FFFMode::default(), false, false, false)
+                    (
+                        // just the defaults
+                        false,
+                        true,
+                        true,
+                        FFFMode::default(),
+                        false,
+                        false,
+                        false,
+                        Default::default(),
+                    )
                 }
             };
 
@@ -851,6 +877,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
+                    git_recency,
                 },
             )
             .map_err(py_err)
@@ -881,13 +908,15 @@ impl FileFinder {
 
         py.detach(move || -> PyResult<bool> {
             let file_path = fff::path_utils::canonicalize(&selected_file_path).map_err(py_err)?;
-            let project_path = {
+            let (project_path, file_path) = {
                 let guard = picker.read().map_err(py_err)?;
-                guard.as_ref().map(|p| p.base_path().to_path_buf())
-            };
-            let project_path = match project_path {
-                Some(p) => p,
-                None => return Ok(false),
+                let Some(picker) = guard.as_ref() else {
+                    return Ok(false);
+                };
+                (
+                    picker.shared_base_path().to_path_buf(),
+                    picker.shared_path_for(&file_path).unwrap_or(file_path),
+                )
             };
 
             let mut qt_guard = query_tracker.write().map_err(py_err)?;
@@ -909,7 +938,7 @@ impl FileFinder {
         py.detach(move || -> PyResult<Option<String>> {
             let project_path = {
                 let guard = picker.read().map_err(py_err)?;
-                guard.as_ref().map(|p| p.base_path().to_path_buf())
+                guard.as_ref().map(|p| p.shared_base_path().to_path_buf())
             };
             let project_path = match project_path {
                 Some(p) => p,

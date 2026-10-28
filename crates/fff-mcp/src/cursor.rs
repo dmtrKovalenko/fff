@@ -1,17 +1,132 @@
-//! Cursor store for grep pagination.
-//!
-//! Maintains an in-memory map of opaque cursor IDs to file offsets.
-//! Cursors are evicted LRU-style when the store exceeds capacity.
-
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 const MAX_CURSORS: usize = 20;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GrepCursor {
+    pub file_offset: usize,
+    pub match_offset: usize,
+    pub match_file: u64,
+    pub stage: GrepStage,
+    pub found_matches: bool,
+    pub missing_path: bool,
+}
+
+impl GrepCursor {
+    pub fn page_limit(self, requested: usize) -> usize {
+        self.match_offset
+            .saturating_add(requested)
+            .saturating_add(1)
+    }
+
+    // Matches already shown from the file where the last page stopped.
+    pub fn resume_skip(&self, result: &fff::GrepResult<'_>, picker: &fff::FilePicker) -> usize {
+        match result.matches.first() {
+            Some(first)
+                if self.match_offset > 0
+                    && file_id(result, first.file_index, picker) == self.match_file =>
+            {
+                result
+                    .matches
+                    .iter()
+                    .take(self.match_offset)
+                    .take_while(|m| m.file_index == first.file_index)
+                    .count()
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn paginate(
+        &mut self,
+        result: &mut fff::GrepResult<'_>,
+        requested: usize,
+        picker: &fff::FilePicker,
+    ) {
+        let start = self.resume_skip(result, picker);
+        let end = start.saturating_add(requested).min(result.matches.len());
+        if end < result.matches.len() {
+            let last_file = result.matches.last().unwrap().file_index;
+            self.file_offset = if result.next_file_offset > 0 {
+                result.next_file_offset - 1
+            } else {
+                result.filtered_file_count.saturating_sub(1)
+            };
+            self.match_offset = result.matches[..end]
+                .iter()
+                .rev()
+                .take_while(|m| m.file_index == last_file)
+                .count();
+            self.match_file = file_id(result, last_file, picker);
+        } else {
+            self.file_offset = result.next_file_offset;
+            self.match_offset = 0;
+        }
+        result.matches.truncate(end);
+        result.matches.drain(..start);
+        self.found_matches |= !result.matches.is_empty();
+    }
+
+    pub fn has_more(self) -> bool {
+        self.file_offset > 0 || self.match_offset > 0
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum GrepStage {
+    #[default]
+    Normal,
+    Broadened,
+    Definitions,
+    References,
+    FuzzyDefinitions,
+    FuzzyMatches,
+}
+
+impl GrepStage {
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Definitions => Some(Self::References),
+            Self::References => Some(Self::FuzzyDefinitions),
+            Self::FuzzyDefinitions => Some(Self::FuzzyMatches),
+            _ => None,
+        }
+    }
+
+    pub fn is_fuzzy(self) -> bool {
+        matches!(self, Self::FuzzyDefinitions | Self::FuzzyMatches)
+    }
+
+    pub fn definition_mode(self) -> fff::DefinitionMode {
+        match self {
+            Self::Definitions | Self::FuzzyDefinitions => fff::DefinitionMode::DefinitionOnly,
+            // A file-path retry can widen these stages, so keep definitions found elsewhere.
+            Self::References | Self::FuzzyMatches | Self::Normal | Self::Broadened => {
+                fff::DefinitionMode::Classify
+            }
+        }
+    }
+
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::References => Some("No matching definitions found. Showing other matches:"),
+            Self::FuzzyDefinitions => {
+                Some("No exact matches found. Maybe you meant these definitions:")
+            }
+            Self::FuzzyMatches => Some(
+                "No exact matches or approximate definitions found. Maybe you meant these other matches:",
+            ),
+            _ => None,
+        }
+    }
+}
 
 /// Stores cursor state for paginated grep results.
 pub struct CursorStore {
     counter: u64,
     /// Map from cursor ID string → file offset for next page.
-    cursors: HashMap<String, usize>,
+    cursors: HashMap<String, GrepCursor>,
     /// Insertion order for LRU eviction.
     insertion_order: VecDeque<String>,
 }
@@ -27,10 +142,17 @@ impl CursorStore {
 
     /// Store a cursor and return its opaque ID string.
     pub fn store(&mut self, file_offset: usize) -> String {
+        self.store_grep(GrepCursor {
+            file_offset,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn store_grep(&mut self, cursor: GrepCursor) -> String {
         self.counter = self.counter.wrapping_add(1);
         let id = self.counter.to_string();
 
-        self.cursors.insert(id.clone(), file_offset);
+        self.cursors.insert(id.clone(), cursor);
         self.insertion_order.push_back(id.clone());
 
         // Evict oldest cursors
@@ -47,6 +169,16 @@ impl CursorStore {
 
     /// Retrieve the file offset for a cursor ID.
     pub fn get(&self, id: &str) -> Option<usize> {
+        self.get_grep(id).map(|cursor| cursor.file_offset)
+    }
+
+    pub(crate) fn get_grep(&self, id: &str) -> Option<GrepCursor> {
         self.cursors.get(id).copied()
     }
+}
+
+fn file_id(result: &fff::GrepResult<'_>, index: usize, picker: &fff::FilePicker) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    result.files[index].relative_path(picker).hash(&mut hasher);
+    hasher.finish()
 }

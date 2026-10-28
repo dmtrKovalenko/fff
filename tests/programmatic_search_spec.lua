@@ -132,6 +132,24 @@ describe('programmatic search APIs', function()
         assert.is_true(count >= 2, 'expected the marker in at least 2 files, got ' .. count)
       end)
 
+      it('keeps file order unless the user config enables classification', function()
+        local fuzzy = require('fff.fuzzy')
+        local original, saved = fuzzy.live_grep, vim.g.fff
+        local modes = {}
+        fuzzy.live_grep = function(...)
+          modes[#modes + 1] = select(12, ...)
+          return original(...)
+        end
+        local search_ok, err = pcall(function()
+          fff.content_search(marker)
+          vim.g.fff = vim.tbl_deep_extend('force', saved or {}, { grep = { classify_definitions = true } })
+          fff.content_search(marker)
+        end)
+        fuzzy.live_grep, vim.g.fff = original, saved
+        assert(search_ok, err)
+        assert.are.same({ 'off', 'classify' }, modes)
+      end)
+
       it('regex mode matches a pattern', function()
         local result = fff.content_search('canonicalize_\\w+', { mode = 'regex' })
         assert.is_true(#result.items > 0, 'regex content_search returned no matches')
@@ -140,11 +158,15 @@ describe('programmatic search APIs', function()
 
       it('fuzzy mode tolerates query typos', function()
         -- Drop a letter from the marker; fuzzy mode should still match.
-        local result = fff.content_search('canonicalize_pickr_path', { mode = 'fuzzy' })
+        local query = 'lua/ ' .. marker:gsub('fff', 'ff', 1)
+        local result = fff.content_search(query, { mode = 'fuzzy', time_budget_ms = 0 })
         assert.is_true(#result.items > 0, 'fuzzy content_search returned no matches')
+        local found_marker = false
         for _, item in ipairs(result.items) do
+          if item.line_content:find(marker, 1, true) then found_marker = true end
           assert.is_number(item.fuzzy_score)
         end
+        assert.is_true(found_marker, 'fuzzy content_search did not match the source marker')
       end)
 
       it('rejects invalid mode', function()
@@ -221,10 +243,22 @@ describe('programmatic search APIs', function()
       -- Poll instead of asserting on the first grep: the index of the new root
       -- can lag a mkdir by a few ms on CI, which flaked on linux too.
       local result
-      vim.wait(2000, function()
+      vim.wait(10000, function()
         result = fff.content_search(marker, { cwd = sandbox_root })
         return #result.items > 0
       end, 50)
+      if #result.items == 0 then
+        -- Print the index state so a CI failure shows why the new root did not match.
+        local health_ok, health = pcall(fff_rust.health_check, sandbox_root)
+        local files = fff.file_search('grep_target', { cwd = sandbox_root })
+        print(vim.inspect({
+          health = health_ok and health or tostring(health),
+          file_hits = #files.items,
+          dir = vim.fn.readdir(sandbox_root),
+          base_path = require('fff.conf').get().base_path,
+          grep = result,
+        }))
+      end
       assert.is_true(#result.items > 0, 'cwd switch did not surface match from the new root')
     end)
   end)

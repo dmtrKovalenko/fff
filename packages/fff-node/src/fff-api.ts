@@ -179,6 +179,8 @@ export interface Score {
   currentFilePenalty: number;
   /** Boost from query history combo matching */
   comboMatchBoost: number;
+  /** Bonus for query segments aligning with path segments */
+  pathAlignmentBonus: number;
   /** Whether this was an exact match */
   exactMatch: boolean;
   /** Type of match: 'fuzzy', 'exact', 'prefix', etc. */
@@ -299,14 +301,18 @@ export interface ScanProgress {
  *
  * rescan = internal OS buffers were overloaded, some events might be missing.
  * The `path` is going to be a folder needs to be rescanned
+ *
+ * renamed = the file was moved to the other path without changing the content
  */
-export type WatchEventKind = "created" | "modified" | "removed" | "rescan";
+export type WatchEventKind = "created" | "modified" | "removed" | "rescan" | "renamed";
 
 /** A single filesystem change notification. */
 export interface WatchEvent {
-  /** Absolute path of the affected file (base path to rescan if `kind ==rescan`) */
+  /** Absolute path of the affected file (base path to rescan if `kind == rescan`) */
   path: string;
   kind: WatchEventKind;
+  /** Absolute path the file moved from. Only set when `kind == "renamed"`. */
+  from?: string;
 }
 
 /** Options for watch subscriptions. */
@@ -388,6 +394,8 @@ export interface HealthCheck {
  */
 export type GrepMode = "plain" | "regex" | "fuzzy";
 
+export type DefinitionMode = "off" | "classify" | "definition_only" | "usage_only";
+
 /**
  * Opaque pagination cursor for grep results.
  * Pass this to `GrepOptions.cursor` to fetch the next page.
@@ -443,12 +451,9 @@ export interface GrepOptions {
   afterContext?: number;
   /** Maximum matches to return in this page across all files (default: 50) */
   pageSize?: number;
-  /**
-   * When true, classify each match line as a code definition (struct/fn/class/...)
-   * and expose it via `GrepMatch.isDefinition`. Let callers re-rank defs first
-   * without a TS-side regex port. (default: false)
-   */
-  classifyDefinitions?: boolean;
+  /** Select matching definitions/usages, or classify all matches. Defaults to "off".
+   * Legacy booleans map false to "off" and true to "classify". Keep the same mode with a cursor. */
+  classifyDefinitions?: DefinitionMode | boolean;
 }
 
 /**
@@ -489,7 +494,7 @@ export interface GrepMatch {
   contextBefore?: string[];
   /** Lines after the match (context). Empty array when context is 0. */
   contextAfter?: string[];
-  /** Whether this line is a code definition (only populated when `classifyDefinitions: true`). */
+  /** Whether the query matches a declared name. Available when classification is enabled. */
   isDefinition?: boolean;
 }
 
@@ -554,11 +559,9 @@ export interface MultiGrepOptions {
   afterContext?: number;
   /** Maximum matches to return in this page across all files (default: 50) */
   pageSize?: number;
-  /**
-   * When true, classify each match line as a code definition (struct/fn/class/...)
-   * and expose it via `GrepMatch.isDefinition`. (default: false)
-   */
-  classifyDefinitions?: boolean;
+  /** Select matching definitions/usages, or classify all matches. Defaults to "off".
+   * Legacy booleans map false to "off" and true to "classify". Keep the same mode with a cursor. */
+  classifyDefinitions?: DefinitionMode | boolean;
 }
 
 /** Metadata for a file added to an index layer without touching the filesystem. */
@@ -672,7 +675,7 @@ export interface FileFinderApi {
    * Patterns may be base-relative globs (./ works), exact paths inside the indexed
    * tree, or existing directories. An empty pattern watches the whole tree.
    *
-   * Events are debounced and submitted in batches per 100-ms window at most 128 events.
+   * Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
    * Gitignored and other ignored files are never triggering watcher.
    */
   watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
@@ -719,4 +722,25 @@ export interface FileFinderApi {
    * Fails while another scan is active.
    */
   loadBase(filePath: string): Result<number>;
+}
+
+/** @internal Convert the public mode to the C integer argument. */
+export function definitionModeToInt(
+  mode: DefinitionMode | boolean | undefined,
+): number | undefined {
+  switch (mode) {
+    case undefined:
+    case false:
+    case "off":
+      return 0;
+    case true:
+    case "classify":
+      return 1;
+    case "definition_only":
+      return 2;
+    case "usage_only":
+      return 3;
+    default:
+      return undefined;
+  }
 }

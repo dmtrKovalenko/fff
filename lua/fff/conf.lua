@@ -8,6 +8,9 @@ local M = {}
 --- @field preview_size number
 --- @field min_list_height number
 --- @field show_scrollbar boolean
+--- @field show_file_count boolean
+--- @field title_position 'left'|'center'|'right'
+--- @field filename_position 'left'|'center'|'right'
 --- @field path_shorten_strategy string
 --- @field show_path_first boolean
 --- @field border? 'single'|'double'|'rounded'|'solid'|'shadow'|'none'|table<string[],string[]> Border preset; falls back to `vim.o.winborder` when nil
@@ -52,21 +55,33 @@ local M = {}
 --- @field enabled boolean
 --- @field db_path string
 
+--- @alias FffGitStatusUpdates 'while_open'|'always'|'manual'
+
 --- @class FffHistoryConfig
 --- @field enabled boolean
 --- @field db_path string
 --- @field min_combo_count number
 --- @field combo_boost_score_multiplier number
 
+--- @alias FffDefinitionMode 'off'|'classify'|'definition_only'|'usage_only'
+--- @alias FffGrepMode 'plain'|'regex'|'fuzzy'|'definition_only'
+
 --- @class FffGrepConfig
 --- @field max_file_size number
 --- @field max_matches_per_file number
 --- @field smart_case boolean
+--- @field casing? "smart"|"sensitive"|"insensitive"
 --- @field time_budget_ms number
 --- @field enforce_time_budget boolean
---- @field modes string[]
+--- @field modes FffGrepMode[]
 --- @field trim_whitespace boolean
+--- @field classify_definitions boolean|FffDefinitionMode
 --- @field location_format string
+--- @field enable_filename_constraint boolean
+
+--- @class FffSuggestionsConfig
+--- @field enabled boolean
+--- @field grep_time_budget_ms number
 
 --- @alias FffSelectAction 'edit' | 'split' | 'vsplit' | 'tab'
 
@@ -98,6 +113,7 @@ local M = {}
 --- @field wrap_around boolean
 --- @field file_picker table
 --- @field grep FffGrepConfig
+--- @field suggestions FffSuggestionsConfig
 
 ---@class fff.conf.State
 local state = {
@@ -273,6 +289,9 @@ local function init()
       -- auto-hidden so the file list stays usable. Set to 0 to disable.
       min_list_height = 10,
       show_scrollbar = true, -- Show scrollbar for pagination
+      show_file_count = true, -- Show the matched/total file count on the right of the prompt
+      title_position = 'left', -- or 'center', 'right'
+      filename_position = 'left', -- preview title (file path) alignment: 'left', 'center', 'right'
       -- How to shorten long directory paths in the file list:
       -- 'middle' (default): always uses dots (a/./b, a/../b, a/.../b)
       -- 'middle_number' uses dots for 1-3 hidden (a/./b, a/../b, a/.../b)
@@ -310,7 +329,7 @@ local function init()
       preview_scroll_up = '<C-u>',
       preview_scroll_down = '<C-d>',
       toggle_debug = '<F2>',
-      -- grep mode: cycle between plain text, regex, and fuzzy search
+      -- Cycle between configured grep modes.
       cycle_grep_modes = '<S-Tab>',
       -- grep mode only: insert a literal `\n` to search across lines
       -- (requires a terminal with extended-key support to distinguish from <CR>)
@@ -374,6 +393,7 @@ local function init()
       grep_regex_active = 'DiagnosticInfo', -- Highlight for keybind + label when regex is on
       grep_plain_active = 'Comment', -- Highlight for keybind + label when regex is off
       grep_fuzzy_active = 'DiagnosticHint', -- Highlight for keybind + label when fuzzy is on
+      grep_definition_active = 'DiagnosticOk', -- Highlight for the definitions-only mode
       -- Cross-mode suggestion highlights
       suggestion_header = 'WarningMsg', -- Highlight for the "No results found. Suggested..." banner
       -- File info panel highlights
@@ -427,6 +447,16 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      -- 'while_open': pause git status while the picker is closed, refresh it on open
+      -- 'always': track every change in the background, 'manual': only on :FFFRefreshGit
+      status_updates = 'while_open',
+      -- Boost files that participated in recent commits of the current branch:
+      -- +1 score point per commit the file appeared in (max = max_commits)
+      recency = {
+        enabled = true,
+        max_commits = 10, -- Analyze the last N branch-specific commits
+        max_files_per_commit = 50, -- Skip bulk commits (merges, refactors) touching more files
+      },
     },
     debug = {
       enabled = false, -- Show file info panel in preview
@@ -458,15 +488,22 @@ local function init()
       current_file_label = '(current)',
       fuzzy_query_highlighting = false,
     },
+    -- Cross-mode suggestions shown when a query has no results
+    suggestions = {
+      enabled = true,
+      grep_time_budget_ms = 50, -- Hard cap for the grep hint in file mode (it never runs before content indexing finishes)
+    },
     -- grep settings
     grep = {
       max_file_size = 10 * 1024 * 1024, -- Skip files larger than 10MB
       max_matches_per_file = 100, -- Maximum matches per file (set 0 to unlimited)
       smart_case = true, -- Case-insensitive unless query has uppercase
+      casing = nil, -- "smart" | "sensitive" | "insensitive"; overrides smart_case when set
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
-      modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
+      modes = { 'plain', 'regex', 'fuzzy', 'definition_only' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
+      classify_definitions = true, -- Show matching definitions first within each page
       -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
       -- file-path filter, scoping the content search to matching files. When off, such
       -- tokens are searched as literal text. A token is a filename if it has a valid-looking

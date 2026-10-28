@@ -3,7 +3,7 @@ name = "fff-grep"
 description = "File grepping logic for fff"
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlok.com>"]
-version = "0.10.6"
+version = "0.11.0"
 edition = "2024"
 
 [lints]

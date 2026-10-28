@@ -369,6 +369,7 @@ fn grep_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::PlainText,
@@ -376,7 +377,7 @@ fn grep_opts() -> GrepSearchOptions {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     }

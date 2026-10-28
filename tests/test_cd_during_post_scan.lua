@@ -33,8 +33,8 @@ fff_rust.restart_index_in_path(plugin_dir)
 local deadline = vim.uv.hrtime() + 30e9 -- 30s
 while true do
   vim.wait(500, function() return false end)
-  local ok, result = pcall(fff_rust.fuzzy_search_files, 'lib', 2, nil, 100, 3, 0, 10)
-  if ok and result and #result.items > 0 then
+  local searched, result = pcall(fff_rust.fuzzy_search_files, 'lib', 2, nil, 100, 3, 0, 10)
+  if searched and result and #result.items > 0 then
     print('PASS: :cd during post-scan did not crash (' .. #result.items .. ' results found)')
     break
   end

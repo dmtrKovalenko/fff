@@ -68,7 +68,7 @@ pub struct FileItemFlags;
 
 impl FileItemFlags {
     pub const BINARY: u8 = 1 << 0;
-    /// Tombstone — file was deleted but index slot is preserved so
+    /// Tombstone: file was deleted but index slot is preserved so
     /// bigram indices for other files stay valid.
     pub const DELETED: u8 = 1 << 1;
     /// File was added after the last full reindex; its indices point
@@ -272,10 +272,12 @@ pub struct FileItem {
     pub modified: u64,
     pub access_frecency_score: i16,
     pub modification_frecency_score: i16,
+    pub git_recency_score: i16,
     pub git_status: Option<git2::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
+    definition_language: u8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
@@ -298,8 +300,10 @@ impl Clone for FileItem {
             modified: self.modified,
             access_frecency_score: self.access_frecency_score,
             modification_frecency_score: self.modification_frecency_score,
+            git_recency_score: self.git_recency_score,
             git_status: self.git_status,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
+            definition_language: self.definition_language,
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
@@ -342,8 +346,10 @@ impl FileItem {
             modified,
             access_frecency_score: 0,
             modification_frecency_score: 0,
+            git_recency_score: 0,
             git_status,
             flags: AtomicU8::new(flags),
+            definition_language: 0,
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -386,10 +392,6 @@ impl FileItem {
         s
     }
 
-    pub(crate) fn write_relative_path_from_arena(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_to_string(arena, out);
-    }
-
     pub fn relative_path_len(&self) -> usize {
         self.path.byte_len as usize
     }
@@ -399,12 +401,7 @@ impl FileItem {
     }
 
     pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
-        if other.len() != self.path.byte_len as usize {
-            return false;
-        }
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let mine = self.path.read_to_buf(arena, &mut buf);
-        mine == other
+        self.path.equals(arena, other)
     }
 
     pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {
@@ -570,6 +567,44 @@ impl FileItem {
         filled
     }
 
+    pub(crate) fn mark_definition_language(&mut self, filename: &str) {
+        self.definition_language = crate::definition::Language::from_filename(filename) as u8;
+    }
+
+    /// Classify a returned match using the language recorded during indexing.
+    /// Lines longer than 256 bytes are not classified as definitions.
+    pub fn is_definition_match(&self, line: &str, ranges: &[(u32, u32)]) -> bool {
+        let flags = self.flags.load(Ordering::Relaxed);
+        flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
+            && crate::definition::is_definition_match(
+                self.definition_language,
+                line.as_bytes(),
+                ranges,
+                false,
+            )
+    }
+
+    pub(crate) fn classify_definition_match(
+        &self,
+        line: &[u8],
+        ranges: &[(u32, u32)],
+        fuzzy: bool,
+    ) -> bool {
+        let flags = self.flags.load(Ordering::Relaxed);
+        flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
+            && crate::definition::is_definition_match(
+                self.definition_language,
+                line,
+                ranges,
+                fuzzy,
+            )
+    }
+
+    #[inline]
+    pub(crate) fn supports_definitions(&self) -> bool {
+        self.definition_language != 0
+    }
+
     #[inline]
     pub fn is_binary(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & FileItemFlags::BINARY != 0
@@ -589,11 +624,11 @@ impl FileItem {
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
-        if self.size == 0 {
+        if self.is_binary() || self.size == 0 {
             return;
         }
 
-        let Ok(mut file) = std::fs::OpenOptions::new()
+        let Ok(file) = std::fs::OpenOptions::new()
             .write(false)
             .read(true)
             .open(path)
@@ -601,6 +636,8 @@ impl FileItem {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
             return;
         };
+        // only classify the first MAX_FFFILE_SIZE bytes, never read large files to EOF
+        let mut file = file.take(MAX_FFFILE_SIZE);
 
         loop {
             match file.read(chunk) {
@@ -612,6 +649,7 @@ impl FileItem {
                 Ok(n) => {
                     if detect_binary_content(&chunk[..n]) {
                         self.set_binary(true);
+                        break;
                     }
                 }
             }
@@ -808,11 +846,7 @@ impl FileItem {
         self.cached_content()
     }
 
-    /// Get file content for searching — **always returns content** for eligible
-    /// files, even when the persistent cache budget is exhausted.
-    ///
-    /// The caller provides a reusable `path_buf` (pre-filled with `base_path/`)
-    /// and its `base_len` to avoid allocations when constructing the absolute path.
+    // Uncached files remain searchable after the persistent cache budget fills.
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -821,6 +855,7 @@ impl FileItem {
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
+        base_dir: Option<&std::fs::File>,
     ) -> Option<&'a [u8]> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -837,11 +872,10 @@ impl FileItem {
             return None;
         }
 
-        let abs = self.absolute_path(arena, base_path);
+        let mut file = self.open_for_search(arena, base_path, base_dir)?;
 
         #[cfg(not(target_os = "windows"))]
         if self.size >= FRESH_MMAP_THRESHOLD {
-            let file = std::fs::File::open(&abs).ok()?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
             return Some(&stored[..]);
@@ -852,9 +886,45 @@ impl FileItem {
         let len = self.size as usize;
         buf.resize(len, 0);
 
-        let mut file = std::fs::File::open(&abs).ok()?;
         file.read_exact(buf).ok()?;
         Some(buf.as_slice())
+    }
+
+    fn open_for_search(
+        &self,
+        arena: ArenaPtr,
+        base_path: &Path,
+        #[cfg_attr(not(unix), allow(unused_variables))] base_dir: Option<&std::fs::File>,
+    ) -> Option<std::fs::File> {
+        let mut path_buf = [0u8; PATH_BUF_SIZE];
+        #[cfg(unix)]
+        if let Some(dir) = base_dir
+            && self.relative_path_len() < path_buf.len()
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let path = self.write_relative_cstr(arena, &mut path_buf);
+            // The directory FD stays borrowed; a successful openat returns an owned FD.
+            loop {
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd >= 0 {
+                    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return None;
+                }
+            }
+        }
+        if base_path.as_os_str().len() + self.relative_path_len() + 1 < path_buf.len() {
+            std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
+        } else {
+            std::fs::File::open(self.absolute_path(arena, base_path)).ok()
+        }
     }
 }
 
@@ -867,6 +937,11 @@ pub type MmapSlot = Option<memmap2::Mmap>;
 pub type MmapSlot = ();
 
 impl Constrainable for FileItem {
+    #[inline]
+    fn has_extension(&self, arena: ArenaPtr, extension: &str, _scratch: &mut String) -> bool {
+        self.path.has_extension(arena, extension)
+    }
+
     #[inline]
     fn write_file_name(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_filename_to(arena, out);
@@ -896,6 +971,7 @@ pub struct Score {
     pub special_filename_bonus: i32,
     pub frecency_boost: i32,
     pub git_status_boost: i32,
+    pub git_recency_boost: i32,
     pub distance_penalty: i32,
     pub current_file_penalty: i32,
     pub combo_match_boost: i32,
@@ -1100,6 +1176,42 @@ impl Default for ContentCacheBudget {
 mod content_cache_budget_tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn uncached_search_reads_relative_and_absolute_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let path = "nested/é file.txt";
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let budget = ContentCacheBudget::with_max_files(0);
+        for size in [17, FRESH_MMAP_THRESHOLD as usize + 17] {
+            let contents = vec![b'x'; size];
+            std::fs::write(root.path().join(path), &contents).unwrap();
+            let mut file = FileItem::new_raw(7, size as u64, 0, None, false);
+            let (store, strings) = crate::simd_path::build_chunked_path_store_from_strings(
+                &[path.to_string()],
+                std::slice::from_ref(&file),
+            );
+            file.set_path(strings.into_iter().next().unwrap());
+            for base_dir in [Some(&directory), None] {
+                let mut buf = Vec::new();
+                let mut mmap = MmapSlot::default();
+                let actual = file
+                    .get_content_for_search(
+                        &mut buf,
+                        &mut mmap,
+                        store.as_arena_ptr(),
+                        root.path(),
+                        &budget,
+                        base_dir,
+                    )
+                    .unwrap();
+                assert_eq!(actual, contents);
+                assert_eq!(budget.cached_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
     #[test]
     fn with_max_files_applies_the_cap_verbatim() {
         // regression: the cap used to be routed through new_for_repo, which
@@ -1128,5 +1240,81 @@ mod content_cache_budget_tests {
         let default = ContentCacheBudget::default();
         assert_eq!(budget.max_bytes, default.max_bytes);
         assert_eq!(budget.max_file_size, default.max_file_size);
+    }
+}
+
+#[cfg(test)]
+mod detect_binary_tests {
+    use super::*;
+
+    fn classify(content: &[u8]) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("f");
+        std::fs::write(&path, content).unwrap();
+        let (item, _) = FileItem::new(path.clone(), root.path(), None);
+        item.detect_binary_per_byte(&path, &mut [0u8; BINARY_CLASSIFICATION_CHUNK_SIZE]);
+        item.is_binary()
+    }
+
+    #[test]
+    fn detects_nul_in_small_file() {
+        let mut content = vec![b'a'; BINARY_CLASSIFICATION_CHUNK_SIZE * 3];
+        content[10] = 0;
+        assert!(classify(&content));
+        assert!(!classify(b"plain text\n"));
+    }
+
+    #[test]
+    fn reads_only_first_max_size_bytes() {
+        let mut content = vec![b'a'; MAX_FFFILE_SIZE as usize + 1];
+        content[0] = 0;
+        assert!(classify(&content));
+
+        content[0] = b'a';
+        content[MAX_FFFILE_SIZE as usize] = 0;
+        assert!(!classify(&content));
+    }
+}
+
+#[cfg(test)]
+mod definition_flag_tests {
+    use super::FileItem;
+
+    #[test]
+    fn language_and_existing_flags_preserve_each_other() {
+        for binary in [false, true] {
+            for deleted in [false, true] {
+                for overflow in [false, true] {
+                    let mut file = FileItem::new_raw(0, 0, 0, None, binary);
+                    file.set_deleted(deleted);
+                    file.set_overflow(overflow);
+                    assert!(!file.supports_definitions());
+                    for filename in ["file.rs", "file.py", "file.txt", "file.hs", "file.rs"] {
+                        file.mark_definition_language(filename);
+                        assert_eq!(file.is_binary(), binary);
+                        assert_eq!(file.is_deleted(), deleted);
+                        assert_eq!(file.is_overflow(), overflow);
+                        assert_eq!(file.supports_definitions(), filename != "file.txt");
+                    }
+
+                    let clone = file.clone();
+                    assert_eq!(clone.is_binary(), binary);
+                    assert_eq!(clone.is_deleted(), deleted);
+                    assert_eq!(clone.is_overflow(), overflow);
+                    assert!(clone.supports_definitions());
+                    clone.set_binary(!binary);
+                    clone.set_deleted(!deleted);
+                    clone.set_overflow(!overflow);
+                    assert!(clone.supports_definitions());
+                    clone.set_binary(false);
+                    clone.set_deleted(false);
+                    clone.set_overflow(false);
+                    assert!(clone.is_definition_match("fn needle() {}", &[(3, 9)]));
+                    assert_eq!(file.is_binary(), binary);
+                    assert_eq!(file.is_deleted(), deleted);
+                    assert_eq!(file.is_overflow(), overflow);
+                }
+            }
+        }
     }
 }

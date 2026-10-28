@@ -80,7 +80,7 @@ with FileFinder("/path/to/project") as finder:
 
     def on_change(events):
         for e in events:
-            print(e.kind, e.path)  # created | modified | removed | rescan
+            print(e.kind, e.path)  # created | modified | removed | renamed | rescan
 
     # Globs are relative to the project root; wildcard-free patterns resolve
     # inside the indexed tree — an existing directory watches its whole
@@ -97,6 +97,10 @@ with FileFinder("/path/to/project") as finder:
     with finder.watch("src", on_change, ignore=["*.log", "src/vendor"]):
         ...
 ```
+
+A `renamed` event carries both paths: `e.path` is the destination and
+`e.from_path` the source. It replaces the removed/created pair, so a move is
+one event. Moves in or out of the indexed tree stay a plain `created`/`removed`.
 
 A `rescan` event means individual changes were lost (index overflow or an
 ignore-file change) — re-check anything you care about.

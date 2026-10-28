@@ -633,7 +633,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fff-c"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "fff-query-parser",
  "fff-search",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "fff-grep"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "bstr",
  "memchr",
@@ -651,13 +651,16 @@ dependencies = [
 
 [[package]]
 name = "fff-mcp"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "clap",
  "fff-query-parser",
  "fff-search",
  "git2",
+ "globset",
  "mimalloc",
+ "rayon",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
@@ -684,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "fff-nvim"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "ahash",
  "chrono",
@@ -705,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "fff-python"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "fff-query-parser",
  "fff-search",
@@ -715,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "fff-query-parser"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "criterion",
  "zlob",
@@ -723,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "fff-search"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -1508,9 +1511,12 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.11.0"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2f6120a8da26bea3587731072111062c5d8c51ca3a3a75a716bd8b735d5882"
+checksum = "fb0dd0e69b342eaddb657120a21a56f3e887ddc505fac780cf430dbbbb3aed26"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "nix"
@@ -3207,9 +3213,9 @@ dependencies = [
 
 [[package]]
 name = "zlob"
-version = "1.6.5"
+version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ed9cfbcfaf165adcf07d994f85a92effaef03029b53afc0872152671efcfbda"
+checksum = "6b87ec8c6fa7d706ea81f68659a7b1de38516d91ba5bde4c97077ad07b30c1b2"
 dependencies = [
  "bindgen",
  "bitflags 2.11.0",

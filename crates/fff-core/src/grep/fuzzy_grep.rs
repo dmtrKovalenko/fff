@@ -1,13 +1,11 @@
+use crate::match_offsets::char_indices_to_byte_offsets;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::lines::LineStep;
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::sink::{
-    char_indices_to_byte_offsets, classify_definition, strip_line_terminators,
-    truncate_display_bytes,
-};
+use super::sink::{strip_line_terminators, truncate_display_bytes};
 use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 
 #[allow(clippy::too_many_arguments)]
@@ -23,6 +21,10 @@ pub(super) fn fuzzy_grep_search<'a>(
     base_path: &Path,
     arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
+    #[cfg(unix)]
+    let base_dir = std::fs::File::open(base_path).ok();
+    #[cfg(not(unix))]
+    let base_dir = None;
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" -> "schema") costs ~1 typo with
     // default gap penalties. We scale max_typos by needle length:
@@ -51,7 +53,7 @@ pub(super) fn fuzzy_grep_search<'a>(
         &neo_frizbee::Config {
             // Use the real max_typos so frizbee's SIMD prefilter actually rejects non-matching lines (~2 SIMD instructions per line vs full SW scoring).
             max_typos: Some(max_typos as u16),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             scoring,
             ..Default::default()
         },
@@ -165,8 +167,14 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                     let file_arena = arenas.get(file.layer_id());
 
-                    let file_bytes =
-                        file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
+                    let file_bytes = file.get_content_for_search(
+                        buf,
+                        mmap_slot,
+                        file_arena,
+                        base_path,
+                        budget,
+                        base_dir.as_ref(),
+                    )?;
 
                     if min_chars_required > 0 {
                         let mut chars_found = 0usize;
@@ -265,7 +273,7 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                         if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
                             // reject widely scattered matches
-                            let span = last - first + 1;
+                            let span = (last - first + 1) as usize;
                             if span > max_match_span {
                                 continue;
                             }
@@ -295,6 +303,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                         let (ln, bo) = line_meta[idx];
                         let match_byte_offsets =
                             char_indices_to_byte_offsets(display_line, &match_indices.indices);
+                        let Some(is_definition) = options.classify_definitions.classify_match(
+                            file,
+                            raw_line.as_bytes(),
+                            &match_byte_offsets,
+                            true,
+                        ) else {
+                            continue;
+                        };
                         let col = match_byte_offsets
                             .first()
                             .map(|r| r.0 as usize)
@@ -305,10 +321,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                             line_number: ln,
                             col,
                             byte_offset: bo,
-                            is_definition: classify_definition(
-                                options.classify_definitions,
-                                display_line,
-                            ),
+                            is_definition,
                             line_content: display_line.to_string(),
                             match_byte_offsets,
                             fuzzy_score: Some(match_indices.score),

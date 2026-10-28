@@ -183,7 +183,7 @@ fn imported_layer_is_searchable_and_sealed_lookups_work() {
     let path = base.join("out/pkg7/mod2999.ts");
     fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
     fs::write(&path, "changed\n").expect("write");
-    picker.handle_create_or_modify(&path);
+    picker.handle_create_or_modify(&path).expect("update indexed file");
     assert_eq!(layer_paths(&picker, layer).len(), 3000, "no duplicate row");
     assert_eq!(
         picker.get_file_by_path(&path).map(|f| f.size),
@@ -195,7 +195,7 @@ fn imported_layer_is_searchable_and_sealed_lookups_work() {
     let fresh = base.join("out/pkg0/new.ts");
     fs::create_dir_all(fresh.parent().unwrap()).expect("mkdir");
     fs::write(&fresh, "new\n").expect("write");
-    picker.handle_create_or_modify(&fresh);
+    picker.handle_create_or_modify(&fresh).expect("update indexed file");
     assert_eq!(picker.current_layer(), layer + 1);
     assert_eq!(layer_paths(&picker, layer).len(), 3000);
     assert_eq!(layer_paths(&picker, layer + 1), vec!["out/pkg0/new.ts"]);

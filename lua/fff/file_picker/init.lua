@@ -150,14 +150,22 @@ end
 function M.is_initialized() return M.state.initialized end
 
 --- Get scan progress information
---- @return table Progress information with scanned_files_count, is_scanning
+--- @return table Progress information with scanned_files_count, is_scanning, is_warmup_complete, is_index_ready
 function M.get_scan_progress()
-  if not M.state.initialized then return { total_files = 0, scanned_files_count = 0, is_scanning = false } end
+  if not M.state.initialized then
+    return {
+      total_files = 0,
+      scanned_files_count = 0,
+      is_scanning = false,
+      is_warmup_complete = false,
+      is_index_ready = false,
+    }
+  end
 
   local ok, result = pcall(fuzzy.get_scan_progress)
   if not ok then
     vim.notify('Failed to get scan progress: ' .. tostring(result), vim.log.levels.WARN)
-    return { scanned_files_count = 0, is_scanning = false }
+    return { scanned_files_count = 0, is_scanning = false, is_warmup_complete = false, is_index_ready = false }
   end
 
   return result
@@ -176,6 +184,27 @@ function M.refresh_git_status()
 
   -- Update our cache
   return result
+end
+
+local function updates_git_status_while_open() return require('fff.core').git_status_updates() == 'while_open' end
+
+--- Resume background git status updates and queue a full refresh (git.status_updates = 'while_open')
+function M.resume_git_status()
+  if not M.state.initialized or not updates_git_status_while_open() then return end
+  pcall(fuzzy.resume_git_status)
+end
+
+--- Pause background git status updates while the picker is closed (git.status_updates = 'while_open')
+function M.pause_git_status()
+  if not M.state.initialized or not updates_git_status_while_open() then return end
+  pcall(fuzzy.pause_git_status)
+end
+
+--- @return boolean true while queued git status work has not been applied yet
+function M.is_git_status_refreshing()
+  if not M.state.initialized then return false end
+  local ok, refreshing = pcall(fuzzy.is_git_status_refreshing)
+  return ok and refreshing == true
 end
 
 --- Stop background git status monitoring

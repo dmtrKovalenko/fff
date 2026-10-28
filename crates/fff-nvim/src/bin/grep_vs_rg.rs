@@ -163,6 +163,7 @@ fn run_fff_full(picker: &FilePicker, query: &str) -> (usize, Duration) {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: usize::MAX,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: usize::MAX,
         mode: Default::default(),
@@ -170,7 +171,7 @@ fn run_fff_full(picker: &FilePicker, query: &str) -> (usize, Duration) {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };
@@ -187,6 +188,7 @@ fn run_fff_page(picker: &FilePicker, query: &str) -> (usize, Duration) {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 50,
         mode: Default::default(),
@@ -194,7 +196,7 @@ fn run_fff_page(picker: &FilePicker, query: &str) -> (usize, Duration) {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };

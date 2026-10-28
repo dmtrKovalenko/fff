@@ -275,6 +275,141 @@ fn moved_out_directory_delivers_removed_event_per_file() {
 }
 
 #[test]
+fn renaming_a_file_delivers_one_renamed_event_with_both_paths() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    let old = base.join("src/renamed_from.rs");
+    fs::write(&old, "pub fn hi() {}\n").unwrap();
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    let events = watch_collect(&picker, "", WatchOptions::default());
+
+    let new = base.join("src/renamed_to.rs");
+    fs::rename(&old, &new).unwrap();
+
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.kind == WatchEventKind::Renamed && e.path == new),
+            Duration::from_secs(10)
+        ),
+        "expected a Renamed event for {}, got: {:?}",
+        new.display(),
+        events.lock()
+    );
+
+    let got = events.lock();
+    let renamed = got
+        .iter()
+        .find(|e| e.kind == WatchEventKind::Renamed)
+        .unwrap();
+    assert_eq!(renamed.from.as_deref(), Some(old.as_path()));
+    assert!(
+        !got.iter()
+            .any(|e| e.path == old && e.kind == WatchEventKind::Removed),
+        "a recognised rename must not also report the source as Removed: {got:?}"
+    );
+}
+
+#[test]
+fn renaming_out_of_a_watched_subtree_still_notifies() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    fs::create_dir_all(base.join("vendor")).unwrap();
+    let inside = base.join("src/leaving.rs");
+    fs::write(&inside, "pub fn leaving() {}\n").unwrap();
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    // Only `src/` is watched; the destination is outside it.
+    let events = watch_collect(&picker, "src", WatchOptions::default());
+
+    let outside = base.join("vendor/leaving.rs");
+    fs::rename(&inside, &outside).unwrap();
+
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.kind == WatchEventKind::Renamed
+                    && e.from.as_deref() == Some(inside.as_path())),
+            Duration::from_secs(10)
+        ),
+        "a subscriber on src/ must hear that a file moved out of it, got: {:?}",
+        events.lock()
+    );
+}
+
+#[test]
+fn renaming_into_a_watched_subtree_still_notifies() {
+    let tmp = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    fs::create_dir_all(base.join("vendor")).unwrap();
+    let outside = base.join("vendor/arriving.rs");
+    fs::write(&outside, "pub fn arriving() {}\n").unwrap();
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    let events = watch_collect(&picker, "src", WatchOptions::default());
+
+    let inside = base.join("src/arriving.rs");
+    fs::rename(&outside, &inside).unwrap();
+
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.kind == WatchEventKind::Renamed && e.path == inside),
+            Duration::from_secs(10)
+        ),
+        "a subscriber on src/ must hear that a file moved into it, got: {:?}",
+        events.lock()
+    );
+}
+
+#[test]
+fn renaming_across_the_base_boundary_degrades_to_removed() {
+    let tmp = TempDir::new().unwrap();
+    let outside_root = TempDir::new().unwrap();
+    let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();
+    seed(&base);
+    let inside = base.join("src/exiting.rs");
+    fs::write(&inside, "pub fn exiting() {}\n").unwrap();
+
+    let (picker, _frecency) = make_watched_picker(&base);
+    let events = watch_collect(&picker, "", WatchOptions::default());
+
+    // The destination is outside the indexed tree, so there is no pair to
+    // report — this stays a plain removal.
+    fs::rename(&inside, outside_root.path().join("exiting.rs")).unwrap();
+
+    assert!(
+        wait_for(
+            || events
+                .lock()
+                .iter()
+                .any(|e| e.path == inside && e.kind == WatchEventKind::Removed),
+            Duration::from_secs(10)
+        ),
+        "expected Removed for a file moved out of the base, got: {:?}",
+        events.lock()
+    );
+    assert!(
+        events
+            .lock()
+            .iter()
+            .all(|e| e.kind != WatchEventKind::Renamed),
+        "no Renamed may escape with a path outside the base: {:?}",
+        events.lock()
+    );
+}
+
+#[test]
 fn empty_pattern_watches_the_whole_tree() {
     let tmp = TempDir::new().unwrap();
     let base = fff_search::path_utils::canonicalize(tmp.path()).unwrap();

@@ -94,6 +94,12 @@ end
 --- @return boolean
 M.is_file_picker_initialized = function() return state.file_picker_initialized end
 
+--- @return FffGitStatusUpdates
+M.git_status_updates = function()
+  local git = require('fff.conf').get().git
+  return git and git.status_updates or 'while_open'
+end
+
 --- Change the base directory for the file picker. Triggers a reindex on the
 --- Rust side and updates `config.base_path` so subsequent `:cd` events compare
 --- against the new root.
@@ -125,6 +131,7 @@ M.change_indexing_directory = function(new_path)
     enable_fs_root_scanning = config.enable_fs_root_scanning,
     enable_home_dir_scanning = config.enable_home_dir_scanning,
     enable_filename_constraint = config.grep and config.grep.enable_filename_constraint,
+    git_recency = config.git and config.git.recency,
   })
   if not ok then
     vim.notify('Failed to change directory: ' .. err, vim.log.levels.ERROR)
@@ -186,11 +193,15 @@ M.ensure_initialized = function()
   -- Guarded separately from one-time setup so a cache clear rebuilds the
   -- picker instead of leaving a dropped one behind (#772).
   if not state.file_picker_initialized then
+    -- paused before init so the initial scan skips the status read as well
+    if M.git_status_updates() ~= 'always' then pcall(fuzzy.pause_git_status) end
+
     local ok, result = pcall(fuzzy.init_file_picker, config.base_path, {
       follow_symlinks = config.follow_symlinks,
       enable_fs_root_scanning = config.enable_fs_root_scanning,
       enable_home_dir_scanning = config.enable_home_dir_scanning,
       enable_filename_constraint = config.grep and config.grep.enable_filename_constraint,
+      git_recency = config.git and config.git.recency,
     })
     if not ok then
       vim.notify('Failed to initialize file picker: ' .. tostring(result), vim.log.levels.ERROR)

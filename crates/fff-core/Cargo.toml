@@ -1,6 +1,6 @@
 [package]
 name = "fff-search"
-version = "0.10.6"
+version = "0.11.0"
 edition = "2024"
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
@@ -38,6 +38,14 @@ harness = false
 name = "layer_bench"
 harness = false
 
+[[bench]]
+name = "definition_bench"
+harness = false
+
+[[bench]]
+name = "fuzzy_search_bench"
+harness = false
+
 [features]
 # `ripgrep` is the pure-Rust walker/glob backend and is on by default so
 # consumers build without a Zig toolchain. CI/release opt into zlob via
@@ -48,7 +56,7 @@ ffi = []
 # Count full rescans and their causes. Always on in debug builds; enable this
 # to keep the accounting in a release build (used by the rescan_probe binary).
 rescan-stats = []
-# Enables POC definition classification for grep result matched lines
+# Compatibility feature. Classification is controlled per grep call.
 definitions = []
 # Pure-Rust filesystem walker + glob matcher (ignore + globset crates).
 ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]
@@ -57,7 +65,7 @@ ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]
 mimalloc-collect = ["dep:libmimalloc-sys"]
 # Use zlob (Zig-compiled C globbing library) for glob matching.
 # Requires Zig to be installed. When disabled, falls back to globset (pure Rust).
-zlob = ["dep:zlob", "fff-query-parser/zlob"]
+zlob = ["dep:zlob", "dep:globset", "fff-query-parser/zlob"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -106,4 +114,3 @@ proptest = { version = "1", default-features = false, features = ["std", "fork"]
 rand = { version = "0.8", features = ["small_rng"] }
 tempfile = "3.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-

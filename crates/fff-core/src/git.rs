@@ -6,6 +6,69 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Process-wide libgit2 tuning for read-heavy local use. By default libgit2
+/// never caches trees over 4KB and additionally verifies every object. This roughly costs 150% of
+/// its valuable runtime
+pub(crate) fn tune_libgit2_for_local_reads() {
+    static TUNE: std::sync::Once = std::sync::Once::new();
+    TUNE.call_once(|| {
+        // Same tradeoff cargo makes: local objects are trusted, skip hashing.
+        git2::opts::strict_hash_verification(false);
+        // SAFETY: plain process-global size limit; total memory stays bounded
+        // by libgit2's 256MB odb cache.
+        let _ =
+            unsafe { git2::opts::set_cache_object_limit(git2::ObjectType::Tree, 8 * 1024 * 1024) };
+    });
+}
+
+// Repository layout resolved from a single `Repository::discover`
+#[derive(Debug, Clone)]
+pub(crate) struct GitDiscovery {
+    pub(crate) workdir: PathBuf,
+    // Per-worktree git dir holding HEAD, index and logs
+    pub(crate) git_dir: PathBuf,
+    // Checkout owning the history shared by every worktree, set only for linked worktrees
+    shared_root: Option<PathBuf>,
+}
+
+impl GitDiscovery {
+    pub(crate) fn discover(base_path: &Path) -> Option<Self> {
+        let repo = Repository::discover(base_path).ok()?;
+        let workdir = crate::path_utils::normalize(repo.workdir()?.to_path_buf());
+        let shared_root = repo
+            .is_worktree()
+            .then(|| main_checkout_root(&repo))
+            .map(crate::path_utils::normalize);
+
+        Some(Self {
+            workdir,
+            git_dir: repo.path().to_path_buf(),
+            shared_root,
+        })
+    }
+
+    // `base_path` re-rooted into the shared checkout, `None` outside linked worktrees
+    pub(crate) fn shared_base(&self, base_path: &Path) -> Option<PathBuf> {
+        let shared_root = self.shared_root.as_ref()?;
+        let relative = match base_path.strip_prefix(&self.workdir) {
+            Ok(relative) => relative.to_path_buf(),
+            // libgit2 reports a symlink-free workdir
+            Err(_) => crate::path_utils::canonicalize(base_path)
+                .ok()?
+                .strip_prefix(&self.workdir)
+                .ok()?
+                .to_path_buf(),
+        };
+
+        // `join("")` appends a separator, changing the history key of the main checkout
+        Some(if relative.as_os_str().is_empty() {
+            shared_root.clone()
+        } else {
+            shared_root.join(relative)
+        })
+    }
+}
+
 pub(crate) fn default_status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
@@ -52,7 +115,10 @@ impl GitStatusCache {
     }
 
     #[tracing::instrument(skip(repo, status_options))]
-    fn read_status_impl(repo: &Repository, status_options: &mut StatusOptions) -> Result<Self> {
+    pub(crate) fn read_status(
+        repo: &Repository,
+        status_options: &mut StatusOptions,
+    ) -> Result<Self> {
         let statuses = repo.statuses(Some(status_options))?;
         let Some(repo_path) = repo.workdir() else {
             return Ok(Self(AHashMap::new())); // repo is bare
@@ -80,7 +146,7 @@ impl GitStatusCache {
         let git_workdir = git_workdir.as_ref()?;
         let repository = Repository::open(git_workdir).ok()?;
 
-        let status = Self::read_status_impl(&repository, status_options);
+        let status = Self::read_status(&repository, status_options);
 
         match status {
             Ok(status) => Some(status),
@@ -118,12 +184,15 @@ impl GitStatusCache {
             return Ok(Self(map));
         }
 
+        // literal paths make libgit2 use a sorted pathlist instead of wildmatching
+        // every entry against every pathspec (O(entries * paths), minutes on 80k paths)
         let mut status_options = default_status_options();
+        status_options.disable_pathspec_match(true);
         for path in paths {
             status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
         }
 
-        let git_status_cache = Self::read_status_impl(repo, &mut status_options)?;
+        let git_status_cache = Self::read_status(repo, &mut status_options)?;
         Ok(git_status_cache)
     }
 }
@@ -172,6 +241,23 @@ pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
 
 pub fn format_git_status(status: Option<Status>) -> &'static str {
     format_git_status_opt(status).unwrap_or("unknown")
+}
+
+// Main checkout twin of `path` for a picker at `base_path` keyed by `shared_base`
+pub(crate) fn shared_twin(path: &Path, base_path: &Path, shared_base: &Path) -> Option<PathBuf> {
+    Some(shared_base.join(path.strip_prefix(base_path).ok()?))
+}
+
+// Same as git's main worktree: the common dir without its `.git` suffix, so bare
+// and separate git dirs key the shared history by the common dir itself.
+fn main_checkout_root(repo: &Repository) -> PathBuf {
+    let common_dir: PathBuf = repo.commondir().components().collect();
+    match common_dir.parent() {
+        Some(main_root) if common_dir.file_name().is_some_and(|name| name == ".git") => {
+            main_root.to_path_buf()
+        }
+        _ => common_dir,
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +366,40 @@ mod tests {
                 status
             );
         }
+    }
+
+    // Paths are literal: `[id]` must not glob-match `i`/`d`, and new/deleted files still resolve.
+    #[test]
+    fn status_for_paths_treats_paths_literally() {
+        let tmp = TempDir::new().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+
+        for n in ["app/[id]/page.tsx", "app/i/page.tsx", "gone.rs"] {
+            let p = base.join(n);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, "x\n").unwrap();
+        }
+        git(&base, &["init", "-b", "main"]);
+        git(&base, &["add", "-A"]);
+        git(&base, &["commit", "-m", "seed", "--no-gpg-sign"]);
+
+        fs::write(base.join("app/[id]/page.tsx"), "y\n").unwrap();
+        fs::remove_file(base.join("gone.rs")).unwrap();
+        fs::create_dir_all(base.join("fresh/dir")).unwrap();
+        fs::write(base.join("fresh/dir/new.rs"), "z\n").unwrap();
+
+        let repo = Repository::open(&base).unwrap();
+        let paths: Vec<PathBuf> = ["app/[id]/page.tsx", "gone.rs", "fresh/dir/new.rs"]
+            .iter()
+            .map(|n| base.join(n))
+            .collect();
+        let cache = GitStatusCache::git_status_for_paths(&repo, &paths).unwrap();
+
+        let status = |n: &str| cache.lookup_status(&base.join(n));
+        assert!(status("app/[id]/page.tsx").is_some_and(|s| s.contains(Status::WT_MODIFIED)));
+        assert!(status("gone.rs").is_some_and(|s| s.contains(Status::WT_DELETED)));
+        assert!(status("fresh/dir/new.rs").is_some_and(|s| s.contains(Status::WT_NEW)));
+        assert_eq!(status("app/i/page.tsx"), None);
+        assert_eq!(cache.statuses_len(), 3);
     }
 }

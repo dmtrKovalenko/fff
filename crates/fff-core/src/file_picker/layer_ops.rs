@@ -200,6 +200,7 @@ impl FileSync {
 
             let mut file =
                 FileItem::new_raw(offset, entry.size, entry.modified, None, entry.is_binary());
+            file.mark_definition_language(&path);
             file.set_path(self.layers.top_builder().add_file_immediate(&path, offset));
             file.set_layer(layer);
             file.parent_dir_index = dir_idx;
@@ -425,9 +426,11 @@ impl FileSync {
     pub(crate) fn from_snapshot(
         snapshot: LayerSnapshot,
         base_path: &Path,
+        git: Option<crate::git::GitDiscovery>,
         frecency: Option<&FrecencyTracker>,
         mode: super::FFFMode,
     ) -> Self {
+        let shared_base = git.as_ref().and_then(|git| git.shared_base(base_path));
         let LayerSnapshot {
             store,
             mut files,
@@ -462,8 +465,8 @@ impl FileSync {
         if let Some(frecency) = frecency {
             let dirs_ref = &dirs;
             BACKGROUND_THREAD_POOL.install(|| {
-                files.par_iter_mut().for_each(|file| {
-                    let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
+                files.par_iter_mut().for_each_init(|| frecency.reader(), |reader, file| {
+                    let _ = file.update_frecency_scores(reader, arena, base_path, shared_base.as_deref(), mode);
                     let score = file.access_frecency_score as i32;
                     if score > 0
                         && let Some(dir) = dirs_ref.get(file.parent_dir_index as usize)
@@ -487,7 +490,8 @@ impl FileSync {
             layers: LayerStack::new(base_count, base_dirs_count),
             open_file_index: PathIndex::default(),
             overlay_dir_index: PathIndex::default(),
-            git_workdir: FileSync::discover_git_workdir(base_path),
+            git,
+            shared_base,
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: Some(store),
@@ -590,16 +594,13 @@ impl FilePicker {
         snapshot: LayerSnapshot,
         frecency: Option<&FrecencyTracker>,
     ) -> Result<(), Error> {
-        if self
-            .signals
-            .post_scan_indexing_active
-            .load(Ordering::Acquire)
-        {
+        if self.is_scan_active() || self.signals.post_scan_indexing_active.load(Ordering::Acquire) {
             return Err(Error::IndexBusy);
         }
 
         let started = std::time::Instant::now();
-        let sync = FileSync::from_snapshot(snapshot, &self.base_path, frecency, self.mode);
+        let mut sync = FileSync::from_snapshot(snapshot, &self.base_path, FileSync::discover_git(&self.base_path), frecency, self.mode);
+        sync.ignore_rules = self.ignore_rules();
         let file_count = sync.files.len();
         self.commit_new_sync(sync);
 
@@ -632,11 +633,7 @@ impl FilePicker {
         if !needs_growth {
             return Ok(());
         }
-        if self
-            .signals
-            .post_scan_indexing_active
-            .load(Ordering::Acquire)
-        {
+        if self.is_scan_active() || self.signals.post_scan_indexing_active.load(Ordering::Acquire) {
             return Err(Error::IndexBusy);
         }
 

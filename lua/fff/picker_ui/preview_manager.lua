@@ -2,6 +2,7 @@ local M = {}
 
 local preview = require('fff.file_picker.preview')
 local utils = require('fff.utils')
+local layout = require('fff.layout')
 local picker_ui_state = require('fff.picker_ui.picker_ui_state')
 
 local canonicalize_fff_path = utils.canonicalize_fff_path
@@ -13,6 +14,8 @@ local P = nil
 function M.init(parent_module) P = parent_module end
 
 local S = picker_ui_state.state
+
+local function filename_pos() return layout.resolve_title_pos(S.config and S.config.layout.filename_position) end
 
 function M.close_preview_timer(timer)
   timer = timer or S.preview_timer
@@ -128,7 +131,7 @@ function M.update_preview_title(item, location)
 
   vim.api.nvim_win_set_config(S.preview_win, {
     title = title,
-    title_pos = 'left',
+    title_pos = filename_pos(),
   })
 end
 
@@ -204,7 +207,7 @@ function M.update_preview()
     preview.update_file_info_buffer(item, S.file_info_buf, S.cursor, S.preview_win)
     if S.file_info_win and vim.api.nvim_win_is_valid(S.file_info_win) then
       local rel = item.relative_path or item.path or ''
-      pcall(vim.api.nvim_win_set_config, S.file_info_win, { title = ' ' .. rel .. ' ', title_pos = 'left' })
+      pcall(vim.api.nvim_win_set_config, S.file_info_win, { title = ' ' .. rel .. ' ', title_pos = filename_pos() })
     end
   end
 
@@ -218,7 +221,7 @@ function M.clear_preview()
 
   vim.api.nvim_win_set_config(S.preview_win, {
     title = ' Preview ',
-    title_pos = 'left',
+    title_pos = filename_pos(),
   })
 
   if S.file_info_buf then

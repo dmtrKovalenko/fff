@@ -24,17 +24,6 @@
 //!   path, or directory subtree with normalized batch delivery
 //!   (see [`SharedFilePicker::watch`]).
 //!
-//! ## Index Layers
-//!
-//! The path index is a stack: layer 0 is the immutable base scan, above it up
-//! to [`MAX_OVERLAY_LAYERS`] append-only overlays with their own path arenas.
-//! [`SESSION_LAYER`] collects watcher additions; `FilePicker::create_layer`
-//! seals the top and opens a new one, compacting the two newest when full.
-//! [`LayerBuilder`] packs entries off-lock into a [`LayerSnapshot`], which can
-//! be imported as a sealed layer, saved to a file, or (for a base scan) fed to
-//! [`SharedFilePicker::import_base`] to replace the walk. Explicit layers survive
-//! a rescan; only the base and session layer are rebuilt.
-//!
 //! ## Shared State
 //!
 //! [`SharedFilePicker`], [`SharedFrecency`], and [`SharedQueryTracker`] are
@@ -130,6 +119,11 @@ pub use dbs::*;
 /// Git status caching and repository detection utilities.
 pub mod git;
 
+pub mod git_recency;
+pub use git_recency::GitRecencyConfig;
+
+mod definition;
+
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;
 pub use grep::*;
@@ -143,6 +137,8 @@ pub mod path_utils;
 /// Core data types shared across the crate.
 pub mod types;
 pub use types::*;
+
+mod match_offsets;
 
 pub mod constants;
 

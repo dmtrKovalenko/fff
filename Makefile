@@ -2,8 +2,10 @@ PLENARY_DIR ?= ../plenary.nvim
 MINI_DIR ?= ../mini.nvim
 
 PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
+PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
 
 # Compile-time cfg that gates the watcher + git-status fuzz stress test.
 STRESS_RUSTFLAGS := --cfg stress
@@ -14,7 +16,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile
+.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
 
 all: format test lint
 
@@ -50,38 +52,25 @@ build:
 build-e2e:
 	cargo build --release -p fff-nvim -p fff-c --no-default-features --features zlob
 
+# Build the C library, header, and pkg-config file via cargo-c.
 build-c-lib:
-	cargo build --release -p fff-c --no-default-features --features zlob
+	@command -v cargo-cbuild >/dev/null 2>&1 || { echo "error: cargo-c is required to build the C library. Install it with: cargo install cargo-c" >&2; exit 1; }
+	cargo cbuild -p fff-c --release --no-default-features --features zlob --prefix=$(PREFIX) --bindir=$(BINDIR) --libdir=$(LIBDIR) --includedir=$(INCLUDEDIR) --pkgconfigdir=$(PKGCONFIGDIR)
 
 header:
 	cbindgen --config crates/fff-c/cbindgen.toml --crate fff-c --output crates/fff-c/include/fff.h
 
-# Install the C library and header under $(PREFIX) (default /usr/local).
-# Override PREFIX for user-local installs, e.g. `make install PREFIX=$$HOME/.local`.
-# DESTDIR is honoured for packagers.
+# Install the C library, header, and pkg-config file via cargo-c.
 install: build-c-lib
-	install -d $(DESTDIR)$(LIBDIR)
-	install -d $(DESTDIR)$(INCLUDEDIR)
-	install -m 0644 crates/fff-c/include/fff.h $(DESTDIR)$(INCLUDEDIR)/fff.h
-	@if [ -f target/release/libfff_c.dylib ]; then \
-		install -m 0755 target/release/libfff_c.dylib $(DESTDIR)$(LIBDIR)/libfff_c.dylib; \
-		echo "Installed $(DESTDIR)$(LIBDIR)/libfff_c.dylib"; \
-	fi
-	@if [ -f target/release/libfff_c.so ]; then \
-		install -m 0755 target/release/libfff_c.so $(DESTDIR)$(LIBDIR)/libfff_c.so; \
-		echo "Installed $(DESTDIR)$(LIBDIR)/libfff_c.so"; \
-	fi
-	@if [ -f target/release/fff_c.dll ]; then \
-		install -m 0755 target/release/fff_c.dll $(DESTDIR)$(LIBDIR)/fff_c.dll; \
-		echo "Installed $(DESTDIR)$(LIBDIR)/fff_c.dll"; \
-	fi
-	@echo "Installed header $(DESTDIR)$(INCLUDEDIR)/fff.h"
+	@command -v cargo-cinstall >/dev/null 2>&1 || { echo "error: cargo-c is required to install the C library. Install it with: cargo install cargo-c" >&2; exit 1; }
+	cargo cinstall -p fff-c --release --no-default-features --features zlob --prefix=$(PREFIX) --bindir=$(BINDIR) --libdir=$(LIBDIR) --includedir=$(INCLUDEDIR) --pkgconfigdir=$(PKGCONFIGDIR) $(if $(DESTDIR),--destdir=$(DESTDIR),)
 
 uninstall:
-	rm -f $(DESTDIR)$(LIBDIR)/libfff_c.dylib
-	rm -f $(DESTDIR)$(LIBDIR)/libfff_c.so
-	rm -f $(DESTDIR)$(LIBDIR)/fff_c.dll
+	rm -f $(DESTDIR)$(LIBDIR)/libfff_c.*
+	rm -f $(DESTDIR)$(LIBDIR)/fff_c.*
+	rm -f $(DESTDIR)$(BINDIR)/fff_c.dll
 	rm -f $(DESTDIR)$(INCLUDEDIR)/fff.h
+	rm -f $(DESTDIR)$(PKGCONFIGDIR)/fff_c.pc
 	@echo "Removed fff-c from $(DESTDIR)$(PREFIX)"
 
 test-setup:
@@ -96,6 +85,15 @@ test-setup:
 
 test-rust:
 	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim --exclude fff-python
+
+bench-search:
+	cargo bench -p fff-search --no-default-features --features zlob --bench fuzzy_search_bench -- $(BENCH_ARGS)
+
+bench-grep:
+	cargo bench -p fff-search --no-default-features --features zlob --bench grep_bench -- $(BENCH_ARGS)
+
+bench-definition:
+	cargo bench -p fff-search --no-default-features --features zlob --bench definition_bench -- $(BENCH_ARGS)
 
 # Watcher rescan harness: asserts that editing, build output, git activity and
 # preview reads all stay on the incremental path instead of re-walking the tree.
@@ -137,7 +135,8 @@ test-c-api: test-c-smoke
 # so check the stdout in case the sigsegv coming out of fff was printed (actual regression).
 # Output is streamed live via `tee`; pipefail (set above) propagates nvim's exit.
 test-lua: test-setup build-e2e
-	@logfile=$$(mktemp); \
+	@set -e -o pipefail; \
+	logfile=$$(mktemp); \
 	trap 'rm -f "$$logfile"' EXIT; \
 	nvim --headless -u tests/minimal_init.lua \
 		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1 \
@@ -149,7 +148,8 @@ test-lua: test-setup build-e2e
 	fi
 
 test-lua-snap: test-setup build-e2e
-	@logfile=$$(mktemp); \
+	@set -e -o pipefail; \
+	logfile=$$(mktemp); \
 	trap 'rm -f "$$logfile"' EXIT; \
 	nvim --headless -u tests/minimal_init.lua \
 		-c "lua local ok,err=pcall(require('mini.test').run_file,'tests/picker_ui_snap.lua'); if not ok then io.stderr:write('mini.test failed to load: '..tostring(err)..'\\n'); vim.cmd('cquit 2') end" 2>&1 \
@@ -288,8 +288,13 @@ format: format-rust format-lua format-ts
 
 lint-rust:
 	cargo clippy --workspace --no-default-features --features zlob -- -D warnings
+# Prefer luacheck from PATH (what CI uses). The luarocks shim is a fallback:
+# it hardcodes the lua binary it was generated against and breaks whenever
+# the interpreter is upgraded.
+LUACHECK ?= $(shell command -v luacheck 2>/dev/null || echo ~/.luarocks/bin/luacheck)
+
 lint-lua:
-	 ~/.luarocks/bin/luacheck .
+	$(LUACHECK) .
 lint-ts:
 	cd packages && bun lint
 

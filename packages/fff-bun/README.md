@@ -29,6 +29,20 @@ The correct native binary for your platform is installed automatically via platf
 
 If the platform package isn't available, the postinstall script will attempt to download from GitHub releases as a fallback.
 
+### Platforms without a prebuilt package
+
+On a platform that has no `@ff-labs/fff-bin-*` package, build the C library from
+source and point `@ff-labs/fff-bun` at it with `FFF_C_LIB`:
+
+```bash
+cargo build --release -p fff-c
+FFF_C_LIB=target/release/libfff_c.so bun ./app.ts
+```
+
+`FFF_C_LIB` is checked before the platform package and the local dev build, so it
+also works for a regular `bun add @ff-labs/fff-bun` install. If the path does not
+exist, resolution fails with an explicit error rather than silently falling back.
+
 ### Standalone executables (`bun build --compile`)
 
 `@ff-labs/fff-bun` embeds the native library into single-file executables built
@@ -104,7 +118,7 @@ up to 128, so callbacks stay cheap even under heavy churn.
 ```typescript
 // Each path appears at most once per batch
 const sub = finder.watch("src/**/*.ts", (events) => {
-  for (const e of events) console.log(e.kind, e.path); // created | modified | removed | rescan
+  for (const e of events) console.log(e.kind, e.path); // created | modified | removed | renamed | rescan
 });
 
 // No pattern: watch the entire indexed tree
@@ -138,6 +152,9 @@ Notes:
 - `ignore` entries exclude matches per subscription: wildcards are globs,
   everything else is a path prefix (a file or a whole subtree).
 - Gitignored paths never produce events.
+- A `renamed` event carries both paths: `e.path` is the destination and
+  `e.from` the source. It replaces the removed/created pair, so a move is one
+  event. Moves in or out of the indexed tree stay a plain `created`/`removed`.
 - A `rescan` event means changes were lost (index overflow, ignore-file
   change) — re-stat anything you care about.
 - Unsubscribing takes effect synchronously on the JS thread: once it

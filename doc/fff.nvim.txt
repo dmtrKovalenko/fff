@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                        For Neovim >= 0.10.0    Last change: 2026 September 14
+                          For Neovim >= 0.10.0    Last change: 2026 October 20
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -62,7 +62,7 @@ VIM.PACK
 >lua
     -- Package name changed from `fff.nvim` to `fff`. If you installed fff.nvim before, clean with `:packdel fff.nvim`
     vim.pack.add({ 'https://github.com/dmtrKovalenko/fff' })
-    
+
     vim.api.nvim_create_autocmd('PackChanged', {
       callback = function(ev)
         local name, kind = ev.data.spec.name, ev.data.kind
@@ -72,12 +72,12 @@ VIM.PACK
         end
       end,
     })
-    
+
     vim.g.fff = {
       lazy_sync = true,
       debug = { enabled = true, show_scores = true },
     }
-    
+
     vim.keymap.set('n', 'ff', function() require('fff').find_files() end, { desc = 'FFFind files' })
 <
 
@@ -92,7 +92,7 @@ PUBLIC API ~
     require('fff').refresh_git_status()                -- refresh git status
     require('fff').find_files_in_dir(path)             -- find in a specific dir
     require('fff').change_indexing_directory(new_path) -- change root
-    
+
     -- Programmatic search (no UI). Useful for plugin integrations.
     require('fff').file_search(query, opts)            -- fuzzy search files / dirs / mixed
     require('fff').content_search(query, opts)         -- programmatic grep
@@ -135,11 +135,13 @@ Each match item has `relative_path`, `name`, `line_number`, `col`,
       max_file_size         = 10 * 1024 * 1024,
       max_matches_per_file  = 100,
       smart_case            = true,
+      casing             = nil,      -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case
       page_size             = 50,
       file_offset           = 0,
       time_budget_ms        = 0,
       enforce_time_budget   = false,    -- also bound zero-match searches
       trim_whitespace       = false,
+      classify_definitions  = nil,      -- off unless grep.classify_definitions is set in your config
       cwd                   = nil,      -- switch indexed root if different
       wait_for_index_ms     = nil,      -- override the default scan wait timeout
     })
@@ -162,6 +164,7 @@ first call to either function lazily initialises the picker at
 - If `cwd` differs, the picker is re-indexed at the new root and the call **blocks** (default up to 10 s) until the new picker is installed and its initial scan completes — so callers always get results from the right tree.
 - If the index is still warming up after a `change_indexing_directory`, you can pass `wait_for_index_ms = N` to block for up to `N` ms regardless of whether `cwd` triggered the swap. Pass `0` to skip waiting entirely (useful for fire-and-forget calls where partial results are acceptable).
 - Invalid or non-existent `cwd` paths return an empty result and emit an error via `vim.notify`.
+- A `cwd` inside a linked git worktree shares frecency and query history with the main checkout, so new worktrees don’t start cold.
 
 
 AUTOCMDS ~
@@ -221,10 +224,13 @@ Defaults are sensible. Override only what you care about.
         --   { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ' },
         --   { ' ', ' ', ' ', ' ', ' ' },
         -- },
-    
+
         flex = { size = 130, wrap = 'top' },
         min_list_height = 10, --  do not display anything except the list below this threshold
         show_scrollbar = true,
+        show_file_count = true, -- false hides the matched/total file count next to the prompt
+        title_position = 'left', -- 'left' | 'center' | 'right'
+        filename_position = 'left', -- preview title (file path) alignment: 'left' | 'center' | 'right'
         path_shorten_strategy = 'middle', -- 'middle' | 'middle_number' | 'end' | 'start'
         -- 'center' | 'top' | 'bottom' | 'left' | 'right' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'
         anchor = 'center',
@@ -291,6 +297,15 @@ Defaults are sensible. Override only what you care about.
       },
       git = {
         status_text_color = false, -- true to color filenames by git status
+        -- 'while_open' pauses git status while the picker is closed and refreshes it on open,
+        -- 'always' tracks every change in the background, 'manual' updates only on :FFFRefreshGit
+        status_updates = 'while_open',
+        -- files that participated in the last N configured commits will get scoring bonus
+        recency = {
+          enabled = true, -- boost files from recent commits of the current branch
+          max_commits = 10, -- analyze the last N branch-specific commits
+          max_files_per_commit = 50, -- skip bulk commits touching more files than this
+        },
       },
       select = {
         -- Return winid to open the chosen file in, or nil to open in the original window
@@ -300,12 +315,18 @@ Defaults are sensible. Override only what you care about.
         max_file_size = 10 * 1024 * 1024,
         max_matches_per_file = 100,
         smart_case = true,
+        casing = nil, -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case when set
         time_budget_ms = 150,
         enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
-        modes = { 'plain', 'regex', 'fuzzy' },
+        modes = { 'plain', 'regex', 'fuzzy', 'definition_only' },
         trim_whitespace = false,
+        classify_definitions = true, -- show matching definitions first within each page
         enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
         location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
+      },
+      suggestions = {
+        enabled = true, -- when a query has no results, look them up in the other mode (files <-> grep) and show as a hint
+        grep_time_budget_ms = 50, -- hard cap for the grep hint in file mode; it is skipped until content indexing finishes
       },
       debug = {
         enabled = false, -- show the file info panel next to the preview
@@ -337,15 +358,69 @@ Defaults are sensible. Override only what you care about.
 
 LIVE GREP MODES ~
 
-`<S-Tab>` cycles between `plain`, `regex`, and `fuzzy`. The list is
-configurable via `grep.modes`, and single-mode setups hide the indicator
-entirely.
+`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The
+list is configurable via `grep.modes`, and single-mode setups hide the
+indicator entirely. `definition_only` uses plain substring matching and returns
+only matched declarations, regardless of `grep.classify_definitions`. Its
+status label uses `hl.grep_definition_active` (default: `DiagnosticOk`).
+`regex` matches stay within one line unless the pattern contains `\n`.
+
+`grep.classify_definitions` shows matching definition lines first within each
+page, grouped under their file names. Each page uses one ordinary grep search;
+classification does not scan ahead for definitions or search the files again
+for usages. It defaults to `true`. Set it to `false` to keep file order without
+definition grouping. It also accepts the strings `'classify'`,
+`'definition_only'`, and `'usage_only'`. A **Definitions** divider separates
+the sections when both are on the same page. With a bottom prompt, the order
+reverses so definitions stay nearest the prompt. Files with both kinds of
+matches appear in both sections, with each match shown once.
+
+Definition filtering occurs before page and per-file result limits. A timed-out
+page can be empty; move down (top prompt) or up (bottom prompt) to continue
+searching. Context lines can still contain ordinary code.
+
+Definition classification accepts source lines up to 256 bytes, including
+indentation and excluding line endings. Longer lines stay ordinary matches and
+are excluded from `definition_only`. The limit uses the original source bytes,
+regardless of display truncation or whitespace trimming. For multiline regex
+matches, it applies to the first physical line.
+
+Supported language families are Rust, Python, Go, JavaScript/TypeScript, Lua,
+C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Elixir,
+Zig, PHP, shell, OCaml/ReScript/F#, and Haskell. The byte-keyword rules in
+`definition/languages.rs` <crates/fff-core/src/definition/languages.rs> compile
+into per-language checkers. Each checker has fixed grammar constants and
+returns a boolean without a runtime rule dispatcher. Language detection checks
+at most the last eight filename bytes against a compile-time suffix table.
+Unknown extensions and extensionless filenames are not classified.
+`definition_only` excludes them before sorting, pagination, or content reads,
+and preserves explicit file constraints on empty results.
+
+Identifier scanning uses compile-time byte tables for short tokens, then checks
+16 bytes at a time with NEON on little-endian ARM64 or SSE2 on x86-64. Other
+targets use the scalar table. Loads stay within the source slice, including the
+final partial block. The parser uses `memchr` for quotes and bracket groups and
+does not allocate.
+
+Files are flagged during scanning. A Rust byte parser uses SIMD-backed
+delimiter searches on matched lines before pagination, including common
+modifiers, methods, and function assignments. Matches must overlap the declared
+name: `user_file` recognizes `fn user_file`, `mod user_file`, `fn
+user_file_test`, and `fn test_user_file`, but not `fn other(value: user_file)`.
+Implementation and extension blocks stay with ordinary matches. In fuzzy mode,
+every matched character must fall inside the declared name; matches spread
+across the name and its arguments, receiver, or return type are ordinary
+matches. Classification adds no file reads or heap allocations. This is a line
+heuristic; multiline declarations and surrounding comment or string context can
+be missed.
 
 Per-call override:
 
 >lua
     require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } })
     require('fff').live_grep({ query = 'search term' }) -- pre-fill
+    require('fff').live_grep({ query = 'user_file', grep = { modes = { 'definition_only' } } })
+    local page = require('fff').content_search('user_file', { mode = 'definition_only' })
 <
 
 
@@ -414,7 +489,7 @@ back to the default built from `hl.normal`, `hl.border`, and `hl.title`.
 >lua
     -- Apply the same winhighlight to all picker windows
     hl = { winhl = 'Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:Title' }
-    
+
     -- Or override specific windows only
     hl = {
       winhl = {

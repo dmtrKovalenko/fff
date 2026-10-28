@@ -20,6 +20,8 @@ export function getTriple(): string {
     osName = detectLinuxLibc();
   } else if (platform === "win32") {
     osName = "pc-windows-msvc";
+  } else if (platform === "freebsd") {
+    osName = "unknown-freebsd";
   } else {
     throw new Error(`Unsupported platform: ${platform}`);
   }

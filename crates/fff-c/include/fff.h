@@ -3,7 +3,7 @@
 #ifndef FFF_C_H
 #define FFF_C_H
 
-/* Generated with cbindgen:0.29.2 */
+/* Generated with cbindgen:0.29.4 */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -414,7 +414,12 @@ typedef struct FffMixedSearchResult {
 
 /**
  * A single watch event. `kind`: 0 = created, 1 = modified, 2 = removed,
- * 3 = rescan (events were lost; re-stat what you care about).
+ * 3 = rescan (events were lost; re-stat what you care about),
+ * 4 = renamed (`path` is the destination; read the source with
+ * `fff_watch_events_get_from_path`).
+ *
+ * Layout is frozen: this is an array element, so growing it would change the
+ * stride every existing binding compiled against.
  */
 typedef struct FffWatchEvent {
   /**
@@ -426,10 +431,17 @@ typedef struct FffWatchEvent {
 
 /**
  * A batch of watch events. Free with `fff_free_watch_events`.
+ * Versioned by append only: existing field offsets never move.
  */
 typedef struct FffWatchEventBatch {
   struct FffWatchEvent *events;
   uint32_t count;
+  /**
+   * Parallel to `events`, `count` long: the pre-rename path for entries
+   * with `kind == 4`, null for every other entry. Null when the batch holds
+   * no renames at all.
+   */
+  char **rename_sources;
 } FffWatchEventBatch;
 
 /**
@@ -617,7 +629,8 @@ struct FffResult *fff_search_mixed(void *fff_handle,
  * 0 = plain text (SIMD), 1 = regex, 2 = fuzzy. Zero picks the default:
  * `max_file_size` 10 MB, `page_limit` 50, `max_matches_per_file` and
  * `time_budget_ms` unlimited. `smart_case` is case-insensitive for
- * all-lowercase queries; `classify_definitions` tags code definitions.
+ * all-lowercase queries. `classify_definitions`: 0 = off, 1 = classify,
+ * 2 = definition_only, 3 = usage_only.
  *
  * ## Safety
  * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -634,7 +647,7 @@ struct FffResult *fff_live_grep(void *fff_handle,
                                 uint64_t time_budget_ms,
                                 uint32_t before_context,
                                 uint32_t after_context,
-                                bool classify_definitions);
+                                uint8_t classify_definitions);
 
 /**
  * [`fff_live_grep`] plus `enforce_time_budget`: when true the budget also bounds
@@ -655,7 +668,7 @@ struct FffResult *fff_live_grep_ex(void *fff_handle,
                                    bool enforce_time_budget,
                                    uint32_t before_context,
                                    uint32_t after_context,
-                                   bool classify_definitions);
+                                   uint8_t classify_definitions);
 
 /**
  * Multi-pattern OR search (SIMD Aho-Corasick): lines matching ANY pattern.
@@ -679,7 +692,7 @@ struct FffResult *fff_multi_grep(void *fff_handle,
                                  uint64_t time_budget_ms,
                                  uint32_t before_context,
                                  uint32_t after_context,
-                                 bool classify_definitions);
+                                 uint8_t classify_definitions);
 
 /**
  * [`fff_multi_grep`] plus `enforce_time_budget`, as in [`fff_live_grep_ex`].
@@ -699,7 +712,7 @@ struct FffResult *fff_multi_grep_ex(void *fff_handle,
                                     bool enforce_time_budget,
                                     uint32_t before_context,
                                     uint32_t after_context,
-                                    bool classify_definitions);
+                                    uint8_t classify_definitions);
 
 /**
  * Trigger a rescan of the file index.
@@ -1227,6 +1240,94 @@ bool fff_grep_match_get_is_definition(const struct FffGrepMatch *m);
 bool fff_grep_match_get_is_binary(const struct FffGrepMatch *m);
 
 /**
+ * Final combined score used for ranking. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_total(const struct FffScore *s);
+
+/**
+ * Raw fuzzy match score before bonuses and penalties. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_base_score(const struct FffScore *s);
+
+/**
+ * Bonus for matching the file name rather than only the path. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_filename_bonus(const struct FffScore *s);
+
+/**
+ * Bonus for special file names (e.g. `README`, `main.rs`). Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_special_filename_bonus(const struct FffScore *s);
+
+/**
+ * Boost from the frecency database. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_frecency_boost(const struct FffScore *s);
+
+/**
+ * Penalty based on directory distance from the current file. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_distance_penalty(const struct FffScore *s);
+
+/**
+ * Penalty applied to the currently open file. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_current_file_penalty(const struct FffScore *s);
+
+/**
+ * Boost when several scoring signals agree. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_combo_match_boost(const struct FffScore *s);
+
+/**
+ * Bonus for query segments aligning with path segments. Returns `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_path_alignment_bonus(const struct FffScore *s);
+
+/**
+ * `true` if the query matched the file name or directory exactly; `false` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+bool fff_score_get_exact_match(const struct FffScore *s);
+
+/**
+ * Match type label (e.g. `"exact_filename"`, `"fuzzy_path"`); null if `s` is null. Do not free.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+const char *fff_score_get_match_type(const struct FffScore *s);
+
+/**
  * Number of items in the result; `0` if `r` is null.
  *
  * ## Safety
@@ -1482,10 +1583,22 @@ uint32_t fff_watch_events_count(const struct FffWatchEventBatch *batch);
 const char *fff_watch_events_get_path(const struct FffWatchEventBatch *batch, uint32_t index);
 
 /**
- * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan)
+ * Pre-rename path of event `index`, null unless its kind is 4 (renamed).
+ * Owned by the batch; do not free separately.
+ *
+ * ## Safety
+ * `batch` must be a valid `FffWatchEventBatch` pointer or null.
+ */
+const char *fff_watch_events_get_from_path(const struct FffWatchEventBatch *batch, uint32_t index);
+
+/**
+ * Kind of event `index` (0 = created, 1 = modified, 2 = removed, 3 = rescan,
+ * 4 = renamed).
  * 3 (rescan aka "re-stat something" kind) returned when OS based buffer
  * has been overflown and some events might be loss. Paths will contain a list of
  * directories that needs to be rescanned to ensure consistency.
+ * 4 reports a move: `path` is the destination and
+ * `fff_watch_events_get_from_path` yields the source.
  *
  * ## Safety
  * `batch` must be a valid `FffWatchEventBatch` pointer or null.

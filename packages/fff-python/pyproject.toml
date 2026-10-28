@@ -1,6 +1,6 @@
 [project]
 name = "fff-search"
-version = "0.10.6"
+version = "0.11.0"
 description = "Python bindings for FFF (Fast File Finder)"
 readme = "README.md"
 license = { text = "MIT" }

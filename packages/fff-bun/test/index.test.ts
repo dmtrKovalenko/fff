@@ -145,6 +145,19 @@ describe("FileFinder - Full Lifecycle", () => {
     }
   });
 
+  test("exact filename query decodes exactMatch=true (#888)", () => {
+    const result = finder.fileSearch("package.json", { pageSize: 5 });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const idx = result.value.items.findIndex((i) => i.relativePath === "package.json");
+      expect(idx).toBeGreaterThanOrEqual(0);
+      const score = result.value.scores[idx];
+      expect(score.matchType).toBe("exact_filename");
+      expect(score.exactMatch).toBe(true);
+      expect(typeof score.pathAlignmentBonus).toBe("number");
+    }
+  });
+
   test("search returns empty for non-matching query", () => {
     const result = finder.fileSearch("xyznonexistentfilenamexyz123456");
     expect(result.ok).toBe(true);

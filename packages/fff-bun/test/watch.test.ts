@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WatchEvent } from "../src/fff-api";
@@ -62,7 +62,9 @@ describe("FileFinder - Watch Subscriptions", () => {
   let finder: FileFinder;
 
   beforeAll(async () => {
-    baseDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
+    // realpath.native: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that
+    // won't match the core's canonicalized paths; only the native variant expands it
+    baseDir = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-watch-test-")));
     writeFileSync(join(baseDir, "seed-one.txt"), "seed one\n");
     writeFileSync(join(baseDir, "seed-two.js"), "// seed two\n");
 
@@ -96,8 +98,48 @@ describe("FileFinder - Watch Subscriptions", () => {
     expect(received.some((e) => e.path.endsWith(".js"))).toBe(false);
     expect(batchSizes.every((n) => n > 0)).toBe(true);
     for (const event of received) {
-      expect(["created", "modified", "removed", "rescan"]).toContain(event.kind);
+      expect(["created", "modified", "removed", "rescan", "renamed"]).toContain(
+        event.kind,
+      );
     }
+
+    sub.value();
+  }, 20_000);
+
+  test("a rename arrives as one renamed event carrying both paths", async () => {
+    const received: WatchEvent[] = [];
+
+    const sub = finder.watch((events) => {
+      received.push(...events);
+    });
+    expect(sub.ok).toBe(true);
+    if (!sub.ok) return;
+
+    const from = join(baseDir, "move-me.txt");
+    const to = join(baseDir, "moved.txt");
+    writeFileSync(from, "move me\n");
+    // Let the create land so the rename is its own batch.
+    expect(await waitFor(() => hasEventFor(received, "move-me.txt"))).toBe(true);
+    received.length = 0;
+
+    renameSync(from, to);
+
+    const gotRename = await waitFor(() =>
+      received.some((e) => e.kind === "renamed" && e.path === to),
+    );
+    expect(gotRename).toBe(true);
+
+    const renamed = received.find((e) => e.kind === "renamed" && e.path === to);
+    expect(renamed?.from).toBe(from);
+    // Let any stray removed/created for the pair surface, then assert absence
+    await sleep(700);
+    expect(received.filter((e) => e.kind === "renamed" && e.path === to).length).toBe(1);
+    // The move is one event, not a removal plus a creation.
+    expect(received.some((e) => e.kind === "removed" && e.path === from)).toBe(false);
+    expect(received.some((e) => e.kind === "created" && e.path === to)).toBe(false);
+    expect(received.every((e) => e.kind === "renamed" || e.from === undefined)).toBe(
+      true,
+    );
 
     sub.value();
   }, 20_000);
@@ -204,7 +246,9 @@ describe("FileFinder - Watch Subscriptions", () => {
   }, 20_000);
 
   test("destroy with an active watcher does not crash", async () => {
-    const otherDir = realpathSync(mkdtempSync(join(tmpdir(), "fff-watch-destroy-")));
+    const otherDir = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "fff-watch-destroy-")),
+    );
     try {
       writeFileSync(join(otherDir, "seed.txt"), "seed\n");
       const other = await createReadyFinder(otherDir);

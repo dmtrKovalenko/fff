@@ -34,7 +34,7 @@ wheels = [
 
 [[package]]
 name = "fff-search"
-version = "0.10.6"
+version = "0.11.0"
 source = { editable = "." }
 
 [package.optional-dependencies]

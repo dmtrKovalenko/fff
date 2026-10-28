@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::file_picker::FFFMode;
 use crate::index::snapshot::LayerSnapshot;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
-use crate::parallelism::BACKGROUND_THREAD_POOL;
+use crate::parallelism::indexing_pool;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
 use crate::watch::BackgroundWatcher;
@@ -70,7 +70,7 @@ impl ScanJob {
         shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
     ) -> Result<Option<Self>, Error> {
-        let guard = shared_picker.read()?;
+        let guard = shared_picker.write()?;
         let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
 
         if picker.is_scan_active()
@@ -99,7 +99,8 @@ impl ScanJob {
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
         };
 
-        drop(guard); // just a sanity check
+        signals.scanning.store(true, Ordering::Release);
+        drop(guard);
 
         Ok(Some(Self {
             mode,
@@ -143,7 +144,7 @@ impl ScanJob {
         }
     }
 
-    /// Run the job on `BACKGROUND_THREAD_POOL`. Returns immediately.
+    /// Run the job on the indexing pool. Returns immediately.
     ///
     /// Routed through the pool — and not a fresh `std::thread::spawn` — so the
     /// orchestrator inherits rayon's QoS pin (USER_INITIATED). Without that
@@ -152,9 +153,8 @@ impl ScanJob {
     /// the kernel drifts those workers onto E-cores. On chromium that turns a
     /// ~800 ms walk into ~3 s.
     pub fn spawn(self) {
-        self.signals.scanning.store(true, Ordering::Release);
         let span = self.trace_span.clone();
-        BACKGROUND_THREAD_POOL.spawn(move || {
+        indexing_pool(self.mode).spawn(move || {
             let _g = span.enter();
             self.run();
         });
@@ -173,17 +173,19 @@ impl ScanJob {
             source,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals);
+        let scanning = ScanningGuard { signals: &signals };
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system (or unpack the saved base) into a file list
-        let git_workdir = FileSync::discover_git_workdir(&base_path);
-        let sync = match source {
+        let git = FileSync::discover_git(&base_path);
+        let restored = source.is_some();
+        let mut sync = match source {
             Some(snapshot) => {
                 let frecency = shared_frecency.read().ok();
                 let sync = FileSync::from_snapshot(
                     snapshot,
                     &base_path,
+                    git.clone(),
                     frecency.as_deref().and_then(Option::as_ref),
                     mode,
                 );
@@ -192,7 +194,7 @@ impl ScanJob {
             }
             None => match FileSync::walk_filesystem(
                 &base_path,
-                git_workdir.clone(),
+                git.clone(),
                 &scanned_files_counter,
                 &shared_frecency,
                 mode,
@@ -216,6 +218,9 @@ impl ScanJob {
                 return;
             }
 
+            if restored {
+                sync.ignore_rules = picker.ignore_rules();
+            }
             let live_count = sync.live_count;
             picker.commit_new_sync(sync);
             git_status_worker = Arc::clone(&picker.git_status_worker);
@@ -230,7 +235,7 @@ impl ScanJob {
 
         // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
         // which is a real use case we need to have a way to start the git worker background thread dynamically
-        if git_workdir.is_some() && !signals.cancelled.load(Ordering::Acquire) {
+        if git.is_some() && !signals.cancelled.load(Ordering::Acquire) {
             git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
             git_status_worker.request_full_rescan(); // this runs anyway
         }
@@ -247,7 +252,7 @@ impl ScanJob {
             None
         };
 
-        signals.scanning.store(false, Ordering::Relaxed); // file are searchable
+        drop(scanning);
 
         // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
         // all the already watched directories are not going to be resubscribed (this is internally deduped)
@@ -259,7 +264,7 @@ impl ScanJob {
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
-            Self::run_post_scan(&shared_picker, &signals, &config, snap);
+            Self::run_post_scan(&shared_picker, &signals, &config, mode, snap);
         }
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
@@ -272,7 +277,7 @@ impl ScanJob {
 
             match BackgroundWatcher::new(
                 base_path.to_path_buf(),
-                git_workdir,
+                git,
                 shared_picker.clone(),
                 shared_frecency.clone(),
                 mode,
@@ -328,6 +333,7 @@ impl ScanJob {
         shared_picker: &SharedFilePicker,
         signals: &ScanSignals,
         config: &ScanConfig,
+        mode: FFFMode,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
     ) {
         let Some(arena) = unsafe_snapshot
@@ -347,14 +353,20 @@ impl ScanJob {
         if config.content_indexing {
             let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
-            let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
+            let pool = indexing_pool(mode);
+            let index =
+                build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena, pool);
 
+            // A root change may have replaced the picker while this index was building.
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
+                && !signals.cancelled.load(Ordering::Acquire)
+                && picker.base_path() == unsafe_snapshot.base_path
             {
                 picker.set_bigram_index(index);
             }
-            crate::index::release_thread_buffers();
+            crate::index::release_thread_buffers(pool);
+            crate::file_picker::hint_allocator_collect(pool);
 
             // Bigram only sniffs files <= MAX_INDEXABLE_FILE_SIZE; large
             // unknown-extension binaries slip past it and would otherwise be
@@ -389,16 +401,9 @@ struct ScanningGuard<'a> {
     signals: &'a ScanSignals,
 }
 
-impl<'a> ScanningGuard<'a> {
-    fn new(signals: &'a ScanSignals) -> Self {
-        signals.scanning.store(true, Ordering::Relaxed);
-        Self { signals }
-    }
-}
-
 impl Drop for ScanningGuard<'_> {
     fn drop(&mut self) {
-        self.signals.scanning.store(false, Ordering::Relaxed);
+        self.signals.scanning.store(false, Ordering::Release);
     }
 }
 
@@ -421,4 +426,68 @@ fn rescubscribe_watcher_post_scan(shared_picker: &SharedFilePicker) {
         watcher.request_watch_dir(dir.to_path_buf());
         std::ops::ControlFlow::Continue(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_picker::{FilePicker, FilePickerOptions};
+
+    fn collected(root: &std::path::Path) -> FilePicker {
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: root.to_string_lossy().into_owned(),
+            enable_mmap_cache: false,
+            enable_content_indexing: true,
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        picker
+    }
+
+    #[test]
+    fn replaced_picker_does_not_install_its_bigram_index_into_the_successor() {
+        let old_root = tempfile::tempdir().unwrap();
+        // The stale index tracks the marker, but only for a file the new root does not have.
+        std::fs::write(old_root.path().join("a.txt"), "unrelated words").unwrap();
+        std::fs::write(old_root.path().join("b.txt"), "isolated_marker").unwrap();
+        let new_root = tempfile::tempdir().unwrap();
+        std::fs::write(new_root.path().join("new.txt"), "isolated_marker").unwrap();
+
+        let shared = SharedFilePicker::default();
+        let old = collected(old_root.path());
+        let signals = old.scan_signals();
+        *shared.write().unwrap() = Some(old);
+        let snapshot = shared
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|picker| unsafe { picker.post_scan_snapshot() })
+            .unwrap();
+        // The root changes while the old post-scan is still building its index.
+        let old = shared.write().unwrap().replace(collected(new_root.path()));
+        let config = ScanConfig {
+            warmup: false,
+            content_indexing: true,
+            watch: false,
+            auto_cache_budget: false,
+            install_watcher: false,
+            follow_symlinks: false,
+            enable_fs_root_scanning: false,
+            enable_home_dir_scanning: false,
+        };
+        ScanJob::run_post_scan(&shared, &signals, &config, FFFMode::default(), &snapshot);
+        drop(snapshot);
+        drop(old);
+
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let query = crate::grep::parse_grep_query("isolated_marker");
+        let options = crate::grep::GrepSearchOptions {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(picker.grep(&query, &options).matches.len(), 1);
+    }
 }

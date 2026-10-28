@@ -10,6 +10,7 @@ export type {
   GrepCursor,
   GrepMatch,
   GrepMode,
+  DefinitionMode,
   GrepOptions,
   GrepResult,
   HealthCheck,

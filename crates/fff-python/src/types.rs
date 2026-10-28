@@ -395,12 +395,21 @@ pub struct WatchEvent {
     pub path: String,
     #[pyo3(get)]
     pub kind: String,
+    /// Path the file moved from. Only set when `kind == "renamed"`.
+    #[pyo3(get)]
+    pub from_path: Option<String>,
 }
 
 #[pymethods]
 impl WatchEvent {
     fn __repr__(&self) -> String {
-        format!("WatchEvent(path={:?}, kind={:?})", self.path, self.kind)
+        match &self.from_path {
+            Some(from) => format!(
+                "WatchEvent(path={:?}, kind={:?}, from_path={:?})",
+                self.path, self.kind, from
+            ),
+            None => format!("WatchEvent(path={:?}, kind={:?})", self.path, self.kind),
+        }
     }
 }
 

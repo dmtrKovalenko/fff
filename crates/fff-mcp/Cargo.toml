@@ -1,6 +1,6 @@
 [package]
 name = "fff-mcp"
-version = "0.10.6"
+version = "0.11.0"
 edition = "2024"
 description = "MCP server for FFF file finder - drop-in replacement for AI code assistant search tools"
 license = "MIT"
@@ -19,8 +19,8 @@ ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
 zlob = ["fff/zlob", "fff-query-parser/zlob"]
 
 [dependencies]
-fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.10.6", features = ["definitions", "mimalloc-collect"] }
-fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.10.6" }
+fff = { package = "fff-search", path = "../fff-core", default-features = false , version = "0.11.0", features = ["definitions", "mimalloc-collect"] }
+fff-query-parser = { path = "../fff-query-parser", default-features = false , version = "0.11.0" }
 mimalloc = { workspace = true }
 rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
 schemars = "1.0"
@@ -29,6 +29,9 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = { workspace = true }
 git2 = { workspace = true }
+regex = { workspace = true }
+rayon = { workspace = true }
+globset = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 
 [target.'cfg(windows)'.dependencies]

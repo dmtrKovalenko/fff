@@ -1,16 +1,19 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
+use crate::git::GitDiscovery;
 use crate::git_status_worker::GitStatusWorker;
+use crate::parallelism::indexing_pool;
 use crate::rescan_stats::RescanReason;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
-use notify::event::{AccessKind, AccessMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
+use rayon::slice::ParallelSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -45,7 +48,7 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
@@ -91,12 +94,13 @@ impl BackgroundWatcher {
         let watch_tx_for_debouncer = watch_tx.clone();
 
         let owner_weak_picker = shared_picker.weaken();
-        let owner_git_workdir = git_workdir.clone();
+        let owner_frecency = shared_frecency.clone();
+        let owner_git_workdir = git.as_ref().map(|git| git.workdir.clone());
         let owner_git_worker = Arc::clone(&git_status_worker);
 
         let debouncer = Self::create_debouncer(
             base_path,
-            git_workdir,
+            git,
             shared_picker,
             shared_frecency,
             mode,
@@ -141,6 +145,7 @@ impl BackgroundWatcher {
                         let subdirs = index_new_directory(
                             &dir,
                             &strong_picker,
+                            &owner_frecency,
                             &owner_git_workdir,
                             &owner_git_worker,
                         );
@@ -174,7 +179,7 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
@@ -188,7 +193,7 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        let git_workdir_for_handler = git_workdir.clone();
+        let git_workdir_for_handler = git.as_ref().map(|git| git.workdir.clone());
         let base_path_for_handler = base_path.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let file_picker = shared_picker.weaken();
@@ -246,39 +251,65 @@ impl BackgroundWatcher {
             let mut watched = 0usize;
             let mut consecutive_failures = 0usize;
 
-            // `inotify` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding this lock is free
+            let mut directories = Vec::new();
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
-                use std::ops::ControlFlow;
                 picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+                    directories.push(PathOp::watch_non_recursive(dir));
+                    std::ops::ControlFlow::Continue(())
+                });
+            }
+            // The debouncer keeps sorted roots; append in order and register off-lock.
+            indexing_pool(mode).install(|| {
+                directories.par_sort_unstable_by(|left, right| left.as_path().cmp(right.as_path()));
+            });
+            let mut directories = directories.into_iter();
+            'register: loop {
+                let mut batch = directories.by_ref().take(1024).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                loop {
+                    let batch_len = batch.len();
+                    match debouncer.update_paths(batch) {
                         Ok(()) => {
-                            watched += 1;
+                            watched += batch_len;
                             consecutive_failures = 0;
-                            ControlFlow::Continue(())
+                            break;
                         }
-                        Err(e) => {
+                        Err(error) => {
+                            let applied = batch_len.saturating_sub(
+                                error.remaining.len() + usize::from(error.origin.is_some()),
+                            );
+                            watched += applied;
+                            if applied > 0 {
+                                consecutive_failures = 0;
+                            }
                             consecutive_failures += 1;
                             if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
+                                warn!(
+                                    error = %error.source,
+                                    path = ?error.origin.as_ref().map(PathOp::as_path),
+                                    watched,
+                                    "Failed to register directory watch"
+                                );
                             }
-
                             if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
                                 warn!(
                                     consecutive_failures,
                                     watched,
                                     "Giving up setting file watcher for all the directories. Check if your system has enough fs watchers limit."
                                 );
-
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
+                                break 'register;
+                            }
+                            batch = error.remaining;
+                            if batch.is_empty() {
+                                break;
                             }
                         }
                     }
-                });
+                }
             }
 
             tracing::info!(
@@ -291,7 +322,10 @@ impl BackgroundWatcher {
         // The .git directory is excluded from the file list but we still need
         // to observe changes that affect git status (staging, unstaging,
         // committing, branch switches, merges, etc)
-        watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+        watch_git_status_paths(
+            &mut debouncer,
+            git.as_ref().map(|git| git.git_dir.as_path()),
+        );
 
         Ok(debouncer)
     }
@@ -350,6 +384,7 @@ pub(crate) fn handle_debounced_events(
     let mut paths_to_add_or_modify = Vec::new();
     let mut new_dirs_to_watch = Vec::new();
     let mut affected_paths_count = 0usize;
+    let mut explicit_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     let watch_registry = shared_picker.watch_registry();
     let need_events_propagation = watch_registry.is_active();
@@ -402,6 +437,15 @@ pub(crate) fn handle_debounced_events(
         }
 
         tracing::debug!(event = ?debounced_event.event, "Processing FS event");
+
+        // Backends that pair the halves for us hand over [from, to] directly.
+        // The per-path pass below still classifies both, we only note the link.
+        if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = debounced_event.event.kind
+            && let [from, to] = debounced_event.event.paths.as_slice()
+        {
+            explicit_renames.push((from.clone(), to.clone()));
+        }
+
         for path in &debounced_event.event.paths {
             if matches!(
                 path.file_name().and_then(|f| f.to_str()),
@@ -431,7 +475,12 @@ pub(crate) fn handle_debounced_events(
                 need_full_git_rescan = true;
             }
 
-            if is_git_file(path) {
+            // bare repos keep worktree git dirs outside of any `.git` component
+            if is_git_file(path)
+                || repo
+                    .as_ref()
+                    .is_some_and(|repo| path.starts_with(repo.path()))
+            {
                 continue;
             }
 
@@ -527,7 +576,12 @@ pub(crate) fn handle_debounced_events(
     let mut index_update_rejected = false;
     let mut overflow_count = 0;
     let mut removed_from_dirs = Vec::new();
-    let mut watch_events = ahash::AHashMap::new();
+    // Destination path -> (kind, rename source). One entry per path, so a
+    // remove+add pair recognised as a rename collapses into a single event.
+    let mut watch_events: ahash::AHashMap<PathBuf, (WatchEventKind, Option<PathBuf>)> =
+        ahash::AHashMap::new();
+    // Destination -> source for every rename recognised in this batch.
+    let mut renames: ahash::AHashMap<PathBuf, PathBuf> = ahash::AHashMap::new();
 
     if !paths_to_remove.is_empty()
         || !dirs_to_remove.is_empty()
@@ -549,12 +603,22 @@ pub(crate) fn handle_debounced_events(
             return new_dirs_to_watch;
         };
 
+        // Must run before the removals below, while the vanished files still
+        // carry their indexed size/mtime.
+        renames.extend(detect_renames(
+            picker,
+            base_path,
+            &paths_to_remove,
+            &paths_to_add_or_modify,
+            &explicit_renames,
+        ));
+
         for (path, may_be_dir) in &paths_to_remove {
             let removed = picker.remove_file_by_path(path);
 
             if removed {
                 if need_events_propagation {
-                    watch_events.insert(path.to_path_buf(), WatchEventKind::Removed);
+                    watch_events.insert(path.to_path_buf(), (WatchEventKind::Removed, None));
                 }
             } else if *may_be_dir {
                 // Not an indexed file: likely a dir renamed out of the tree
@@ -579,11 +643,12 @@ pub(crate) fn handle_debounced_events(
 
         if need_events_propagation {
             for path in removed_from_dirs.drain(..) {
-                watch_events.insert(path, WatchEventKind::Removed);
+                watch_events.insert(path, (WatchEventKind::Removed, None));
             }
         }
 
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
+        let mut landed_renames = ahash::AHashSet::with_capacity(renames.len());
         for path in &paths_to_add_or_modify {
             if picker.open_layer_file_count() >= MAX_OVERFLOW_FILES
                 && picker.get_file_by_path(path).is_none()
@@ -596,17 +661,29 @@ pub(crate) fn handle_debounced_events(
 
             if picker.handle_create_or_modify(path).is_some() {
                 files_to_update_git_status.push(path.to_path_buf());
+                if renames.contains_key(*path) {
+                    landed_renames.insert(path.to_path_buf());
+                }
                 if need_events_propagation {
-                    let kind = if existed {
-                        WatchEventKind::Modified
-                    } else {
-                        WatchEventKind::Created
+                    let event = match renames.get(*path) {
+                        Some(from) => (WatchEventKind::Renamed, Some(from.clone())),
+                        None if existed => (WatchEventKind::Modified, None),
+                        None => (WatchEventKind::Created, None),
                     };
 
-                    watch_events.insert(path.to_path_buf(), kind);
+                    watch_events.insert(path.to_path_buf(), event);
                 }
             } else {
                 index_update_rejected = true;
+            }
+        }
+
+        // A destination the picker rejected is not a rename: its source stays
+        // Removed and no history is carried. For the rest, the move is one event.
+        renames.retain(|to, _| landed_renames.contains(to));
+        if need_events_propagation {
+            for from in renames.values() {
+                watch_events.remove(from);
             }
         }
 
@@ -638,13 +715,49 @@ pub(crate) fn handle_debounced_events(
             base_path,
             watch_events
                 .into_iter()
-                .map(|(path, kind)| RawWatchEvent {
+                .map(|(path, (kind, from))| RawWatchEvent {
                     path,
                     kind,
                     is_ignored: false,
+                    from,
                 })
                 .collect(),
         );
+    }
+
+    // Carry the access history onto the new path. Copied, not moved: checking
+    // out a revision where the old path exists again must still rank it.
+    if !renames.is_empty() {
+        let mut carried = Vec::new();
+        if let Ok(frecency_guard) = shared_frecency.read()
+            && let Some(ref frecency) = *frecency_guard
+        {
+            for (to, from) in &renames {
+                match frecency.copy_history(from, to) {
+                    Ok(true) => carried.push(to.clone()),
+                    Ok(false) => {}
+                    Err(e) => error!(
+                        ?from,
+                        ?to,
+                        "Failed to carry frecency over a rename: {:?}",
+                        e
+                    ),
+                }
+            }
+        }
+
+        if !carried.is_empty() {
+            info!(count = carried.len(), "Carried frecency across renames");
+            if let Ok(mut picker_guard) = shared_picker.write()
+                && let Some(ref mut picker) = *picker_guard
+                && let Ok(frecency_guard) = shared_frecency.read()
+                && let Some(ref frecency) = *frecency_guard
+            {
+                for path in &carried {
+                    let _ = picker.update_single_file_frecency(path, frecency);
+                }
+            }
+        }
     }
 
     // AI mode: auto-track frecency for all modified/created files.
@@ -653,6 +766,12 @@ pub(crate) fn handle_debounced_events(
     // This runs after apply_changes so the picker write lock is released.
     if mode.is_ai() && !paths_to_add_or_modify.is_empty() {
         let mut tracked_count = 0usize;
+        let shared_base = shared_picker.read().ok().and_then(|guard| {
+            guard
+                .as_ref()?
+                .worktree_shared_base()
+                .map(Path::to_path_buf)
+        });
         if let Ok(frecency_guard) = shared_frecency.read()
             && let Some(ref frecency) = *frecency_guard
         {
@@ -667,7 +786,10 @@ pub(crate) fn handle_debounced_events(
                     continue;
                 }
 
-                if let Err(e) = frecency.track_access(path) {
+                let shared = shared_base
+                    .as_deref()
+                    .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
+                if let Err(e) = frecency.track_access_shared(path, shared.as_deref()) {
                     error!("Failed to track frecency for {:?}: {:?}", path, e);
                 } else {
                     tracked_count += 1;
@@ -709,6 +831,7 @@ pub(crate) fn handle_debounced_events(
 fn index_new_directory(
     dir: &Path,
     shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
@@ -765,7 +888,8 @@ fn index_new_directory(
         return subdirs;
     }
 
-    let mut indexed_files = Vec::with_capacity(files_to_add.len());
+    let mut indexed_files = Vec::with_capacity(files_to_add.len().min(MAX_OVERFLOW_FILES));
+    let mut index_update_rejected = false;
     {
         let Ok(mut guard) = shared_picker.write() else {
             return subdirs;
@@ -778,26 +902,46 @@ fn index_new_directory(
         for path in files_to_add {
             if picker.handle_create_or_modify(&path).is_some() {
                 indexed_files.push(path);
+            } else {
+                index_update_rejected = true;
+                break;
             }
         }
     }
     let added = indexed_files.len();
 
     let watch_registry = shared_picker.watch_registry();
-    if watch_registry.is_active() {
+    // Capacity rejection cannot fall back to incremental processing if a rescan is throttled.
+    let rescan_started = if index_update_rejected {
+        match shared_picker.trigger_full_rescan_async(shared_frecency) {
+            Ok(()) => {
+                watch_registry.dispatch_rescan(&base_path);
+                true
+            }
+            Err(e) => {
+                error!(?e, dir = %dir.display(), "Failed to rescan after new-directory overflow");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !rescan_started && watch_registry.is_active() {
         let events = indexed_files
             .iter()
             .map(|path| RawWatchEvent {
                 path: path.clone(),
                 kind: WatchEventKind::Created,
                 is_ignored: false,
+                from: None,
             })
             .collect();
 
         watch_registry.dispatch(&base_path, events);
     }
 
-    if repo.is_some() {
+    if !rescan_started && repo.is_some() {
         git_status_worker.enqueue_paths(indexed_files);
     }
 
@@ -924,20 +1068,16 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     false
 }
 
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBuf>) {
-    let Some(workdir) = git_workdir else {
+// `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
+fn watch_git_status_paths(debouncer: &mut Debouncer, git_dir: Option<&Path>) {
+    let Some(git_dir) = git_dir.filter(|git_dir| git_dir.is_dir()) else {
         return;
     };
-
-    let git_dir = workdir.join(".git");
-    if !git_dir.is_dir() {
-        return;
-    }
 
     // We have tried to be smart about the internal git state but
     // it appeared more harmful that it's worth it, so we just watch
     // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
-    if let Err(e) = debouncer.watch(&git_dir, RecursiveMode::NonRecursive) {
+    if let Err(e) = debouncer.watch(git_dir, RecursiveMode::NonRecursive) {
         warn!("Failed to watch .git directory: {}", e);
     }
 
@@ -954,6 +1094,130 @@ fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBu
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    size: u64,
+    mtime: u64,
+}
+
+// Returns destination -> source. Explicit pairs from the OS win outright; the
+// rest is inferred from files that kept their exact size and mtime. Call while
+// the removed paths are still indexed — that is the only source of their
+// metadata once they are gone from disk.
+fn detect_renames(
+    picker: &crate::file_picker::FilePicker,
+    base_path: &Path,
+    paths_to_remove: &[(&Path, bool)],
+    paths_to_add_or_modify: &[&Path],
+    explicit: &[(PathBuf, PathBuf)],
+) -> ahash::AHashMap<PathBuf, PathBuf> {
+    // Subscribers only ever see paths relative to the base, so a move that
+    // crosses the boundary stays a plain removal or creation.
+    let mut renames: ahash::AHashMap<PathBuf, PathBuf> = explicit
+        .iter()
+        .filter(|(from, to)| from != to && from.starts_with(base_path) && to.starts_with(base_path))
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+
+    if paths_to_remove.is_empty() || paths_to_add_or_modify.is_empty() {
+        return renames;
+    }
+
+    let explicit_sources: ahash::AHashSet<&Path> = renames.values().map(PathBuf::as_path).collect();
+    let removed: Vec<(PathBuf, FileIdentity)> = paths_to_remove
+        .iter()
+        .filter(|(path, _)| !explicit_sources.contains(path))
+        .filter_map(|(path, _)| {
+            let file = picker.get_file_by_path(path)?;
+            Some((
+                path.to_path_buf(),
+                FileIdentity {
+                    size: file.size,
+                    mtime: file.modified,
+                },
+            ))
+        })
+        .collect();
+
+    let added: Vec<(PathBuf, FileIdentity)> = paths_to_add_or_modify
+        .iter()
+        .filter(|path| !renames.contains_key(**path))
+        // A path already live in the index was edited, not moved into place.
+        .filter(|path| {
+            picker
+                .get_file_by_path(path)
+                .is_none_or(|file| file.is_deleted())
+        })
+        .filter_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((
+                path.to_path_buf(),
+                FileIdentity {
+                    size: meta.len(),
+                    mtime,
+                },
+            ))
+        })
+        .collect();
+
+    for (from, to) in pair_renames_by_identity(&removed, &added) {
+        renames.insert(to, from);
+    }
+
+    renames
+}
+
+// Pair a removed with an added path when they are the only two files in the
+// batch sharing a (size, mtime) — a rename preserves both exactly. Uniqueness
+// on both sides is what stops bulk operations from cross-wiring histories.
+fn pair_renames_by_identity(
+    removed: &[(PathBuf, FileIdentity)],
+    added: &[(PathBuf, FileIdentity)],
+) -> Vec<(PathBuf, PathBuf)> {
+    if removed.is_empty() || added.is_empty() {
+        return Vec::new();
+    }
+
+    // `None` marks an identity claimed by more than one distinct path. The OS
+    // repeats a path within a batch (FSEvents does routinely), and a repeat is
+    // still one candidate, not a collision.
+    fn index_by_identity(
+        entries: &[(PathBuf, FileIdentity)],
+    ) -> ahash::AHashMap<FileIdentity, Option<&Path>> {
+        let mut by_identity: ahash::AHashMap<FileIdentity, Option<&Path>> =
+            ahash::AHashMap::default();
+        for (path, identity) in entries {
+            by_identity
+                .entry(*identity)
+                .and_modify(|slot| {
+                    if *slot != Some(path.as_path()) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(path.as_path()));
+        }
+        by_identity
+    }
+
+    let sources = index_by_identity(removed);
+    let targets = index_by_identity(added);
+
+    targets
+        .into_iter()
+        .filter_map(|(identity, target)| {
+            let target = target?;
+            let source = (*sources.get(&identity)?)?;
+            Some((source.to_path_buf(), target.to_path_buf()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,6 +1227,108 @@ mod tests {
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn overflow_admission_is_bounded_without_rejecting_existing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        for i in 0..MAX_OVERFLOW_FILES {
+            let path = base.join(format!("file-{i}.txt"));
+            std::fs::write(&path, "initial").unwrap();
+            assert!(picker.handle_create_or_modify(&path).is_some());
+        }
+        let extra = base.join("extra.txt");
+        std::fs::write(&extra, "extra").unwrap();
+        assert!(picker.add_new_file(&extra).is_none());
+        assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+
+        let existing = base.join("file-0.txt");
+        std::fs::write(&existing, "modified content").unwrap();
+        assert!(picker.handle_create_or_modify(&existing).is_some());
+        assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+    }
+
+    #[test]
+    fn new_directory_overflow_rescans_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let shared_picker = SharedFilePicker::default();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        *shared_picker.write().unwrap() = Some(picker);
+        shared_picker.rebase_watches(&base);
+        let (sender, receiver) = mpsc::channel::<Vec<WatchEvent>>();
+        shared_picker
+            .watch_registry()
+            .subscribe(
+                &base,
+                "**",
+                WatchOptions::default(),
+                Box::new(move |_, events| {
+                    let _ = sender.send(events.to_vec());
+                }),
+            )
+            .unwrap();
+
+        let dir = base.join("new-directory");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            std::fs::write(dir.join(format!("file-{i}.txt")), "content").unwrap();
+        }
+        index_new_directory(
+            &dir,
+            &shared_picker,
+            &SharedFrecency::noop(),
+            &None,
+            &GitStatusWorker::new(),
+        );
+        {
+            let guard = shared_picker.read().unwrap();
+            assert!(guard.as_ref().unwrap().get_overflow_files().len() <= MAX_OVERFLOW_FILES);
+        }
+        let marker = base.join("after-overflow.txt");
+        shared_picker.watch_registry().dispatch(
+            &base,
+            vec![RawWatchEvent {
+                path: marker.clone(),
+                kind: WatchEventKind::Removed,
+                is_ignored: false,
+                from: None,
+            }],
+        );
+        let events = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, WatchEventKind::Rescan);
+        assert_eq!(events[0].path, base);
+        let next = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].kind, WatchEventKind::Removed);
+        assert_eq!(next[0].path, marker);
+        assert!(shared_picker.wait_for_indexing_complete(Duration::from_secs(10)));
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            assert!(
+                picker
+                    .get_file_by_path(dir.join(format!("file-{i}.txt")))
+                    .is_some()
+            );
+        }
+        assert_eq!(picker.get_overflow_files().len(), 0);
+    }
 
     #[test]
     fn replacement_batch_emits_one_modified_event() {
@@ -1026,6 +1392,112 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].path, path);
         assert_eq!(received[0].kind, WatchEventKind::Modified);
+    }
+
+    fn identity(size: u64, mtime: u64) -> FileIdentity {
+        FileIdentity { size, mtime }
+    }
+
+    fn entry(path: &str, size: u64, mtime: u64) -> (PathBuf, FileIdentity) {
+        (PathBuf::from(path), identity(size, mtime))
+    }
+
+    #[test]
+    fn unique_size_and_mtime_pairs_as_a_rename() {
+        let pairs = pair_renames_by_identity(
+            &[entry("/w/old.rs", 120, 1_700_000_000)],
+            &[entry("/w/new.rs", 120, 1_700_000_000)],
+        );
+
+        assert_eq!(
+            pairs,
+            vec![(PathBuf::from("/w/old.rs"), PathBuf::from("/w/new.rs"))]
+        );
+    }
+
+    #[test]
+    fn ambiguous_identities_are_never_paired() {
+        let two_removed = pair_renames_by_identity(
+            &[entry("/w/a.rs", 10, 5), entry("/w/b.rs", 10, 5)],
+            &[entry("/w/c.rs", 10, 5)],
+        );
+        assert!(
+            two_removed.is_empty(),
+            "two removed files sharing an identity are ambiguous: {two_removed:?}"
+        );
+
+        let two_added = pair_renames_by_identity(
+            &[entry("/w/a.rs", 10, 5)],
+            &[entry("/w/b.rs", 10, 5), entry("/w/c.rs", 10, 5)],
+        );
+        assert!(
+            two_added.is_empty(),
+            "two added files sharing an identity are ambiguous: {two_added:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_path_is_one_candidate_not_a_collision() {
+        // FSEvents routinely reports the same path several times per batch.
+        let pairs = pair_renames_by_identity(
+            &[entry("/w/old.rs", 15, 99), entry("/w/old.rs", 15, 99)],
+            &[entry("/w/new.rs", 15, 99), entry("/w/new.rs", 15, 99)],
+        );
+
+        assert_eq!(
+            pairs,
+            vec![(PathBuf::from("/w/old.rs"), PathBuf::from("/w/new.rs"))]
+        );
+    }
+
+    #[test]
+    fn empty_files_are_paired_only_when_unambiguous() {
+        let unique = pair_renames_by_identity(&[entry("/w/a", 0, 7)], &[entry("/w/b", 0, 7)]);
+        assert_eq!(
+            unique,
+            vec![(PathBuf::from("/w/a"), PathBuf::from("/w/b"))],
+            "a lone empty file still has a usable identity"
+        );
+
+        let colliding = pair_renames_by_identity(
+            &[entry("/w/a", 0, 7), entry("/w/b", 0, 7)],
+            &[entry("/w/c", 0, 7), entry("/w/d", 0, 7)],
+        );
+        assert!(colliding.is_empty(), "{colliding:?}");
+    }
+
+    #[test]
+    fn differing_metadata_is_not_a_rename() {
+        // git checkout rewrites mtime, so branch switches must never pair.
+        let fresh_mtime = pair_renames_by_identity(
+            &[entry("/w/old.rs", 120, 1_700_000_000)],
+            &[entry("/w/new.rs", 120, 1_700_000_900)],
+        );
+        assert!(fresh_mtime.is_empty(), "{fresh_mtime:?}");
+
+        let other_size = pair_renames_by_identity(
+            &[entry("/w/old.rs", 120, 1_700_000_000)],
+            &[entry("/w/new.rs", 121, 1_700_000_000)],
+        );
+        assert!(other_size.is_empty(), "{other_size:?}");
+    }
+
+    #[test]
+    fn independent_identities_pair_side_by_side() {
+        let pairs = pair_renames_by_identity(
+            &[entry("/w/a.rs", 10, 1), entry("/w/b.rs", 20, 2)],
+            &[entry("/w/y.rs", 20, 2), entry("/w/x.rs", 10, 1)],
+        );
+
+        let mut pairs = pairs;
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (PathBuf::from("/w/a.rs"), PathBuf::from("/w/x.rs")),
+                (PathBuf::from("/w/b.rs"), PathBuf::from("/w/y.rs")),
+            ]
+        );
     }
 
     #[test]

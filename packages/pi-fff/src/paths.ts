@@ -18,6 +18,12 @@ export function isHomeDir(dir: string): boolean {
   return path.resolve(dir) === HOME_DIR;
 }
 
+// Mirrors the native `path.parent().is_none()` check: a path that is its own parent.
+export function isFsRoot(dir: string): boolean {
+  const resolved = path.resolve(dir);
+  return path.dirname(resolved) === resolved;
+}
+
 // Resolution order: explicit override > existing fff.nvim db > pi-local data dir.
 // Reusing the nvim db lets pi rank files by the frecency the user built in their editor.
 export function resolveDbPaths(overrides: {

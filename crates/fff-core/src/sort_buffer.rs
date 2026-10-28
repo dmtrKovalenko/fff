@@ -53,20 +53,6 @@ where
     }
 }
 
-pub fn sort_by_key_with_buffer<T, K, F>(slice: &mut [T], key_fn: F)
-where
-    K: Ord,
-    F: FnMut(&T) -> K,
-{
-    match try_lock_shared_buf() {
-        Some(mut buf) => {
-            let typed = buf.as_slice_mut::<T>(slice.len());
-            glidesort::sort_with_buffer_by_key(slice, typed, key_fn);
-        }
-        None => glidesort::sort_by_key(slice, key_fn),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,13 +62,6 @@ mod tests {
         let mut data = vec![5, 2, 8, 1, 9];
         sort_with_buffer(&mut data, |a, b| a.cmp(b));
         assert_eq!(data, vec![1, 2, 5, 8, 9]);
-    }
-
-    #[test]
-    fn test_sort_by_key_with_buffer() {
-        let mut data = vec![(1, 50), (2, 20), (3, 80), (4, 10), (5, 90)];
-        sort_by_key_with_buffer(&mut data, |a| a.1);
-        assert_eq!(data, vec![(4, 10), (2, 20), (1, 50), (3, 80), (5, 90)]);
     }
 
     #[test]
