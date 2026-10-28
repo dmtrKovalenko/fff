@@ -2,7 +2,7 @@ name: Build & Publish
 
 on:
   push:
-    branches: [main, fix/npm-pulish]
+    branches: [main]
     tags:
       - "v*"
   pull_request:
@@ -17,8 +17,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Per-sha group on main: a shared group drops queued runs, leaving commits with no release to download.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
@@ -595,6 +596,9 @@ jobs:
   release:
     name: Release
     needs: [build-nvim, build-c, build-mcp, build-python, build-python-sdist]
+    concurrency:
+      group: release-${{ github.ref }}
+      queue: max
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
@@ -689,15 +693,6 @@ jobs:
         id: version
         run: lua scripts/determine-version.lua
 
-      # Nightlies publish to a permanent per-sha tag (release_tag == version) so
-      # pinned/stale installs always fetch the binary built for their own commit.
-      # The rolling `nightly` tag is also moved to HEAD for "give me latest" tooling.
-      - name: Move rolling nightly tag to current commit
-        if: steps.version.outputs.is_release != 'true'
-        run: |
-          git tag -f nightly "${{ github.sha }}"
-          git push -f origin refs/tags/nightly
-
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
@@ -733,6 +728,20 @@ jobs:
             ```sh
             curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff/main/install-mcp.sh | bash
             ```
+
+      # Nightlies publish to a permanent per-sha tag (release_tag == version) so
+      # pinned/stale installs always fetch the binary built for their own commit.
+      # The rolling `nightly` tag is also moved to HEAD for "give me latest" tooling.
+      - name: Move rolling nightly tag to current commit
+        if: steps.version.outputs.is_release != 'true'
+        run: |
+          # Runs on main can finish out of order; only the current tip moves the tag.
+          if [ "$(git ls-remote origin refs/heads/main | cut -f1)" != "${{ github.sha }}" ]; then
+            echo "Not the tip of main, leaving the nightly tag alone"
+            exit 0
+          fi
+          git tag -f nightly "${{ github.sha }}"
+          git push -f origin refs/tags/nightly
 
       - name: Bump Homebrew formula (uses local checksums)
         if: steps.version.outputs.is_release == 'true' && github.repository_owner == 'dmtrKovalenko'
@@ -812,8 +821,11 @@ jobs:
   npm-publish:
     name: Publish npm packages
     needs: [build-c]
+    concurrency:
+      group: npm-publish-${{ github.ref }}
+      queue: max
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/npm-pulish' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       id-token: write
@@ -835,6 +847,19 @@ jobs:
         id: version
         run: lua scripts/determine-version.lua
 
+      - name: Choose npm dist-tag
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.npm_tag }}
+        run: |
+          tag="$RELEASE_TAG"
+          if [[ "$tag" == nightly ]]; then
+            main_ref=$(git ls-remote --exit-code origin refs/heads/main)
+            if [[ "${main_ref%%[[:space:]]*}" != "$GITHUB_SHA" ]]; then
+              tag=nightly-history
+            fi
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
       - name: Download npm package artifacts
         uses: actions/download-artifact@v4
         with:
@@ -844,7 +869,6 @@ jobs:
       - name: Publish platform packages
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           for pkg_dir in ./npm-packages/npm-*/; do
             if [ -d "$pkg_dir" ]; then
@@ -872,7 +896,6 @@ jobs:
       - name: Publish bun package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           echo "Publishing @ff-labs/fff-bun@${VERSION} with tag ${TAG}..."
           make set-npm-version PKG=packages/fff-bun VERSION="$VERSION"
@@ -883,7 +906,6 @@ jobs:
       - name: Publish Node.js package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           echo "Publishing @ff-labs/fff-node@${VERSION} with tag ${TAG}..."
           make set-npm-version PKG=packages/fff-node VERSION="$VERSION"
@@ -894,7 +916,6 @@ jobs:
       - name: Publish pi-fff package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           echo "Publishing @ff-labs/pi-fff@${VERSION} with tag ${TAG}..."
           make set-npm-version PKG=packages/pi-fff VERSION="$VERSION"
