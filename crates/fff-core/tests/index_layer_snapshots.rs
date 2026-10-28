@@ -370,7 +370,9 @@ fn base_scan_round_trips_through_a_file() {
     // The restored base behaves like a scanned one for watcher updates.
     let created = base.join("src/m0/new.rs");
     fs::write(&created, "new\n").expect("write");
-    restored.handle_create_or_modify(&created);
+    restored
+        .handle_create_or_modify(&created)
+        .expect("index new file after restore");
     assert_eq!(layer_paths(&restored, SESSION_LAYER), vec!["src/m0/new.rs"]);
 }
 

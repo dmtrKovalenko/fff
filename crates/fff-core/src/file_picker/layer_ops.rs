@@ -460,7 +460,7 @@ impl FileSync {
                 files.par_iter_mut().for_each_init(
                     || frecency.reader(),
                     |reader, file| {
-                        let _ = file.update_frecency_scores(
+                        file.update_frecency_scores(
                             reader,
                             arena,
                             base_path,
