@@ -457,7 +457,9 @@ impl LayerSnapshot {
         }
         let store = ChunkedPathStore::from_parts(arena, indices);
 
-        let mut dirs: Vec<DirItem> = Vec::with_capacity(dir_count);
+        let mut dirs: Vec<DirItem> = Vec::new();
+        dirs.try_reserve_exact(dir_count)
+            .map_err(|_| Error::LayerFormat("directory table too large"))?;
         let mut path_buf = [0u8; PATH_BUF_SIZE];
         let mut other_buf = [0u8; PATH_BUF_SIZE];
         for _ in 0..dir_count {
@@ -477,7 +479,10 @@ impl LayerSnapshot {
             dirs.push(DirItem::new(path, last_segment));
         }
 
-        let mut files = Vec::with_capacity(file_count);
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(file_count)
+            .map_err(|_| Error::LayerFormat("file table too large"))?;
         for _ in 0..file_count {
             let size = cur.u64()?;
             let modified = cur.u64()?;
@@ -654,8 +659,8 @@ fn validated_layout(
 
 fn is_relative_file_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-        && !path.contains(['\\', '\0'])
+    let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    !(drive_prefix || path.contains(['\\', '\0']))
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
