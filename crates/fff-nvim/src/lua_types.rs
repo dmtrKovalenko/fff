@@ -236,6 +236,10 @@ impl IntoLua for MixedSearchResultLua<'_> {
 impl IntoLua for GrepResultLua<'_> {
     fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
         let table = lua.create_table()?;
+        table.set(
+            "base_path",
+            self.picker.base_path().to_string_lossy().as_ref(),
+        )?;
 
         // Convert grep match items — each includes file metadata + match metadata
         let items_table = lua.create_table()?;
