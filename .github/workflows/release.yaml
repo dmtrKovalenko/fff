@@ -596,6 +596,9 @@ jobs:
   release:
     name: Release
     needs: [build-nvim, build-c, build-mcp, build-python, build-python-sdist]
+    concurrency:
+      group: release-${{ github.ref }}
+      queue: max
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
@@ -818,8 +821,11 @@ jobs:
   npm-publish:
     name: Publish npm packages
     needs: [build-c]
+    concurrency:
+      group: npm-publish-${{ github.ref }}
+      queue: max
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' ||startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       id-token: write
@@ -841,6 +847,19 @@ jobs:
         id: version
         run: lua scripts/determine-version.lua
 
+      - name: Choose npm dist-tag
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.npm_tag }}
+        run: |
+          tag="$RELEASE_TAG"
+          if [[ "$tag" == nightly ]]; then
+            main_ref=$(git ls-remote --exit-code origin refs/heads/main)
+            if [[ "${main_ref%%[[:space:]]*}" != "$GITHUB_SHA" ]]; then
+              tag=nightly-history
+            fi
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
       - name: Download npm package artifacts
         uses: actions/download-artifact@v4
         with:
@@ -850,7 +869,6 @@ jobs:
       - name: Publish platform packages
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           for pkg_dir in ./npm-packages/npm-*/; do
             if [ -d "$pkg_dir" ]; then
@@ -878,7 +896,6 @@ jobs:
       - name: Publish bun package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           echo "Publishing @ff-labs/fff-bun@${VERSION} with tag ${TAG}..."
           make set-npm-version PKG=packages/fff-bun VERSION="$VERSION"
@@ -889,7 +906,6 @@ jobs:
       - name: Publish Node.js package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           echo "Publishing @ff-labs/fff-node@${VERSION} with tag ${TAG}..."
           make set-npm-version PKG=packages/fff-node VERSION="$VERSION"
@@ -900,7 +916,6 @@ jobs:
       - name: Publish pi-fff package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.npm_tag }}"
 
           echo "Publishing @ff-labs/pi-fff@${VERSION} with tag ${TAG}..."
           make set-npm-version PKG=packages/pi-fff VERSION="$VERSION"
