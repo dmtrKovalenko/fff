@@ -20,6 +20,7 @@ describe('go_to_definition', function()
       'fn RepeatedTarget() {}',
       'fn RepeatedTargetExtra() {}',
       'fn test_partial_name() {}',
+      'fn TwinOne() {} fn TwinTwo() {}',
     }, root .. '/definitions.rs')
     vim.fn.writefile({ 'UniqueTarget();', 'RepeatedTarget();', 'NoDefinition();' }, root .. '/usage.rs')
     vim.cmd('noautocmd cd ' .. vim.fn.fnameescape(root))
@@ -35,8 +36,7 @@ describe('go_to_definition', function()
     config.grep.max_matches_per_file = 1
     core.mark_file_picker_uninitialized()
     core.ensure_initialized()
-    rust.wait_for_initial_scan(30000)
-    assert.is_true(fuzzy.get_scan_progress().is_index_ready)
+    assert.is_true(vim.wait(30000, function() return fuzzy.get_scan_progress().is_index_ready end))
     grep = require('fff.picker_ui.grep_renderer')
     vim.cmd('edit usage.rs')
     vim.api.nvim_win_set_cursor(0, { 1, 0 })
@@ -113,6 +113,12 @@ describe('go_to_definition', function()
     assert.are.equal('usage.rs', vim.fn.expand('%:t'))
   end)
 
+  it('opens the picker when two matching declarations share a line', function()
+    assert.is_false(fff.go_to_definition({ query = 'Twin' }))
+    assert.are.equal('Twin', fallback.query)
+    assert.are.equal('usage.rs', vim.fn.expand('%:t'))
+  end)
+
   it('opens the definition picker when only usages match', function()
     assert.is_false(fff.go_to_definition({ query = 'NoDefinition' }))
     assert.are.equal('NoDefinition', fallback.query)
@@ -151,6 +157,11 @@ describe('go_to_definition', function()
     end
     assert.is_false(fff.go_to_definition())
     assert.are.equal('usage.rs', vim.fn.expand('%:t'))
+  end)
+
+  it('uses the active index when cwd is empty', function()
+    assert.is_true(fff.go_to_definition({ cwd = '' }))
+    assert.are.equal('definitions.rs', vim.fn.expand('%:t'))
   end)
 
   it('jumps for an explicit cwd that matches the active index', function()
