@@ -244,8 +244,9 @@ impl IntoLua for GrepResultLua<'_> {
 
             // File metadata from the deduplicated files vec
             let file = self.inner.files[m.file_index];
+            let filename = file.file_name(self.picker);
             item.set("relative_path", file.relative_path(self.picker))?;
-            item.set("name", file.file_name(self.picker))?;
+            item.set("name", filename.as_str())?;
             item.set("is_binary", file.is_binary())?;
             item.set("git_status", format_git_status(file.git_status))?;
             item.set("size", file.size)?;
@@ -267,6 +268,7 @@ impl IntoLua for GrepResultLua<'_> {
             let is_binary_content = m.line_content.as_bytes().contains(&0u8);
             item.set("is_binary_content", is_binary_content)?;
             item.set("line_content", m.line_content.as_str())?;
+            item.set("is_definition", !is_binary_content && m.is_definition)?;
 
             set_match_ranges(lua, &item, m.match_byte_offsets.as_slice())?;
 

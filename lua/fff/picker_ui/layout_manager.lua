@@ -145,6 +145,7 @@ function M.close()
   S.combo_initial_cursor = nil
   P.reset_history_state()
   pcall(vim.api.nvim_del_augroup_by_name, 'fff_picker_focus')
+  require('fff.file_picker').pause_git_status()
 
   vim.api.nvim_exec_autocmds('User', { pattern = 'FFFClose', modeline = false })
 end

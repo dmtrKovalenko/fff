@@ -1,16 +1,19 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
+use crate::git::GitDiscovery;
 use crate::git_status_worker::GitStatusWorker;
+use crate::parallelism::indexing_pool;
 use crate::rescan_stats::RescanReason;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
+use rayon::slice::ParallelSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -45,7 +48,7 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
@@ -91,12 +94,13 @@ impl BackgroundWatcher {
         let watch_tx_for_debouncer = watch_tx.clone();
 
         let owner_weak_picker = shared_picker.weaken();
-        let owner_git_workdir = git_workdir.clone();
+        let owner_frecency = shared_frecency.clone();
+        let owner_git_workdir = git.as_ref().map(|git| git.workdir.clone());
         let owner_git_worker = Arc::clone(&git_status_worker);
 
         let debouncer = Self::create_debouncer(
             base_path,
-            git_workdir,
+            git,
             shared_picker,
             shared_frecency,
             mode,
@@ -141,6 +145,7 @@ impl BackgroundWatcher {
                         let subdirs = index_new_directory(
                             &dir,
                             &strong_picker,
+                            &owner_frecency,
                             &owner_git_workdir,
                             &owner_git_worker,
                         );
@@ -174,7 +179,7 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
@@ -188,7 +193,7 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        let git_workdir_for_handler = git_workdir.clone();
+        let git_workdir_for_handler = git.as_ref().map(|git| git.workdir.clone());
         let base_path_for_handler = base_path.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let file_picker = shared_picker.weaken();
@@ -246,39 +251,65 @@ impl BackgroundWatcher {
             let mut watched = 0usize;
             let mut consecutive_failures = 0usize;
 
-            // `inotify` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding this lock is free
+            let mut directories = Vec::new();
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
-                use std::ops::ControlFlow;
                 picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+                    directories.push(PathOp::watch_non_recursive(dir));
+                    std::ops::ControlFlow::Continue(())
+                });
+            }
+            // The debouncer keeps sorted roots; append in order and register off-lock.
+            indexing_pool(mode).install(|| {
+                directories.par_sort_unstable_by(|left, right| left.as_path().cmp(right.as_path()));
+            });
+            let mut directories = directories.into_iter();
+            'register: loop {
+                let mut batch = directories.by_ref().take(1024).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                loop {
+                    let batch_len = batch.len();
+                    match debouncer.update_paths(batch) {
                         Ok(()) => {
-                            watched += 1;
+                            watched += batch_len;
                             consecutive_failures = 0;
-                            ControlFlow::Continue(())
+                            break;
                         }
-                        Err(e) => {
+                        Err(error) => {
+                            let applied = batch_len.saturating_sub(
+                                error.remaining.len() + usize::from(error.origin.is_some()),
+                            );
+                            watched += applied;
+                            if applied > 0 {
+                                consecutive_failures = 0;
+                            }
                             consecutive_failures += 1;
                             if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
+                                warn!(
+                                    error = %error.source,
+                                    path = ?error.origin.as_ref().map(PathOp::as_path),
+                                    watched,
+                                    "Failed to register directory watch"
+                                );
                             }
-
                             if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
                                 warn!(
                                     consecutive_failures,
                                     watched,
                                     "Giving up setting file watcher for all the directories. Check if your system has enough fs watchers limit."
                                 );
-
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
+                                break 'register;
+                            }
+                            batch = error.remaining;
+                            if batch.is_empty() {
+                                break;
                             }
                         }
                     }
-                });
+                }
             }
 
             tracing::info!(
@@ -291,7 +322,10 @@ impl BackgroundWatcher {
         // The .git directory is excluded from the file list but we still need
         // to observe changes that affect git status (staging, unstaging,
         // committing, branch switches, merges, etc)
-        watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+        watch_git_status_paths(
+            &mut debouncer,
+            git.as_ref().map(|git| git.git_dir.as_path()),
+        );
 
         Ok(debouncer)
     }
@@ -441,7 +475,12 @@ pub(crate) fn handle_debounced_events(
                 need_full_git_rescan = true;
             }
 
-            if is_git_file(path) {
+            // bare repos keep worktree git dirs outside of any `.git` component
+            if is_git_file(path)
+                || repo
+                    .as_ref()
+                    .is_some_and(|repo| path.starts_with(repo.path()))
+            {
                 continue;
             }
 
@@ -611,7 +650,7 @@ pub(crate) fn handle_debounced_events(
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
         let mut landed_renames = ahash::AHashSet::with_capacity(renames.len());
         for path in &paths_to_add_or_modify {
-            if picker.get_overflow_files().len() >= MAX_OVERFLOW_FILES
+            if picker.open_layer_file_count() >= MAX_OVERFLOW_FILES
                 && picker.get_file_by_path(path).is_none()
             {
                 index_update_rejected = true;
@@ -648,7 +687,7 @@ pub(crate) fn handle_debounced_events(
             }
         }
 
-        overflow_count = picker.get_overflow_files().len();
+        overflow_count = picker.open_layer_file_count();
     }
 
     info!(
@@ -727,6 +766,12 @@ pub(crate) fn handle_debounced_events(
     // This runs after apply_changes so the picker write lock is released.
     if mode.is_ai() && !paths_to_add_or_modify.is_empty() {
         let mut tracked_count = 0usize;
+        let shared_base = shared_picker.read().ok().and_then(|guard| {
+            guard
+                .as_ref()?
+                .worktree_shared_base()
+                .map(Path::to_path_buf)
+        });
         if let Ok(frecency_guard) = shared_frecency.read()
             && let Some(ref frecency) = *frecency_guard
         {
@@ -741,7 +786,10 @@ pub(crate) fn handle_debounced_events(
                     continue;
                 }
 
-                if let Err(e) = frecency.track_access(path) {
+                let shared = shared_base
+                    .as_deref()
+                    .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
+                if let Err(e) = frecency.track_access_shared(path, shared.as_deref()) {
                     error!("Failed to track frecency for {:?}: {:?}", path, e);
                 } else {
                     tracked_count += 1;
@@ -783,6 +831,7 @@ pub(crate) fn handle_debounced_events(
 fn index_new_directory(
     dir: &Path,
     shared_picker: &SharedFilePicker,
+    shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
@@ -839,7 +888,8 @@ fn index_new_directory(
         return subdirs;
     }
 
-    let mut indexed_files = Vec::with_capacity(files_to_add.len());
+    let mut indexed_files = Vec::with_capacity(files_to_add.len().min(MAX_OVERFLOW_FILES));
+    let mut index_update_rejected = false;
     {
         let Ok(mut guard) = shared_picker.write() else {
             return subdirs;
@@ -852,13 +902,32 @@ fn index_new_directory(
         for path in files_to_add {
             if picker.handle_create_or_modify(&path).is_some() {
                 indexed_files.push(path);
+            } else {
+                index_update_rejected = true;
+                break;
             }
         }
     }
     let added = indexed_files.len();
 
     let watch_registry = shared_picker.watch_registry();
-    if watch_registry.is_active() {
+    // Capacity rejection cannot fall back to incremental processing if a rescan is throttled.
+    let rescan_started = if index_update_rejected {
+        match shared_picker.trigger_full_rescan_async(shared_frecency) {
+            Ok(()) => {
+                watch_registry.dispatch_rescan(&base_path);
+                true
+            }
+            Err(e) => {
+                error!(?e, dir = %dir.display(), "Failed to rescan after new-directory overflow");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !rescan_started && watch_registry.is_active() {
         let events = indexed_files
             .iter()
             .map(|path| RawWatchEvent {
@@ -872,7 +941,7 @@ fn index_new_directory(
         watch_registry.dispatch(&base_path, events);
     }
 
-    if repo.is_some() {
+    if !rescan_started && repo.is_some() {
         git_status_worker.enqueue_paths(indexed_files);
     }
 
@@ -999,20 +1068,16 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     false
 }
 
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBuf>) {
-    let Some(workdir) = git_workdir else {
+// `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
+fn watch_git_status_paths(debouncer: &mut Debouncer, git_dir: Option<&Path>) {
+    let Some(git_dir) = git_dir.filter(|git_dir| git_dir.is_dir()) else {
         return;
     };
-
-    let git_dir = workdir.join(".git");
-    if !git_dir.is_dir() {
-        return;
-    }
 
     // We have tried to be smart about the internal git state but
     // it appeared more harmful that it's worth it, so we just watch
     // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
-    if let Err(e) = debouncer.watch(&git_dir, RecursiveMode::NonRecursive) {
+    if let Err(e) = debouncer.watch(git_dir, RecursiveMode::NonRecursive) {
         warn!("Failed to watch .git directory: {}", e);
     }
 
@@ -1162,6 +1227,108 @@ mod tests {
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn overflow_admission_is_bounded_without_rejecting_existing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        for i in 0..MAX_OVERFLOW_FILES {
+            let path = base.join(format!("file-{i}.txt"));
+            std::fs::write(&path, "initial").unwrap();
+            assert!(picker.handle_create_or_modify(&path).is_some());
+        }
+        let extra = base.join("extra.txt");
+        std::fs::write(&extra, "extra").unwrap();
+        assert!(picker.add_new_file(&extra).is_none());
+        assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+
+        let existing = base.join("file-0.txt");
+        std::fs::write(&existing, "modified content").unwrap();
+        assert!(picker.handle_create_or_modify(&existing).is_some());
+        assert_eq!(picker.get_overflow_files().len(), MAX_OVERFLOW_FILES);
+    }
+
+    #[test]
+    fn new_directory_overflow_rescans_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let shared_picker = SharedFilePicker::default();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        *shared_picker.write().unwrap() = Some(picker);
+        shared_picker.rebase_watches(&base);
+        let (sender, receiver) = mpsc::channel::<Vec<WatchEvent>>();
+        shared_picker
+            .watch_registry()
+            .subscribe(
+                &base,
+                "**",
+                WatchOptions::default(),
+                Box::new(move |_, events| {
+                    let _ = sender.send(events.to_vec());
+                }),
+            )
+            .unwrap();
+
+        let dir = base.join("new-directory");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            std::fs::write(dir.join(format!("file-{i}.txt")), "content").unwrap();
+        }
+        index_new_directory(
+            &dir,
+            &shared_picker,
+            &SharedFrecency::noop(),
+            &None,
+            &GitStatusWorker::new(),
+        );
+        {
+            let guard = shared_picker.read().unwrap();
+            assert!(guard.as_ref().unwrap().get_overflow_files().len() <= MAX_OVERFLOW_FILES);
+        }
+        let marker = base.join("after-overflow.txt");
+        shared_picker.watch_registry().dispatch(
+            &base,
+            vec![RawWatchEvent {
+                path: marker.clone(),
+                kind: WatchEventKind::Removed,
+                is_ignored: false,
+                from: None,
+            }],
+        );
+        let events = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, WatchEventKind::Rescan);
+        assert_eq!(events[0].path, base);
+        let next = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].kind, WatchEventKind::Removed);
+        assert_eq!(next[0].path, marker);
+        assert!(shared_picker.wait_for_indexing_complete(Duration::from_secs(10)));
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        for i in 0..MAX_OVERFLOW_FILES * 2 {
+            assert!(
+                picker
+                    .get_file_by_path(dir.join(format!("file-{i}.txt")))
+                    .is_some()
+            );
+        }
+        assert_eq!(picker.get_overflow_files().len(), 0);
+    }
 
     #[test]
     fn replacement_batch_emits_one_modified_event() {

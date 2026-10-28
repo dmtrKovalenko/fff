@@ -134,4 +134,84 @@ describe('grep_jump_to_next_file / grep_jump_to_prev_file', function()
 
     picker_ui.load_next_page = original_load_next
   end)
+
+  it('navigates empty partial grep pages for both prompt positions', function()
+    local next_page, previous_page = 0, 0
+    local original_next, original_previous = picker_ui.load_next_page, picker_ui.load_previous_page
+    local original_config = state_mod.state.config
+    picker_ui.load_next_page = function() next_page = next_page + 1 end
+    picker_ui.load_previous_page = function() previous_page = previous_page + 1 end
+    local ok, err = pcall(function()
+      for _, position in ipairs({ 'top', 'bottom' }) do
+        reset_state({}, 1)
+        state_mod.state.config = { layout = { prompt_position = position } }
+        state_mod.state.pagination.page_size = 50
+        state_mod.state.pagination.grep_next_file_offset = 7
+        local forward = position == 'top' and picker_ui.move_down or picker_ui.move_up
+        local backward = position == 'top' and picker_ui.move_up or picker_ui.move_down
+        forward()
+        state_mod.state.pagination.page_index = 1
+        backward()
+      end
+      assert.are.equal(2, next_page)
+      assert.are.equal(2, previous_page)
+    end)
+    picker_ui.load_next_page, picker_ui.load_previous_page = original_next, original_previous
+    state_mod.state.config = original_config
+    assert.is_true(ok, err)
+  end)
+
+  it('records consecutive empty partial pages before a matching page', function()
+    local manager = require('fff.picker_ui.search_manager')
+    local grep = require('fff.picker_ui.grep_renderer')
+    local original_search = grep.search
+    manager.init({ render_list = function() end, update_preview = function() end, update_status = function() end })
+    grep.search = function(_, offset)
+      return {
+        items = offset == 9 and { make_item('a.lua', 1, 0) } or {},
+        next_file_offset = offset == 0 and 4 or (offset == 4 and 9 or 0),
+      }
+    end
+    local ok, err = pcall(function()
+      reset_state({}, 1)
+      state_mod.state.pagination.page_size = 50
+      assert.is_true(manager.load_page_at_index(0))
+      assert.is_true(manager.load_next_page())
+      assert.are.equal(1, state_mod.state.pagination.page_index)
+      assert.are.equal(9, state_mod.state.pagination.grep_next_file_offset)
+      assert.is_true(manager.load_next_page())
+      assert.are.equal(2, state_mod.state.pagination.page_index)
+      assert.are.equal(1, #state_mod.state.filtered_items)
+      assert.is_true(manager.load_previous_page())
+      assert.are.equal(1, state_mod.state.pagination.page_index)
+    end)
+    grep.search = original_search
+    manager.init(picker_ui)
+    assert.is_true(ok, err)
+  end)
+
+  it('renders completion when all partial pages are empty', function()
+    local manager = require('fff.picker_ui.search_manager')
+    local grep = require('fff.picker_ui.grep_renderer')
+    local original_search = grep.search
+    local rendered = 0
+    manager.init({
+      render_list = function() rendered = rendered + 1 end,
+      update_preview = function() end,
+      update_status = function() end,
+    })
+    grep.search = function(_, offset) return { items = {}, next_file_offset = offset == 0 and 4 or 0 } end
+    local ok, err = pcall(function()
+      reset_state({}, 1)
+      state_mod.state.pagination.page_size = 50
+      assert.is_true(manager.load_page_at_index(0))
+      assert.is_true(manager.load_next_page())
+      assert.are.equal(0, state_mod.state.pagination.grep_next_file_offset)
+      assert.are.equal(2, rendered)
+      assert.is_false(manager.load_next_page())
+    end)
+    grep.search = original_search
+    manager.init(picker_ui)
+    assert.is_true(ok, err)
+  end)
 end)

@@ -48,9 +48,20 @@ Pick what you are interested in:
 <h2>MCP server</h2>
 </summary>
 
-Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. Fewer grep roundtrips, less wasted context, faster answers.
+Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable client. A resident Rust index supports file discovery and content search across tool calls.
 
-![Benchmark chart comparing FFF against the built-in AI file-search tools](./chart.png)
+![Measured search time and tokens for FFF MCP versus normal shell search](./chart.png)
+
+The chart compares warm FFF MCP with shell search in the small and big repos. Startup and indexing are excluded.
+
+Six additional tasks were held out from tuning in the small repo. The big repo appears in the main comparison above, but did not have a separate held-out run.
+
+| Held-out model | Shell time | FFF time | Shell tokens | FFF tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Opus 5.5 | 10.7 s | 9.0 s | 58.3k | 49.2k |
+| GPT-6 Astra | 8.1 s | 9.0 s | 43.9k | 49.3k |
+
+[Held-out chart](scripts/search-benchmark-heldout.png). Both models returned all six expected answers in each recorded search mode. Tokens include cached input.
 
 ### One-line install
 
@@ -102,7 +113,9 @@ command = "/opt/homebrew/bin/fff-mcp"
 
 Use the actual installed path for your system, then restart Codex or start a new task so it loads the server.
 
-Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
+On Codex versions that support `omit_tools_from`, add `omit_tools_from = ["deferred"]` to this server's configuration to expose FFF's tools immediately. This avoids a separate tool-discovery round trip. The measurements above use this setting.
+
+Once the server is connected, ask the agent to "use fff". The MCP tools are `grep`, `find_files`, and `multi_grep`.
 
 ### Recommended agent prompt
 
@@ -110,7 +123,43 @@ Drop this into your project's `CLAUDE.md` or equivalent:
 
 ```markdown
 For any file search or grep in the current git-indexed directory, use fff tools.
+Include the known directory or module in the first search. Use definitions_only
+for declarations. Read more source only when the returned lines need context.
 ```
+
+### Definition search
+
+MCP and Pi accept `definitions_only: true` to search declarations. MCP uses `{ "query": "AudioMap", "path": "src/audio", "definitions_only": true }`; Pi's `ffgrep` uses `pattern` instead of `query`. In MCP, use `path` for a known file or directory and `globs` for patterns. MCP's `path` also scopes `find_files`. Inline query constraints remain supported.
+
+An existing checkout-relative `path` anchors the search at the root; otherwise the name matches at any depth. Case or `-`/`_` differences use the indexed spelling with a notice. Missing paths also produce a notice. A definition query drops a filename constraint that matches no indexed file and reports that change.
+
+MCP also accepts ripgrep-style searches without putting scope tokens in the pattern:
+
+```json
+{"query":"retry|backoff","mode":"regex","paths":["src","lib"],"globs":["*.rs","!**/tests/**"],"context":3}
+```
+
+`mode: "regex"` and `mode: "literal"` preserve the query, including whitespace, and default to case-sensitive matching. `case` also accepts `"insensitive"` and `"smart"`. Without a mode, smart-case and inline constraints remain available. Supplying `paths` or `globs` keeps the query verbatim, so inline constraint tokens become search text. Regex matches stay within one line unless the pattern contains `\n`.
+
+`paths` contains checkout-relative files or directories. Positive `globs` are alternatives; exclusions take priority. `hidden: false` skips hidden paths unless a path or glob explicitly includes them. Globs cannot restore files excluded by the index's ignore rules. Ripgrep-specific `.rgignore` files can also make its file inventory differ.
+
+Grep returns up to 100 matching lines per page by default, 30 with `definitions_only`, and at most 200. Use `maxResults` and the returned cursor to continue, including within a file. `max_matches_per_file` explicitly limits matches per file. Small content result sets include bounded surrounding source automatically. `context`, `before_context`, and `after_context` request explicit context; overlapping windows are merged. Set `context: 0` for matching lines only.
+
+`find_files` matches path fragments before approximate filenames. Its default mode treats hyphens and underscores alike. Set `mode: "glob"` or `mode: "regex"` for exact path filtering, with the same `paths`, `globs`, and `hidden` options. Its optional `filters` array applies additional path regexes, like `rg --files | rg pattern1 | rg pattern2`.
+
+Single-query definition search tries these stages in order:
+
+1. Matching declarations.
+2. Ordinary exact matches, with a notice that no matching declarations were found.
+3. Fuzzy declarations, labeled "Maybe you meant these definitions".
+4. Fuzzy ordinary matches, labeled "Maybe you meant these other matches".
+5. If all four stages found nothing, suggest files from a broader search. Exclusions remain active. Filename-only suggestions are labeled as unverified.
+
+Exact stages advance only after a complete search returns no matches. Each fuzzy stage has a two-second budget and can advance with zero matches before scanning the full index. Cursors preserve the stage, and a stage that returned matches never broadens when pagination ends. The first four stages keep the original file constraints; the final suggestions can come from elsewhere in the indexed project and include a notice. The multi-pattern tools accept the same flag but use only the first two stages; their patterns remain literal.
+
+On each page, files that declare the query as a whole name come first, and that declaration leads its file. `Value` lists `enum Value` before `ArgValueCompletion` and `DebuggableValue(pub Value)`. MCP confirms the declared name with the definition classifier; Pi approximates it. This ordering does not add a search.
+
+MCP's broader suggestions can include up to eight matching source lines. MCP tries partial module names before searching the whole index. Pi returns suggested filenames.
 
 ### What changes
 
@@ -123,7 +172,7 @@ Source: [`crates/fff-mcp/`](./crates/fff-mcp/).
 
 </details>
 
-The MCP server gives any agent a file search tool that is faster and more token-efficient than the built-in one.
+The MCP server keeps the file and content indexes available across agent tool calls.
 
 <details id="pi-extension">
 <summary>
@@ -152,6 +201,8 @@ Env vars: `PI_FFF_MODE`, `FFF_FRECENCY_DB`, `FFF_HISTORY_DB`. Flags: `--fff-mode
 
 - `ffgrep`. Content search. Accepts `path`, `exclude` (comma, space, or array; leading `!` optional), `caseSensitive`, `context`, and cursor pagination. Auto-detects regex, falls back to fuzzy on zero exact matches, rejects `.*`-style wildcard-only patterns up front.
 - `fffind`. Path and filename search. Matches the whole repo-relative path, not just the filename. Frecency-aware. The weak-match detector flags scattered fuzzy noise before it floods the agent's context.
+
+Set `definitions_only: true` on `ffgrep` to try declarations first, then exact references, fuzzy declarations, and fuzzy references. Each fallback includes a notice. See the [extension documentation](packages/pi-fff/README.md) for pagination and multi-pattern behavior.
 
 ### Commands
 
@@ -286,6 +337,7 @@ local r = require('fff').content_search('TODO', {
   time_budget_ms        = 0,
   enforce_time_budget   = false,    -- also bound zero-match searches
   trim_whitespace       = false,
+  classify_definitions  = nil,      -- off unless grep.classify_definitions is set in your config
   cwd                   = nil,      -- switch indexed root if different
   wait_for_index_ms     = nil,      -- override the default scan wait timeout
 })
@@ -304,6 +356,7 @@ Both `file_search` and `content_search` honour an optional `cwd` field. The firs
 - If `cwd` differs, the picker is re-indexed at the new root and the call **blocks** (default up to 10 s) until the new picker is installed and its initial scan completes — so callers always get results from the right tree.
 - If the index is still warming up after a `change_indexing_directory`, you can pass `wait_for_index_ms = N` to block for up to `N` ms regardless of whether `cwd` triggered the swap. Pass `0` to skip waiting entirely (useful for fire-and-forget calls where partial results are acceptable).
 - Invalid or non-existent `cwd` paths return an empty result and emit an error via `vim.notify`.
+- A `cwd` inside a linked git worktree shares frecency and query history with the main checkout, so new worktrees don't start cold.
 
 ### Autocmds
 
@@ -431,6 +484,9 @@ require('fff').setup({
   },
   git = {
     status_text_color = false, -- true to color filenames by git status
+    -- 'while_open' pauses git status while the picker is closed and refreshes it on open,
+    -- 'always' tracks every change in the background, 'manual' updates only on :FFFRefreshGit
+    status_updates = 'while_open',
     -- files that participated in the last N configured commits will get scoring bonus
     recency = {
       enabled = true, -- boost files from recent commits of the current branch
@@ -449,8 +505,9 @@ require('fff').setup({
     casing = nil, -- 'smart' | 'sensitive' | 'insensitive'; overrides smart_case when set
     time_budget_ms = 150,
     enforce_time_budget = false, -- apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
-    modes = { 'plain', 'regex', 'fuzzy' },
+    modes = { 'plain', 'regex', 'fuzzy', 'definition_only' },
     trim_whitespace = false,
+    classify_definitions = true, -- show matching definitions first within each page
     enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
@@ -487,13 +544,27 @@ require('fff').setup({
 
 ### Live grep modes
 
-`<S-Tab>` cycles between `plain`, `regex`, and `fuzzy`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely.
+`<S-Tab>` cycles between `plain`, `regex`, `fuzzy`, and `definition_only`. The list is configurable via `grep.modes`, and single-mode setups hide the indicator entirely. `definition_only` uses plain substring matching and returns only matched declarations, regardless of `grep.classify_definitions`. Its status label uses `hl.grep_definition_active` (default: `DiagnosticOk`). `regex` matches stay within one line unless the pattern contains `\n`.
+
+`grep.classify_definitions` shows matching definition lines first within each page, grouped under their file names. Each page uses one ordinary grep search; classification does not scan ahead for definitions or search the files again for usages. It defaults to `true`. Set it to `false` to keep file order without definition grouping. It also accepts the strings `'classify'`, `'definition_only'`, and `'usage_only'`. A **Definitions** divider separates the sections when both are on the same page. With a bottom prompt, the order reverses so definitions stay nearest the prompt. Files with both kinds of matches appear in both sections, with each match shown once.
+
+Definition filtering occurs before page and per-file result limits. A timed-out page can be empty; move down (top prompt) or up (bottom prompt) to continue searching. Context lines can still contain ordinary code.
+
+Definition classification accepts source lines up to 256 bytes, including indentation and excluding line endings. Longer lines stay ordinary matches and are excluded from `definition_only`. The limit uses the original source bytes, regardless of display truncation or whitespace trimming. For multiline regex matches, it applies to the first physical line.
+
+Supported language families are Rust, Python, Go, JavaScript/TypeScript, Lua, C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Elixir, Zig, PHP, shell, OCaml/ReScript/F#, and Haskell. The byte-keyword rules in [`definition/languages.rs`](crates/fff-core/src/definition/languages.rs) compile into per-language checkers. Each checker has fixed grammar constants and returns a boolean without a runtime rule dispatcher. Language detection checks at most the last eight filename bytes against a compile-time suffix table. Unknown extensions and extensionless filenames are not classified. `definition_only` excludes them before sorting, pagination, or content reads, and preserves explicit file constraints on empty results.
+
+Identifier scanning uses compile-time byte tables for short tokens, then checks 16 bytes at a time with NEON on little-endian ARM64 or SSE2 on x86-64. Other targets use the scalar table. Loads stay within the source slice, including the final partial block. The parser uses `memchr` for quotes and bracket groups and does not allocate.
+
+Files are flagged during scanning. A Rust byte parser uses SIMD-backed delimiter searches on matched lines before pagination, including common modifiers, methods, and function assignments. Matches must overlap the declared name: `user_file` recognizes `fn user_file`, `mod user_file`, `fn user_file_test`, and `fn test_user_file`, but not `fn other(value: user_file)`. Implementation and extension blocks stay with ordinary matches. In fuzzy mode, every matched character must fall inside the declared name; matches spread across the name and its arguments, receiver, or return type are ordinary matches. Classification adds no file reads or heap allocations. This is a line heuristic; multiline declarations and surrounding comment or string context can be missed.
 
 Per-call override:
 
 ```lua
 require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } })
 require('fff').live_grep({ query = 'search term' }) -- pre-fill
+require('fff').live_grep({ query = 'user_file', grep = { modes = { 'definition_only' } } })
+local page = require('fff').content_search('user_file', { mode = 'definition_only' })
 ```
 
 ### Constraints
@@ -633,10 +704,36 @@ const hits = finder.value.grep("GetOffTheRecordProfile", {
 // Run extremely fast glob matching which is significantly (10-100 times) faster than Bun's and Node implementation
 const rustFiles = finder.value.glob("**/*.rs", { pageSize: 100 });
 
+// Index layers: append paths the scanner can't see and persist any layer (0 = base scan) to a file
+finder.value.createLayer("generated");
+finder.value.addPaths(["build/out/a.js", "build/out/b.js"]);
+finder.value.saveLayer(0, "/tmp/base.fff");   // later: loadBase(...) skips the rescan
+finder.value.loadLayer("/tmp/prebuilt.fff");  // built with FileFinder.buildLayerFile(paths, out)
+
 finder.value.destroy();
 ```
 
 Every method returns a `Result<T>` (`{ ok: true, value } | { ok: false, error }`). Full type reference: [`packages/fff-node/src/fff-api.ts`](./packages/fff-node/src/fff-api.ts).
+
+### Definition modes
+
+Each core grep call uses one `classify_definitions` mode. Rust stores it in `GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript SDKs expose the same setting as `classifyDefinitions`.
+
+| Mode | Rust variant | C integer | Result |
+| --- | --- | --- | --- |
+| `off` | `Off` | `0` | All matches, without classification |
+| `classify` | `Classify` | `1` | All matches, with definition labels |
+| `definition_only` | `DefinitionOnly` | `2` | Only matches on declared names |
+| `usage_only` | `UsageOnly` | `3` | Only other matches |
+
+JavaScript also accepts the existing booleans: `false` means `off`, and `true` means `classify`. The SDK default is `off`. Use the same mode when continuing with a cursor. The C argument is a `uint8_t`, preserving the byte representation of existing boolean calls (`0` and `1`). Modes `2` and `3` require the updated native library; never send them to a library that still expects `bool`.
+
+```typescript
+finder.grep('AudioMap', { classifyDefinitions: 'definition_only' });
+finder.multiGrep({ patterns: ['AudioMap', 'audio_map'], classifyDefinitions: 'definition_only' });
+```
+
+SDK definition filtering occurs before page and per-file result limits. `definition_only` retains file constraints when no matches exist. `usage_only` keeps the file-path and literal retries of ordinary grep. Cursors resume at the next file; page size is a soft limit because the current file is returned together. Repeat the same query, mode, and constraints for each page. A timed-out page can be empty with a continuation cursor. Context lines can still contain ordinary code.
 
 </details>
 
@@ -790,6 +887,21 @@ FffResult *res = fff_glob(handle, "**/*.rs", "", 0, 0, 100);
 // FffSearchResult in res->handle, free with fff_free_search_result.
 ```
 
+### Index layers
+
+`fff_layer_create` / `fff_layer_add_paths` append paths the scanner can't see;
+`fff_layer_save` writes any layer (0 = base scan) to a file and
+`fff_layer_load` attaches it back as a sealed overlay; `fff_base_load` installs
+it as the base scan in the background (wait with `fff_wait_for_scan`).
+`fff_layer_build` packs a layer file without an instance. Pass NUL-terminated UTF-8 paths in one buffer, with optional parallel `sizes` / `modified` arrays (NULL to omit).
+
+```c
+const char paths[] = "build/out/a.js\0build/out/b.js";
+struct FffResult *added = fff_layer_add_paths(handle, paths, sizeof(paths), NULL, NULL, 2);
+if (!added->success) fprintf(stderr, "%s\n", added->error);
+fff_free_result(added);
+```
+
 ### Notes
 
 - Every function returning `FffResult*` allocates with Rust's `Box`. Free with `fff_free_result`, do not use malloc's free
@@ -892,12 +1004,13 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm. It
 ### What the core actually does
 
 - **Frecency-ranked fuzzy matching.** Every indexed file carries an access score and a modification score. Searches rank files you have opened recently and frequently above cold results. This is the same idea as VS Code's recently-opened list, but applied to every search result, not just a sidebar.
+- **Git worktree aware.** A linked worktree starts with the main checkout's frecency, query history and combo boosts instead of an empty history. Files opened in a worktree also feed the main checkout's history, and they count double in the worktree where you opened them. The shared path is cached during scanning; history reads reuse database transactions.
 - **Typo-resistant matching for both paths and content.** Smith-Waterman fuzzy scoring is available on the grep path; path search uses SIMD-accelerated fuzzy matching (via the [`frizbee`](https://github.com/saghen/frizbee)-derived core) that survives dropped characters and reorderings.
 - **Content grep with three modes.** Plain literal (SIMD memmem), regex (the Rust `regex` crate), and fuzzy (Smith-Waterman per line). Auto-detects which mode to use from the pattern, falls back to fuzzy when a plain search returns zero hits.
 - **Multi-pattern OR search.** SIMD Aho-Corasick for "find any of these 20 identifiers at once", which is faster than regex alternation and a lot faster than 20 separate ripgrep runs.
 - **Background file watcher.** The index updates as files change. You never pay for a rescan on the hot path.
 - **Git status awareness.** Modified, staged, untracked, and ignored states are cached and returned with every result, so callers can sort or filter them without shelling out to git. The watcher talks to libgit2 directly instead of spawning the `git` CLI.
-- **Definition classifier.** A byte-level scanner on the Rust side tags lines that start with `struct`, `fn`, `class`, `def`, `impl`, and friends.
+- **Definition classifier.** A byte-level scanner on the Rust side checks whether the query matches the declared name in a `struct`, `fn`, `class`, `def`, or another supported declaration.
 
 ### Performance choices that matter
 
@@ -944,6 +1057,14 @@ If you are running one grep from a terminal, `rg` is still the right tool. If yo
 ## Contributing
 
 Bug reports and pull requests welcome. Agentic coding tools are welcome to be used, but human review is mandatory.
+
+Run `make bench-definition` for Criterion benchmarks of Rust, JavaScript, and Python declarations and references. Each case measures classification through `FileItem::is_definition_match`, with match ranges prepared before timing. The `mixed_256` cases classify shuffled batches of 256 lines; their throughput is reported in lines per second. File indexing, I/O, and finding query matches are excluded.
+
+The `identifier_*_bytes` cases measure names of 16, 32, and 96 bytes. The `indented_*_bytes` cases measure the 255/256/257-byte boundary and rejection of 1 KiB and 16 KiB lines.
+
+```sh
+make bench-definition BENCH_ARGS='definition/rust --noplot'
+```
 
 ## License
 

@@ -1,8 +1,10 @@
 mod cursor;
+mod file_search;
 mod handshake;
 mod healthcheck;
 mod output;
 mod parent;
+mod scope;
 mod server;
 mod update_check;
 
@@ -36,81 +38,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
 static TUNE_MIMALLOC: extern "C" fn() = fff::tune_mimalloc;
 
-pub const MCP_INSTRUCTIONS: &str = concat!(
-    "FFF is a fast file finder with frecency-ranked results (frequent/recent files first, git-dirty files boosted).\n",
-    "\n",
-    "## Which Tool Should I Use?\n",
-    "\n",
-    "- **grep**: DEFAULT tool. Searches file CONTENTS -- definitions, usage, patterns. Use when you have a specific name or pattern.\n",
-    "- **find_files**: Explores which files/modules exist for a topic. Use when you DON'T have a specific identifier or LOOKING FOR A FILE.\n",
-    "- **multi_grep**: OR logic across multiple patterns. Use for case variants (e.g. ['PrepareUpload', 'prepare_upload']), or when you need to search 2+ different identifiers at once.\n",
-    "\n",
-    "## Core Rules\n",
-    "\n",
-    "### 1. Search BARE IDENTIFIERS only\n",
-    "Grep matches single lines. Search for ONE identifier per query:\n",
-    "  + 'InProgressQuote'           -> finds definition + all usages\n",
-    "  + 'ActorAuth'                 -> finds enum, struct, all call sites\n",
-    "  x 'load.*metadata.*InProgressQuote' -> regex spanning multiple tokens, 0 results\n",
-    "  x 'ctx.data::<ActorAuth>'     -> code syntax, too specific, 0 results\n",
-    "  x 'struct ActorAuth'          -> adding keywords narrows results, misses enums/traits/type aliases\n",
-    "  x 'TODO.*#\\d+'               -> complex regex, use simple 'TODO' then filter visually\n",
-    "\n",
-    "### 2. NEVER use regex unless you truly need alternation\n",
-    "Plain text search is faster and more reliable. Regex patterns like `.*`, `\\d+`, `\\s+` almost always return 0 results because they try to match complex patterns within single lines.\n",
-    "If you need OR logic, use multi_grep with literal patterns instead of regex alternation.\n",
-    "\n",
-    "### 3. Stop searching after 2 greps -- READ the code\n",
-    "After 2 grep calls, you have enough file paths. Read the top result to understand the code.\n",
-    "Do NOT keep grepping with variations. More greps != better understanding.\n",
-    "\n",
-    "### 4. Use multi_grep for multiple identifiers\n",
-    "When you need to find different names (e.g. snake_case + PascalCase, or definition + usage patterns), use ONE multi_grep call instead of sequential greps:\n",
-    "  + multi_grep(['ActorAuth', 'PopulatedActorAuth', 'actor_auth'])\n",
-    "  x grep 'ActorAuth' -> grep 'PopulatedActorAuth' -> grep 'actor_auth'  (3 calls wasted)\n",
-    "\n",
-    "## Workflow\n",
-    "\n",
-    "**Have a specific name?** -> grep the bare identifier.\n",
-    "**Need multiple name variants?** -> multi_grep with all variants in one call.\n",
-    "**Exploring a topic / finding files?** -> find_files.\n",
-    "**Got results?** -> Read the top file. Don't grep again.\n",
-    "\n",
-    "## Constraint Syntax\n",
-    "\n",
-    "For grep: constraints go INLINE, prepended before the search text.\n",
-    "For multi_grep: constraints go in the separate 'constraints' parameter.\n",
-    "\n",
-    "Constraints MUST match one of these formats:\n",
-    "  Extension: '*.rs', '*.{ts,tsx}'\n",
-    "  Directory: 'src/', 'quotes/'\n",
-    "  Filename: 'schema.rs', 'src/main.rs'\n",
-    "  Exclude: '!test/', '!*.spec.ts'\n",
-    "\n",
-    "! Bare words without extensions are NOT constraints. 'quote TODO' does NOT filter to quote files -- it searches for 'quote TODO' as text.\n",
-    "  + 'schema.rs TODO'   -> searches for 'TODO' in files schema.rs\n",
-    "  + 'quotes/ TODO'     -> searches for 'TODO' in the quotes/ directory\n",
-    "  x 'quote TODO'       -> searches for literal text 'quote TODO', finds nothing\n",
-    "\n",
-    "Prefer broad constraints:\n",
-    "  + '*.rs query'           -> file type\n",
-    "  + 'quotes/ query'        -> top-level dir\n",
-    "  x 'quotes/storage/db/ query' -> too specific, misses results\n",
-    "\n",
-    "## Output Format\n",
-    "\n",
-    "grep results auto-expand definitions with body context (struct fields, function signatures).\n",
-    "This often provides enough information WITHOUT a follow-up Read call.\n",
-    "Lines marked with | are definition body context. [def] marks definition files.\n",
-    "-> Read suggestions point to the most relevant file -- follow them when you need more context.\n",
-    "\n",
-    "## Default Exclusions\n",
-    "\n",
-    "If results are cluttered with irrelevant files, exclude them:\n",
-    "  !tests/ - exclude tests directory\n",
-    "  !*.spec.ts - exclude test files\n",
-    "  !generated/ - exclude generated code",
-);
+pub const MCP_INSTRUCTIONS: &str = include_str!("instructions.md");
 
 /// FFF MCP Server - a high performance & accuracy file finder for AI code assistants.
 #[derive(Parser)]

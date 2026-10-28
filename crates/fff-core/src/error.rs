@@ -13,6 +13,15 @@ pub enum Error {
     FilesystemRoot(std::path::PathBuf),
     #[error("File picker not initialized")]
     FilePickerMissing,
+    #[error("Index is busy with post-scan processing, retry later")]
+    IndexBusy,
+    #[error("Layer file {path}: {source}")]
+    LayerFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Invalid layer file: {0}")]
+    LayerFormat(&'static str),
     #[error("Failed to acquire lock for frecency")]
     AcquireFrecencyLock,
     #[error("Failed to acquire lock for items by provider")]

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
@@ -8,6 +10,7 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
 use crate::constants::{MAX_CACHED_CONTENT_BYTES, MAX_FFFILE_SIZE, PATH_BUF_SIZE};
 use crate::index::constraints::Constrainable;
+use crate::index::layers::{LAYER_MASK, LAYER_SHIFT, LayerId};
 use crate::query_tracker::QueryMatchEntry;
 use crate::simd_path::ArenaPtr;
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
@@ -19,10 +22,25 @@ pub trait FFFStringStorage {
     /// Resolve the arena for a [`FileItem`] (handles base vs overflow split).
     fn arena_for(&self, file: &FileItem) -> ArenaPtr;
 
+    /// Resolve the arena for a directory from this index.
+    fn arena_for_dir(&self, dir: &DirItem) -> ArenaPtr {
+        self.arena_for_layer(dir.layer_id())
+    }
+
     /// The base arena (scan-time paths).
     fn base_arena(&self) -> ArenaPtr;
     /// The overflow arena (paths added after the last full scan).
     fn overflow_arena(&self) -> ArenaPtr;
+
+    /// Arena backing a specific index layer. The default collapses the layer
+    /// stack onto the legacy base/overflow split.
+    fn arena_for_layer(&self, layer: LayerId) -> ArenaPtr {
+        if layer == 0 {
+            self.base_arena()
+        } else {
+            self.overflow_arena()
+        }
+    }
 }
 
 impl FFFStringStorage for ArenaPtr {
@@ -57,12 +75,14 @@ pub struct FileItemFlags;
 
 impl FileItemFlags {
     pub const BINARY: u8 = 1 << 0;
-    /// Tombstone — file was deleted but index slot is preserved so
+    /// Tombstone: file was deleted but index slot is preserved so
     /// bigram indices for other files stay valid.
     pub const DELETED: u8 = 1 << 1;
     /// File was added after the last full reindex; its indices point
-    /// into the overflow builder arena, not the base arena.
+    /// into an overlay layer arena, not the base arena.
     pub const OVERFLOW: u8 = 1 << 2;
+    /// Bits 3..5 hold the arena layer id (0 = base scan).
+    pub const LAYER: u8 = LAYER_MASK;
 }
 
 pub struct DirFlags;
@@ -70,9 +90,12 @@ pub struct DirFlags;
 impl DirFlags {
     pub const OVERFLOW: u8 = 1 << 0;
     pub const DELETED: u8 = 1 << 1;
+    /// Bits 3..5 hold the arena layer id (0 = base scan).
+    pub const LAYER: u8 = LAYER_MASK;
 }
 
-/// A directory in the file index. Shares chunk arena with file paths.
+/// A directory in the file index. Copy its path before mutating its picker
+/// if the path must outlive the index generation.
 #[derive(Debug)]
 pub struct DirItem {
     flags: u8,
@@ -129,16 +152,33 @@ impl DirItem {
         }
     }
 
-    /// A dir appended after the initial scan; its path lives in the overflow arena.
-    pub(crate) fn new_overflow(
+    /// A dir appended after the initial scan; its path lives in the arena of
+    /// overlay layer `layer`.
+    pub(crate) fn new_in_layer(
         path: crate::simd_path::ChunkedString,
         last_segment_offset: u16,
+        layer: LayerId,
     ) -> Self {
         Self {
             path,
-            flags: DirFlags::OVERFLOW,
+            flags: DirFlags::OVERFLOW | ((layer << LAYER_SHIFT) & LAYER_MASK),
             last_segment_offset,
             max_access_frecency: AtomicI32::new(0),
+        }
+    }
+
+    /// Arena layer owning this dir's path. `0` is the base scan.
+    #[inline(always)]
+    pub fn layer_id(&self) -> LayerId {
+        (self.flags & LAYER_MASK) >> LAYER_SHIFT
+    }
+
+    pub(crate) fn set_layer(&mut self, layer: LayerId) {
+        self.flags = (self.flags & !LAYER_MASK) | ((layer << LAYER_SHIFT) & LAYER_MASK);
+        if layer == 0 {
+            self.flags &= !DirFlags::OVERFLOW;
+        } else {
+            self.flags |= DirFlags::OVERFLOW;
         }
     }
 
@@ -174,13 +214,8 @@ impl DirItem {
     /// Relative dir path as owned String (cold path).
     pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
-        let ptr = if self.is_overflow() {
-            arena.overflow_arena()
-        } else {
-            arena.base_arena()
-        };
-
-        self.path.write_to_string(ptr, &mut out);
+        self.path
+            .write_to_string(arena.arena_for_dir(self), &mut out);
         out
     }
 
@@ -201,12 +236,7 @@ impl DirItem {
     /// The dirname (last segment) as an owned String. Cold path.
     pub fn dir_name(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
-        let ptr = if self.is_overflow() {
-            arena.overflow_arena()
-        } else {
-            arena.base_arena()
-        };
-        self.write_dir_name(ptr, &mut out);
+        self.write_dir_name(arena.arena_for_dir(self), &mut out);
         out
     }
 
@@ -239,11 +269,13 @@ impl Constrainable for DirItem {
     }
 
     #[inline]
-    fn is_overflow(&self) -> bool {
-        DirItem::is_overflow(self)
+    fn layer_id(&self) -> LayerId {
+        DirItem::layer_id(self)
     }
 }
 
+/// A file in the index. Copy its path before mutating its picker if the
+/// path must outlive the index generation.
 #[derive(Debug)]
 pub struct FileItem {
     pub size: u64,
@@ -255,6 +287,7 @@ pub struct FileItem {
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
+    definition_language: u8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
@@ -280,6 +313,7 @@ impl Clone for FileItem {
             git_recency_score: self.git_recency_score,
             git_status: self.git_status,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
+            definition_language: self.definition_language,
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
@@ -325,6 +359,7 @@ impl FileItem {
             git_recency_score: 0,
             git_status,
             flags: AtomicU8::new(flags),
+            definition_language: 0,
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -385,34 +420,34 @@ impl FileItem {
         path.starts_with(prefix)
     }
 
-    /// Write `base_path + '/' + relative_path` into `buf` and return it
-    /// as `&Path`. Takes a fixed-size array so the buffer can live on
-    /// the stack (no heap allocation, no bounds checks in the hot loop).
+    /// Uses the caller's stack buffer when the complete path fits.
     pub(crate) fn write_absolute_path<'a>(
         &self,
         arena: ArenaPtr,
         base_path: &Path,
         buf: &'a mut [u8; PATH_BUF_SIZE],
-    ) -> &'a Path {
+    ) -> Cow<'a, Path> {
         let base = base_path.as_os_str().as_encoded_bytes();
-        let base_len = base.len();
-        buf[..base_len].copy_from_slice(base);
-        let sep_len = if base_len > 0 && base[base_len - 1] != std::path::MAIN_SEPARATOR as u8 {
-            buf[base_len] = std::path::MAIN_SEPARATOR as u8;
-            1
-        } else {
-            0
-        };
-
-        let base_end_idx = base_len + sep_len;
-        let relative_portion_str = self.path.read_to_buf(arena, &mut buf[base_end_idx..]);
-        let rel_len = relative_portion_str.len();
-        let total = base_end_idx + rel_len;
-        // Stored relative paths are '/'-canonical; rewrite to the OS-native
-        // separator so the result matches git-cache keys, the frecency DB, and
-        // Win32 file APIs. No-op off Windows.
-        crate::path_utils::nativize_slashes_in_place(&mut buf[base_end_idx..total]);
-        Path::new(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
+        let sep = !base.is_empty() && !base.ends_with(&[std::path::MAIN_SEPARATOR as u8]);
+        let start = base.len() + usize::from(sep);
+        if start + self.relative_path_len() > buf.len() {
+            let relative = self.relative_path(arena);
+            #[cfg(windows)]
+            let relative = relative.replace('/', "\\");
+            return Cow::Owned(base_path.join(relative));
+        }
+        buf[..base.len()].copy_from_slice(base);
+        if sep {
+            buf[base.len()] = std::path::MAIN_SEPARATOR as u8;
+        }
+        let len = self.path.read_to_buf(arena, &mut buf[start..]).len();
+        let end = start + len;
+        crate::path_utils::nativize_slashes_in_place(&mut buf[start..end]);
+        // SAFETY: the native-encoded base and UTF-8 relative path are joined
+        // at an ASCII separator. The base can contain non-Unicode OS bytes.
+        Cow::Borrowed(Path::new(unsafe {
+            OsStr::from_encoded_bytes_unchecked(&buf[..end])
+        }))
     }
 
     /// Write the relative path into `buf` and NUL-terminate, returning
@@ -542,6 +577,39 @@ impl FileItem {
         filled
     }
 
+    pub(crate) fn mark_definition_language(&mut self, filename: &str) {
+        self.definition_language = crate::definition::Language::from_filename(filename) as u8;
+    }
+
+    /// Classify a returned match using the language recorded during indexing.
+    /// Lines longer than 256 bytes are not classified as definitions.
+    pub fn is_definition_match(&self, line: &str, ranges: &[(u32, u32)]) -> bool {
+        let flags = self.flags.load(Ordering::Relaxed);
+        flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
+            && crate::definition::is_definition_match(
+                self.definition_language,
+                line.as_bytes(),
+                ranges,
+                false,
+            )
+    }
+
+    pub(crate) fn classify_definition_match(
+        &self,
+        line: &[u8],
+        ranges: &[(u32, u32)],
+        fuzzy: bool,
+    ) -> bool {
+        let flags = self.flags.load(Ordering::Relaxed);
+        flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
+            && crate::definition::is_definition_match(self.definition_language, line, ranges, fuzzy)
+    }
+
+    #[inline]
+    pub(crate) fn supports_definitions(&self) -> bool {
+        self.definition_language != 0
+    }
+
     #[inline]
     pub fn is_binary(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & FileItemFlags::BINARY != 0
@@ -561,11 +629,11 @@ impl FileItem {
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
-        if self.size == 0 {
+        if self.is_binary() || self.size == 0 {
             return;
         }
 
-        let Ok(mut file) = std::fs::OpenOptions::new()
+        let Ok(file) = std::fs::OpenOptions::new()
             .write(false)
             .read(true)
             .open(path)
@@ -573,6 +641,8 @@ impl FileItem {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
             return;
         };
+        // only classify the first MAX_FFFILE_SIZE bytes, never read large files to EOF
+        let mut file = file.take(MAX_FFFILE_SIZE);
 
         loop {
             match file.read(chunk) {
@@ -584,6 +654,7 @@ impl FileItem {
                 Ok(n) => {
                     if detect_binary_content(&chunk[..n]) {
                         self.set_binary(true);
+                        break;
                     }
                 }
             }
@@ -615,12 +686,45 @@ impl FileItem {
 
     #[inline]
     pub fn set_overflow(&self, val: bool) {
+        // The public overflow flag does not transfer ownership of the path arena.
         if val {
             self.flags
                 .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
         } else {
             self.flags
                 .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
+        }
+    }
+
+    /// Arena layer owning this file's path. `0` is the base scan, higher ids
+    /// are overlay layers stacked in creation order.
+    #[inline(always)]
+    pub fn layer_id(&self) -> LayerId {
+        (self.flags.load(Ordering::Relaxed) & LAYER_MASK) >> LAYER_SHIFT
+    }
+
+    /// Moves the file onto `layer`. Only the picker may call this — the path
+    /// indices must already point into that layer's arena.
+    #[inline]
+    pub(crate) fn set_layer(&self, layer: LayerId) {
+        let bits = (layer << LAYER_SHIFT) & LAYER_MASK;
+        let overflow = if layer == 0 {
+            0
+        } else {
+            FileItemFlags::OVERFLOW
+        };
+        let mut current = self.flags.load(Ordering::Relaxed);
+        loop {
+            let next = (current & !(LAYER_MASK | FileItemFlags::OVERFLOW)) | bits | overflow;
+            match self.flags.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -824,11 +928,7 @@ impl FileItem {
                 }
             }
         }
-        if base_path.as_os_str().len() + self.relative_path_len() + 1 < path_buf.len() {
-            std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
-        } else {
-            std::fs::File::open(self.absolute_path(arena, base_path)).ok()
-        }
+        std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
     }
 }
 
@@ -862,8 +962,8 @@ impl Constrainable for FileItem {
     }
 
     #[inline]
-    fn is_overflow(&self) -> bool {
-        FileItem::is_overflow(self)
+    fn layer_id(&self) -> LayerId {
+        FileItem::layer_id(self)
     }
 }
 
@@ -1080,6 +1180,34 @@ impl Default for ContentCacheBudget {
 mod content_cache_budget_tests {
     use super::*;
 
+    #[test]
+    fn absolute_paths_preserve_the_complete_os_path_across_the_stack_limit() {
+        let relative = "é.rs";
+        let mut file = FileItem::new_raw(0, 0, 0, None, false);
+        let (store, paths) = crate::simd_path::build_chunked_path_store_from_strings(
+            &[relative.to_string()],
+            std::slice::from_ref(&file),
+        );
+        file.set_path(paths.into_iter().next().unwrap());
+        let mut buf = [0; PATH_BUF_SIZE];
+        let arena = store.as_arena_ptr();
+        let short = file.write_absolute_path(arena, Path::new("a"), &mut buf);
+        assert!(matches!(short, Cow::Borrowed(_)));
+        assert_eq!(short.as_ref(), Path::new("a").join(relative));
+        for n in [PATH_BUF_SIZE - 2, PATH_BUF_SIZE + 1] {
+            let base = PathBuf::from("x".repeat(n));
+            let absolute = file.write_absolute_path(arena, &base, &mut buf);
+            assert_eq!(absolute.as_ref(), base.join(relative));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let base = Path::new(OsStr::from_bytes(b"dir/\xff"));
+            let absolute = file.write_absolute_path(arena, base, &mut buf);
+            assert_eq!(absolute.as_ref(), base.join(relative));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn uncached_search_reads_relative_and_absolute_paths() {
@@ -1144,5 +1272,81 @@ mod content_cache_budget_tests {
         let default = ContentCacheBudget::default();
         assert_eq!(budget.max_bytes, default.max_bytes);
         assert_eq!(budget.max_file_size, default.max_file_size);
+    }
+}
+
+#[cfg(test)]
+mod detect_binary_tests {
+    use super::*;
+
+    fn classify(content: &[u8]) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("f");
+        std::fs::write(&path, content).unwrap();
+        let (item, _) = FileItem::new(path.clone(), root.path(), None);
+        item.detect_binary_per_byte(&path, &mut [0u8; BINARY_CLASSIFICATION_CHUNK_SIZE]);
+        item.is_binary()
+    }
+
+    #[test]
+    fn detects_nul_in_small_file() {
+        let mut content = vec![b'a'; BINARY_CLASSIFICATION_CHUNK_SIZE * 3];
+        content[10] = 0;
+        assert!(classify(&content));
+        assert!(!classify(b"plain text\n"));
+    }
+
+    #[test]
+    fn reads_only_first_max_size_bytes() {
+        let mut content = vec![b'a'; MAX_FFFILE_SIZE as usize + 1];
+        content[0] = 0;
+        assert!(classify(&content));
+
+        content[0] = b'a';
+        content[MAX_FFFILE_SIZE as usize] = 0;
+        assert!(!classify(&content));
+    }
+}
+
+#[cfg(test)]
+mod definition_flag_tests {
+    use super::FileItem;
+
+    #[test]
+    fn language_and_existing_flags_preserve_each_other() {
+        for binary in [false, true] {
+            for deleted in [false, true] {
+                for overflow in [false, true] {
+                    let mut file = FileItem::new_raw(0, 0, 0, None, binary);
+                    file.set_deleted(deleted);
+                    file.set_overflow(overflow);
+                    assert!(!file.supports_definitions());
+                    for filename in ["file.rs", "file.py", "file.txt", "file.hs", "file.rs"] {
+                        file.mark_definition_language(filename);
+                        assert_eq!(file.is_binary(), binary);
+                        assert_eq!(file.is_deleted(), deleted);
+                        assert_eq!(file.is_overflow(), overflow);
+                        assert_eq!(file.supports_definitions(), filename != "file.txt");
+                    }
+
+                    let clone = file.clone();
+                    assert_eq!(clone.is_binary(), binary);
+                    assert_eq!(clone.is_deleted(), deleted);
+                    assert_eq!(clone.is_overflow(), overflow);
+                    assert!(clone.supports_definitions());
+                    clone.set_binary(!binary);
+                    clone.set_deleted(!deleted);
+                    clone.set_overflow(!overflow);
+                    assert!(clone.supports_definitions());
+                    clone.set_binary(false);
+                    clone.set_deleted(false);
+                    clone.set_overflow(false);
+                    assert!(clone.is_definition_match("fn needle() {}", &[(3, 9)]));
+                    assert_eq!(file.is_binary(), binary);
+                    assert_eq!(file.is_deleted(), deleted);
+                    assert_eq!(file.is_overflow(), overflow);
+                }
+            }
+        }
     }
 }

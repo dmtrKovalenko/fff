@@ -122,6 +122,8 @@ pub mod git;
 pub mod git_recency;
 pub use git_recency::GitRecencyConfig;
 
+mod definition;
+
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;
 pub use grep::*;
@@ -139,6 +141,12 @@ pub use types::*;
 mod match_offsets;
 
 pub mod constants;
+
+/// Layered index arenas: the immutable base scan plus stacked overlays.
+pub use index::layers::{
+    LayerArenas, LayerId, LayerInfo, MAX_INDEX_LAYERS, MAX_OVERLAY_LAYERS, SESSION_LAYER,
+};
+pub use index::snapshot::{IndexEntry, LayerBuilder, LayerSnapshot, SnapshotLayout};
 
 /// Watcher rescan request accounting.
 pub mod rescan_stats;

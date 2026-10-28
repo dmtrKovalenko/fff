@@ -6,18 +6,6 @@ use smallvec::SmallVec;
 /// JS or huge single-line files from blowing up memory.
 pub(super) const MAX_LINE_DISPLAY_LEN: usize = 512;
 
-#[cfg(feature = "definitions")]
-#[inline]
-pub(super) fn classify_definition(enabled: bool, line: &str) -> bool {
-    enabled && super::classify::is_definition_line(line)
-}
-
-#[cfg(not(feature = "definitions"))]
-#[inline]
-pub(super) fn classify_definition(_enabled: bool, _line: &str) -> bool {
-    false
-}
-
 #[inline]
 pub(super) fn debug_assert_newline_terminator(searcher: &Searcher) {
     debug_assert_eq!(
@@ -36,16 +24,17 @@ pub(super) fn strip_line_terminators(bytes: &[u8]) -> &[u8] {
     &bytes[..len]
 }
 
-pub(super) struct SinkState {
+pub(super) struct SinkState<'a> {
+    pub(super) file: &'a crate::types::FileItem,
+    pub(super) definition_mode: super::DefinitionMode,
     pub(super) file_index: usize,
     pub(super) matches: Vec<GrepMatch>,
     pub(super) max_matches: usize,
     pub(super) before_context: usize,
     pub(super) after_context: usize,
-    pub(super) classify_definitions: bool,
 }
 
-impl SinkState {
+impl SinkState<'_> {
     #[inline]
     pub(super) fn prepare_line<'a>(
         line_bytes: &'a [u8],
@@ -73,10 +62,10 @@ impl SinkState {
         byte_offset: u64,
         line_content: String,
         match_byte_offsets: SmallVec<[(u32, u32); 4]>,
+        is_definition: bool,
         context_before: Vec<String>,
         context_after: Vec<String>,
-    ) {
-        let is_definition = classify_definition(self.classify_definitions, &line_content);
+    ) -> bool {
         self.matches.push(GrepMatch {
             file_index: self.file_index,
             line_number,
@@ -89,6 +78,7 @@ impl SinkState {
             context_before,
             context_after,
         });
+        self.max_matches == 0 || self.matches.len() < self.max_matches
     }
 
     /// Extract context lines from the full buffer around a matched region.

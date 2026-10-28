@@ -83,8 +83,17 @@ This extension registers FFF-powered tools (`fffind`, `ffgrep`, `fff-multi-grep`
 
 Search file contents. Smart case, plain text by default, regex optional.
 
+Set `definitions_only: true` to try matching declarations, ordinary exact matches, fuzzy declarations, then fuzzy ordinary matches. Exact stages finish before fallback. An empty fuzzy stage can fall back after two seconds, before it has scanned the full index.
+
+Fallback results carry a notice; fuzzy results say “Maybe you meant”. Cursors keep the current stage and file constraints. Once a stage returns matches, pagination stays in that stage.
+
+If all four stages find nothing, the tool suggests up to three files elsewhere in the same index, preserving exclusions. Filename-only suggestions are labeled as unverified.
+
+The optional `fff-multi-grep` tool accepts the same flag but only tries declarations and ordinary literal matches. Omitting the flag keeps ordinary search behavior.
+
 Parameters:
 - `pattern` — search text or regex
+- `definitions_only` — try declarations first and report fallbacks
 - `path` — directory/file constraint (e.g. `src/`, `*.ts`)
 - `ignoreCase` — force case-insensitive
 - `literal` — treat as literal string (default: true)
@@ -107,6 +116,7 @@ OR-logic multi-pattern content search. SIMD-accelerated Aho-Corasick.
 
 Parameters:
 - `patterns` — array of literal patterns (OR logic)
+- `definitions_only` — prefer declarations; fall back to ordinary literal matches with a notice
 - `constraints` — file constraints (e.g. `*.{ts,tsx} !test/`)
 - `context` — context lines
 - `limit` — max matches (default: 100)

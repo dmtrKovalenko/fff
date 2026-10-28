@@ -388,6 +388,8 @@ export interface HealthCheck {
  */
 export type GrepMode = "plain" | "regex" | "fuzzy";
 
+export type DefinitionMode = "off" | "classify" | "definition_only" | "usage_only";
+
 /**
  * Opaque pagination cursor for grep results.
  * Pass this to `GrepOptions.cursor` to fetch the next page.
@@ -443,12 +445,9 @@ export interface GrepOptions {
   afterContext?: number;
   /** Maximum matches to return in this page across all files (default: 50) */
   pageSize?: number;
-  /**
-   * When true, classify each match line as a code definition (struct/fn/class/...)
-   * and expose it via `GrepMatch.isDefinition`. Let callers re-rank defs first
-   * without a TS-side regex port. (default: false)
-   */
-  classifyDefinitions?: boolean;
+  /** Select matching definitions/usages, or classify all matches. Defaults to "off".
+   * Legacy booleans map false to "off" and true to "classify". Keep the same mode with a cursor. */
+  classifyDefinitions?: DefinitionMode | boolean;
 }
 
 /**
@@ -489,7 +488,7 @@ export interface GrepMatch {
   contextBefore?: string[];
   /** Lines after the match (context). Empty array when context is 0. */
   contextAfter?: string[];
-  /** Whether this line is a code definition (only populated when `classifyDefinitions: true`). */
+  /** Whether the query matches a declared name. Available when classification is enabled. */
   isDefinition?: boolean;
 }
 
@@ -554,11 +553,33 @@ export interface MultiGrepOptions {
   afterContext?: number;
   /** Maximum matches to return in this page across all files (default: 50) */
   pageSize?: number;
-  /**
-   * When true, classify each match line as a code definition (struct/fn/class/...)
-   * and expose it via `GrepMatch.isDefinition`. (default: false)
-   */
-  classifyDefinitions?: boolean;
+  /** Select matching definitions/usages, or classify all matches. Defaults to "off".
+   * Legacy booleans map false to "off" and true to "classify". Keep the same mode with a cursor. */
+  classifyDefinitions?: DefinitionMode | boolean;
+}
+
+/** Metadata for a file added to an index layer without touching the filesystem. */
+export interface LayerEntry {
+  /** Path relative to the indexed root, `/` separated. */
+  path: string;
+  /** Size in bytes (default 0). */
+  size?: number;
+  /** Modification time as unix seconds (default 0). */
+  modified?: number;
+}
+
+/** One overlay layer of the index. */
+export interface LayerInfo {
+  id: number;
+  label: string | null;
+  /** Index slots owned by the layer, tombstones included. */
+  fileCount: number;
+  liveFileCount: number;
+  dirCount: number;
+  /** Bytes held by the layer's path arena. */
+  arenaBytes: number;
+  /** True for the single writable layer at the top of the stack. */
+  isOpen: boolean;
 }
 
 /**
@@ -660,4 +681,60 @@ export interface FileFinderApi {
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;
+
+  /**
+   * Seal the writable index layer and open a new one. Returns its id.
+   * At most 4 overlays exist; past that the two newest are merged.
+   */
+  createLayer(label?: string): Result<number>;
+
+  /** Id of the layer new files are currently written into. */
+  currentLayer(): Result<number>;
+
+  /** Every overlay layer, oldest first. The base scan (layer 0) is not listed. */
+  listLayers(): Result<LayerInfo[]>;
+
+  /** Live file count of `layer` (0 = base scan). */
+  layerFileCount(layer: number): Result<number>;
+
+  /**
+   * Append paths to the writable layer without touching the filesystem.
+   * Paths already indexed are skipped. Returns the number added.
+   */
+  addPaths(entries: Array<string | LayerEntry>): Result<number>;
+
+  /** Write `layer` (0 = base scan) to a file. Returns bytes written. */
+  saveLayer(layer: number, filePath: string): Result<number>;
+
+  /** Load a layer file as a new sealed overlay. Returns its id. */
+  loadLayer(filePath: string): Result<number>;
+
+  /**
+   * Load a layer file as the base scan in the background, like a rescan:
+   * explicit overlays are kept, frecency and content indexing are applied.
+   * Returns the file count; wait with `waitForScan` before searching.
+   * Fails while another scan is active.
+   */
+  loadBase(filePath: string): Result<number>;
+}
+
+/** @internal Convert the public mode to the C integer argument. */
+export function definitionModeToInt(
+  mode: DefinitionMode | boolean | undefined,
+): number | undefined {
+  switch (mode) {
+    case undefined:
+    case false:
+    case "off":
+      return 0;
+    case true:
+    case "classify":
+      return 1;
+    case "definition_only":
+      return 2;
+    case "usage_only":
+      return 3;
+    default:
+      return undefined;
+  }
 }

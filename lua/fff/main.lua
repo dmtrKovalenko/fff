@@ -28,7 +28,7 @@ end
 
 --- Live grep: search file contents in the current directory.
 --- When opts.resume is true, resumes the last live_grep picker (or opens a new one if none saved).
---- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, casing?: "smart"|"sensitive"|"insensitive", max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
+--- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, casing?: "smart"|"sensitive"|"insensitive", max_matches_per_file?: number, modes?: string[], classify_definitions?: boolean|FffDefinitionMode}, query?: string, resume?: boolean} Optional configuration overrides
 function M.live_grep(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
   if not picker_ok then
@@ -325,7 +325,7 @@ function M.file_search(query, opts)
 end
 
 --- @class fff.ContentSearchOpts
---- @field mode? "plain"|"regex"|"fuzzy" Grep mode (default: 'plain').
+--- @field mode? FffGrepMode Grep mode (default: 'plain').
 --- @field max_file_size? number Skip files larger than N bytes (default: config.grep.max_file_size).
 --- @field max_matches_per_file? number Cap matches per file, 0 = unlimited (default: config.grep.max_matches_per_file).
 --- @field smart_case? boolean Case-insensitive when query is all lowercase (default: config.grep.smart_case).
@@ -335,6 +335,7 @@ end
 --- @field time_budget_ms? number Max wall-clock time, 0 = unlimited (default: config.grep.time_budget_ms).
 --- @field enforce_time_budget? boolean Apply the budget even with zero matches (default: config.grep.enforce_time_budget).
 --- @field trim_whitespace? boolean Strip leading whitespace from matched lines (default: config.grep.trim_whitespace).
+--- @field classify_definitions? boolean|FffDefinitionMode Classify matches or return definitions/usages only (default: grep.classify_definitions from the user config, otherwise off).
 --- @field cwd? string Switch indexed root before grepping (same semantics as `file_search`).
 --- @field wait_for_index_ms? number Block up to this many ms for the index to be ready.
 
@@ -351,8 +352,10 @@ function M.content_search(query, opts)
   opts = opts or {}
 
   local mode = opts.mode or 'plain'
-  if mode ~= 'plain' and mode ~= 'regex' and mode ~= 'fuzzy' then
-    error("fff.content_search: opts.mode must be 'plain', 'regex', or 'fuzzy', got " .. tostring(mode))
+  if mode ~= 'plain' and mode ~= 'regex' and mode ~= 'fuzzy' and mode ~= 'definition_only' then
+    error(
+      "fff.content_search: opts.mode must be 'plain', 'regex', 'fuzzy', or 'definition_only', got " .. tostring(mode)
+    )
   end
 
   local empty = {
@@ -381,7 +384,13 @@ function M.content_search(query, opts)
     time_budget_ms = opts.time_budget_ms or grep_cfg.time_budget_ms,
     enforce_time_budget = opts.enforce_time_budget == nil and grep_cfg.enforce_time_budget or opts.enforce_time_budget,
     trim_whitespace = opts.trim_whitespace == nil and grep_cfg.trim_whitespace or opts.trim_whitespace,
+    classify_definitions = opts.classify_definitions,
   }
+  if merged_grep_cfg.classify_definitions == nil then
+    -- Programmatic results keep file order unless the user's own config enables grouping.
+    local user_grep = type(vim.g.fff) == 'table' and vim.g.fff.grep or nil
+    merged_grep_cfg.classify_definitions = type(user_grep) == 'table' and user_grep.classify_definitions or false
+  end
 
   local ok, result = pcall(grep.search, query, opts.file_offset or 0, opts.page_size or 50, merged_grep_cfg, mode)
   if not ok then

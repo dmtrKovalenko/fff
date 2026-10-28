@@ -256,24 +256,14 @@ impl FrecencyTracker {
     }
 
     pub fn track_access(&self, path: &Path) -> Result<()> {
-        let key_hash = Self::path_to_hash_bytes(path)?;
-        let mut accesses = self.get_accesses(path)?.unwrap_or_default();
+        self.track_access_shared(path, None)
+    }
 
+    /// Records an access of `path` and of `shared`, its main checkout twin when
+    /// `path` lives in a linked git worktree, within a single transaction.
+    pub fn track_access_shared(&self, path: &Path, shared: Option<&Path>) -> Result<()> {
         let now = self.get_now();
         let cutoff_time = now.saturating_sub((MAX_HISTORY_DAYS * SECONDS_PER_DAY) as u64);
-
-        // Drop stale timestamps from the front while also enforcing the
-        // per-file cap. Reserves one slot for the `push_back` below.
-        while let Some(&front_time) = accesses.front() {
-            if front_time < cutoff_time || accesses.len() >= MAX_TIMESTAMPS_PER_FILE {
-                accesses.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        accesses.push_back(now);
-        tracing::debug!(?path, accesses = accesses.len(), "Tracking access");
 
         let mut wtxn = self
             .env
@@ -282,21 +272,47 @@ impl FrecencyTracker {
                 db: Self::LABEL,
                 source,
             })?;
-        if let Err(e) = self.db.put(&mut wtxn, &key_hash, &accesses) {
-            if is_map_full(&e) {
-                self.health.mark_unhealthy("MDB_MAP_FULL on put");
-                tracing::error!(
-                    ?path,
-                    "Frecency DB hit MDB_MAP_FULL; dropping write — db will be \
-                     erased on next open via LmdbStore::erase_if_oversized"
-                );
-                return Ok(());
+
+        for path in std::iter::once(path).chain(shared.filter(|shared| *shared != path)) {
+            let key_hash = Self::path_to_hash_bytes(path)?;
+            let mut accesses = self
+                .db
+                .get(&wtxn, &key_hash)
+                .map_err(|source| Error::DbRead {
+                    db: Self::LABEL,
+                    source,
+                })?
+                .unwrap_or_default();
+
+            // Drop stale timestamps from the front while also enforcing the
+            // per-file cap. Reserves one slot for the `push_back` below.
+            while let Some(&front_time) = accesses.front() {
+                if front_time < cutoff_time || accesses.len() >= MAX_TIMESTAMPS_PER_FILE {
+                    accesses.pop_front();
+                } else {
+                    break;
+                }
             }
 
-            return Err(Error::DbWrite {
-                db: Self::LABEL,
-                source: e,
-            });
+            accesses.push_back(now);
+            tracing::debug!(?path, accesses = accesses.len(), "Tracking access");
+
+            if let Err(e) = self.db.put(&mut wtxn, &key_hash, &accesses) {
+                if is_map_full(&e) {
+                    self.health.mark_unhealthy("MDB_MAP_FULL on put");
+                    tracing::error!(
+                        ?path,
+                        "Frecency DB hit MDB_MAP_FULL; dropping write — db will be \
+                         erased on next open via LmdbStore::erase_if_oversized"
+                    );
+                    return Ok(());
+                }
+
+                return Err(Error::DbWrite {
+                    db: Self::LABEL,
+                    source: e,
+                });
+            }
         }
 
         wtxn.commit()
@@ -371,49 +387,21 @@ impl FrecencyTracker {
     }
 
     pub fn get_access_score(&self, file_path: &Path, mode: FFFMode) -> i64 {
-        let accesses = self
-            .get_accesses(file_path)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        self.reader().access_score(file_path, None, mode)
+    }
 
-        if accesses.is_empty() {
-            return 0;
+    // Scores many files under one read transaction: a transaction per lookup
+    // serializes parallel scans on the LMDB reader table mutex
+    pub(crate) fn reader(&self) -> FrecencyReader<'_> {
+        FrecencyReader {
+            tracker: self,
+            rtxn: self
+                .env
+                .read_txn()
+                .inspect_err(|e| tracing::debug!(?e, "Frecency read txn failed"))
+                .ok(),
+            now: self.get_now(),
         }
-
-        let decay_constant = if mode.is_ai() {
-            AI_DECAY_CONSTANT
-        } else {
-            DECAY_CONSTANT
-        };
-        let max_history_days = if mode.is_ai() {
-            AI_MAX_HISTORY_DAYS
-        } else {
-            MAX_HISTORY_DAYS
-        };
-
-        let now = self.get_now();
-        let mut total_frecency = 0.0;
-
-        let cutoff_time = now.saturating_sub((max_history_days * SECONDS_PER_DAY) as u64);
-
-        for &access_time in accesses.iter().rev() {
-            if access_time < cutoff_time {
-                break; // All remaining entries are older, stop processing
-            }
-
-            let days_ago = (now.saturating_sub(access_time) as f64) / SECONDS_PER_DAY;
-            let decay_factor = (-decay_constant * days_ago).exp();
-            total_frecency += decay_factor;
-        }
-
-        let normalized_frecency = if total_frecency <= 10.0 {
-            total_frecency
-        } else {
-            10.0 + (total_frecency - 10.0).sqrt() // Diminishing: >10 accesses grow slowly
-        };
-
-        normalized_frecency.round() as i64
     }
 
     /// Calculating modification score but only if the file is modified in the current git dir
@@ -423,43 +411,122 @@ impl FrecencyTracker {
         git_status: Option<git2::Status>,
         mode: FFFMode,
     ) -> i64 {
-        let is_modified_git_status = git_status.is_some_and(is_modified_status);
-        if !is_modified_git_status {
-            return 0;
-        }
+        modification_score(modified_time, git_status, mode, self.get_now())
+    }
+}
 
-        let thresholds = if mode.is_ai() {
-            &AI_MODIFICATION_THRESHOLDS
-        } else {
-            &MODIFICATION_THRESHOLDS
+pub(crate) struct FrecencyReader<'a> {
+    tracker: &'a FrecencyTracker,
+    rtxn: Option<heed::RoTxn<'a, heed::WithoutTls>>,
+    now: u64,
+}
+
+impl FrecencyReader<'_> {
+    // Access score of `path` merged with `shared`, its main checkout twin in linked
+    // worktrees. Local opens are mirrored into `shared`, so they weigh double here
+    pub(crate) fn access_score(&self, path: &Path, shared: Option<&Path>, mode: FFFMode) -> i64 {
+        let total = self.decayed_accesses(path, mode)
+            + shared.map_or(0.0, |shared| self.decayed_accesses(shared, mode));
+
+        normalize_frecency(total)
+    }
+
+    fn decayed_accesses(&self, path: &Path, mode: FFFMode) -> f64 {
+        let Some(rtxn) = self.rtxn.as_ref() else {
+            return 0.0;
+        };
+        let Ok(key) = FrecencyTracker::path_to_hash_bytes(path) else {
+            return 0.0;
         };
 
-        let now = self.get_now();
-        let duration_since = now.saturating_sub(modified_time);
+        match self.tracker.db.get(rtxn, &key) {
+            Ok(Some(accesses)) => decay_sum(&accesses, self.now, mode),
+            _ => 0.0,
+        }
+    }
 
-        for i in 0..thresholds.len() {
-            let (current_points, current_threshold) = thresholds[i];
+    pub(crate) fn modification_score(
+        &self,
+        modified_time: u64,
+        git_status: Option<git2::Status>,
+        mode: FFFMode,
+    ) -> i64 {
+        modification_score(modified_time, git_status, mode, self.now)
+    }
+}
 
-            if duration_since <= current_threshold {
-                if i == 0 || duration_since == current_threshold {
-                    return current_points;
-                }
+fn decay_sum(accesses: &VecDeque<u64>, now: u64, mode: FFFMode) -> f64 {
+    let (decay_constant, max_history_days) = if mode.is_ai() {
+        (AI_DECAY_CONSTANT, AI_MAX_HISTORY_DAYS)
+    } else {
+        (DECAY_CONSTANT, MAX_HISTORY_DAYS)
+    };
+    let cutoff_time = now.saturating_sub((max_history_days * SECONDS_PER_DAY) as u64);
 
-                let (prev_points, prev_threshold) = thresholds[i - 1];
-
-                let time_range = current_threshold - prev_threshold;
-                let time_offset = duration_since - prev_threshold;
-                let points_diff = prev_points - current_points;
-
-                let interpolated_score =
-                    prev_points - (points_diff * time_offset as i64) / time_range as i64;
-
-                return interpolated_score;
-            }
+    let mut total_frecency = 0.0;
+    for &access_time in accesses.iter().rev() {
+        if access_time < cutoff_time {
+            break; // All remaining entries are older, stop processing
         }
 
-        0
+        let days_ago = (now.saturating_sub(access_time) as f64) / SECONDS_PER_DAY;
+        total_frecency += (-decay_constant * days_ago).exp();
     }
+
+    total_frecency
+}
+
+fn modification_score(
+    modified_time: u64,
+    git_status: Option<git2::Status>,
+    mode: FFFMode,
+    now: u64,
+) -> i64 {
+    let is_modified_git_status = git_status.is_some_and(is_modified_status);
+    if !is_modified_git_status {
+        return 0;
+    }
+
+    let thresholds = if mode.is_ai() {
+        &AI_MODIFICATION_THRESHOLDS
+    } else {
+        &MODIFICATION_THRESHOLDS
+    };
+
+    let duration_since = now.saturating_sub(modified_time);
+
+    for i in 0..thresholds.len() {
+        let (current_points, current_threshold) = thresholds[i];
+
+        if duration_since <= current_threshold {
+            if i == 0 || duration_since == current_threshold {
+                return current_points;
+            }
+
+            let (prev_points, prev_threshold) = thresholds[i - 1];
+
+            let time_range = current_threshold - prev_threshold;
+            let time_offset = duration_since - prev_threshold;
+            let points_diff = prev_points - current_points;
+
+            let interpolated_score =
+                prev_points - (points_diff * time_offset as i64) / time_range as i64;
+
+            return interpolated_score;
+        }
+    }
+
+    0
+}
+
+fn normalize_frecency(total_frecency: f64) -> i64 {
+    let normalized_frecency = if total_frecency <= 10.0 {
+        total_frecency
+    } else {
+        10.0 + (total_frecency - 10.0).sqrt() // Diminishing: >10 accesses grow slowly
+    };
+
+    normalized_frecency.round() as i64
 }
 
 #[cfg(test)]

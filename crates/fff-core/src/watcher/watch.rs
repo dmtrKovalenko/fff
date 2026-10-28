@@ -966,7 +966,8 @@ mod tests {
                 .collect(),
         );
 
-        let old_events = wait_events(&collected, 128);
+        registry.dispatcher.drain();
+        let old_events = collected.lock().clone();
         assert_eq!(old_events.len(), 128);
         assert!(
             !old_events
@@ -978,7 +979,8 @@ mod tests {
             &new_base,
             vec![raw("/new/current", WatchEventKind::Created, false)],
         );
-        let events = wait_events(&collected, 129);
+        registry.dispatcher.drain();
+        let events = collected.lock().clone();
         assert_eq!(events.last().unwrap().path, Path::new("/new/current"));
     }
 

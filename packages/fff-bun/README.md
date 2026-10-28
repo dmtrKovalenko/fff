@@ -162,6 +162,43 @@ Notes:
 - Watching requires the instance to be created with watching enabled
   (the default).
 
+## Index layers
+
+The path index is a stack: layer 0 is the base scan, on top of it sit up to
+four append-only overlays. Layer 1 is opened automatically and collects
+everything the watcher indexes during the session. Layers only hold paths;
+file contents are never layered.
+
+Add paths that the scanner can't see (generated files, remote checkouts,
+virtual trees) and persist any layer — the base scan included — to a file:
+
+```typescript
+import type { Result } from "@ff-labs/fff-bun";
+
+function checked<T>(result: Result<T>): T {
+  if (!result.ok) throw new Error(result.error);
+  return result.value;
+}
+
+const layer = checked(finder.createLayer("generated"));
+const paths = ["build/out/a.js", { path: "build/out/b.js", size: 1024, modified: 1_700_000_000 }];
+checked(finder.addPaths(paths));
+checked(finder.saveLayer(layer, "/tmp/generated.fff"));
+checked(finder.saveLayer(0, "/tmp/base.fff"));
+
+checked(finder.loadLayer("/tmp/generated.fff"));
+checked(finder.loadBase("/tmp/base.fff"));
+if (!checked(await finder.waitForScan())) throw new Error("Base scan timed out");
+
+checked(FileFinder.buildLayerFile(paths, "/tmp/prebuilt.fff", "prebuilt"));
+for (const layer of checked(finder.listLayers())) {
+  console.log(layer.id, layer.label, layer.liveFileCount, layer.isOpen);
+}
+```
+
+Batch paths in one `addPaths` call to reduce FFI overhead. Explicit layers survive a rescan.
+Once the overlay stack is full, FFF compacts the two newest overlays.
+
 ## API Reference
 
 Verify the latest API in the local interface at [`./src/fff-api.ts`](./src/fff-api.ts). Every field and type is documented.

@@ -125,9 +125,9 @@ pub struct GrepSearchOptions {
     pub before_context: usize,
     /// Number of context lines to include after each match. 0 = disabled.
     pub after_context: usize,
-    /// Whether to classify each match as a definition line. Adds ~2% overhead
-    /// on large repos; disable for interactive grep where it is not needed.
-    pub classify_definitions: bool,
+    /// Classify all matches or return only definitions/usages for this query.
+    /// Defaults to Off.
+    pub classify_definitions: super::DefinitionMode,
     /// Strip leading whitespace from matched lines and context lines, adjusting
     /// highlight byte offsets accordingly. Useful for AI/MCP consumers and UIs
     /// that don't need indentation. Default: false.
@@ -163,7 +163,7 @@ impl Default for GrepSearchOptions {
             enforce_time_budget: false,
             before_context: 0,
             after_context: 0,
-            classify_definitions: false,
+            classify_definitions: Default::default(),
             trim_whitespace: false,
             abort_signal: None,
         }
@@ -229,6 +229,7 @@ impl<'a> GrepResult<'a> {
         // files between them that had no matches were still searched and can be
         // safely skipped on the next page
         let mut files_consumed: usize = 0;
+        let mut page_filled = false;
 
         for (batch_idx, file, file_matches) in per_file_results {
             // Matches past the abort point are dropped; the next page re-searches them.
@@ -255,15 +256,16 @@ impl<'a> GrepResult<'a> {
             // stopping, so no matches are dropped. A page may return up to
             // page_limit + max_matches_per_file - 1 matches in the worst case
             if all_matches.len() >= page_limit {
+                page_filled = true;
                 break;
             }
         }
 
-        // Abort stops at a known index; otherwise zero matches means a full scan.
+        // A full page resumes after its last returned file, even if later workers aborted.
         match abort_resume {
-            Some(resume_at) => files_consumed = resume_at.min(files_to_search_len),
+            Some(resume_at) if !page_filled => files_consumed = resume_at.min(files_to_search_len),
             None if result_files.is_empty() => files_consumed = files_to_search_len,
-            None => {}
+            _ => {}
         }
 
         let has_more = files_consumed < files_to_search_len

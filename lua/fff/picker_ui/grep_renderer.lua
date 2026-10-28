@@ -9,38 +9,60 @@ local fuzzy = require('fff.fuzzy')
 local file_renderer = require('fff.picker_ui.file_renderer')
 local tresitter_highlight = require('fff.treesitter_hl')
 
+---@class fff.grep.Match: FileItem
+---@field is_definition boolean
+
 ---@class fff.grep.SearchResult
----@field items table[] Array of grep match items
+---@field items fff.grep.Match[] Array of grep match items
 ---@field total_matched number Total matches found in this call
 ---@field total_files_searched number Files actually searched in this call
 ---@field total_files number Total indexed files
 ---@field filtered_file_count number Total searchable files after filtering
----@field next_file_offset number File offset to pass for the next page (0 = no more results)
+---@field next_file_offset number File offset for the next page (0 = no more results)
 ---@field regex_fallback_error string|nil Error message if regex compilation failed and search fell back to literal
 
 local last_result = nil
 
 --- Perform a grep search.
 ---@param query string The search query (may contain file constraints like *.rs)
----@param file_offset? number Index into sorted file list to start from (default 0)
+---@param file_offset? number File offset returned by the previous search (default 0)
 ---@param page_size? number Max matches to collect (default 50)
 ---@param config? table Grep configuration overrides
----@param grep_mode? string Search mode: "plain" (default), "regex", or "fuzzy"
+---@param grep_mode? FffGrepMode Search mode (default: "plain")
 ---@return fff.grep.SearchResult
 function M.search(query, file_offset, page_size, config, grep_mode)
-  local conf = config or {}
+  file_offset = file_offset or 0
+  page_size = page_size or 50
+  config = config or require('fff.conf').get().grep
+  local classify_definitions = config.classify_definitions
+  if grep_mode == 'definition_only' then
+    grep_mode = 'plain'
+    classify_definitions = 'definition_only'
+  end
+  if classify_definitions == true then classify_definitions = 'classify' end
+  if not classify_definitions then classify_definitions = 'off' end
+  vim.validate({ classify_definitions = { classify_definitions, 'string' } })
+  if
+    classify_definitions ~= 'off'
+    and classify_definitions ~= 'classify'
+    and classify_definitions ~= 'definition_only'
+    and classify_definitions ~= 'usage_only'
+  then
+    error('Invalid classify_definitions mode: ' .. classify_definitions)
+  end
   last_result = fuzzy.live_grep(
     query or '',
-    file_offset or 0,
-    page_size or 50,
-    conf.max_file_size,
-    conf.max_matches_per_file,
-    conf.smart_case,
+    file_offset,
+    page_size,
+    config.max_file_size,
+    config.max_matches_per_file,
+    config.smart_case,
     grep_mode or 'plain',
-    conf.time_budget_ms,
-    conf.trim_whitespace,
-    conf.enforce_time_budget,
-    conf.casing
+    config.time_budget_ms,
+    config.trim_whitespace,
+    config.enforce_time_budget,
+    config.casing,
+    classify_definitions
   )
   return last_result
 end
@@ -63,7 +85,7 @@ end
 
 --- Build the file group header line using the same layout as file_renderer.
 --- Delegates to file_renderer.render_line (with combo disabled).
----@param item FileItem Grep match
+---@param item fff.grep.Match Grep match
 ---@param ctx table Render context
 ---@return string The header line string
 local function build_group_header(item, ctx)
@@ -72,7 +94,7 @@ local function build_group_header(item, ctx)
 end
 
 --- Apply highlights for a file group header line using file_renderer.
----@param item FileItem Grep match item
+---@param item fff.grep.Match Grep match item
 ---@param ctx ListRenderContext Render context
 ---@param buf number Buffer handle
 ---@param ns_id number Namespace id
@@ -252,7 +274,7 @@ end
 --- Render a single item's lines (called by list_renderer).
 --- Returns 2 lines [header, match] for the first match of a file group,
 --- or 1 line [match] for subsequent matches in the same file.
----@param item FileItem Grep match item
+---@param item fff.grep.Match Grep match item
 ---@param ctx table Render context
 ---@param item_idx number 1-based item index in ctx.items
 ---@return string[]
@@ -260,8 +282,11 @@ function M.render_line(item, ctx, item_idx)
   -- First rendered item in this pass always gets header — fixes missing header
   -- when paginating backward in multi-page grep results (ctx is fresh per render).
   local is_first_visible = (item_idx == ctx.iter_start)
-  local is_new_group = is_first_visible or (item.relative_path ~= ctx.grep_last_file)
+  local is_new_group = is_first_visible
+    or item.relative_path ~= ctx.grep_last_file
+    or item.is_definition ~= ctx.grep_last_definition
   ctx.grep_last_file = item.relative_path
+  ctx.grep_last_definition = item.is_definition
 
   local match_line = render_match_line(item, ctx)
 
@@ -278,7 +303,7 @@ function M.render_line(item, ctx, item_idx)
 end
 
 --- Apply highlights for rendered lines (called by list_renderer).
----@param item FileItem Grep match item
+---@param item fff.grep.Match Grep match item
 ---@param ctx ListRenderContext Render context
 ---@param item_idx number 1-based item index
 ---@param buf number Buffer handle

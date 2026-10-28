@@ -40,7 +40,7 @@ fn plain_opts() -> GrepSearchOptions {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     }
@@ -60,7 +60,7 @@ fn regex_opts() -> GrepSearchOptions {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     }
@@ -80,7 +80,7 @@ fn fuzzy_opts() -> GrepSearchOptions {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     }
@@ -612,25 +612,10 @@ fn large_unknown_extension_binary_is_classified_at_scan_time() {
     )
     .expect("Failed to create FilePicker");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        std::thread::sleep(Duration::from_millis(25));
-        let ready = shared_picker
-            .read()
-            .ok()
-            .and_then(|g| {
-                g.as_ref()
-                    .map(|p| !p.is_scan_active() && p.bigram_index().is_some())
-            })
-            .unwrap_or(false);
-        if ready {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Timed out waiting for bigram build"
-        );
-    }
+    assert!(
+        shared_picker.wait_for_indexing_complete(Duration::from_secs(15)),
+        "Timed out waiting for content indexing"
+    );
 
     let guard = shared_picker.read().unwrap();
     let picker = guard.as_ref().unwrap();

@@ -107,6 +107,59 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), names.len());
     }
 
+    #[test]
+    fn parallel_walk_preserves_files_directories_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        for directory in 0..64 {
+            let path = root.join(format!("src{directory}"));
+            fs::create_dir(&path).unwrap();
+            for file in 0..32 {
+                fs::write(path.join(format!("file{file}.rs")), "fn main() {}\n").unwrap();
+            }
+        }
+        let mut results = Vec::new();
+        for threads in [1, 4] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let out = walk_collect_files(root, true, false, threads, &counter).unwrap();
+            let mut files: Vec<_> = out
+                .pairs
+                .into_iter()
+                .map(|(item, path)| (path, item.size))
+                .collect();
+            files.sort();
+            let mut directories = out.dirs;
+            directories.sort();
+            results.push((files, directories, counter.load(Ordering::Relaxed)));
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[1].2, 64 * 32);
+    }
+
+    #[test]
+    fn skips_git_metadata_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("module")).unwrap();
+        fs::write(root.join(".git"), "gitdir: ../admin\n").unwrap();
+        fs::write(
+            root.join("module/.git"),
+            "gitdir: ../../admin/modules/lib\n",
+        )
+        .unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("module/lib.rs"), "pub fn lib() {}\n").unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, true, false, 4, &counter).unwrap();
+        let mut paths: Vec<_> = out.pairs.into_iter().map(|(_, path)| path).collect();
+        paths.sort();
+        assert_eq!(
+            (paths, counter.load(Ordering::Relaxed)),
+            (vec!["main.rs".to_string(), "module/lib.rs".to_string()], 2)
+        );
+    }
+
     // Non-git roots prune known non-code directories (node_modules).
     #[test]
     fn prunes_non_code_dirs_for_non_git_root() {

@@ -4,6 +4,7 @@ use fff_query_parser::{Constraint, GitStatusFilter};
 use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
+use crate::index::layers::{LayerArenas, LayerId};
 use crate::simd_path::ArenaPtr;
 use crate::simd_string_utils::memmem::find_case_insensitive_short;
 
@@ -13,7 +14,7 @@ pub(crate) trait Constrainable {
     fn write_file_name(&self, arena: ArenaPtr, out: &mut String);
     fn git_status(&self) -> Option<git2::Status>;
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String);
-    fn is_overflow(&self) -> bool;
+    fn layer_id(&self) -> LayerId;
 
     fn has_extension(&self, arena: ArenaPtr, extension: &str, scratch: &mut String) -> bool {
         self.write_file_name(arena, scratch);
@@ -138,18 +139,20 @@ pub fn path_contains_segment(path: &str, segment: &str) -> bool {
 pub(crate) fn apply_constraints<'a, T: Constrainable + Sync>(
     items: &'a [T],
     constraints: &[Constraint<'_>],
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
 ) -> Option<Vec<&'a T>> {
     if constraints.is_empty() {
         return None;
     }
-    let plan = ConstraintPlan::build(constraints, items, base_arena, overflow_arena);
-    Some(plan.run(items, base_arena, overflow_arena))
+    let plan = ConstraintPlan::build(constraints, items, arenas);
+    Some(plan.run(items, arenas))
 }
 
 #[cfg(feature = "zlob")]
-pub(crate) type GlobPattern = zlob::ZlobPattern;
+pub(crate) enum GlobPattern {
+    Zlob(zlob::ZlobPattern),
+    Globset(Box<globset::GlobMatcher>),
+}
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) type GlobPattern = globset::GlobMatcher;
 
@@ -199,8 +202,16 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
     pub(crate) fn build<T: Constrainable>(
         constraints: &'c [Constraint<'q>],
         items: &[T],
-        base_arena: ArenaPtr,
-        overflow_arena: ArenaPtr,
+        arenas: LayerArenas,
+    ) -> Self {
+        Self::build_with_prefilter(constraints, items, arenas, false)
+    }
+
+    pub(crate) fn build_with_prefilter<T: Constrainable>(
+        constraints: &'c [Constraint<'q>],
+        items: &[T],
+        arenas: LayerArenas,
+        prefiltered: bool,
     ) -> Self {
         let mut extensions = SmallVec::new();
         let mut rest: SmallVec<[&'c Constraint<'q>; 8]> = SmallVec::new();
@@ -210,8 +221,9 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
                 _ => rest.push(c),
             }
         }
-        let has_pre_filter = !extensions.is_empty() || rest.iter().any(|&c| !is_glob_node(c));
-        let glob = build_glob_strategy(&rest, has_pre_filter, items, base_arena, overflow_arena);
+        let has_pre_filter =
+            prefiltered || !extensions.is_empty() || rest.iter().any(|&c| !is_glob_node(c));
+        let glob = build_glob_strategy(&rest, has_pre_filter, items, arenas);
 
         Self {
             extensions,
@@ -220,20 +232,14 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         }
     }
 
-    fn run<'a, T: Constrainable + Sync>(
-        &self,
-        items: &'a [T],
-        base_arean: ArenaPtr,
-        overflow_arena: ArenaPtr,
-    ) -> Vec<&'a T> {
+    fn run<'a, T: Constrainable + Sync>(&self, items: &'a [T], arenas: LayerArenas) -> Vec<&'a T> {
         if items.len() >= PAR_THRESHOLD {
             use rayon::prelude::*;
             items
                 .par_iter()
                 .enumerate()
                 .map_init(ConstraintsBuffers::new, |scratch, (i, item)| {
-                    self.matches(item, i, base_arean, overflow_arena, scratch)
-                        .then_some(item)
+                    self.matches(item, i, arenas, scratch).then_some(item)
                 })
                 .flatten()
                 .collect()
@@ -242,10 +248,7 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
             items
                 .iter()
                 .enumerate()
-                .filter_map(|(i, item)| {
-                    self.matches(item, i, base_arean, overflow_arena, &mut scratch)
-                        .then_some(item)
-                })
+                .filter_map(|(i, item)| self.matches(item, i, arenas, &mut scratch).then_some(item))
                 .collect()
         }
     }
@@ -255,15 +258,10 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         &self,
         item: &T,
         index: usize,
-        base_arena: ArenaPtr,
-        overflow_arena: ArenaPtr,
+        arenas: LayerArenas,
         scratch: &mut ConstraintsBuffers,
     ) -> bool {
-        let arena = if item.is_overflow() {
-            overflow_arena
-        } else {
-            base_arena
-        };
+        let arena = arenas.get(item.layer_id());
 
         if !self.passes_extensions(item, arena, scratch) {
             return false;
@@ -379,7 +377,10 @@ fn matches_git_status(status: Option<git2::Status>, filter: &GitStatusFilter) ->
 #[inline]
 #[cfg(feature = "zlob")]
 pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
-    p.matches_default(path)
+    match p {
+        GlobPattern::Zlob(p) => p.matches_default(path),
+        GlobPattern::Globset(p) => p.is_match(path),
+    }
 }
 
 #[inline]
@@ -392,11 +393,16 @@ pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
 /// zlob backend: ONE FFI call for the whole batch.
 #[cfg(feature = "zlob")]
 pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<usize>) {
-    match p.match_indices(rels, p.flags()) {
-        Ok(ix) => out.extend_from_slice(ix.as_slice()),
-        Err(e) => {
-            tracing::warn!(?e, "zlob batch match failed, falling back to per-path");
-            out.extend((0..rels.len()).filter(|&i| p.matches_default(rels[i])));
+    match p {
+        GlobPattern::Zlob(p) => match p.match_indices(rels, p.flags()) {
+            Ok(ix) => out.extend_from_slice(ix.as_slice()),
+            Err(e) => {
+                tracing::warn!(?e, "zlob batch match failed, falling back to per-path");
+                out.extend((0..rels.len()).filter(|&i| p.matches_default(rels[i])));
+            }
+        },
+        GlobPattern::Globset(p) => {
+            out.extend((0..rels.len()).filter(|&i| p.is_match(rels[i])));
         }
     }
 }
@@ -416,8 +422,7 @@ fn build_glob_strategy<T: Constrainable>(
     rest: &[&Constraint<'_>],
     has_pre_filter: bool,
     items: &[T],
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: LayerArenas,
 ) -> GlobStrategy {
     if !contains_glob(rest) {
         return GlobStrategy::None;
@@ -425,7 +430,7 @@ fn build_glob_strategy<T: Constrainable>(
     if has_pre_filter {
         return GlobStrategy::Inline(compile_globs(rest));
     }
-    let buf = PathBuffer::collect(items, arena, overflow_arena);
+    let buf = PathBuffer::collect(items, arenas);
     let path_refs = buf.as_strs();
     GlobStrategy::Prepass(precompute_masks(rest, &path_refs))
 }
@@ -453,16 +458,12 @@ struct PathBuffer {
 }
 
 impl PathBuffer {
-    fn collect<T: Constrainable>(items: &[T], arena: ArenaPtr, overflow_arena: ArenaPtr) -> Self {
+    fn collect<T: Constrainable>(items: &[T], arenas: LayerArenas) -> Self {
         let mut bytes = Vec::<u8>::new();
         let mut offsets = Vec::with_capacity(items.len());
         let mut tmp = String::with_capacity(64);
         for item in items {
-            let item_arena = if item.is_overflow() {
-                overflow_arena
-            } else {
-                arena
-            };
+            let item_arena = arenas.get(item.layer_id());
             let start = bytes.len();
             item.write_relative_path(item_arena, &mut tmp);
             bytes.extend_from_slice(tmp.as_bytes());
@@ -511,20 +512,26 @@ fn walk_globs<F: FnMut(&str)>(c: &Constraint<'_>, f: &mut F) {
 
 #[cfg(feature = "zlob")]
 pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
-    zlob::ZlobPattern::compile(pattern, GLOB_FLAGS).ok()
+    if needs_globset(pattern) {
+        return compile_globset(pattern).map(|g| GlobPattern::Globset(Box::new(g)));
+    }
+    zlob::ZlobPattern::compile(pattern, GLOB_FLAGS)
+        .ok()
+        .map(GlobPattern::Zlob)
 }
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
-    globset::Glob::new(pattern)
-        .ok()
-        .map(|g| g.compile_matcher())
+    compile_globset(pattern)
 }
 
 /// Build a `paths.len()`-sized bitmap. Vec<bool> beats AHashSet ~2× in the per-item
 /// filter loop — no hashing, plain array indexing, sequential prefetcher-friendly.
 #[cfg(feature = "zlob")]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
+    if needs_globset(pattern) {
+        return match_globset_pattern(pattern, paths);
+    }
     let mut mask = vec![false; paths.len()];
     let Ok(hits) = zlob::zlob_match_paths_indices(pattern, paths, GLOB_FLAGS) else {
         return mask;
@@ -539,11 +546,14 @@ fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
+    match_globset_pattern(pattern, paths)
+}
+
+fn match_globset_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     let mut mask = vec![false; paths.len()];
-    let Ok(glob) = globset::Glob::new(pattern) else {
+    let Some(matcher) = compile_globset(pattern) else {
         return mask;
     };
-    let matcher = glob.compile_matcher();
     if paths.len() >= PAR_THRESHOLD {
         use rayon::prelude::*;
         mask.par_iter_mut()
@@ -555,6 +565,30 @@ fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
         }
     }
     mask
+}
+
+#[cfg(feature = "zlob")]
+fn needs_globset(pattern: &str) -> bool {
+    // zlob's non-recursive matcher lets wildcards cross separators. Brace arms
+    // can mix recursive and non-recursive patterns, so use globset for those too.
+    if pattern.contains('/')
+        && (pattern.contains('{') || !pattern.split('/').any(|part| part == "**"))
+    {
+        return true;
+    }
+    // zlob expands braces inside classes and rewrites class backslashes on Windows.
+    pattern
+        .as_bytes()
+        .windows(3)
+        .any(|class| matches!(class, b"[{]" | b"[}]" | b"[,]" | b"[\\]"))
+}
+
+fn compile_globset(pattern: &str) -> Option<globset::GlobMatcher> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(pattern.contains('/'))
+        .build()
+        .ok()
+        .map(|glob| glob.compile_matcher())
 }
 
 #[cfg(test)]
@@ -582,8 +616,8 @@ mod tests {
             None
         }
 
-        fn is_overflow(&self) -> bool {
-            false
+        fn layer_id(&self) -> LayerId {
+            0
         }
     }
 
@@ -808,13 +842,15 @@ mod tests {
         let mismatch = [Constraint::FilePath("트.c")];
 
         let exact_items = [item.clone()];
-        let exact_matches = apply_constraints(&exact_items, &exact, arena_ptr, arena_ptr)
-            .expect("constraints applied");
+        let exact_matches =
+            apply_constraints(&exact_items, &exact, LayerArenas::uniform(arena_ptr))
+                .expect("constraints applied");
         assert_eq!(exact_matches.len(), 1);
 
         let mismatch_items = [item];
-        let mismatch_matches = apply_constraints(&mismatch_items, &mismatch, arena_ptr, arena_ptr)
-            .expect("constraints applied");
+        let mismatch_matches =
+            apply_constraints(&mismatch_items, &mismatch, LayerArenas::uniform(arena_ptr))
+                .expect("constraints applied");
         assert!(mismatch_matches.is_empty());
     }
 
@@ -866,7 +902,8 @@ mod tests {
 
         // Not(Glob("**/*.rs")) should exclude .rs files
         let constraints = vec![Constraint::Not(Box::new(Constraint::Glob("**/*.rs")))];
-        let result = apply_constraints(&items, &constraints, arena_ptr, arena_ptr).unwrap();
+        let result =
+            apply_constraints(&items, &constraints, LayerArenas::uniform(arena_ptr)).unwrap();
         let paths: Vec<&str> = result.iter().map(|i| i.relative_path).collect();
         assert!(
             !paths.contains(&"src/main.rs"),
@@ -877,6 +914,115 @@ mod tests {
             paths.contains(&"include/fff.h"),
             "h file should be included"
         );
+    }
+
+    #[test]
+    fn literal_punctuation_matches_in_every_glob_strategy() {
+        for (pattern, literal, neighbor) in [
+            ("{a[,]b.rs,a[,]b.rs/**}", "a,b.rs", "axb.rs"),
+            (
+                "{pkg/[{]a[,]b[}],pkg/[{]a[,]b[}]/**}",
+                "pkg/{a,b}/a.rs",
+                "pkg/XaXbY/a.rs",
+            ),
+            #[cfg(unix)]
+            (r"{a[\]b.rs,a[\]b.rs/**}", r"a\b.rs", "axb.rs"),
+        ] {
+            let paths = [literal, neighbor];
+            let compiled = compile_one(pattern).unwrap();
+            assert!(compiled_matches(&compiled, literal), "{pattern}");
+            assert!(!compiled_matches(&compiled, neighbor), "{pattern}");
+            let mut indices = Vec::new();
+            glob_matches_into(&compiled, &paths, &mut indices);
+            assert_eq!(indices, [0], "{pattern}");
+            let items = paths.map(|path| TestItem {
+                relative_path: path,
+                file_name: path.rsplit('/').next().unwrap(),
+            });
+            for constraints in [
+                vec![Constraint::Glob(pattern)],
+                vec![Constraint::Glob(pattern), Constraint::Extension("rs")],
+            ] {
+                let matches =
+                    apply_constraints(&items, &constraints, LayerArenas::uniform(ArenaPtr::null()))
+                        .unwrap();
+                let found: Vec<_> = matches.iter().map(|item| item.relative_path).collect();
+                assert_eq!(found, [literal], "{pattern}");
+            }
+        }
+    }
+
+    #[test]
+    fn path_glob_boundaries_match_in_every_strategy() {
+        let paths = [
+            "src/a.rs",
+            "src/foo.rs",
+            "src/nested/foo.rs",
+            "src/deep/nested/foo.rs",
+            "lib/foo.rs",
+            "lib/nested/foo.rs",
+            "src/a,b.rs",
+            "src/nested/a,b.rs",
+            "src/.hidden/foo.rs",
+        ];
+        let items = paths.map(|path| TestItem {
+            relative_path: path,
+            file_name: path.rsplit('/').next().unwrap(),
+        });
+        for (pattern, expected) in [
+            ("src/*.rs", vec![0, 1, 6]),
+            ("src/?.rs", vec![0]),
+            ("src/*/foo.rs", vec![2, 8]),
+            ("src/**/*.rs", vec![0, 1, 2, 3, 6, 7, 8]),
+            ("src/**/", vec![]),
+            ("**/[^a].rs", vec![]),
+            ("**/[^b].rs", vec![0]),
+            ("src/*a[,]b.rs", vec![6]),
+            ("{src/*.rs,lib/**}", vec![0, 1, 4, 5, 6]),
+            ("{src,lib}/*.rs", vec![0, 1, 4, 6]),
+            ("**/*.{rs,ts}", (0..paths.len()).collect()),
+            ("*.rs", (0..paths.len()).collect()),
+        ] {
+            let compiled = compile_one(pattern).unwrap();
+            let mut indices = Vec::new();
+            glob_matches_into(&compiled, &paths, &mut indices);
+            assert_eq!(indices, expected, "batched {pattern}");
+            for (index, path) in paths.iter().enumerate() {
+                assert_eq!(
+                    compiled_matches(&compiled, path),
+                    expected.contains(&index),
+                    "compiled {pattern}: {path}"
+                );
+            }
+            for negate in [false, true] {
+                let constraint = if negate {
+                    Constraint::Not(Box::new(Constraint::Glob(pattern)))
+                } else {
+                    Constraint::Glob(pattern)
+                };
+                for prefiltered in [false, true] {
+                    let constraints = [constraint.clone()];
+                    let plan = ConstraintPlan::build_with_prefilter(
+                        &constraints,
+                        &items,
+                        LayerArenas::uniform(ArenaPtr::null()),
+                        prefiltered,
+                    );
+                    let found: Vec<_> = plan
+                        .run(&items, LayerArenas::uniform(ArenaPtr::null()))
+                        .iter()
+                        .map(|item| item.relative_path)
+                        .collect();
+                    let expected_paths: Vec<_> = paths
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| expected.contains(index) != negate)
+                        .map(|(_, path)| *path)
+                        .collect();
+                    assert_eq!(found, expected_paths, "{pattern}, negate={negate}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -904,22 +1050,37 @@ mod tests {
         ];
 
         let mixed = vec![Constraint::Extension("rs"), Constraint::Glob("src/**")];
-        let mixed_paths: Vec<&str> = apply_constraints(&items, &mixed, arena_ptr, arena_ptr)
-            .unwrap()
-            .iter()
-            .map(|i| i.relative_path)
-            .collect();
+        let mixed_paths: Vec<&str> =
+            apply_constraints(&items, &mixed, LayerArenas::uniform(arena_ptr))
+                .unwrap()
+                .iter()
+                .map(|i| i.relative_path)
+                .collect();
         assert_eq!(mixed_paths, vec!["src/main.rs"]);
 
         let pure_glob = vec![Constraint::Glob("src/**")];
-        let glob_paths: Vec<&str> = apply_constraints(&items, &pure_glob, arena_ptr, arena_ptr)
-            .unwrap()
-            .iter()
-            .map(|i| i.relative_path)
-            .collect();
+        let glob_paths: Vec<&str> =
+            apply_constraints(&items, &pure_glob, LayerArenas::uniform(arena_ptr))
+                .unwrap()
+                .iter()
+                .map(|i| i.relative_path)
+                .collect();
         assert!(glob_paths.contains(&"src/main.rs"));
         assert!(glob_paths.contains(&"src/lib.ts"));
         assert_eq!(glob_paths.len(), 2);
+        let sparse_plan = ConstraintPlan::build_with_prefilter(
+            &pure_glob,
+            &items,
+            LayerArenas::uniform(arena_ptr),
+            true,
+        );
+        assert!(matches!(sparse_plan.glob, GlobStrategy::Inline(_)));
+        let sparse_paths: Vec<_> = sparse_plan
+            .run(&items, LayerArenas::uniform(arena_ptr))
+            .iter()
+            .map(|i| i.relative_path)
+            .collect();
+        assert_eq!(sparse_paths, glob_paths);
     }
 
     #[test]
@@ -946,11 +1107,12 @@ mod tests {
             Constraint::Extension("rs"),
             Constraint::Not(Box::new(Constraint::Glob("vendor/**"))),
         ];
-        let paths: Vec<&str> = apply_constraints(&items, &constraints, arena_ptr, arena_ptr)
-            .unwrap()
-            .iter()
-            .map(|i| i.relative_path)
-            .collect();
+        let paths: Vec<&str> =
+            apply_constraints(&items, &constraints, LayerArenas::uniform(arena_ptr))
+                .unwrap()
+                .iter()
+                .map(|i| i.relative_path)
+                .collect();
         assert_eq!(paths, vec!["src/main.rs"]);
     }
 }

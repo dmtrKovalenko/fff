@@ -29,6 +29,20 @@ The correct native binary for your platform is installed automatically via platf
 
 If the platform package isn't available, the postinstall script will attempt to download from GitHub releases as a fallback.
 
+### Platforms without a prebuilt package
+
+On a platform that has no `@ff-labs/fff-bin-*` package (e.g. FreeBSD), build the C
+library from source and point `@ff-labs/fff-node` at it with `FFF_C_LIB`:
+
+```bash
+cargo build --release -p fff-c
+FFF_C_LIB=target/release/libfff_c.so node ./app.mjs
+```
+
+`FFF_C_LIB` is checked before the platform package and the local dev build. If the
+path does not exist, resolution fails with an explicit error rather than silently
+falling back. `ffi-rs` has no FreeBSD prebuilt either and must be built from source.
+
 ## Quick Start
 
 Each `FileFinder` instance owns an independent native index. Create one, wait
@@ -126,6 +140,43 @@ Notes:
   returns, the callback will not be invoked again.
 - Watching requires the instance to be created with watching enabled
   (the default).
+
+## Index layers
+
+The path index is a stack: layer 0 is the base scan, on top of it sit up to
+four append-only overlays. Layer 1 is opened automatically and collects
+everything the watcher indexes during the session. Layers only hold paths;
+file contents are never layered.
+
+Add paths that the scanner can't see (generated files, remote checkouts,
+virtual trees) and persist any layer — the base scan included — to a file:
+
+```typescript
+import type { Result } from "@ff-labs/fff-node";
+
+function checked<T>(result: Result<T>): T {
+  if (!result.ok) throw new Error(result.error);
+  return result.value;
+}
+
+const layer = checked(finder.createLayer("generated"));
+const paths = ["build/out/a.js", { path: "build/out/b.js", size: 1024, modified: 1_700_000_000 }];
+checked(finder.addPaths(paths));
+checked(finder.saveLayer(layer, "/tmp/generated.fff"));
+checked(finder.saveLayer(0, "/tmp/base.fff"));
+
+checked(finder.loadLayer("/tmp/generated.fff"));
+checked(finder.loadBase("/tmp/base.fff"));
+if (!checked(await finder.waitForScan())) throw new Error("Base scan timed out");
+
+checked(FileFinder.buildLayerFile(paths, "/tmp/prebuilt.fff", "prebuilt"));
+for (const layer of checked(finder.listLayers())) {
+  console.log(layer.id, layer.label, layer.liveFileCount, layer.isOpen);
+}
+```
+
+Batch paths in one `addPaths` call to reduce FFI overhead. Explicit layers survive a rescan.
+Once the overlay stack is full, FFF compacts the two newest overlays.
 
 ## API Reference
 

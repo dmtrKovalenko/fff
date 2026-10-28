@@ -36,7 +36,7 @@ ignore = "0.4.22"
 memmap2 = "0.9"
 mimalloc = "0.1.47"
 signal-hook-registry = "1.4"
-zlob = { version = "=1.6.5" }
+zlob = { version = "=1.7.1" }
 
 mlua = { version = "0.11.1", features = ["module", "luajit"] }
 neo_frizbee = { version = "0.13.3", features = ["match_end_col"] }

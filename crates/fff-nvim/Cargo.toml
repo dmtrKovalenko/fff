@@ -26,6 +26,7 @@ tracing = { workspace = true }
 # Local crates
 fff = { package = "fff-search", path = "../fff-core", version = "0.11.0", default-features = false, features = [
 	"mimalloc-collect",
+	"definitions",
 ] }
 fff-query-parser = { path = "../fff-query-parser", version = "0.11.0", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }

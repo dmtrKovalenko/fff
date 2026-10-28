@@ -74,7 +74,7 @@ pub(crate) const MAX_PATH_CHUNKS: usize = PATH_BUF_SIZE.div_ceil(SIMD_CHUNK_BYTE
 
 /// A path stored as a run of chunk indices in the owning store's flat index
 /// table. 8 bytes; every read needs the store's `ArenaPtr`.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChunkedString {
     index_offset: u32,
     pub byte_len: u16,
@@ -173,6 +173,11 @@ impl ChunkedString {
     }
 
     #[inline]
+    pub fn index_offset(&self) -> u32 {
+        self.index_offset
+    }
+
+    #[inline]
     pub fn resolve_ptrs<'a>(&self, arena: ArenaPtr, buf: &'a mut [*const u8]) -> &'a [*const u8] {
         let indices = self.indices(arena);
         let count = indices.len().min(buf.len());
@@ -252,7 +257,13 @@ impl ChunkedString {
             }
         }
 
-        unsafe { core::str::from_utf8_unchecked(&buf[..total]) }
+        // A shorter caller-owned buffer can end in the middle of a code point.
+        let len = if total < self.byte_len as usize {
+            core::str::from_utf8(&buf[..total]).map_or_else(|error| error.valid_up_to(), str::len)
+        } else {
+            total
+        };
+        unsafe { core::str::from_utf8_unchecked(&buf[..len]) }
     }
 
     #[inline]
@@ -346,6 +357,27 @@ unsafe impl Send for ChunkedPathStore {}
 unsafe impl Sync for ChunkedPathStore {}
 
 impl ChunkedPathStore {
+    pub fn empty() -> Self {
+        Self {
+            arena: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    pub fn from_parts(arena: Vec<SimdChunk>, indices: Vec<u32>) -> Self {
+        Self { arena, indices }
+    }
+
+    #[inline]
+    pub fn chunks(&self) -> &[SimdChunk] {
+        &self.arena
+    }
+
+    #[inline]
+    pub fn indices(&self) -> &[u32] {
+        &self.indices
+    }
+
     pub fn heap_bytes(&self) -> usize {
         self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
     }
@@ -361,6 +393,9 @@ impl ChunkedPathStore {
     }
 }
 
+// Most paths fit into 64 bytes = 4 chunks; dedup keeps the arena well below that.
+const EST_CHUNKS_PER_PATH: usize = 4;
+
 /// At runtime the builder should be split out from the store after `finish()`.
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkedPathStoreBuilder {
@@ -371,12 +406,33 @@ pub(crate) struct ChunkedPathStoreBuilder {
 
 impl ChunkedPathStoreBuilder {
     pub fn new(estimated_files: usize) -> Self {
-        // most paths fit into 64 bytes = 4 chunks; dedup keeps the arena well below that
-        let est_indices = estimated_files * 4;
+        let est_indices = estimated_files * EST_CHUNKS_PER_PATH;
         Self {
             arena: Vec::with_capacity(est_indices / 2),
             indices: Vec::with_capacity(est_indices),
             chunk_dedup: AHashMap::with_capacity(est_indices / 2),
+        }
+    }
+
+    // Reopens a sealed store: rebuilds the dedup table from its chunks so new
+    // paths keep sharing prefixes with the existing ones.
+    pub fn from_store(store: ChunkedPathStore, extra_files: usize) -> Self {
+        let ChunkedPathStore {
+            mut arena,
+            mut indices,
+        } = store;
+        let extra = extra_files * EST_CHUNKS_PER_PATH;
+        arena.reserve(extra / 2);
+        indices.reserve(extra);
+        let mut chunk_dedup = AHashMap::with_capacity(arena.len() + extra / 2);
+        for (idx, chunk) in arena.iter().enumerate() {
+            chunk_dedup.entry(chunk.0).or_insert(idx as u32);
+        }
+
+        Self {
+            arena,
+            indices,
+            chunk_dedup,
         }
     }
 
@@ -395,6 +451,12 @@ impl ChunkedPathStoreBuilder {
         ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
     }
 
+    /// Chunks + index table, like [`ChunkedPathStore::heap_bytes`]; the dedup
+    /// table is transient and dropped by `finish`.
+    pub fn heap_bytes(&self) -> usize {
+        self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
+    }
+
     /// Like [`add_file_immediate`] but for directory paths where the entire
     /// string is the "directory" portion (filename_offset == byte_len).
     pub fn add_dir_immediate(&mut self, dir_rel_path: &str) -> ChunkedString {
@@ -404,7 +466,28 @@ impl ChunkedPathStoreBuilder {
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
         let index_offset = self.indices.len() as u32;
+        self.add_chunks(path_bytes);
 
+        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
+    }
+
+    pub fn add_file_with_parent(
+        &mut self,
+        rel_path: &str,
+        parent: &ChunkedString,
+    ) -> ChunkedString {
+        let index_offset = self.indices.len() as u32;
+        let parent_chunks = usize::from(parent.byte_len) / SIMD_CHUNK_BYTES;
+        let parent_start = parent.index_offset as usize;
+        // Only complete parent chunks match; the boundary chunk also contains filename bytes.
+        self.indices
+            .extend_from_within(parent_start..parent_start + parent_chunks);
+        self.add_chunks(&rel_path.as_bytes()[parent_chunks * SIMD_CHUNK_BYTES..]);
+
+        ChunkedString::new(index_offset, rel_path.len() as u16, parent.byte_len)
+    }
+
+    fn add_chunks(&mut self, path_bytes: &[u8]) {
         for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
             chunk_bytes[..chunk.len()].copy_from_slice(chunk);
@@ -421,8 +504,6 @@ impl ChunkedPathStoreBuilder {
 
             self.indices.push(arena_idx);
         }
-
-        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
     }
 }
 
@@ -475,6 +556,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn short_path_buffers_stop_at_a_character_boundary() {
+        let (store, paths, _) = build_test_store(&["a/é.rs"]);
+        let mut buf = [0; 3];
+        assert_eq!(paths[0].read_to_buf(store.as_arena_ptr(), &mut buf), "a/");
+    }
+
     fn make_file_item(path: &str) -> crate::types::FileItem {
         let filename_start = path
             .rfind(std::path::is_separator)
@@ -498,6 +586,57 @@ mod tests {
             file.set_path(strings[i].clone());
         }
         (store, strings, files)
+    }
+
+    #[test]
+    fn file_paths_reuse_complete_parent_chunks() {
+        let mut expected = ChunkedPathStoreBuilder::new(0);
+        let mut actual = ChunkedPathStoreBuilder::new(0);
+        let mut paths = Vec::new();
+        for length in 0..=64 {
+            for suffix in ["", "é/", "日本語/🦀/"] {
+                let parent = if length == 0 {
+                    suffix.to_string()
+                } else {
+                    format!("{}/{suffix}", "d".repeat(length))
+                };
+                expected.add_dir_immediate(&parent);
+                let directory = actual.add_dir_immediate(&parent);
+                for filename in ["file.rs", "filename_beyond_one_chunk.txt", "é🦀.rs"] {
+                    let path = format!("{parent}{filename}");
+                    let expected_string = expected.add_file_immediate(&path, parent.len() as u16);
+                    let actual_string = actual.add_file_with_parent(&path, &directory);
+                    assert_eq!(
+                        (
+                            actual_string.index_offset,
+                            actual_string.byte_len,
+                            actual_string.filename_offset,
+                        ),
+                        (
+                            expected_string.index_offset,
+                            expected_string.byte_len,
+                            expected_string.filename_offset,
+                        ),
+                    );
+                    paths.push((path, actual_string));
+                }
+            }
+        }
+        let expected = expected.finish();
+        let actual = actual.finish();
+        assert_eq!(actual.indices, expected.indices);
+        assert_eq!(
+            actual.arena.iter().map(|chunk| chunk.0).collect::<Vec<_>>(),
+            expected
+                .arena
+                .iter()
+                .map(|chunk| chunk.0)
+                .collect::<Vec<_>>(),
+        );
+        let mut buffer = [0; PATH_BUF_SIZE];
+        for (path, string) in paths {
+            assert_eq!(string.read_to_buf(actual.as_arena_ptr(), &mut buffer), path);
+        }
     }
 
     #[test]

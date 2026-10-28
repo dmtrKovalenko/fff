@@ -11,6 +11,8 @@ struct Pending {
     paths: AHashSet<PathBuf>,
     full_rescan: bool,
     shutdown: bool,
+    // the consumer took a batch and has not applied it yet
+    running: bool,
 }
 
 impl Pending {
@@ -24,14 +26,21 @@ pub(crate) struct GitStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
+    // owned by `SharedPickerInner` so the pause survives picker re-creation
+    paused: Arc<AtomicBool>,
 }
 
 impl GitStatusWorker {
     pub(crate) fn new() -> Arc<Self> {
+        Self::with_pause_flag(Arc::default())
+    }
+
+    pub(crate) fn with_pause_flag(paused: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             consumer_spawned: AtomicBool::new(false),
+            paused,
         })
     }
 
@@ -54,6 +63,9 @@ impl GitStatusWorker {
         I: IntoIterator<Item = PathBuf>,
     {
         let mut guard = self.state.lock();
+        if self.paused.load(Ordering::Acquire) {
+            return;
+        }
         guard.paths.extend(paths);
         drop(guard);
         self.cv.notify_one();
@@ -61,9 +73,28 @@ impl GitStatusWorker {
 
     pub(crate) fn request_full_rescan(&self) {
         let mut guard = self.state.lock();
+        if self.paused.load(Ordering::Acquire) {
+            return;
+        }
         guard.full_rescan = true;
         drop(guard);
         self.cv.notify_one();
+    }
+
+    // the caller flips `paused` first, so nothing can be queued after this
+    pub(crate) fn drop_pending(&self) {
+        let mut guard = self.state.lock();
+        guard.paths.clear();
+        guard.full_rescan = false;
+    }
+
+    // without a consumer nothing will ever run, so there is nothing to wait for
+    pub(crate) fn is_idle(&self) -> bool {
+        if !self.consumer_spawned.load(Ordering::Acquire) {
+            return true;
+        }
+        let guard = self.state.lock();
+        guard.shutdown || (!guard.has_work() && !guard.running)
     }
 
     pub(crate) fn signal_shutdown(&self) {
@@ -81,7 +112,13 @@ impl GitStatusWorker {
         if guard.shutdown {
             return None;
         }
-        Some(std::mem::take(&mut *guard))
+        let work = std::mem::take(&mut *guard);
+        guard.running = true;
+        Some(work)
+    }
+
+    fn finish_batch(&self) {
+        self.state.lock().running = false;
     }
 
     // the problem: git status update can take a lot of time especially on big repositories
@@ -111,10 +148,36 @@ impl GitStatusWorker {
                             tracing::error!("git-status worker: path update failed: {e:?}");
                         }
                     }
+
+                    mailbox.finish_batch();
                 }
 
                 tracing::info!("git-status worker stopped");
             })
             .inspect_err(|err| tracing::error!(?err, "Failed to spawn git status worker"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stays_busy_until_the_taken_batch_is_applied() {
+        let worker = GitStatusWorker::new();
+        worker.consumer_spawned.store(true, Ordering::Release);
+        assert!(worker.is_idle());
+
+        worker.request_full_rescan();
+        assert!(!worker.is_idle());
+
+        assert!(worker.wait_and_take().unwrap().full_rescan);
+        assert!(
+            !worker.is_idle(),
+            "queue is empty but the batch is not applied"
+        );
+
+        worker.finish_batch();
+        assert!(worker.is_idle());
     }
 }

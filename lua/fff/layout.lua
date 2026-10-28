@@ -26,7 +26,8 @@ local T_JUNCTION_PRESETS = {
 -- respecting the user's global preference.
 local function get_border_chars(config)
   local border = config and config.layout and config.layout.border
-  if border == nil or border == '' then border = vim.o.winborder end
+  -- 'winborder' only exists on Neovim 0.11+, reading it on 0.10 throws
+  if (border == nil or border == '') and vim.fn.exists('+winborder') == 1 then border = vim.o.winborder end
   if border == nil or border == '' then border = 'single' end
 
   if type(border) == 'table' then

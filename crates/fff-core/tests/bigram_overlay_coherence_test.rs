@@ -1087,6 +1087,22 @@ fn bigram_overlay_coherence_fuzzy_search_base_overflow_and_deleted() {
             results.iter().any(|p| p.contains("controller_user")),
             "should find controller_user.rs"
         );
+
+        let file = picker
+            .get_file_by_path(base.join("controller_auth.rs"))
+            .unwrap();
+        file.set_deleted(true);
+        assert!(
+            !fuzzy_search_paths(picker, "contr")
+                .iter()
+                .any(|p| p == "controller_auth.rs")
+        );
+        file.set_deleted(false);
+        assert!(
+            fuzzy_search_paths(picker, "contro")
+                .iter()
+                .any(|p| p == "controller_auth.rs")
+        );
     }
 
     std::thread::sleep(Duration::from_millis(1100));
@@ -1318,7 +1334,7 @@ fn grep_opts() -> GrepSearchOptions {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     }

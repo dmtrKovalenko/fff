@@ -238,6 +238,26 @@ static int watch_smoke(void) {
     return 0;
 }
 
+static int layer_batch_smoke(void *picker) {
+    const char paths[] = "virtual/first\nfile\0virtual/second";
+    const struct { size_t len, count; } malformed[] = {
+        {sizeof(paths) - 1, 2}, /* missing final NUL */
+        {sizeof(paths), 1},    /* more paths than metadata */
+        {sizeof(paths), 3},    /* fewer paths than metadata */
+    };
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); ++i) {
+        struct FffResult *r = fff_layer_add_paths(picker, paths, malformed[i].len,
+                                                   NULL, NULL, malformed[i].count);
+        int accepted = r->success;
+        fff_free_result(r);
+        if (accepted) return 1;
+    }
+    struct FffResult *r = fff_layer_add_paths(picker, paths, sizeof(paths), NULL, NULL, 2);
+    int added = r->success && r->int_value == 2;
+    fff_free_result(r);
+    return !added;
+}
+
 int main(int argc, char **argv) {
     const char *base_path = argc > 1 ? argv[1] : ".";
 
@@ -276,6 +296,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     fff_free_result(scan_result);
+
+    if (layer_batch_smoke(file_picker)) {
+        fprintf(stderr, "FAIL: invalid layer batch handling\n");
+        fff_destroy(file_picker);
+        return 1;
+    }
 
     struct FffResult *res = fff_search(file_picker, "smkoe.c", "", 0, 0, 50, 0, 0);
     if (!res->success) {

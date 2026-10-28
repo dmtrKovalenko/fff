@@ -139,7 +139,7 @@ fn budget_opts(mode: GrepMode, enforce_time_budget: bool) -> GrepSearchOptions {
         enforce_time_budget,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     }

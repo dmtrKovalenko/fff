@@ -31,10 +31,12 @@
 use crate::FFFStringStorage;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
-use crate::frecency::FrecencyTracker;
-use crate::git::GitStatusCache;
+use crate::frecency::{FrecencyReader, FrecencyTracker};
+use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
+use crate::index::layers::{LayerArenas, LayerStack};
+use crate::index::path_index::PathIndex;
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
@@ -65,7 +67,9 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
-use crate::parallelism::{BACKGROUND_THREAD_POOL, SEARCH_THREAD_POOL};
+use crate::parallelism::{SEARCH_THREAD_POOL, indexing_pool};
+
+mod layer_ops;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FFFMode {
@@ -96,7 +100,10 @@ pub struct FuzzySearchOptions<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileSync {
-    pub(crate) git_workdir: Option<PathBuf>,
+    pub(crate) git: Option<GitDiscovery>,
+    // Base path re-rooted into the main checkout when indexing a linked git worktree,
+    // frecency and query history are keyed by it so all worktrees share one history
+    shared_base: Option<PathBuf>,
     /// Base files laid out in two partitions, each internally sorted by
     /// (parent_dir, filename):
     ///   `files[..indexable_count]` - indexable
@@ -107,6 +114,8 @@ pub(crate) struct FileSync {
     base_count: usize,
     /// Number of active present files that exists in the file system
     pub(crate) live_count: usize,
+    // Files appended by watcher events since the last scan. Imported layers have their own reserve.
+    watcher_additions: usize,
     /// Sorted directory table. `StableVec` so post-scan snapshots can keep
     /// the allocation alive across a picker drop without copying, and so
     /// concurrent readers observe a consistent view via the same shared
@@ -118,9 +127,13 @@ pub(crate) struct FileSync {
     base_dirs_count: usize,
     /// Number of dirs with at least one live file (mirrors `live_count`).
     live_dirs_count: usize,
-    /// Shared builder for overflow file paths. Each overflow file's ChunkedString
-    /// uses `arena_override` pointing into this builder's arena.
-    overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
+    /// Overlay layers stacked on the base arena. Each layer owns a contiguous
+    /// suffix of `files`/`dirs` plus its own path arena.
+    layers: LayerStack,
+    /// Point lookups into the unsorted regions: the open top layer's files
+    /// and every overlay dir.
+    open_file_index: PathIndex,
+    overlay_dir_index: PathIndex,
     bigram_index: Option<Arc<BigramFilter>>,
     bigram_overlay: Option<Arc<parking_lot::RwLock<BigramOverlay>>>,
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
@@ -138,11 +151,15 @@ impl FileSync {
             indexable_count: 0,
             base_count: 0,
             live_count: 0,
+            watcher_additions: 0,
             dirs: StableVec::from_vec_with_reserve(Vec::new(), MAX_OVERFLOW_FILES),
             base_dirs_count: 0,
             live_dirs_count: 0,
-            overflow_builder: None,
-            git_workdir: None,
+            layers: LayerStack::new(0, 0),
+            open_file_index: PathIndex::default(),
+            overlay_dir_index: PathIndex::default(),
+            git: None,
+            shared_base: None,
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: None,
@@ -160,19 +177,17 @@ impl FileSync {
 
     #[inline]
     fn arena_overflow_ptr(&self) -> ArenaPtr {
-        self.overflow_builder
-            .as_ref()
-            .map(|b| b.as_arena_ptr())
-            .unwrap_or(ArenaPtr::null())
+        self.layers.top_arena()
+    }
+
+    #[inline]
+    fn layer_arenas(&self) -> LayerArenas {
+        self.layers.arenas(self.arena_base_ptr())
     }
 
     #[inline]
     fn arena_for_file(&self, file: &FileItem) -> ArenaPtr {
-        if file.is_overflow() {
-            self.arena_overflow_ptr()
-        } else {
-            self.arena_base_ptr()
-        }
+        self.layer_arenas().get(file.layer_id())
     }
 
     #[inline]
@@ -187,28 +202,32 @@ impl FileSync {
 
     #[inline]
     fn get_file_mut(&mut self, index: usize) -> Option<(ArenaPtr, &mut FileItem)> {
-        Some((
-            if index < self.base_count {
-                self.arena_base_ptr()
-            } else {
-                self.arena_overflow_ptr()
-            },
-            self.files.get_mut(index)?,
-        ))
+        let arenas = self.layer_arenas();
+        let file = self.files.get_mut(index)?;
+        Some((arenas.get(file.layer_id()), file))
     }
 
     #[inline]
     fn find_file_index(&self, path: &Path, base_path: &Path) -> Option<usize> {
+        self.find_file_index_with(path, base_path, |dir| self.find_base_dir_index(dir))
+    }
+
+    fn find_file_index_with(
+        &self,
+        path: &Path,
+        base_path: &Path,
+        find_dir: impl FnOnce(&str) -> Option<usize>,
+    ) -> Option<usize> {
         // Strip base_path prefix to get the relative path. On Windows this
         // can fail for 8.3 short names or a different casing; fall back to
         // canonicalize-then-strip so watcher events still land on the right
         // `FileItem`.
-        let rel_path_owned: String = match path.strip_prefix(base_path) {
-            Ok(r) => r.to_string_lossy().into_owned(),
+        let rel_path = match path.strip_prefix(base_path) {
+            Ok(r) => r.to_string_lossy(),
             Err(_) => {
                 #[cfg(windows)]
                 {
-                    canonical_relative_path(path, base_path)?
+                    std::borrow::Cow::Owned(canonical_relative_path(path, base_path)?)
                 }
                 #[cfg(not(windows))]
                 {
@@ -218,31 +237,45 @@ impl FileSync {
         };
         // The dir table and stored file paths are '/'-canonical; fold the
         // native relative path so the byte-wise comparisons below match.
-        self.find_by_relative_path(&crate::path_utils::to_canonical_slashes(&rel_path_owned))
+        self.find_by_relative_path_with(
+            &crate::path_utils::to_canonical_slashes(&rel_path),
+            self.files.len(),
+            find_dir,
+        )
     }
 
-    // Lookup for a base-relative, '/'-canonical path — the form paths are
-    // stored in, so no normalization is needed.
-    fn find_by_relative_path(&self, rel_path: &str) -> Option<usize> {
+    fn find_base_dir_index(&self, dir: &str) -> Option<usize> {
         let arena = self.arena_base_ptr();
+        let mut buf = [0; PATH_BUF_SIZE];
+        self.dirs[..self.base_dirs_count]
+            .binary_search_by(|d| d.read_relative_path(arena, &mut buf).cmp(dir))
+            .ok()
+    }
 
+    fn find_relative_path_index(&self, path: &str) -> Option<usize> {
+        self.lookup_relative_path(path, self.files.len())
+    }
+
+    fn lookup_relative_path(&self, path: &str, files_end: usize) -> Option<usize> {
+        self.find_by_relative_path_with(path, files_end, |dir| self.find_base_dir_index(dir))
+    }
+
+    fn find_by_relative_path_with(
+        &self,
+        relative_path: &str,
+        files_end: usize,
+        find_dir: impl FnOnce(&str) -> Option<usize>,
+    ) -> Option<usize> {
+        let arena = self.arena_base_ptr();
         // Split into directory (with trailing '/') and filename.
-        let parent_end = rel_path
+        let parent_end = relative_path
             .rfind(std::path::is_separator)
             .map(|i| i + 1)
             .unwrap_or(0);
-        let dir_rel = &rel_path[..parent_end];
-        let filename = &rel_path[parent_end..];
+        let dir_rel = &relative_path[..parent_end];
+        let filename = &relative_path[parent_end..];
 
-        // Binary search dirs to find the parent directory index.
-        // Dir items store the relative path including trailing '/' (e.g. "src/components/").
-        // Only the scan-built region is sorted; watcher-appended dirs are not.
-        let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        let dir_idx = self.dirs[..self.base_dirs_count]
-            .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
-            .ok();
-
-        if let Some(dir_idx) = dir_idx {
+        if let Some(dir_idx) = find_dir(dir_rel) {
             let dir_idx = dir_idx as u32;
             let cmp_key = |f: &FileItem| {
                 f.parent_dir_index.cmp(&dir_idx).then_with(|| {
@@ -265,14 +298,29 @@ impl FileSync {
             }
         }
 
-        // Overflow region: linear scan by full relative path.
-        if self.base_count < self.files.len() {
-            let overflow_arena = self.arena_overflow_ptr();
-            if let Some(pos) = self.files[self.base_count..]
-                .iter()
-                .position(|f| f.relative_path_eq(overflow_arena, rel_path))
-            {
-                return Some(self.base_count + pos);
+        let key = (dir_rel.as_bytes(), filename.as_bytes());
+        for (start, end, layer_arena, sorted) in self.layers.lookup_ranges(files_end) {
+            if start >= files_end {
+                break;
+            }
+            let found = if sorted {
+                let mut dir_buf = [0; PATH_BUF_SIZE];
+                self.files[start..end]
+                    .binary_search_by(|f| {
+                        let path = f.path.read_to_buf(layer_arena, &mut dir_buf);
+                        crate::index::snapshot::dir_name_key(path, f.path.filename_offset).cmp(&key)
+                    })
+                    .ok()
+                    .map(|pos| start + pos)
+            } else {
+                self.open_file_index
+                    .lookup(start, end, relative_path, &mut |slot, buf| {
+                        self.files[slot].path.read_to_buf(layer_arena, buf).len()
+                    })
+            };
+
+            if found.is_some() {
+                return found;
             }
         }
 
@@ -287,20 +335,14 @@ impl FileSync {
         F: FnMut(&FileItem, ArenaPtr) -> bool,
         T: FnMut(&mut FileItem, ArenaPtr),
     {
-        let base_arena = self.arena_base_ptr();
-        let overflow_arena = self.arena_overflow_ptr();
-        let base_count = self.base_count;
+        let arenas = self.layer_arenas();
 
         let mut tombstoned = 0usize;
-        for (idx, file) in self.files.iter_mut().enumerate() {
+        for file in self.files.iter_mut() {
             if file.is_deleted() {
                 continue;
             }
-            let arena = if idx < base_count {
-                base_arena
-            } else {
-                overflow_arena
-            };
+            let arena = arenas.get(file.layer_id());
             if predicate(file, arena) {
                 on_tombstone(file, arena);
                 file.set_deleted(true);
@@ -317,20 +359,14 @@ impl FileSync {
     where
         F: FnMut(&DirItem, ArenaPtr) -> bool,
     {
-        let base_arena = self.arena_base_ptr();
-        let overflow_arena = self.arena_overflow_ptr();
-        let base_dirs_count = self.base_dirs_count;
+        let arenas = self.layer_arenas();
 
         let mut removed = 0usize;
-        for (idx, dir) in self.dirs.iter_mut().enumerate() {
+        for dir in self.dirs.iter_mut() {
             if dir.is_deleted() {
                 continue;
             }
-            let arena = if idx < base_dirs_count {
-                base_arena
-            } else {
-                overflow_arena
-            };
+            let arena = arenas.get(dir.layer_id());
             if predicate(dir, arena) && dir.set_deleted(true) {
                 removed += 1;
             }
@@ -358,12 +394,18 @@ impl FileSync {
             return Some(idx);
         }
 
-        // Watcher-appended region: unsorted, small (bounded by overflow cap).
-        let overflow_arena = self.arena_overflow_ptr();
-        self.dirs[self.base_dirs_count..]
-            .iter()
-            .position(|d| d.read_relative_path(overflow_arena, &mut dir_buf) == dir_rel)
-            .map(|pos| self.base_dirs_count + pos)
+        // Overlay region: unsorted, hash indexed.
+        let arenas = self.layer_arenas();
+        self.overlay_dir_index.lookup(
+            self.base_dirs_count,
+            self.dirs.len(),
+            dir_rel,
+            &mut |slot, buf| {
+                let dir = &self.dirs[slot];
+                dir.read_relative_path(arenas.get(dir.layer_id()), buf)
+                    .len()
+            },
+        )
     }
 
     /// Finds or appends the DirItem for `dir_rel`, returning its index.
@@ -373,10 +415,8 @@ impl FileSync {
             return Some(idx as u32);
         }
 
-        let builder = self.overflow_builder.get_or_insert_with(|| {
-            crate::simd_path::ChunkedPathStoreBuilder::new(MAX_OVERFLOW_FILES)
-        });
-        let chunked = builder.add_dir_immediate(dir_rel);
+        let layer = self.ensure_open_top();
+        let chunked = self.layers.top_builder().add_dir_immediate(dir_rel);
 
         let last_seg = if dir_rel.is_empty() {
             0
@@ -389,7 +429,10 @@ impl FileSync {
         };
 
         let idx = self.dirs.len();
-        if !self.dirs.push(DirItem::new_overflow(chunked, last_seg)) {
+        if !self
+            .dirs
+            .push(DirItem::new_in_layer(chunked, last_seg, layer))
+        {
             return None;
         }
         self.live_dirs_count += 1;
@@ -431,14 +474,15 @@ impl FileItem {
             None => (0, 0),
         };
 
-        let is_binary = is_known_binary_extension(&path);
+        let is_binary = is_binary_file(&path);
 
         let filename_start = relative_path
             .rfind(std::path::is_separator)
             .map(|i| i + 1)
             .unwrap_or(0) as u16;
 
-        let item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
+        let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
+        item.mark_definition_language(&relative_path);
         (item, relative_path)
     }
 
@@ -479,7 +523,7 @@ impl FileItem {
         size: u64,
         modified: u64,
     ) -> (Self, String) {
-        let is_binary = is_known_binary_extension(path);
+        let is_binary = is_binary_file(path);
 
         let rel = pathdiff::diff_paths(path, base_path).unwrap_or_else(|| path.to_path_buf());
         // The index is '/'-canonical on every platform; fold native separators.
@@ -489,7 +533,8 @@ impl FileItem {
             .map(|i| i + 1)
             .unwrap_or(0) as u16;
 
-        let item = Self::new_raw(fname_offset, size, modified, git_status, is_binary);
+        let mut item = Self::new_raw(fname_offset, size, modified, git_status, is_binary);
+        item.mark_definition_language(&rel_str);
         (item, rel_str)
     }
 
@@ -510,7 +555,7 @@ impl FileItem {
         size: u64,
         modified: u64,
     ) -> (Self, String) {
-        let is_binary = is_known_binary_extension(path);
+        let is_binary = is_binary_file(path);
         // SAFETY-ish: paths on macOS/Linux are bytes; lossy conversion mirrors
         // the existing `to_string_lossy()` behavior on non-UTF8 names.
         let decoded = String::from_utf8_lossy(relative_path).into_owned();
@@ -524,24 +569,33 @@ impl FileItem {
         } else {
             String::from_utf8_lossy(dir_bytes).len() as u16
         };
-        let item = Self::new_raw(basename_offset, size, modified, git_status, is_binary);
+        let mut item = Self::new_raw(basename_offset, size, modified, git_status, is_binary);
+        item.mark_definition_language(&decoded);
         (item, decoded)
     }
 
     pub(crate) fn update_frecency_scores(
         &mut self,
-        tracker: &FrecencyTracker,
+        reader: &FrecencyReader,
         arena: ArenaPtr,
         base_path: &Path,
+        shared_base: Option<&Path>,
         mode: FFFMode,
-    ) -> Result<(), Error> {
+    ) {
         let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         let abs = self.write_absolute_path(arena, base_path, &mut abs_buf);
-        self.access_frecency_score = tracker.get_access_score(abs, mode) as i16;
-        self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
+        let access_score = match shared_base {
+            Some(shared_base) => {
+                let mut shared_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                let shared = self.write_absolute_path(arena, shared_base, &mut shared_buf);
+                reader.access_score(&abs, Some(&shared), mode)
+            }
+            None => reader.access_score(&abs, None, mode),
+        };
 
-        Ok(())
+        self.access_frecency_score = access_score as i16;
+        self.modification_frecency_score =
+            reader.modification_score(self.modified, self.git_status, mode) as i16;
     }
 }
 
@@ -634,7 +688,30 @@ impl std::fmt::Debug for FilePicker {
 impl FFFStringStorage for &FilePicker {
     #[inline]
     fn arena_for(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
+        let files = self.get_files();
+        if !files.as_ptr_range().contains(&std::ptr::from_ref(file)) {
+            assert!(
+                self.files_in_layer(file.layer_id())
+                    .iter()
+                    .any(|live| live.path == file.path),
+                "file path no longer belongs to this index"
+            );
+        }
         self.sync_data.arena_for_file(file)
+    }
+
+    #[inline]
+    fn arena_for_dir(&self, dir: &DirItem) -> crate::simd_path::ArenaPtr {
+        let dirs = &self.sync_data.dirs;
+        if !dirs.as_ptr_range().contains(&std::ptr::from_ref(dir)) {
+            assert!(
+                self.dirs_in_layer(dir.layer_id()).iter().any(|live| {
+                    live.path == dir.path && live.last_segment_offset() == dir.last_segment_offset()
+                }),
+                "directory path no longer belongs to this index"
+            );
+        }
+        self.arena_for_layer(dir.layer_id())
     }
 
     #[inline]
@@ -646,6 +723,11 @@ impl FFFStringStorage for &FilePicker {
     fn overflow_arena(&self) -> crate::simd_path::ArenaPtr {
         self.sync_data.arena_overflow_ptr()
     }
+
+    #[inline]
+    fn arena_for_layer(&self, layer: crate::index::layers::LayerId) -> crate::simd_path::ArenaPtr {
+        self.sync_data.layer_arenas().get(layer)
+    }
 }
 
 impl FilePicker {
@@ -654,7 +736,7 @@ impl FilePicker {
     }
 
     pub fn has_git_repo(&self) -> bool {
-        self.sync_data.git_workdir.is_some()
+        self.sync_data.git.is_some()
     }
 
     /// Ignore rules the walker assembled during the last scan (zlob backend
@@ -729,7 +811,26 @@ impl FilePicker {
     /// Absolute path to the repository root if the indexed tree lives
     /// inside a git working directory. `None` for non-git bases.
     pub fn git_root(&self) -> Option<&Path> {
-        self.sync_data.git_workdir.as_deref()
+        self.sync_data.git.as_ref().map(|git| git.workdir.as_path())
+    }
+
+    /// Path keying the project history: frecency, query history and combo boosts.
+    /// Inside a linked git worktree it is the main checkout twin of the base path.
+    pub fn shared_base_path(&self) -> &Path {
+        self.sync_data
+            .shared_base
+            .as_deref()
+            .unwrap_or(&self.base_path)
+    }
+
+    /// Main checkout twin of `path` when the picker indexes a linked git worktree.
+    pub fn shared_path_for(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
+        let shared_base = self.sync_data.shared_base.as_deref()?;
+        crate::git::shared_twin(path.as_ref(), &self.base_path, shared_base)
+    }
+
+    pub(crate) fn worktree_shared_base(&self) -> Option<&Path> {
+        self.sync_data.shared_base.as_deref()
     }
 
     pub fn has_explicit_cache_budget(&self) -> bool {
@@ -757,13 +858,24 @@ impl FilePicker {
         self.sync_data.overflow_files()
     }
 
+    // Files appended to the writable top layer; imported layers grow the
+    // tables themselves and never count against the watcher cap.
+    pub(crate) fn open_layer_file_count(&self) -> usize {
+        let sync = &self.sync_data;
+        if !sync.layers.top_is_open() {
+            return 0;
+        }
+        sync.layers
+            .file_range(sync.layers.top_id(), sync.files.len())
+            .map_or(0, |(start, end)| end - start)
+    }
+
     /// Get the directory table (sorted by path).
     pub fn get_dirs(&self) -> &[DirItem] {
         &self.sync_data.dirs
     }
 
-    /// Actual heap bytes used: (chunked_path_store, 0, 0).
-    /// The second element is 0 because leaked overflow stores aren't tracked.
+    /// Actual heap bytes used: (base arena, overlay layer arenas, 0).
     pub fn arena_bytes(&self) -> (usize, usize, usize) {
         let chunked = self
             .sync_data
@@ -771,7 +883,7 @@ impl FilePicker {
             .as_ref()
             .map_or(0, |s| s.heap_bytes());
 
-        (chunked, 0, 0)
+        (chunked, self.sync_data.layers.overlay_arena_bytes(), 0)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -780,8 +892,7 @@ impl FilePicker {
         let base = self.base_path.as_path();
 
         if !dir_table.is_empty() {
-            let arena = self.arena_base_ptr();
-            let overflow_arena = self.sync_data.arena_overflow_ptr();
+            let arenas = self.sync_data.layer_arenas();
             let mut path_buf = PathBuf::with_capacity(crate::simd_path::PATH_BUF_SIZE);
             let mut prev_relative_path = String::new();
 
@@ -790,11 +901,7 @@ impl FilePicker {
                 if dir_item.is_deleted() {
                     continue;
                 }
-                let item_arena = if dir_item.is_overflow() {
-                    overflow_arena
-                } else {
-                    arena
-                };
+                let item_arena = arenas.get(dir_item.layer_id());
                 let full_relative_path = dir_item.read_relative_path(item_arena, &mut scratch_buf);
                 let relative_path = full_relative_path.trim_end_matches(std::path::is_separator);
 
@@ -947,7 +1054,10 @@ impl FilePicker {
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let picker = Self::new(options)?;
+        let mut picker = Self::new(options)?;
+        picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
+            shared_picker.git_status_pause_flag(),
+        );
 
         info!(
             "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
@@ -970,12 +1080,7 @@ impl FilePicker {
         let path = picker.base_path.clone();
         let trace_span = picker.trace_span.clone();
 
-        // Pre-arm `scanning` BEFORE publishing the new picker. `ScanJob::spawn`
-        // also sets it, but that runs after this function returns; consumers
-        // (e.g. lua `wait_for_initial_scan` after `restart_index_in_path`)
-        // that grab the signal Arc between publish and spawn would otherwise
-        // observe scanning=false and skip the wait, racing the walker. The
-        // race is wide on Windows CI where notify is slow.
+        // Publish the initial picker with its scan already reserved.
         signals
             .scanning
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1022,30 +1127,36 @@ impl FilePicker {
     /// // picker.get_files() is now populated
     /// ```
     pub fn collect_files(&mut self) -> Result<(), Error> {
-        self.signals.scanning.store(true, Ordering::Relaxed);
+        if self.is_scan_active()
+            || self
+                .signals
+                .post_scan_indexing_active
+                .load(Ordering::Acquire)
+        {
+            return Err(Error::IndexBusy);
+        }
+        let _scanning = crate::scan::ScanningGuard::new(&self.signals);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git_workdir = FileSync::discover_git_workdir(&self.base_path);
-        let git_handle = git_workdir.clone().map(FileSync::spawn_git_status);
+        let git = FileSync::discover_git(&self.base_path);
+        let git_handle = git
+            .as_ref()
+            .map(|git| FileSync::spawn_git_status(git.workdir.clone()));
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
             &self.base_path,
-            git_workdir,
+            git,
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
         )?;
 
-        self.sync_data = sync;
-        *self.fuzzy_cache.get_mut() = None;
-
+        let file_count = sync.files().len();
+        self.commit_new_sync(sync);
         if !self.has_explicit_cache_budget {
-            let file_count = self.sync_data.files().len();
             self.cache_budget = Arc::new(ContentCacheBudget::new_for_repo(file_count));
-        } else {
-            self.cache_budget.reset();
         }
 
         if let Some(handle) = git_handle
@@ -1054,8 +1165,9 @@ impl FilePicker {
             let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
 
             let arena = self.arena_base_ptr();
-            for file in self.sync_data.files.iter_mut() {
-                file.git_status = git_cache.lookup_status(file.write_absolute_path(
+            let base_count = self.sync_data.base_count;
+            for file in self.sync_data.files.iter_mut().take(base_count) {
+                file.git_status = git_cache.lookup_status(&file.write_absolute_path(
                     arena,
                     &self.base_path,
                     &mut path_buf,
@@ -1063,7 +1175,7 @@ impl FilePicker {
             }
         }
 
-        if let Some(workdir) = self.sync_data.git_workdir.clone()
+        if let Some(workdir) = self.git_root().map(Path::to_path_buf)
             && let Ok(repo) = Repository::open(&workdir)
                 .inspect_err(|e| debug!(?e, ?workdir, "git recency: failed to open repo"))
         {
@@ -1072,7 +1184,6 @@ impl FilePicker {
             self.apply_git_recency(recency.as_ref());
         }
 
-        self.signals.scanning.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1146,21 +1257,21 @@ impl FilePicker {
 
         let time = std::time::Instant::now();
 
-        let base_arena = self.sync_data.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
+        let arenas = self.sync_data.layer_arenas();
+        let overlay_ranges = self.sync_data.layers.file_ranges(files.len());
 
         let mut cache = self.fuzzy_cache.lock().take();
         let (items, scores, total_matched) = fuzzy_match_and_score_files(
             files,
             &context,
             self.sync_data.base_count,
-            base_arena,
-            overflow_arena,
+            arenas,
+            &overlay_ranges,
             &mut cache,
         );
         *self.fuzzy_cache.lock() = cache;
         let match_byte_offsets =
-            fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
+            fuzzy_match_byte_offsets_for_page(query, &items, max_typos, arenas);
 
         info!(
             ?query,
@@ -1220,12 +1331,11 @@ impl FilePicker {
             pagination: options.pagination,
         };
 
-        let arena = self.sync_data.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
+        let arenas = self.sync_data.layer_arenas();
         let time = std::time::Instant::now();
 
         let (items, scores, total_matched) =
-            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena, overflow_arena);
+            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arenas);
 
         info!(
             ?query,
@@ -1401,8 +1511,7 @@ impl FilePicker {
     /// cancellation flag, giving the caller full control over when to stop.
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
-        let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
+        let arenas = self.sync_data.layer_arenas();
         let cancel = options
             .abort_signal
             .as_deref()
@@ -1419,8 +1528,7 @@ impl FilePicker {
                 overlay_guard.as_deref(),
                 cancel,
                 &self.base_path,
-                arena,
-                overflow_arena,
+                arenas,
             )
         })
     }
@@ -1433,8 +1541,7 @@ impl FilePicker {
         options: &GrepSearchOptions,
     ) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
-        let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
+        let arenas = self.sync_data.layer_arenas();
         let cancel = options
             .abort_signal
             .as_deref()
@@ -1451,8 +1558,7 @@ impl FilePicker {
                 overlay_guard.as_deref(),
                 cancel,
                 &self.base_path,
-                arena,
-                overflow_arena,
+                arenas,
             )
         })
     }
@@ -1528,8 +1634,10 @@ impl FilePicker {
         })
     }
 
+    // Explicit layers outlive a rescan; the base and session layer are rebuilt.
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        self.sync_data = sync;
+        let mut old = std::mem::replace(&mut self.sync_data, sync);
+        self.sync_data.adopt_overlays(&mut old);
         *self.fuzzy_cache.get_mut() = None;
         self.cache_budget.reset();
     }
@@ -1552,15 +1660,37 @@ impl FilePicker {
 
         let mode = self.mode;
         let bp = self.base_path.clone();
+        let shared_base = self.sync_data.shared_base.clone();
         let frecency = shared_frecency.read()?;
+        let reader = frecency.as_ref().map(FrecencyTracker::reader);
 
+        let mut directories =
+            (status_cache.statuses_len() >= 8192).then(AHashMap::<String, Option<usize>>::new);
         status_cache
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
-                if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
+                let index = if let Some(cache) = directories.as_mut() {
+                    self.sync_data.find_file_index_with(&path, &bp, |dir| {
+                        if let Some(&index) = cache.get(dir) {
+                            return index;
+                        }
+                        let index = self.sync_data.find_base_dir_index(dir);
+                        cache.insert(dir.to_owned(), index);
+                        index
+                    })
+                } else {
+                    self.sync_data.find_file_index(&path, &bp)
+                };
+                if let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) {
                     file.git_status = Some(status);
-                    if let Some(ref f) = *frecency {
-                        file.update_frecency_scores(f, arena, &bp, mode)?;
+                    if let Some(reader) = reader.as_ref() {
+                        file.update_frecency_scores(
+                            reader,
+                            arena,
+                            &bp,
+                            shared_base.as_deref(),
+                            mode,
+                        );
                     }
                     // Update parent dir frecency inline. `DirItem` has an
                     // interior-mutable atomic score, so `&self` access is
@@ -1597,7 +1727,7 @@ impl FilePicker {
 
         let mut applied = 0usize;
         for (relative_path, score) in scores {
-            if let Some(index) = self.sync_data.find_by_relative_path(relative_path)
+            if let Some(index) = self.sync_data.find_relative_path_index(relative_path)
                 && let Some((_, file)) = self.sync_data.get_file_mut(index)
             {
                 file.git_recency_score = *score;
@@ -1619,8 +1749,15 @@ impl FilePicker {
             return Ok(());
         };
 
+        let shared_base = self.sync_data.shared_base.clone();
         if let Some((arena, file)) = self.sync_data.get_file_mut(index) {
-            file.update_frecency_scores(frecency_tracker, arena, &self.base_path, self.mode)?;
+            file.update_frecency_scores(
+                &frecency_tracker.reader(),
+                arena,
+                &self.base_path,
+                shared_base.as_deref(),
+                self.mode,
+            );
 
             // Update parent dir frecency inline (atomic, &self access).
             let score = file.access_frecency_score as i32;
@@ -1645,7 +1782,7 @@ impl FilePicker {
     ) -> Option<(ArenaPtr, &mut FileItem)> {
         let path = path.as_ref();
         let index = self.sync_data.find_file_index(path, &self.base_path);
-        index.and_then(|i| self.sync_data.get_file_mut(i))
+        index.and_then(|i| self.get_file_mut(i))
     }
 
     /// Handle the event of certain file being modified or adds a neww file if it is not added
@@ -1726,6 +1863,12 @@ impl FilePicker {
     /// which indicates that it's time to trigger a new sync
     #[tracing::instrument(skip(self))]
     pub fn add_new_file(&mut self, path: &Path) -> Option<&FileItem> {
+        if self.sync_data.watcher_additions >= MAX_OVERFLOW_FILES
+            || self.sync_data.files.len() == self.sync_data.files.capacity()
+        {
+            return None;
+        }
+
         // On Windows `pathdiff::diff_paths` is byte-wise, so a short-name
         // input never shares a prefix with the canonicalized base_path and
         // the resulting relative path becomes absolute. Canonicalize first.
@@ -1755,13 +1898,16 @@ impl FilePicker {
             &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
         );
 
-        let builder = self.sync_data.overflow_builder.get_or_insert_with(|| {
-            // we know that overflow would never create more files during the file
-            crate::simd_path::ChunkedPathStoreBuilder::new(MAX_OVERFLOW_FILES)
-        });
+        *self.fuzzy_cache.get_mut() = None;
+        let layer = self.sync_data.ensure_open_top();
+        let chunked = self
+            .sync_data
+            .layers
+            .top_builder()
+            .add_file_immediate(&rel_path, file_item.path.filename_offset);
 
-        file_item.set_path(builder.add_file_immediate(&rel_path, file_item.path.filename_offset));
-        file_item.set_overflow(true);
+        file_item.set_path(chunked);
+        file_item.set_layer(layer);
 
         // Keep the dir table consistent: register (or revive) the parent dir
         // so directory search reflects watcher-added files immediately.
@@ -1777,9 +1923,9 @@ impl FilePicker {
         if !self.sync_data.files.push(file_item) {
             return None;
         }
-        *self.fuzzy_cache.get_mut() = None;
 
         self.sync_data.live_count += 1;
+        self.sync_data.watcher_additions += 1;
         // Dir may have been tombstoned by an earlier removal; a new file
         // under it proves it exists again.
         self.sync_data.revive_dir(parent_dir);
@@ -1807,17 +1953,7 @@ impl FilePicker {
     }
 
     fn untombstone_file(&mut self, index: usize) {
-        let file = &mut self.sync_data.files[index];
-        if !file.is_deleted() {
-            return;
-        }
-        file.set_deleted(false);
-        let parent_dir = file.parent_dir_index;
-        *self.fuzzy_cache.get_mut() = None;
-
-        self.sync_data.live_count += 1;
-        // The path exists on disk again, so its parent dir does too.
-        self.sync_data.revive_dir(parent_dir);
+        self.sync_data.revive_file(index);
     }
 
     /// Marks file as deleted, make sure that if you call this yourself these changes can be reverted
@@ -1892,7 +2028,7 @@ impl FilePicker {
             |file, arena| {
                 file.invalidate_mmap(cache_budget);
                 if let Some(callback) = callback.as_mut() {
-                    callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
+                    callback(&file.write_absolute_path(arena, &base_path, &mut path_buf));
                 }
             },
         );
@@ -1969,23 +2105,23 @@ impl FilePicker {
 /// `find_file_index` so events still match tombstoned entries.
 #[cfg(windows)]
 fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
-    if let Ok(canonical) = crate::path_utils::canonicalize(path)
-        && let Ok(stripped) = canonical.strip_prefix(base)
-        && let Some(s) = stripped.to_str()
-    {
-        return Some(crate::path_utils::to_canonical_slashes(s).into_owned());
+    // Virtual entries and deleted subtrees can have several missing ancestors.
+    for ancestor in path.ancestors() {
+        match crate::path_utils::canonicalize(ancestor) {
+            Ok(canonical) => {
+                let mut relative = canonical.strip_prefix(base).ok()?.to_path_buf();
+                if ancestor != path {
+                    relative.push(path.strip_prefix(ancestor).ok()?);
+                }
+                return relative
+                    .to_str()
+                    .map(|s| crate::path_utils::to_canonical_slashes(s).into_owned());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        }
     }
-
-    // Deleted files can't be canonicalized — canonicalize the parent and
-    // re-attach the filename.
-    let parent = path.parent()?;
-    let file_name = path.file_name()?;
-    let canonical_parent = crate::path_utils::canonicalize(parent).ok()?;
-    let stripped_parent = canonical_parent.strip_prefix(base).ok()?;
-    let mut rel = stripped_parent.to_path_buf();
-    rel.push(file_name);
-    rel.to_str()
-        .map(|s| crate::path_utils::to_canonical_slashes(s).into_owned())
+    None
 }
 
 impl Drop for FilePicker {
@@ -2060,18 +2196,16 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_git_workdir(base_path: &Path) -> Option<PathBuf> {
-        let git_workdir = Repository::discover(base_path)
-            .ok()
-            .and_then(|repo| repo.workdir().map(Path::to_path_buf))
-            .map(crate::path_utils::normalize);
-
-        match &git_workdir {
-            Some(workdir) => debug!("Git repository found at: {}", workdir.display()),
+    pub(crate) fn discover_git(base_path: &Path) -> Option<GitDiscovery> {
+        let git = GitDiscovery::discover(base_path);
+        match &git {
+            Some(git) => {
+                debug!(workdir = ?git.workdir, git_dir = ?git.git_dir, "Git repository found")
+            }
             None => warn!("No git repository found for path: {}", base_path.display()),
         }
 
-        git_workdir
+        git
     }
 
     pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
@@ -2089,7 +2223,7 @@ impl FileSync {
     #[tracing::instrument(skip_all, name = "walk_filesystem", level = Level::INFO)]
     pub(crate) fn walk_filesystem(
         base_path: &Path,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
@@ -2099,8 +2233,16 @@ impl FileSync {
         info!("SCAN: Starting filesystem walk and git status (async)");
 
         // Walk files (the fast part, typically 2-3s even on huge repos).
-        let is_git_repo = git_workdir.is_some();
-        let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
+        let is_git_repo = git.is_some();
+        let shared_base = git.as_ref().and_then(|git| git.shared_base(base_path));
+        if let Some(shared_base) = &shared_base {
+            info!(
+                ?shared_base,
+                "Linked git worktree, sharing the main checkout history"
+            );
+        }
+        let pool = indexing_pool(mode);
+        let bg_threads = pool.current_num_threads();
 
         let WalkOutput {
             dirs: mut walked_dirs,
@@ -2116,7 +2258,7 @@ impl FileSync {
         let ignore_rules = ignore_rules.map(Arc::new);
 
         // group walked dirs and files with a dir part to the same order
-        BACKGROUND_THREAD_POOL.install(|| {
+        pool.install(|| {
             rayon::join(
                 || {
                     pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
@@ -2147,48 +2289,39 @@ impl FileSync {
 
         if let Some(frecency) = frecency.as_ref() {
             let dirs_ref = &dirs;
-            BACKGROUND_THREAD_POOL.install(|| {
-                files.par_iter_mut().for_each(|file| {
-                    let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
-                    let score = file.access_frecency_score as i32;
-                    if score > 0 {
-                        let dir_idx = file.parent_dir_index as usize;
-                        if let Some(dir) = dirs_ref.get(dir_idx) {
-                            dir.update_frecency_if_larger(score);
+            let shared_base = shared_base.as_deref();
+            pool.install(|| {
+                files.par_iter_mut().for_each_init(
+                    || frecency.reader(),
+                    |reader, file| {
+                        file.update_frecency_scores(reader, arena, base_path, shared_base, mode);
+                        let score = file.access_frecency_score as i32;
+                        if score > 0 {
+                            let dir_idx = file.parent_dir_index as usize;
+                            if let Some(dir) = dirs_ref.get(dir_idx) {
+                                dir.update_frecency_if_larger(score);
+                            }
                         }
-                    }
-                });
+                    },
+                );
             });
         }
         drop(frecency);
 
-        // un-indexable files that are binary or not fitting the size cap has to beplaced in the end
-        let is_indexable = |f: &FileItem| {
-            !f.is_binary()
-                && f.size > 0
-                && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
-        };
-
-        BACKGROUND_THREAD_POOL.install(|| {
-            files.par_sort_unstable_by(|a, b| {
-                (!is_indexable(a))
-                    .cmp(&!is_indexable(b))
-                    // this just makes it faster in terms of allocation - we store the dir indexes
-                    .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
-            });
-        });
-        let indexable_count = files.partition_point(is_indexable);
+        let indexable_count = files.iter().filter(|file| is_indexable(file)).count();
+        let mut unindexable = Vec::with_capacity(files.len() - indexable_count);
+        unindexable.extend(files.extract_if(.., |file| !is_indexable(file)));
+        files.extend(unindexable);
 
         // Ask the allocator to return freed pages to the OS.
-        hint_allocator_collect();
+        hint_allocator_collect(pool);
 
         let file_item_size = std::mem::size_of::<FileItem>();
         let files_vec_bytes = files.len() * file_item_size;
         let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
             + dirs
                 .iter()
-                .map(|d| d.relative_path(arena).len())
+                .map(|d| usize::from(d.path.byte_len))
                 .sum::<usize>();
 
         let total_time = scan_start.elapsed();
@@ -2212,11 +2345,15 @@ impl FileSync {
             indexable_count,
             base_count,
             live_count: base_count,
+            watcher_additions: 0,
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,
-            overflow_builder: None,
-            git_workdir,
+            layers: LayerStack::new(base_count, base_dirs_count),
+            open_file_index: PathIndex::default(),
+            overlay_dir_index: PathIndex::default(),
+            git,
+            shared_base,
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
@@ -2307,7 +2444,7 @@ fn populates_dirs_files_chunked_storage<'a>(
             prev_dir = dir_part;
         }
 
-        file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.path = chunk_storage.add_file_with_parent(rel, &dirs[current_dir_idx as usize].path);
         file.parent_dir_index = current_dir_idx;
     }
 
@@ -2350,11 +2487,35 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
     is_binary_extension_str(ext)
 }
 
+// Extension check, then a content sniff for extensions shared by text and binary formats.
+pub(crate) fn is_binary_file(path: &Path) -> bool {
+    is_known_binary_extension(path)
+        && (!path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_ambiguous_binary_name)
+            || starts_with_binary_content(path))
+}
+
+// `.blp` names both GTK Blueprint text and a binary texture format.
+#[inline]
+pub(crate) fn is_ambiguous_binary_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".blp")
+}
+
+pub(crate) fn starts_with_binary_content(path: &Path) -> bool {
+    use std::io::Read;
+    let mut chunk = [0u8; 4096];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut chunk))
+        .is_ok_and(|read| crate::types::detect_binary_content(&chunk[..read]))
+}
+
 /// Like [`is_known_binary_extension`] but takes a basename string directly,
 /// avoiding `Path::extension()` overhead. Mirrors `Path::extension()`
 /// semantics: dotfiles with no other dots → no extension. Used by the zlob
 /// walker, which already has the basename slice from traversal.
-#[cfg(feature = "zlob")]
 #[inline]
 pub(crate) fn is_known_binary_extension_basename(name: &str) -> bool {
     match name.rfind('.') {
@@ -2403,7 +2564,7 @@ fn is_binary_extension_str(ext: &str) -> bool {
         // ML/Data Science
         "npy" | "npz" | "h5" | "hdf5" | "pt" | "onnx" |
         "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib" |
-        // 3D/Game assets
+        // 3D/Game assets (indexing also sniffs `.blp`, see `is_ambiguous_binary_name`)
         "glb" | "blend" | "blp" |
         // Gzipped-XML / binary maps
         "dia" | "bcmap" |
@@ -2414,6 +2575,10 @@ fn is_binary_extension_str(ext: &str) -> bool {
         // IDE/OS metadata
         "suo"
     )
+}
+
+pub(crate) fn is_indexable(f: &FileItem) -> bool {
+    !f.is_binary() && f.size > 0 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
 }
 
 /// Length of the longest shared directory prefix of two relative dir
@@ -2470,13 +2635,12 @@ pub extern "C" fn tune_mimalloc() {
 /// Ask the global allocator to return freed pages to the OS.
 /// Enabled via the `mimalloc-collect` feature (set by fff-nvim).
 /// No-op when the feature is off (tests, system allocator).
-pub(crate) fn hint_allocator_collect() {
+pub(crate) fn hint_allocator_collect(pool: &rayon::ThreadPool) {
+    #[cfg(not(feature = "mimalloc-collect"))]
+    let _ = pool;
     #[cfg(feature = "mimalloc-collect")]
     {
-        // Collect BACKGROUND_THREAD_POOL workers — that's where the bigram
-        // builder allocated memory. `rayon::broadcast` would target the global
-        // pool, which is the wrong set of threads.
-        BACKGROUND_THREAD_POOL.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+        pool.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
 
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };
@@ -2486,6 +2650,46 @@ pub(crate) fn hint_allocator_collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blueprint_text_is_searchable_while_blp_textures_stay_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("window.blp"),
+            "template $Window : Gtk.Window {\n  tooltip-text: \"Needle\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("texture.blp"), b"BLP2\0\0\0Needle\0").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: dir.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            enable_mmap_cache: false,
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let query =
+            fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig).parse("Needle");
+        let options = crate::grep::GrepSearchOptions {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        let result = picker.grep(&query, &options);
+        let files: Vec<_> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path(&picker))
+            .collect();
+        assert_eq!(files, ["window.blp"]);
+
+        // The public extension helper keeps reporting `.blp` as binary.
+        assert!(is_known_binary_extension(Path::new("window.blp")));
+        for (name, binary) in [("texture.blp", true), ("window.blp", false)] {
+            let (item, _) = crate::types::FileItem::new(dir.path().join(name), dir.path(), None);
+            assert_eq!(item.is_binary(), binary, "{name}");
+        }
+    }
 
     #[test]
     fn refuses_home_dir_with_trailing_separator() {

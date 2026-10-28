@@ -104,7 +104,7 @@ fn grep_options(
         enforce_time_budget,
         before_context: before_context as usize,
         after_context: after_context as usize,
-        classify_definitions,
+        classify_definitions: classify_definitions.into(),
         trim_whitespace: false,
         abort_signal: None,
     }
@@ -373,7 +373,7 @@ impl FileFinder {
                 fuzzy_options(
                     max_threads,
                     current_file.as_deref(),
-                    picker.base_path(),
+                    picker.shared_base_path(),
                     page_index,
                     page_size,
                     defaulted_i32(combo_boost_score_multiplier, DEFAULT_COMBO_BOOST_MULTIPLIER),
@@ -425,7 +425,7 @@ impl FileFinder {
                 fuzzy_options(
                     max_threads,
                     current_file.as_deref(),
-                    picker.base_path(),
+                    picker.shared_base_path(),
                     page_index,
                     page_size,
                     0,
@@ -478,7 +478,7 @@ impl FileFinder {
                 fuzzy_options(
                     max_threads,
                     current_file.as_deref(),
-                    picker.base_path(),
+                    picker.shared_base_path(),
                     page_index,
                     page_size,
                     0,
@@ -540,7 +540,7 @@ impl FileFinder {
                     fuzzy_options(
                         max_threads,
                         current_file.as_deref(),
-                        picker.base_path(),
+                        picker.shared_base_path(),
                         page_index,
                         page_size,
                         defaulted_i32(combo_boost_score_multiplier, DEFAULT_COMBO_BOOST_MULTIPLIER),
@@ -908,13 +908,15 @@ impl FileFinder {
 
         py.detach(move || -> PyResult<bool> {
             let file_path = fff::path_utils::canonicalize(&selected_file_path).map_err(py_err)?;
-            let project_path = {
+            let (project_path, file_path) = {
                 let guard = picker.read().map_err(py_err)?;
-                guard.as_ref().map(|p| p.base_path().to_path_buf())
-            };
-            let project_path = match project_path {
-                Some(p) => p,
-                None => return Ok(false),
+                let Some(picker) = guard.as_ref() else {
+                    return Ok(false);
+                };
+                (
+                    picker.shared_base_path().to_path_buf(),
+                    picker.shared_path_for(&file_path).unwrap_or(file_path),
+                )
             };
 
             let mut qt_guard = query_tracker.write().map_err(py_err)?;
@@ -936,7 +938,7 @@ impl FileFinder {
         py.detach(move || -> PyResult<Option<String>> {
             let project_path = {
                 let guard = picker.read().map_err(py_err)?;
-                guard.as_ref().map(|p| p.base_path().to_path_buf())
+                guard.as_ref().map(|p| p.shared_base_path().to_path_buf())
             };
             let project_path = match project_path {
                 Some(p) => p,

@@ -1,6 +1,6 @@
 use super::grep::{GrepContext, perform_grep};
 use super::prefilter::prefilter_files;
-use super::sink::{SinkState, debug_assert_newline_terminator};
+use super::sink::{SinkState, debug_assert_newline_terminator, strip_line_terminators};
 use super::types::{GrepResult, GrepSearchOptions};
 use crate::index::{BigramFilter, BigramOverlay, bigram_boundary, literal_candidates};
 use crate::types::{ContentCacheBudget, FileItem, FileSliceExt};
@@ -41,7 +41,7 @@ impl Matcher for AhoCorasickMatcher<'_> {
 ///
 /// Collects all pattern match positions on each matched line for highlighting.
 struct AhoCorasickSink<'a> {
-    state: SinkState,
+    state: SinkState<'a>,
     ac: &'a AhoCorasick,
 }
 
@@ -50,15 +50,11 @@ impl Sink for AhoCorasickSink<'_> {
 
     fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         debug_assert_newline_terminator(searcher);
-        if self.state.max_matches != 0 && self.state.matches.len() >= self.state.max_matches {
-            return Ok(false);
-        }
-
         let line_bytes = mat.bytes();
         let (display_bytes, display_len, line_number, byte_offset) =
             SinkState::prepare_line(line_bytes, mat);
 
-        let line_content = String::from_utf8_lossy(display_bytes).into_owned();
+        let line_content = String::from_utf8_lossy(display_bytes);
         let mut match_byte_offsets: SmallVec<[(u32, u32); 4]> = SmallVec::new();
         let mut col = 0usize;
         let mut first = true;
@@ -73,17 +69,25 @@ impl Sink for AhoCorasickSink<'_> {
             match_byte_offsets.push((abs_start, abs_end));
         }
 
+        let Some(is_definition) = self.state.definition_mode.classify_match(
+            self.state.file,
+            strip_line_terminators(line_bytes),
+            &match_byte_offsets,
+            false,
+        ) else {
+            return Ok(true);
+        };
         let (context_before, context_after) = self.state.extract_context(mat);
-        self.state.push_match(
+        Ok(self.state.push_match(
             line_number,
             col,
             byte_offset,
-            line_content,
+            line_content.into_owned(),
             match_byte_offsets,
+            is_definition,
             context_before,
             context_after,
-        );
-        Ok(true)
+        ))
     }
 
     fn finish(&mut self, _: &Searcher, _: &fff_grep::SinkFinish) -> Result<(), Self::Error> {
@@ -109,8 +113,7 @@ pub(crate) fn multi_grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     let total_files = files.live_count();
 
@@ -122,14 +125,13 @@ pub(crate) fn multi_grep_search<'a>(
     let base_file_count = bigram_boundary(bigram_overlay, files.len());
 
     // Constraints are separate from patterns, so a miss must not broaden the search.
-    let (files_to_search, filtered_file_count) = prefilter_files(
+    let (mut files_to_search, filtered_file_count) = prefilter_files(
         files,
         constraints,
         bigram_candidates.as_deref(),
         base_file_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     if files_to_search.is_empty() {
@@ -153,26 +155,26 @@ pub(crate) fn multi_grep_search<'a>(
 
     let ac_matcher = AhoCorasickMatcher { ac: &ac };
     perform_grep(
-        &files_to_search,
+        &mut files_to_search,
         options,
         &GrepContext {
             total_files,
             filtered_file_count,
             budget,
             base_path,
-            arena,
-            overflow_arena,
+            arenas,
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
         },
-        |file_bytes: &[u8], max_matches: usize| {
+        |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
+                file,
+                definition_mode: options.classify_definitions,
                 file_index: 0,
                 matches: Vec::with_capacity(4),
                 max_matches,
                 before_context: options.before_context,
                 after_context: options.after_context,
-                classify_definitions: options.classify_definitions,
             };
 
             let mut sink = AhoCorasickSink { state, ac: &ac };

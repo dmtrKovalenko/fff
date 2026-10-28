@@ -55,11 +55,16 @@ local M = {}
 --- @field enabled boolean
 --- @field db_path string
 
+--- @alias FffGitStatusUpdates 'while_open'|'always'|'manual'
+
 --- @class FffHistoryConfig
 --- @field enabled boolean
 --- @field db_path string
 --- @field min_combo_count number
 --- @field combo_boost_score_multiplier number
+
+--- @alias FffDefinitionMode 'off'|'classify'|'definition_only'|'usage_only'
+--- @alias FffGrepMode 'plain'|'regex'|'fuzzy'|'definition_only'
 
 --- @class FffGrepConfig
 --- @field max_file_size number
@@ -68,8 +73,9 @@ local M = {}
 --- @field casing? "smart"|"sensitive"|"insensitive"
 --- @field time_budget_ms number
 --- @field enforce_time_budget boolean
---- @field modes string[]
+--- @field modes FffGrepMode[]
 --- @field trim_whitespace boolean
+--- @field classify_definitions boolean|FffDefinitionMode
 --- @field location_format string
 --- @field enable_filename_constraint boolean
 
@@ -323,7 +329,7 @@ local function init()
       preview_scroll_up = '<C-u>',
       preview_scroll_down = '<C-d>',
       toggle_debug = '<F2>',
-      -- grep mode: cycle between plain text, regex, and fuzzy search
+      -- Cycle between configured grep modes.
       cycle_grep_modes = '<S-Tab>',
       -- grep mode only: insert a literal `\n` to search across lines
       -- (requires a terminal with extended-key support to distinguish from <CR>)
@@ -387,6 +393,7 @@ local function init()
       grep_regex_active = 'DiagnosticInfo', -- Highlight for keybind + label when regex is on
       grep_plain_active = 'Comment', -- Highlight for keybind + label when regex is off
       grep_fuzzy_active = 'DiagnosticHint', -- Highlight for keybind + label when fuzzy is on
+      grep_definition_active = 'DiagnosticOk', -- Highlight for the definitions-only mode
       -- Cross-mode suggestion highlights
       suggestion_header = 'WarningMsg', -- Highlight for the "No results found. Suggested..." banner
       -- File info panel highlights
@@ -440,6 +447,9 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      -- 'while_open': pause git status while the picker is closed, refresh it on open
+      -- 'always': track every change in the background, 'manual': only on :FFFRefreshGit
+      status_updates = 'while_open',
       -- Boost files that participated in recent commits of the current branch:
       -- +1 score point per commit the file appeared in (max = max_commits)
       recency = {
@@ -491,8 +501,9 @@ local function init()
       casing = nil, -- "smart" | "sensitive" | "insensitive"; overrides smart_case when set
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
-      modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
+      modes = { 'plain', 'regex', 'fuzzy', 'definition_only' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
+      classify_definitions = true, -- Show matching definitions first within each page
       -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
       -- file-path filter, scoping the content search to matching files. When off, such
       -- tokens are searched as literal text. A token is a filename if it has a valid-looking

@@ -657,7 +657,10 @@ dependencies = [
  "fff-query-parser",
  "fff-search",
  "git2",
+ "globset",
  "mimalloc",
+ "rayon",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
@@ -3210,9 +3213,9 @@ dependencies = [
 
 [[package]]
 name = "zlob"
-version = "1.6.5"
+version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ed9cfbcfaf165adcf07d994f85a92effaef03029b53afc0872152671efcfbda"
+checksum = "6b87ec8c6fa7d706ea81f68659a7b1de38516d91ba5bde4c97077ad07b30c1b2"
 dependencies = [
  "bindgen",
  "bitflags 2.11.0",

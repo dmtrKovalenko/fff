@@ -356,7 +356,7 @@ pub fn fuzzy_search_files(
         FuzzySearchOptions {
             max_threads,
             current_file: current_file.as_deref(),
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier,
             min_combo_count,
             pagination: PaginationArgs {
@@ -422,7 +422,7 @@ pub fn fuzzy_search_directories(
         FuzzySearchOptions {
             max_threads,
             current_file: current_file.as_deref(),
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: PaginationArgs {
@@ -471,7 +471,7 @@ pub fn fuzzy_search_mixed(
         FuzzySearchOptions {
             max_threads,
             current_file: current_file.as_deref(),
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier,
             min_combo_count: min_combo_count.unwrap_or(3),
             pagination: PaginationArgs {
@@ -484,73 +484,23 @@ pub fn fuzzy_search_mixed(
     lua_types::MixedSearchResultLua::new(results, picker).into_lua(lua)
 }
 
-#[allow(clippy::type_complexity)]
-pub fn live_grep(
-    lua: &Lua,
-    (
-        query,
-        file_offset,
-        page_size,
-        max_file_size,
-        max_matches_per_file,
-        smart_case,
-        grep_mode,
-        time_budget_ms,
-        trim_whitespace,
-        enforce_time_budget,
-        casing,
-    ): (
-        String,
-        Option<usize>,
-        Option<usize>,
-        Option<u64>,
-        Option<usize>,
-        Option<bool>,
-        Option<String>,
-        Option<u64>,
-        Option<bool>,
-        Option<bool>,
-        Option<String>,
-    ),
-) -> LuaResult<LuaValue> {
-    let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
-    let Some(ref picker) = *file_picker_guard else {
-        return Err(error::to_lua_error(Error::FilePickerMissing));
-    };
+type GrepArgs = (
+    String,
+    Option<usize>,
+    Option<usize>,
+    Option<u64>,
+    Option<usize>,
+    Option<bool>,
+    Option<String>,
+    Option<u64>,
+    Option<bool>,
+    Option<bool>,
+    Option<String>,
+);
 
-    let parsed_query = FFFQuery::parse(&query, NvimGrepConfig);
-    let mode = match grep_mode.as_deref() {
-        Some("regex") => fff::GrepMode::Regex,
-        Some("fuzzy") => fff::GrepMode::Fuzzy,
-        _ => fff::GrepMode::PlainText, // "plain" or nil or unknown
-    };
-    // nil/unknown falls back to the legacy smart_case toggle
-    let casing = match casing.as_deref() {
-        Some("smart") => Some(fff::Casing::Smart),
-        Some("sensitive") => Some(fff::Casing::Sensitive),
-        Some("insensitive") => Some(fff::Casing::Insensitive),
-        _ => None,
-    };
-
-    let options = fff::GrepSearchOptions {
-        max_file_size: max_file_size.unwrap_or(10 * 1024 * 1024),
-        max_matches_per_file: max_matches_per_file.unwrap_or(200),
-        smart_case: smart_case.unwrap_or(true),
-        casing,
-        file_offset: file_offset.unwrap_or(0),
-        page_limit: page_size.unwrap_or(50),
-        mode,
-        time_budget_ms: time_budget_ms.unwrap_or(0),
-        enforce_time_budget: enforce_time_budget.unwrap_or(false),
-        before_context: 0,
-        after_context: 0,
-        classify_definitions: false,
-        trim_whitespace: trim_whitespace.unwrap_or(false),
-        abort_signal: None,
-    };
-
-    let result = picker.grep(&parsed_query, &options);
-    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
+pub fn live_grep(lua: &Lua, args: GrepArgs) -> LuaResult<LuaValue> {
+    let (query, options) = parse_grep_args(args);
+    live_grep_with_options(lua, &query, &options)
 }
 
 /// Build a file-picker result for an absolute path that exists on disk but
@@ -611,6 +561,14 @@ pub fn track_access(_: &Lua, file_path: String) -> LuaResult<bool> {
     // prevent users from deadlock of the main thread if someone deletes a lock
     let file_path = PathBuf::from(&file_path);
     std::thread::spawn(move || {
+        // inside a linked git worktree the access also feeds the main checkout history
+        let shared_path = match FILE_PICKER.read() {
+            Ok(guard) => guard
+                .as_ref()
+                .and_then(|picker| picker.shared_path_for(&file_path)),
+            Err(_) => None,
+        };
+
         {
             let frecency_guard = match FRECENCY.read() {
                 Ok(g) => g,
@@ -622,7 +580,7 @@ pub fn track_access(_: &Lua, file_path: String) -> LuaResult<bool> {
             let Some(ref frecency) = *frecency_guard else {
                 return;
             };
-            if let Err(e) = frecency.track_access(file_path.as_path()) {
+            if let Err(e) = frecency.track_access_shared(&file_path, shared_path.as_deref()) {
                 ::tracing::debug!(?e, ?file_path, "track_access: frecency DB write failed");
                 return;
             }
@@ -702,13 +660,37 @@ pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<usize> {
     FILE_PICKER.refresh_git_status(&FRECENCY).into_lua_result()
 }
 
+pub fn pause_git_status(_: &Lua, _: ()) -> LuaResult<()> {
+    FILE_PICKER.pause_git_status();
+    Ok(())
+}
+
+pub fn resume_git_status(_: &Lua, _: ()) -> LuaResult<()> {
+    FILE_PICKER.resume_git_status();
+    Ok(())
+}
+
+pub fn is_git_status_refreshing(_: &Lua, _: ()) -> LuaResult<bool> {
+    Ok(!FILE_PICKER.wait_for_git_status(Duration::ZERO))
+}
+
 pub fn get_file_access_count(_: &Lua, file_path: String) -> LuaResult<u64> {
     let path = PathBuf::from(&file_path);
+    let shared_path = FILE_PICKER
+        .read()
+        .into_lua_result()?
+        .as_ref()
+        .and_then(|picker| picker.shared_path_for(&path));
+
     let frecency_guard = FRECENCY.read().into_lua_result()?;
     let Some(ref frecency) = *frecency_guard else {
         return Ok(0);
     };
-    let count = frecency.access_count(&path).into_lua_result()?;
+    let mut count = frecency.access_count(&path).into_lua_result()?;
+    // worktree opens are mirrored into the shared history, so it already counts them
+    if let Some(shared_path) = shared_path {
+        count = count.max(frecency.access_count(&shared_path).into_lua_result()?);
+    }
     Ok(count as u64)
 }
 
@@ -757,28 +739,26 @@ pub fn cancel_scan(_: &Lua, _: ()) -> LuaResult<bool> {
 }
 
 pub fn track_query_completion(_: &Lua, (query, file_path): (String, String)) -> LuaResult<bool> {
-    // Everything runs on a background thread — including the
-    // `FILE_PICKER.read()` used to fetch `project_path`. Doing that read
-    // on the main (UI) thread stalled nvim whenever a reindex writer was
-    // in flight: parking_lot's fair queue makes a read block behind a
-    // pending writer, so the main thread would freeze for the full
-    // duration of the scan.
+    // Keep picker locks off the UI thread; a queued scan writer can block readers.
     let query_tracker = QUERY_TRACKER.clone();
     std::thread::spawn(move || {
-        let project_path = match FILE_PICKER.read() {
-            Ok(guard) => match *guard {
-                Some(ref picker) => picker.base_path().to_path_buf(),
-                None => return,
-            },
-            Err(_) => return,
-        };
-
         let file_path = match fff::path_utils::canonicalize(&file_path) {
             Ok(path) => path,
             Err(e) => {
                 tracing::warn!(?file_path, error = ?e, "Failed to canonicalize file path for tracking");
                 return;
             }
+        };
+
+        let (project_path, file_path) = match FILE_PICKER.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(picker) => (
+                    picker.shared_base_path().to_path_buf(),
+                    picker.shared_path_for(&file_path).unwrap_or(file_path),
+                ),
+                None => return,
+            },
+            Err(_) => return,
         };
 
         if let Ok(mut guard) = query_tracker.write()
@@ -803,7 +783,7 @@ pub fn get_historical_query(_: &Lua, offset: usize) -> LuaResult<Option<String>>
         let Some(ref picker) = *file_picker else {
             return Ok(None);
         };
-        picker.base_path().to_path_buf()
+        picker.shared_base_path().to_path_buf()
     };
 
     let query_tracker = QUERY_TRACKER.read().into_lua_result()?;
@@ -823,7 +803,7 @@ pub fn track_grep_query(_: &Lua, query: String) -> LuaResult<bool> {
     std::thread::spawn(move || {
         let project_path = match FILE_PICKER.read() {
             Ok(guard) => match *guard {
-                Some(ref picker) => picker.base_path().to_path_buf(),
+                Some(ref picker) => picker.shared_base_path().to_path_buf(),
                 None => return,
             },
             Err(_) => return,
@@ -850,7 +830,7 @@ pub fn get_historical_grep_query(_: &Lua, offset: usize) -> LuaResult<Option<Str
         let Some(ref picker) = *file_picker else {
             return Ok(None);
         };
-        picker.base_path().to_path_buf()
+        picker.shared_base_path().to_path_buf()
     };
 
     let query_tracker = QUERY_TRACKER.read().into_lua_result()?;
@@ -932,6 +912,12 @@ pub fn health_check(lua: &Lua, test_path: Option<String>) -> LuaResult<LuaValue>
                     "base_path",
                     picker.base_path().to_string_lossy().to_string(),
                 )?;
+                if picker.shared_base_path() != picker.base_path() {
+                    picker_info.set(
+                        "shared_base_path",
+                        picker.shared_base_path().to_string_lossy().to_string(),
+                    )?;
+                }
                 picker_info.set("is_scanning", picker.is_scan_active())?;
                 let progress = picker.get_scan_progress();
                 picker_info.set("indexed_files", progress.scanned_files_count)?;
@@ -1056,7 +1042,27 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
         "fuzzy_search_mixed",
         lua.create_function(fuzzy_search_mixed)?,
     )?;
-    exports.set("live_grep", lua.create_function(live_grep)?)?;
+    exports.set(
+        "live_grep",
+        lua.create_function(|lua, args: LuaMultiValue| {
+            let classify_definitions = match args.get(11) {
+                None | Some(LuaValue::Nil) => fff::DefinitionMode::Off,
+                Some(LuaValue::Boolean(enabled)) => (*enabled).into(),
+                Some(LuaValue::String(mode)) => fff::DefinitionMode::parse(&mode.to_str()?)
+                    .ok_or_else(|| {
+                        LuaError::RuntimeError("Invalid classify_definitions mode".into())
+                    })?,
+                _ => {
+                    return Err(LuaError::RuntimeError(
+                        "classify_definitions must be a mode string or boolean".into(),
+                    ));
+                }
+            };
+            let (query, mut options) = parse_grep_args(GrepArgs::from_lua_multi(args, lua)?);
+            options.classify_definitions = classify_definitions;
+            live_grep_with_options(lua, &query, &options)
+        })?,
+    )?;
     exports.set("track_access", lua.create_function(track_access)?)?;
     exports.set(
         "get_file_access_count",
@@ -1067,6 +1073,12 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     exports.set(
         "refresh_git_status",
         lua.create_function(refresh_git_status)?,
+    )?;
+    exports.set("pause_git_status", lua.create_function(pause_git_status)?)?;
+    exports.set("resume_git_status", lua.create_function(resume_git_status)?)?;
+    exports.set(
+        "is_git_status_refreshing",
+        lua.create_function(is_git_status_refreshing)?,
     )?;
     exports.set("get_git_root", lua.create_function(get_git_root)?)?;
     exports.set(
@@ -1113,4 +1125,69 @@ fn fff_nvim(lua: &Lua) -> LuaResult<LuaTable> {
     crate::log::install_panic_hook();
 
     create_exports(lua)
+}
+
+fn parse_grep_args(
+    (
+        query,
+        file_offset,
+        page_size,
+        max_file_size,
+        max_matches_per_file,
+        smart_case,
+        grep_mode,
+        time_budget_ms,
+        trim_whitespace,
+        enforce_time_budget,
+        casing,
+    ): GrepArgs,
+) -> (String, fff::GrepSearchOptions) {
+    let mode = match grep_mode.as_deref() {
+        Some("regex") => fff::GrepMode::Regex,
+        Some("fuzzy") => fff::GrepMode::Fuzzy,
+        _ => fff::GrepMode::PlainText, // "plain" or nil or unknown
+    };
+    // nil/unknown falls back to the legacy smart_case toggle
+    let casing = match casing.as_deref() {
+        Some("smart") => Some(fff::Casing::Smart),
+        Some("sensitive") => Some(fff::Casing::Sensitive),
+        Some("insensitive") => Some(fff::Casing::Insensitive),
+        _ => None,
+    };
+
+    let options = fff::GrepSearchOptions {
+        max_file_size: max_file_size.unwrap_or(10 * 1024 * 1024),
+        max_matches_per_file: max_matches_per_file.unwrap_or(200),
+        smart_case: smart_case.unwrap_or(true),
+        casing,
+        file_offset: file_offset.unwrap_or(0),
+        page_limit: page_size.unwrap_or(50),
+        mode,
+        time_budget_ms: time_budget_ms.unwrap_or(0),
+        enforce_time_budget: enforce_time_budget.unwrap_or(false),
+        before_context: 0,
+        after_context: 0,
+        classify_definitions: Default::default(),
+        trim_whitespace: trim_whitespace.unwrap_or(false),
+        abort_signal: None,
+    };
+
+    (query, options)
+}
+
+fn live_grep_with_options(
+    lua: &Lua,
+    query: &str,
+    options: &fff::GrepSearchOptions,
+) -> LuaResult<LuaValue> {
+    let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
+    let Some(ref picker) = *file_picker_guard else {
+        return Err(error::to_lua_error(Error::FilePickerMissing));
+    };
+    let parsed_query = FFFQuery::parse(query, NvimGrepConfig);
+    let mut result = picker.grep(&parsed_query, options);
+    if options.classify_definitions == fff::DefinitionMode::Classify {
+        result.matches.sort_by_key(|m| !m.is_definition);
+    }
+    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }

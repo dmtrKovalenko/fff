@@ -186,6 +186,27 @@ function M.refresh_git_status()
   return result
 end
 
+local function updates_git_status_while_open() return require('fff.core').git_status_updates() == 'while_open' end
+
+--- Resume background git status updates and queue a full refresh (git.status_updates = 'while_open')
+function M.resume_git_status()
+  if not M.state.initialized or not updates_git_status_while_open() then return end
+  pcall(fuzzy.resume_git_status)
+end
+
+--- Pause background git status updates while the picker is closed (git.status_updates = 'while_open')
+function M.pause_git_status()
+  if not M.state.initialized or not updates_git_status_while_open() then return end
+  pcall(fuzzy.pause_git_status)
+end
+
+--- @return boolean true while queued git status work has not been applied yet
+function M.is_git_status_refreshing()
+  if not M.state.initialized then return false end
+  local ok, refreshing = pcall(fuzzy.is_git_status_refreshing)
+  return ok and refreshing == true
+end
+
 --- Stop background git status monitoring
 --- @return boolean Success status
 function M.stop_background_monitor()
