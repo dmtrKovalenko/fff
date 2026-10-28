@@ -46,7 +46,7 @@ impl FileSync {
 
     fn make_room(&mut self) {
         if self.layers.is_full() {
-            self.compact_layers_at(self.layers.merge_candidate());
+            self.compact_newest_layers();
         }
     }
 
@@ -70,7 +70,7 @@ impl FileSync {
         }
 
         let arenas = self.layer_arenas();
-        self.files[start..end].sort_unstable_by(|a, b| {
+        self.files.range_mut(start..end).sort_unstable_by(|a, b| {
             let mut buf_a = [0u8; PATH_BUF_SIZE];
             let mut buf_b = [0u8; PATH_BUF_SIZE];
             let pa = a.path.read_to_buf(arenas.get(a.layer_id()), &mut buf_a);
@@ -81,7 +81,7 @@ impl FileSync {
 
     // Brings a tombstoned slot back; `false` when it was already live.
     pub(super) fn revive_file(&mut self, index: usize) -> bool {
-        let file = &mut self.files[index];
+        let file = &self.files[index];
         if !file.is_deleted() {
             return false;
         }
@@ -93,72 +93,55 @@ impl FileSync {
         true
     }
 
-    // Merges layers `at` and `at + 1` into one re-deduped arena and shifts
-    // higher ids down so an id always equals its stack position.
-    fn compact_layers_at(&mut self, at: usize) {
-        let first = (at + 1) as LayerId;
-        let second = first + 1;
+    fn revive_entry(&mut self, index: usize, size: u64, modified: u64, binary: bool) -> bool {
+        if !self.revive_file(index) {
+            return false;
+        }
+        // Tombstoning already evicted the old cached contents.
+        let file = &mut self.files[index];
+        file.size = size;
+        file.modified = modified;
+        file.set_binary(binary);
+        if index < self.indexable_count
+            && let Some(overlay) = &self.bigram_overlay
+        {
+            overlay.write().invalidate_file(index);
+        }
+        true
+    }
+
+    fn compact_newest_layers(&mut self) {
+        let at = self.layers.merge_candidate();
+        let merged = (at + 1) as LayerId;
+        let files_end = self.files.len();
+        let dirs_end = self.dirs.len();
+        let (files_start, _) = self
+            .layers
+            .file_range(merged, files_end)
+            .expect("layer to compact");
+        let (dirs_start, _) = self
+            .layers
+            .dir_range(merged, dirs_end)
+            .expect("layer to compact");
         let arenas = self.layer_arenas();
+        let mut builder =
+            ChunkedPathStoreBuilder::new((files_end - files_start) + (dirs_end - dirs_start));
         let mut buf = [0u8; PATH_BUF_SIZE];
 
-        let mut file_paths: Vec<(usize, String, u16)> = Vec::new();
-        for (idx, file) in self.files.iter().enumerate().skip(self.base_count) {
-            let layer = file.layer_id();
-            if layer == first || layer == second {
-                let path = file
-                    .path
-                    .read_to_buf(arenas.get(layer), &mut buf)
-                    .to_owned();
-                file_paths.push((idx, path, file.path.filename_offset));
-            }
+        for file in self.files.range_mut(files_start..files_end) {
+            let path = file.path.read_to_buf(arenas.get(file.layer_id()), &mut buf);
+            file.set_path(builder.add_file_immediate(path, file.path.filename_offset));
+            file.set_layer(merged);
         }
-
-        let mut dir_paths: Vec<(usize, String)> = Vec::new();
-        for (idx, dir) in self.dirs.iter().enumerate().skip(self.base_dirs_count) {
-            let layer = dir.layer_id();
-            if layer == first || layer == second {
-                let path = dir.path.read_to_buf(arenas.get(layer), &mut buf).to_owned();
-                dir_paths.push((idx, path));
-            }
-        }
-
-        let mut builder = ChunkedPathStoreBuilder::new(file_paths.len() + dir_paths.len());
-
-        for (idx, path, filename_offset) in &file_paths {
-            let chunked = builder.add_file_immediate(path, *filename_offset);
-            if let Some(file) = self.files.get_mut(*idx) {
-                file.set_path(chunked);
-                file.set_layer(first);
-            }
-        }
-
-        for (idx, path) in &dir_paths {
-            let chunked = builder.add_dir_immediate(path);
-            if let Some(dir) = self.dirs.get_mut(*idx) {
-                dir.path = chunked;
-                dir.set_layer(first);
-            }
-        }
-
-        for file in self.files.iter_mut().skip(self.base_count) {
-            let layer = file.layer_id();
-            if layer > second {
-                file.set_layer(layer - 1);
-            }
-        }
-
-        for dir in self.dirs.iter_mut().skip(self.base_dirs_count) {
-            let layer = dir.layer_id();
-            if layer > second {
-                dir.set_layer(layer - 1);
-            }
+        for dir in self.dirs.range_mut(dirs_start..dirs_end) {
+            let path = dir.path.read_to_buf(arenas.get(dir.layer_id()), &mut buf);
+            dir.path = builder.add_dir_immediate(path);
+            dir.set_layer(merged);
         }
 
         self.layers.merge_at(at, builder.finish());
-        if let Some((start, end)) = self.layers.file_range(first, self.files.len()) {
-            self.sort_file_range(start, end);
-            self.layers.set_sorted(first, true);
-        }
+        self.sort_file_range(files_start, files_end);
+        self.layers.set_sorted(merged, true);
     }
 
     // `true` when the tables were reallocated (mmap caches are dropped).
@@ -189,7 +172,8 @@ impl FileSync {
                 continue;
             };
             if let Some(idx) = self.find_relative_path_index(&path) {
-                added += self.revive_file(idx) as usize;
+                added +=
+                    self.revive_entry(idx, entry.size, entry.modified, entry.is_binary()) as usize;
                 continue;
             }
 
@@ -264,7 +248,8 @@ impl FileSync {
             };
             let path = file.path.read_to_buf(arena, &mut path_buf);
             if let Some(idx) = self.lookup_relative_path(path, files_start) {
-                added += self.revive_file(idx) as usize;
+                added +=
+                    self.revive_entry(idx, file.size, file.modified, file.is_binary()) as usize;
                 continue;
             }
 
@@ -383,10 +368,17 @@ impl FileSync {
 
     fn export_base(&self) -> Option<LayerSnapshot> {
         let store = Arc::clone(self.chunked_paths.as_ref()?);
+        let mut layout = SnapshotLayout::BasePartitioned;
         let files = self.files[..self.base_count]
             .iter()
-            .filter(|f| !f.is_deleted())
-            .cloned()
+            .enumerate()
+            .filter(|(_, f)| !f.is_deleted())
+            .map(|(index, file)| {
+                if is_indexable(file) != (index < self.indexable_count) {
+                    layout = SnapshotLayout::Unsorted;
+                }
+                file.clone()
+            })
             .collect();
         let dirs = self.dirs[..self.base_dirs_count]
             .iter()
@@ -402,7 +394,7 @@ impl FileSync {
             store,
             files,
             dirs,
-            layout: SnapshotLayout::BasePartitioned,
+            layout,
         })
     }
 
@@ -558,8 +550,7 @@ impl FilePicker {
     /// Appends entries to the writable layer without touching the filesystem.
     /// Paths already in the index are skipped. Returns the number added.
     ///
-    /// Grows the file table when needed; fails with [`Error::IndexBusy`] while
-    /// a post-scan pass holds a snapshot of it.
+    /// Grows the file table when needed. Returns [`Error::IndexBusy`] during post-scan indexing.
     pub fn add_entries<'a>(
         &mut self,
         entries: impl IntoIterator<Item = IndexEntry<'a>>,
@@ -628,11 +619,6 @@ impl FilePicker {
     }
 
     fn reserve_index(&mut self, files: usize, dirs: usize) -> Result<(), Error> {
-        let needs_growth = self.sync_data.files.len() + files > self.sync_data.files.capacity()
-            || self.sync_data.dirs.len() + dirs > self.sync_data.dirs.capacity();
-        if !needs_growth {
-            return Ok(());
-        }
         if self.is_scan_active() || self.signals.post_scan_indexing_active.load(Ordering::Acquire) {
             return Err(Error::IndexBusy);
         }

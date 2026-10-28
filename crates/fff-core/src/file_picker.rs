@@ -2057,23 +2057,23 @@ impl FilePicker {
 /// `find_file_index` so events still match tombstoned entries.
 #[cfg(windows)]
 fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
-    if let Ok(canonical) = crate::path_utils::canonicalize(path)
-        && let Ok(stripped) = canonical.strip_prefix(base)
-        && let Some(s) = stripped.to_str()
-    {
-        return Some(crate::path_utils::to_canonical_slashes(s).into_owned());
+    // Virtual entries and deleted subtrees can have several missing ancestors.
+    for ancestor in path.ancestors() {
+        match crate::path_utils::canonicalize(ancestor) {
+            Ok(canonical) => {
+                let mut relative = canonical.strip_prefix(base).ok()?.to_path_buf();
+                if ancestor != path {
+                    relative.push(path.strip_prefix(ancestor).ok()?);
+                }
+                return relative
+                    .to_str()
+                    .map(|s| crate::path_utils::to_canonical_slashes(s).into_owned());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        }
     }
-
-    // Deleted files can't be canonicalized — canonicalize the parent and
-    // re-attach the filename.
-    let parent = path.parent()?;
-    let file_name = path.file_name()?;
-    let canonical_parent = crate::path_utils::canonicalize(parent).ok()?;
-    let stripped_parent = canonical_parent.strip_prefix(base).ok()?;
-    let mut rel = stripped_parent.to_path_buf();
-    rel.push(file_name);
-    rel.to_str()
-        .map(|s| crate::path_utils::to_canonical_slashes(s).into_owned())
+    None
 }
 
 impl Drop for FilePicker {

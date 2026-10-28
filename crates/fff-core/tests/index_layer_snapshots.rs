@@ -212,7 +212,9 @@ fn add_entries_revives_a_tombstoned_file() {
     let mut picker = picker(base);
     assert_eq!(
         picker
-            .add_entries([IndexEntry::new("virtual/gone.rs")])
+            .add_entries([IndexEntry::new("virtual/gone.rs")
+                .with_metadata(10, 30)
+                .with_binary(true)])
             .expect("add"),
         1
     );
@@ -221,13 +223,64 @@ fn add_entries_revives_a_tombstoned_file() {
 
     assert_eq!(
         picker
-            .add_entries([IndexEntry::new("virtual/gone.rs")])
+            .add_entries([IndexEntry::new("virtual/gone.rs")
+                .with_metadata(5, 20)
+                .with_binary(false)])
             .expect("add"),
         1
+    );
+    let revived = picker
+        .get_file_by_path(base.join("virtual/gone.rs"))
+        .unwrap();
+    assert_eq!(
+        (revived.size, revived.modified, revived.is_binary()),
+        (5, 20, false)
     );
     assert_eq!(layer_paths(&picker, SESSION_LAYER), vec!["virtual/gone.rs"]);
     assert_eq!(picker.files_in_layer(SESSION_LAYER).len(), 1, "slot reused");
     assert!(search_paths(&picker, "gone").contains(&"virtual/gone.rs".to_string()));
+}
+
+#[test]
+fn imported_entry_refreshes_tombstoned_base_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+    let path = base.join("before.rs");
+    fs::write(&path, "original data").unwrap();
+    let mut picker = picker(base);
+    assert!(picker.remove_file_by_path(&path));
+    let mut builder = LayerBuilder::new(None);
+    assert!(
+        builder.push(
+            &IndexEntry::new("before.rs")
+                .with_metadata(7, 1)
+                .with_binary(true)
+        )
+    );
+    picker.import_layer(builder.finish()).unwrap();
+    let file = picker.get_file_by_path(path).unwrap();
+    assert_eq!((file.size, file.modified, file.is_binary()), (7, 1, true));
+    assert_eq!(
+        picker.export_layer(0).unwrap().layout(),
+        SnapshotLayout::Unsorted
+    );
+}
+
+#[test]
+fn toggling_overflow_preserves_the_owning_arena() {
+    let tmp = TempDir::new().unwrap();
+    let mut picker = picker(tmp.path());
+    let layer = picker.create_layer(None);
+    picker
+        .add_entries([IndexEntry::new("overlay/only.rs")])
+        .unwrap();
+    let file = &picker.files_in_layer(layer)[0];
+    for overflow in [false, true] {
+        file.set_overflow(overflow);
+        assert_eq!(file.is_overflow(), overflow);
+        assert_eq!(file.layer_id(), layer);
+        assert_eq!(file.relative_path(&picker), "overlay/only.rs");
+    }
 }
 
 #[test]

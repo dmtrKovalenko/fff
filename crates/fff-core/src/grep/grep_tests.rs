@@ -1018,3 +1018,39 @@ fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
     assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
     assert_eq!(searched, 3);
 }
+
+#[test]
+fn metadata_only_revival_keeps_a_base_file_searchable() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("changed.txt");
+    std::fs::write(&path, "old contents").unwrap();
+    std::fs::write(temp.path().join("other.txt"), "diluted").unwrap();
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: temp.path().to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let base = BigramIndexBuilder::new(2);
+    let skip = BigramIndexBuilder::new(2);
+    base.add_file_content(&skip, 0, b"old contents");
+    base.add_file_content(&skip, 1, b"diluted");
+    let index = base.compress(Some(0));
+    assert_eq!(index.query(b"different"), Some(vec![0b10]));
+    picker.set_bigram_index(index);
+    assert!(picker.remove_file_by_path(&path));
+    std::fs::write(&path, "different text").unwrap();
+    assert_eq!(
+        picker
+            .add_entries([crate::IndexEntry::new("changed.txt").with_metadata(14, 1)])
+            .unwrap(),
+        1
+    );
+    let result = picker.grep(
+        &super::parse_grep_query("different"),
+        &GrepSearchOptions::default(),
+    );
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.files[0].relative_path(&picker), "changed.txt");
+}

@@ -122,6 +122,15 @@ impl<T> StableVec<T> {
         unsafe { Some(&mut *self.inner.ptr.as_ptr().add(index)) }
     }
 
+    // Borrow only the writable overlay. A post-scan reader can still hold the base prefix.
+    pub fn range_mut(&mut self, range: std::ops::Range<usize>) -> &mut [T] {
+        assert!(range.start <= range.end && range.end <= self.len());
+        // SAFETY: the checked range lies in the initialized buffer and has a single writer.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.inner.ptr.as_ptr().add(range.start), range.len())
+        }
+    }
+
     #[inline]
     pub fn capacity(&self) -> usize {
         self.inner.cap

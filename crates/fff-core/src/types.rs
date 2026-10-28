@@ -681,11 +681,14 @@ impl FileItem {
 
     #[inline]
     pub fn set_overflow(&self, val: bool) {
-        self.set_layer(if val {
-            crate::index::layers::SESSION_LAYER
+        // The public overflow flag does not transfer ownership of the path arena.
+        if val {
+            self.flags
+                .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
         } else {
-            0
-        });
+            self.flags
+                .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
+        }
     }
 
     /// Arena layer owning this file's path. `0` is the base scan, higher ids
