@@ -112,6 +112,8 @@ pub(crate) struct FileSync {
     base_count: usize,
     /// Number of active present files that exists in the file system
     pub(crate) live_count: usize,
+    // Files appended by watcher events since the last scan. Imported layers have their own reserve.
+    watcher_additions: usize,
     /// Sorted directory table. `StableVec` so post-scan snapshots can keep
     /// the allocation alive across a picker drop without copying, and so
     /// concurrent readers observe a consistent view via the same shared
@@ -147,6 +149,7 @@ impl FileSync {
             indexable_count: 0,
             base_count: 0,
             live_count: 0,
+            watcher_additions: 0,
             dirs: StableVec::from_vec_with_reserve(Vec::new(), MAX_OVERFLOW_FILES),
             base_dirs_count: 0,
             live_dirs_count: 0,
@@ -1850,7 +1853,9 @@ impl FilePicker {
     /// which indicates that it's time to trigger a new sync
     #[tracing::instrument(skip(self))]
     pub fn add_new_file(&mut self, path: &Path) -> Option<&FileItem> {
-        if self.get_overflow_files().len() >= MAX_OVERFLOW_FILES {
+        if self.sync_data.watcher_additions >= MAX_OVERFLOW_FILES
+            || self.sync_data.files.len() == self.sync_data.files.capacity()
+        {
             return None;
         }
 
@@ -1909,6 +1914,7 @@ impl FilePicker {
         }
 
         self.sync_data.live_count += 1;
+        self.sync_data.watcher_additions += 1;
         // Dir may have been tombstoned by an earlier removal; a new file
         // under it proves it exists again.
         self.sync_data.revive_dir(parent_dir);
@@ -2328,6 +2334,7 @@ impl FileSync {
             indexable_count,
             base_count,
             live_count: base_count,
+            watcher_additions: 0,
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,

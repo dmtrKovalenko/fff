@@ -485,6 +485,7 @@ impl FileSync {
             indexable_count,
             base_count,
             live_count: base_count,
+            watcher_additions: 0,
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,
