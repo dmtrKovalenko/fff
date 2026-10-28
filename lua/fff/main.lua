@@ -690,7 +690,7 @@ function M.go_to_definition(opts)
   opts.grep.classify_definitions = 'definition_only'
   local config = require('fff.conf').get()
   local root, same_root
-  if opts.cwd then
+  if opts.cwd and opts.cwd ~= '' then
     root = vim.uv.fs_realpath(vim.fn.expand(opts.cwd))
     if not root or vim.fn.isdirectory(root) ~= 1 then
       vim.notify('FFF go_to_definition: cwd does not exist', vim.log.levels.ERROR)
@@ -715,6 +715,7 @@ function M.go_to_definition(opts)
       ok
       and result.is_index_ready
       and #result.items == 1
+      and #(result.items[1].match_ranges or {}) == 1
       and result.next_file_offset == 0
       and (not root or vim.uv.fs_realpath(result.base_path) == root)
     then
