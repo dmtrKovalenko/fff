@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
@@ -418,34 +420,34 @@ impl FileItem {
         path.starts_with(prefix)
     }
 
-    /// Write `base_path + '/' + relative_path` into `buf` and return it
-    /// as `&Path`. Takes a fixed-size array so the buffer can live on
-    /// the stack (no heap allocation, no bounds checks in the hot loop).
+    /// Uses the caller's stack buffer when the complete path fits.
     pub(crate) fn write_absolute_path<'a>(
         &self,
         arena: ArenaPtr,
         base_path: &Path,
         buf: &'a mut [u8; PATH_BUF_SIZE],
-    ) -> &'a Path {
+    ) -> Cow<'a, Path> {
         let base = base_path.as_os_str().as_encoded_bytes();
-        let base_len = base.len();
-        buf[..base_len].copy_from_slice(base);
-        let sep_len = if base_len > 0 && base[base_len - 1] != std::path::MAIN_SEPARATOR as u8 {
-            buf[base_len] = std::path::MAIN_SEPARATOR as u8;
-            1
-        } else {
-            0
-        };
-
-        let base_end_idx = base_len + sep_len;
-        let relative_portion_str = self.path.read_to_buf(arena, &mut buf[base_end_idx..]);
-        let rel_len = relative_portion_str.len();
-        let total = base_end_idx + rel_len;
-        // Stored relative paths are '/'-canonical; rewrite to the OS-native
-        // separator so the result matches git-cache keys, the frecency DB, and
-        // Win32 file APIs. No-op off Windows.
-        crate::path_utils::nativize_slashes_in_place(&mut buf[base_end_idx..total]);
-        Path::new(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
+        let sep = !base.is_empty() && !base.ends_with(&[std::path::MAIN_SEPARATOR as u8]);
+        let start = base.len() + usize::from(sep);
+        if start + self.relative_path_len() > buf.len() {
+            let relative = self.relative_path(arena);
+            #[cfg(windows)]
+            let relative = relative.replace('/', "\\");
+            return Cow::Owned(base_path.join(relative));
+        }
+        buf[..base.len()].copy_from_slice(base);
+        if sep {
+            buf[base.len()] = std::path::MAIN_SEPARATOR as u8;
+        }
+        let len = self.path.read_to_buf(arena, &mut buf[start..]).len();
+        let end = start + len;
+        crate::path_utils::nativize_slashes_in_place(&mut buf[start..end]);
+        // SAFETY: the native-encoded base and UTF-8 relative path are joined
+        // at an ASCII separator. The base can contain non-Unicode OS bytes.
+        Cow::Borrowed(Path::new(unsafe {
+            OsStr::from_encoded_bytes_unchecked(&buf[..end])
+        }))
     }
 
     /// Write the relative path into `buf` and NUL-terminate, returning
@@ -931,11 +933,7 @@ impl FileItem {
                 }
             }
         }
-        if base_path.as_os_str().len() + self.relative_path_len() + 1 < path_buf.len() {
-            std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
-        } else {
-            std::fs::File::open(self.absolute_path(arena, base_path)).ok()
-        }
+        std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
     }
 }
 
@@ -1186,6 +1184,34 @@ impl Default for ContentCacheBudget {
 #[cfg(test)]
 mod content_cache_budget_tests {
     use super::*;
+
+    #[test]
+    fn absolute_paths_preserve_the_complete_os_path_across_the_stack_limit() {
+        let relative = "é.rs";
+        let mut file = FileItem::new_raw(0, 0, 0, None, false);
+        let (store, paths) = crate::simd_path::build_chunked_path_store_from_strings(
+            &[relative.to_string()],
+            std::slice::from_ref(&file),
+        );
+        file.set_path(paths.into_iter().next().unwrap());
+        let mut buf = [0; PATH_BUF_SIZE];
+        let arena = store.as_arena_ptr();
+        let short = file.write_absolute_path(arena, Path::new("a"), &mut buf);
+        assert!(matches!(short, Cow::Borrowed(_)));
+        assert_eq!(short.as_ref(), Path::new("a").join(relative));
+        for n in [PATH_BUF_SIZE - 2, PATH_BUF_SIZE + 1] {
+            let base = PathBuf::from("x".repeat(n));
+            let absolute = file.write_absolute_path(arena, &base, &mut buf);
+            assert_eq!(absolute.as_ref(), base.join(relative));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let base = Path::new(OsStr::from_bytes(b"dir/\xff"));
+            let absolute = file.write_absolute_path(arena, base, &mut buf);
+            assert_eq!(absolute.as_ref(), base.join(relative));
+        }
+    }
 
     #[cfg(unix)]
     #[test]

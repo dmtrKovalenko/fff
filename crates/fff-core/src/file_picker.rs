@@ -583,9 +583,9 @@ impl FileItem {
             Some(shared_base) => {
                 let mut shared_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
                 let shared = self.write_absolute_path(arena, shared_base, &mut shared_buf);
-                reader.access_score(abs, Some(shared), mode)
+                reader.access_score(&abs, Some(&shared), mode)
             }
-            None => reader.access_score(abs, None, mode),
+            None => reader.access_score(&abs, None, mode),
         };
 
         self.access_frecency_score = access_score as i16;
@@ -1150,7 +1150,7 @@ impl FilePicker {
             let arena = self.arena_base_ptr();
             let base_count = self.sync_data.base_count;
             for file in self.sync_data.files.iter_mut().take(base_count) {
-                file.git_status = git_cache.lookup_status(file.write_absolute_path(
+                file.git_status = git_cache.lookup_status(&file.write_absolute_path(
                     arena,
                     &self.base_path,
                     &mut path_buf,
@@ -2004,7 +2004,7 @@ impl FilePicker {
             |file, arena| {
                 file.invalidate_mmap(cache_budget);
                 if let Some(callback) = callback.as_mut() {
-                    callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
+                    callback(&file.write_absolute_path(arena, &base_path, &mut path_buf));
                 }
             },
         );

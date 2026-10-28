@@ -1282,7 +1282,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
         }
 
         let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
-        file.detect_binary_per_byte(abs, &mut chunk);
+        file.detect_binary_per_byte(&abs, &mut chunk);
     }
 }
 

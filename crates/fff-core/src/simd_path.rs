@@ -257,7 +257,13 @@ impl ChunkedString {
             }
         }
 
-        unsafe { core::str::from_utf8_unchecked(&buf[..total]) }
+        // A shorter caller-owned buffer can end in the middle of a code point.
+        let len = if total < self.byte_len as usize {
+            core::str::from_utf8(&buf[..total]).map_or_else(|error| error.valid_up_to(), str::len)
+        } else {
+            total
+        };
+        unsafe { core::str::from_utf8_unchecked(&buf[..len]) }
     }
 
     #[inline]
@@ -548,6 +554,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn short_path_buffers_stop_at_a_character_boundary() {
+        let (store, paths, _) = build_test_store(&["a/é.rs"]);
+        let mut buf = [0; 3];
+        assert_eq!(paths[0].read_to_buf(store.as_arena_ptr(), &mut buf), "a/");
     }
 
     fn make_file_item(path: &str) -> crate::types::FileItem {
