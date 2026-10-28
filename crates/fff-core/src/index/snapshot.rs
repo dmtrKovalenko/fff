@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use crate::constants::PATH_BUF_SIZE;
 use crate::error::Error;
+use crate::file_picker::is_indexable;
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::simd_path::{
     ChunkedPathStore, ChunkedPathStoreBuilder, ChunkedString, SIMD_CHUNK_BYTES, SimdChunk,
@@ -101,7 +102,7 @@ impl LayerBuilder {
         }
     }
 
-    /// `false` when the path is absolute, empty, or too long for the index.
+    /// Returns `false` for paths that cannot be stored as portable, root-relative file names.
     pub fn push(&mut self, entry: &IndexEntry<'_>) -> bool {
         let Some(path) = normalize_relative_path(entry.relative_path) else {
             return false;
@@ -125,12 +126,12 @@ impl LayerBuilder {
         self.entries.is_empty()
     }
 
-    /// Sorts by `(dir, name)`, drops duplicate paths, derives every ancestor
+    /// Sorts by `(dir, name)`, keeps the first entry for each path, derives every ancestor
     /// dir and packs paths into a fresh arena.
     pub fn finish(self) -> LayerSnapshot {
         let mut entries = self.entries;
         BACKGROUND_THREAD_POOL.install(|| {
-            entries.par_sort_unstable_by(|a, b| {
+            entries.par_sort_by(|a, b| {
                 dir_name_key(&a.path, a.filename_offset)
                     .cmp(&dir_name_key(&b.path, b.filename_offset))
             });
@@ -252,7 +253,8 @@ impl LayerSnapshot {
         self.dirs.iter().map(move |d| d.relative_path(arena))
     }
 
-    /// Writes the snapshot to `path`, returning the bytes written.
+    /// Atomically publishes the snapshot at `path`, returning the bytes written.
+    /// Readers with the old file open can finish reading that snapshot.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<u64, Error> {
         let path = path.as_ref();
         let io_err = |source| Error::LayerFile {
@@ -260,10 +262,35 @@ impl LayerSnapshot {
             source,
         };
 
-        let file = std::fs::File::create(path).map_err(io_err)?;
-        let mut writer = io::BufWriter::with_capacity(1 << 20, file);
+        let permissions = match std::fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && !metadata.permissions().readonly() =>
+            {
+                Some(metadata.permissions())
+            }
+            Ok(_) => {
+                return Err(io_err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "snapshot destination must be a writable regular file",
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_err(error)),
+        };
+        let directory = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut temp = tempfile::NamedTempFile::new_in(directory).map_err(io_err)?;
+        let mut writer = io::BufWriter::with_capacity(1 << 20, temp.as_file_mut());
         let written = self.write_to(&mut writer).map_err(io_err)?;
         writer.flush().map_err(io_err)?;
+        drop(writer);
+        if let Some(mode) = permissions {
+            temp.as_file().set_permissions(mode).map_err(io_err)?;
+        }
+        temp.as_file().sync_all().map_err(io_err)?;
+        temp.persist(path).map_err(|error| io_err(error.error))?;
         Ok(written)
     }
 
@@ -284,15 +311,35 @@ impl LayerSnapshot {
         let chunks = self.store.chunks();
         let indices = self.store.indices();
 
+        let overflow = |_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot exceeds format limits",
+            )
+        };
         let mut header = [0u8; HEADER_BYTES];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         header[12] = self.layout as u8;
-        header[14..16].copy_from_slice(&(label.len() as u16).to_le_bytes());
-        header[16..20].copy_from_slice(&(self.files.len() as u32).to_le_bytes());
-        header[20..24].copy_from_slice(&(self.dirs.len() as u32).to_le_bytes());
-        header[24..28].copy_from_slice(&(chunks.len() as u32).to_le_bytes());
-        header[28..32].copy_from_slice(&(indices.len() as u32).to_le_bytes());
+        header[14..16]
+            .copy_from_slice(&u16::try_from(label.len()).map_err(overflow)?.to_le_bytes());
+        header[16..20].copy_from_slice(
+            &u32::try_from(self.files.len())
+                .map_err(overflow)?
+                .to_le_bytes(),
+        );
+        header[20..24].copy_from_slice(
+            &u32::try_from(self.dirs.len())
+                .map_err(overflow)?
+                .to_le_bytes(),
+        );
+        header[24..28]
+            .copy_from_slice(&u32::try_from(chunks.len()).map_err(overflow)?.to_le_bytes());
+        header[28..32].copy_from_slice(
+            &u32::try_from(indices.len())
+                .map_err(overflow)?
+                .to_le_bytes(),
+        );
         w.write_all(&header)?;
         w.write_all(label)?;
 
@@ -310,11 +357,15 @@ impl LayerSnapshot {
         w.write_all(arena_bytes)?;
         written += arena_bytes.len() as u64;
 
-        // SAFETY: plain u32s; the reader parses them back as little-endian.
-        let index_bytes =
-            unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4) };
-        w.write_all(index_bytes)?;
-        written += index_bytes.len() as u64;
+        // Encode the table in batches to keep write_to efficient for unbuffered writers.
+        let mut index_bytes = [0u8; 4096];
+        for batch in indices.chunks(index_bytes.len() / 4) {
+            for (slot, index) in index_bytes.chunks_exact_mut(4).zip(batch) {
+                slot.copy_from_slice(&index.to_le_bytes());
+            }
+            w.write_all(&index_bytes[..batch.len() * 4])?;
+            written += (batch.len() * 4) as u64;
+        }
 
         let mut buf = Vec::with_capacity(64);
         for dir in &self.dirs {
@@ -357,7 +408,9 @@ impl LayerSnapshot {
             2 => SnapshotLayout::Unsorted,
             _ => return Err(Error::LayerFormat("bad layout")),
         };
-        cur.take(1)?;
+        if cur.u8()? != 0 {
+            return Err(Error::LayerFormat("unsupported header flags"));
+        }
         let label_len = cur.u16()? as usize;
         let file_count = cur.u32()? as usize;
         let dir_count = cur.u32()? as usize;
@@ -369,7 +422,20 @@ impl LayerSnapshot {
         let label = (!label.is_empty()).then(|| Box::from(label));
         cur.take(label_len.next_multiple_of(SIMD_CHUNK_BYTES) - label_len)?;
 
-        let arena_bytes = cur.take(chunk_count * SIMD_CHUNK_BYTES)?;
+        let byte_count = |count: usize, width: usize| {
+            count
+                .checked_mul(width)
+                .ok_or(Error::LayerFormat("section too large"))
+        };
+        let arena_bytes = cur.take(byte_count(chunk_count, SIMD_CHUNK_BYTES)?)?;
+        let index_bytes = cur.take(byte_count(index_count, 4)?)?;
+        if cur
+            .remaining()
+            .checked_sub(byte_count(dir_count, MIN_DIR_RECORD)?)
+            != Some(byte_count(file_count, MIN_FILE_RECORD)?)
+        {
+            return Err(Error::LayerFormat("inconsistent record counts"));
+        }
         let mut arena: Vec<SimdChunk> = Vec::with_capacity(chunk_count);
         // SAFETY: `arena_bytes` holds exactly `chunk_count * 16` bytes and any
         // byte pattern is a valid SimdChunk; the Vec allocation is aligned.
@@ -382,8 +448,7 @@ impl LayerSnapshot {
             arena.set_len(chunk_count);
         }
 
-        let indices: Vec<u32> = cur
-            .take(index_count * 4)?
+        let indices: Vec<u32> = index_bytes
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
             .collect();
@@ -392,32 +457,57 @@ impl LayerSnapshot {
         }
         let store = ChunkedPathStore::from_parts(arena, indices);
 
-        // Capacities are bounded by the bytes left, not by the header.
-        let mut dirs = Vec::with_capacity(dir_count.min(cur.remaining() / MIN_DIR_RECORD));
+        let mut dirs: Vec<DirItem> = Vec::with_capacity(dir_count);
+        let mut path_buf = [0u8; PATH_BUF_SIZE];
+        let mut other_buf = [0u8; PATH_BUF_SIZE];
         for _ in 0..dir_count {
-            let last_segment_offset = cur.u16()?;
-            let path = read_chunked(&mut cur, &store, last_segment_offset)?;
-            dirs.push(DirItem::new(path, last_segment_offset));
+            let last_segment = cur.u16()?;
+            let (mut path, text) = read_chunked(&mut cur, &store, &mut path_buf)?;
+            if !(text.is_empty() || text.strip_suffix('/').is_some_and(is_relative_file_path))
+                || last_segment != last_segment_offset(text)
+            {
+                return Err(Error::LayerFormat("invalid directory path"));
+            }
+            if dirs.last().is_some_and(|prev| {
+                prev.read_relative_path(store.as_arena_ptr(), &mut other_buf) >= text
+            }) {
+                return Err(Error::LayerFormat("directory table out of order"));
+            }
+            path.filename_offset = path.byte_len;
+            dirs.push(DirItem::new(path, last_segment));
         }
 
-        let mut files = Vec::with_capacity(file_count.min(cur.remaining() / MIN_FILE_RECORD));
+        let mut files = Vec::with_capacity(file_count);
         for _ in 0..file_count {
             let size = cur.u64()?;
             let modified = cur.u64()?;
-            let binary = cur.u8()? != 0;
-            let filename_offset = cur.u16()?;
+            let binary = match cur.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::LayerFormat("invalid binary flag")),
+            };
+            let offset = cur.u16()?;
             let parent_dir_index = cur.u32()?;
-            if parent_dir_index as usize >= dir_count {
-                return Err(Error::LayerFormat("parent dir out of range"));
+            let parent = dirs
+                .get(parent_dir_index as usize)
+                .ok_or(Error::LayerFormat("parent dir out of range"))?;
+            let (mut path, text) = read_chunked(&mut cur, &store, &mut path_buf)?;
+            if !is_relative_file_path(text) || usize::from(offset) != filename_offset(text) {
+                return Err(Error::LayerFormat("invalid file path"));
             }
-
-            let path = read_chunked(&mut cur, &store, filename_offset)?;
-            let mut file = FileItem::new_raw(filename_offset, size, modified, None, binary);
+            if parent.read_relative_path(store.as_arena_ptr(), &mut other_buf)
+                != &text[..usize::from(offset)]
+            {
+                return Err(Error::LayerFormat("parent directory does not match path"));
+            }
+            path.filename_offset = offset;
+            let mut file = FileItem::new_raw(offset, size, modified, None, binary);
             file.set_path(path);
             file.parent_dir_index = parent_dir_index;
             files.push(file);
         }
 
+        let layout = validated_layout(layout, &files, &store)?;
         Ok(Self {
             label,
             store: Arc::new(store),
@@ -478,49 +568,101 @@ fn write_chunked(buf: &mut Vec<u8>, path: &ChunkedString) {
     buf.extend_from_slice(&path.byte_len.to_le_bytes());
 }
 
-// Every reader slices paths as `str` unchecked, so the bytes are validated
-// here once: UTF-8 and `filename_offset` on a char boundary.
-fn read_chunked(
+// Only checked UTF-8 may enter the path store exposed to search. Normal path
+// readers assume that invariant, so they cannot be used on unvalidated bytes.
+fn read_chunked<'a>(
     cur: &mut Cursor<'_>,
     store: &ChunkedPathStore,
-    filename_offset: u16,
-) -> Result<ChunkedString, Error> {
+    buf: &'a mut [u8; PATH_BUF_SIZE],
+) -> Result<(ChunkedString, &'a str), Error> {
     let index_offset = cur.u32()?;
     let byte_len = cur.u16()?;
-    let path = ChunkedString::new(index_offset, byte_len, filename_offset);
-    let index_end = index_offset as usize + path.chunk_count();
-    if filename_offset > byte_len
-        || byte_len as usize >= PATH_BUF_SIZE
-        || index_end > store.indices().len()
-    {
-        return Err(Error::LayerFormat("inconsistent path record"));
+    let path = ChunkedString::new(index_offset, byte_len, 0);
+    let start = index_offset as usize;
+    let len = byte_len as usize;
+    let indices = start
+        .checked_add(path.chunk_count())
+        .and_then(|end| store.indices().get(start..end))
+        .filter(|_| len < PATH_BUF_SIZE)
+        .ok_or(Error::LayerFormat("inconsistent path record"))?;
+    for (out, &index) in buf[..len].chunks_mut(SIMD_CHUNK_BYTES).zip(indices) {
+        out.copy_from_slice(&store.chunks()[index as usize].0[..out.len()]);
     }
+    let text =
+        std::str::from_utf8(&buf[..len]).map_err(|_| Error::LayerFormat("path is not utf-8"))?;
+    Ok((path, text))
+}
 
-    let mut bytes = [0u8; PATH_BUF_SIZE];
-    let text = path.read_to_buf(store.as_arena_ptr(), &mut bytes);
-    if std::str::from_utf8(text.as_bytes()).is_err() {
-        return Err(Error::LayerFormat("path is not utf-8"));
+// A base file may have changed size or binary status since its initial scan.
+// Only take binary-search fast paths when the serialized order supports them.
+fn validated_layout(
+    layout: SnapshotLayout,
+    files: &[FileItem],
+    store: &ChunkedPathStore,
+) -> Result<SnapshotLayout, Error> {
+    let arena = store.as_arena_ptr();
+    let mut left = [0u8; PATH_BUF_SIZE];
+    let mut right = [0u8; PATH_BUF_SIZE];
+    let mut compare = |a: &FileItem, b: &FileItem| {
+        a.parent_dir_index.cmp(&b.parent_dir_index).then_with(|| {
+            a.path
+                .read_to_buf(arena, &mut left)
+                .cmp(b.path.read_to_buf(arena, &mut right))
+        })
+    };
+    let mut sorted = true;
+    let mut partitioned = true;
+    for pair in files.windows(2) {
+        let order = compare(&pair[0], &pair[1]);
+        if order.is_eq() {
+            return Err(Error::LayerFormat("duplicate file path"));
+        }
+        sorted &= order.is_lt();
+        partitioned &= (!is_indexable(&pair[0]))
+            .cmp(&!is_indexable(&pair[1]))
+            .then(order)
+            .is_lt();
     }
-    if !text.is_char_boundary(filename_offset as usize) {
-        return Err(Error::LayerFormat("filename offset splits a char"));
+    if !sorted && partitioned {
+        // Both runs are sorted. Check for duplicates across the boundary
+        // without storing another copy of the file paths.
+        let mid = files.partition_point(is_indexable);
+        let (mut i, mut j) = (0, mid);
+        while i < mid && j < files.len() {
+            match compare(&files[i], &files[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => return Err(Error::LayerFormat("duplicate file path")),
+            }
+        }
+    } else if !sorted {
+        let mut ordered: Vec<_> = files.iter().collect();
+        ordered.sort_unstable_by(|a, b| compare(a, b));
+        if ordered
+            .windows(2)
+            .any(|pair| compare(pair[0], pair[1]).is_eq())
+        {
+            return Err(Error::LayerFormat("duplicate file path"));
+        }
     }
+    Ok(match layout {
+        SnapshotLayout::BasePartitioned if !partitioned => SnapshotLayout::Unsorted,
+        SnapshotLayout::Sorted if !sorted => SnapshotLayout::Unsorted,
+        other => other,
+    })
+}
 
-    Ok(path)
+fn is_relative_file_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        && !path.contains(['\\', '\0'])
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
 pub(crate) fn normalize_relative_path(raw: &str) -> Option<String> {
     let path = crate::path_utils::to_canonical_slashes(raw);
     let path = path.trim_start_matches("./");
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.ends_with('/')
-        || path.len() >= PATH_BUF_SIZE
-        || Path::new(path).is_absolute()
-    {
-        return None;
-    }
-
-    Some(path.to_owned())
+    (path.len() < PATH_BUF_SIZE && is_relative_file_path(path)).then(|| path.to_owned())
 }
 
 #[inline]
@@ -573,6 +715,7 @@ mod tests {
 
         let dirs: Vec<String> = snap.dir_paths().collect();
         assert_eq!(dirs, ["", "src/", "src/b/", "src/b/c/"]);
+        assert_eq!(snap.files[2].size, 0, "first duplicate supplies metadata");
 
         let arena = snap.store.as_arena_ptr();
         for file in &snap.files {
@@ -584,9 +727,24 @@ mod tests {
     #[test]
     fn builder_rejects_absolute_and_empty_paths() {
         let mut builder = LayerBuilder::new(None);
-        assert!(!builder.push(&IndexEntry::new("/etc/passwd")));
-        assert!(!builder.push(&IndexEntry::new("")));
-        assert!(!builder.push(&IndexEntry::new("dir/")));
+        for invalid in [
+            "",
+            "/etc/passwd",
+            "dir/",
+            "..",
+            "../file",
+            "dir/../file",
+            "dir/./file",
+            "dir//file",
+            "C:/file",
+            "d:file",
+            r"..\file",
+            r"\file",
+            r"\\host\share\file",
+            "file\0name",
+        ] {
+            assert!(!builder.push(&IndexEntry::new(invalid)), "{invalid:?}");
+        }
         assert!(builder.push(&IndexEntry::new("./ok.rs")));
         assert_eq!(builder.len(), 1);
     }
@@ -664,6 +822,81 @@ mod tests {
     }
 
     #[test]
+    fn decoder_checks_directory_and_parent_paths_even_when_records_are_in_bounds() {
+        let snap = snapshot(&["root", "ab/file"]);
+        let mut bytes = Vec::new();
+        snap.write_to(&mut bytes).unwrap();
+        let files_start = bytes.len() - 2 * MIN_FILE_RECORD;
+        let dirs_start = files_start - 2 * MIN_DIR_RECORD;
+
+        let mut bad = bytes.clone();
+        bad[files_start + MIN_FILE_RECORD + 19..files_start + MIN_FILE_RECORD + 23]
+            .copy_from_slice(&0u32.to_le_bytes());
+        assert!(LayerSnapshot::from_bytes(&bad).is_err());
+
+        let mut bad = bytes.clone();
+        bad[dirs_start..files_start].rotate_left(MIN_DIR_RECORD);
+        assert!(LayerSnapshot::from_bytes(&bad).is_err());
+
+        let arena_start = HEADER_BYTES + SIMD_CHUNK_BYTES;
+        let arena_end = arena_start + snap.store.chunks().len() * SIMD_CHUNK_BYTES;
+        for bad_prefix in [b"../", b"C:/", b"/x/", b"x//", b"x\\/"] {
+            let mut bad = bytes.clone();
+            for chunk in bad[arena_start..arena_end].chunks_exact_mut(SIMD_CHUNK_BYTES) {
+                if chunk.starts_with(b"ab/") {
+                    chunk[..3].copy_from_slice(bad_prefix);
+                }
+            }
+            assert!(LayerSnapshot::from_bytes(&bad).is_err(), "{bad_prefix:?}");
+        }
+
+        let mut bad = bytes.clone();
+        bad[dirs_start + MIN_DIR_RECORD] = 1;
+        assert!(LayerSnapshot::from_bytes(&bad).is_err());
+
+        let mut bad = bytes;
+        bad.push(0);
+        assert!(LayerSnapshot::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn layout_claims_are_checked_and_duplicate_file_records_are_rejected() {
+        // A changed size can move the first file out of the indexable partition.
+        let snap = snapshot(&["a", "b", "c"]);
+        let mut bytes = Vec::new();
+        snap.write_to(&mut bytes).unwrap();
+        bytes[12] = SnapshotLayout::BasePartitioned as u8;
+        assert_eq!(
+            LayerSnapshot::from_bytes(&bytes).unwrap().layout(),
+            SnapshotLayout::Unsorted
+        );
+
+        let records = bytes.len() - 3 * MIN_FILE_RECORD;
+        bytes[12] = SnapshotLayout::Sorted as u8;
+        bytes[records..].rotate_right(MIN_FILE_RECORD);
+        assert_eq!(
+            LayerSnapshot::from_bytes(&bytes).unwrap().layout(),
+            SnapshotLayout::Unsorted
+        );
+
+        // Copy the first path record over the nonadjacent final one.
+        let end = bytes.len();
+        bytes.copy_within(
+            records + MIN_FILE_RECORD - 6..records + MIN_FILE_RECORD,
+            end - 6,
+        );
+        assert!(LayerSnapshot::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn label_length_must_fit_the_header() {
+        let snap = LayerBuilder::new(Some(&"a".repeat(u16::MAX as usize + 1))).finish();
+        let mut bytes = Vec::new();
+        assert!(snap.write_to(&mut bytes).is_err());
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
     fn filename_offset_inside_a_char_is_rejected() {
         let snap = snapshot(&["é/x.rs"]);
         let mut bytes = Vec::new();
@@ -679,6 +912,64 @@ mod tests {
         );
         bytes[offset_pos] = 1;
         assert!(LayerSnapshot::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn save_replaces_complete_snapshots_and_preserves_the_old_one_on_failure() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layer.fff");
+        snapshot(&["old"]).save(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let invalid = LayerBuilder::new(Some(&"a".repeat(u16::MAX as usize + 1))).finish();
+        assert!(invalid.save(&path).is_err());
+        assert_eq!(
+            LayerSnapshot::load(&path)
+                .unwrap()
+                .relative_paths()
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+
+        snapshot(&["new"]).save(&path).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            LayerSnapshot::from_bytes(&bytes)
+                .unwrap()
+                .relative_paths()
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+        assert_eq!(
+            LayerSnapshot::load(&path)
+                .unwrap()
+                .relative_paths()
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+    }
+
+    #[test]
+    fn save_respects_a_read_only_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layer.fff");
+        snapshot(&["old"]).save(&path).unwrap();
+        let original = path.metadata().unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).unwrap();
+        let result = snapshot(&["new"]).save(&path);
+        std::fs::set_permissions(&path, original).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            LayerSnapshot::load(&path)
+                .unwrap()
+                .relative_paths()
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
     }
 
     #[test]
