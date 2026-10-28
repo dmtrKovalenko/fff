@@ -1037,7 +1037,7 @@ fn metadata_only_revival_keeps_a_base_file_searchable() {
     base.add_file_content(&skip, 0, b"old contents");
     base.add_file_content(&skip, 1, b"diluted");
     let index = base.compress(Some(0));
-    assert_eq!(index.query(b"different"), Some(vec![0b10]));
+    assert_eq!(index.query(b"different"), Some(vec![0]));
     picker.set_bigram_index(index);
     assert!(picker.remove_file_by_path(&path));
     std::fs::write(&path, "different text").unwrap();
