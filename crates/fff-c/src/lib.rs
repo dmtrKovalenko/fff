@@ -959,6 +959,26 @@ pub unsafe extern "C" fn fff_wait_for_scan(
     FffResult::ok_int(completed as i64)
 }
 
+/// Wait for the filesystem walk and post-scan indexing before changing index layers.
+/// Returns 1 if the picker is ready, or 0 on timeout.
+///
+/// # Safety
+/// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_wait_for_indexing_complete(
+    fff_handle: *mut c_void,
+    timeout_ms: u64,
+) -> *mut FffResult {
+    let instance = match unsafe { instance_ref(fff_handle) } {
+        Ok(instance) => instance,
+        Err(error) => return error,
+    };
+    let completed = instance
+        .picker
+        .wait_for_indexing_complete(Duration::from_millis(timeout_ms));
+    FffResult::ok_int(completed as i64)
+}
+
 /// Wait for the background file watcher to be ready.
 ///
 /// ## Safety
