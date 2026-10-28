@@ -713,7 +713,7 @@ export interface FileFinderApi {
    * Load a layer file as the base scan in the background, like a rescan:
    * explicit overlays are kept, frecency and content indexing are applied.
    * Returns the file count; wait with `waitForScan` before searching.
-   * Fails while another scan is active.
+   * Wait with `waitForIndexReady` before changing layers or loading another base.
    */
   loadBase(filePath: string): Result<number>;
 }

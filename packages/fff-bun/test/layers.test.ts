@@ -7,19 +7,19 @@ import { FileFinder } from "../src/index";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fff-layers-"));
 fs.writeFileSync(path.join(tmp, "scanned.ts"), "export {};\n");
 
-function open(): FileFinder {
+async function open(): Promise<FileFinder> {
   const created = FileFinder.create({ basePath: tmp, disableWatch: true });
   if (!created.ok) throw new Error(created.error);
   const finder = created.value;
-  expect(finder.waitForScanBlocking(5000)).toEqual({ ok: true, value: true });
+  expect(await finder.waitForIndexReady(5000)).toEqual({ ok: true, value: true });
   return finder;
 }
 
 describe("FileFinder - index layers", () => {
   let finder: FileFinder;
 
-  beforeEach(() => {
-    finder = open();
+  beforeEach(async () => {
+    finder = await open();
   });
 
   afterEach(() => finder.destroy());
@@ -82,7 +82,7 @@ describe("FileFinder - index layers", () => {
     }
   });
 
-  test("saveLayer / loadLayer round-trip", () => {
+  test("saveLayer / loadLayer round-trip", async () => {
     expect(finder.createLayer("second")).toEqual({ ok: true, value: 2 });
     expect(finder.addPaths(["second/x.ts"])).toEqual({ ok: true, value: 1 });
     const file = path.join(tmp, "second.fff");
@@ -90,7 +90,7 @@ describe("FileFinder - index layers", () => {
     expect(saved.ok).toBe(true);
     if (saved.ok) expect(saved.value).toBe(fs.statSync(file).size);
 
-    const other = open();
+    const other = await open();
     try {
       const loaded = other.loadLayer(file);
       expect(loaded).toEqual({ ok: true, value: 2 });
@@ -117,11 +117,11 @@ describe("FileFinder - index layers", () => {
     }
   });
 
-  test("saveLayer(0) / loadBase restores the scan", () => {
+  test("saveLayer(0) / loadBase restores the scan", async () => {
     const file = path.join(tmp, "base.fff");
     expect(finder.saveLayer(0, file).ok).toBe(true);
 
-    const other = open();
+    const other = await open();
     try {
       const loaded = other.loadBase(file);
       expect(loaded.ok).toBe(true);

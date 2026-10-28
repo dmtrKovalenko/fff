@@ -159,6 +159,7 @@ function checked<T>(result: Result<T>): T {
   return result.value;
 }
 
+if (!checked(await finder.waitForIndexReady())) throw new Error("Initial indexing timed out");
 const layer = checked(finder.createLayer("generated"));
 const paths = ["build/out/a.js", { path: "build/out/b.js", size: 1024, modified: 1_700_000_000 }];
 checked(finder.addPaths(paths));

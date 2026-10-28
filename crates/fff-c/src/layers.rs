@@ -195,7 +195,9 @@ pub unsafe extern "C" fn fff_layer_load(
     }
 }
 
-/// Start a base scan from a snapshot and return its file count. Wait with `fff_wait_for_scan`.
+/// Start a base scan from a snapshot and return its file count.
+/// Use `fff_wait_for_scan` before searching.
+/// Use `fff_wait_for_indexing_complete` before changing layers.
 /// # Safety
 /// Provide a live instance and a NUL-terminated UTF-8 path.
 #[unsafe(no_mangle)]

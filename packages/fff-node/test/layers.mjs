@@ -8,18 +8,18 @@ import { FileFinder } from "../dist/index.js";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fff-node-layers-"));
 fs.writeFileSync(path.join(tmp, "scanned.ts"), "export {};\n");
 
-function open() {
+async function open() {
   const created = FileFinder.create({ basePath: tmp, disableWatch: true });
   assert.ok(created.ok, created.ok ? "" : created.error);
-  assert.deepEqual(created.value.waitForScanBlocking(5000), { ok: true, value: true });
+  assert.deepEqual(await created.value.waitForIndexReady(5000), { ok: true, value: true });
   return created.value;
 }
 
 describe("fff-node index layers", { concurrency: 1 }, () => {
   let finder;
 
-  beforeEach(() => {
-    finder = open();
+  beforeEach(async () => {
+    finder = await open();
   });
 
   afterEach(() => finder.destroy());
@@ -66,7 +66,7 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     );
   });
 
-  it("save / load layer and base", () => {
+  it("save / load layer and base", async () => {
     assert.deepEqual(finder.createLayer("second"), { ok: true, value: 2 });
     assert.deepEqual(finder.addPaths(["second/x.ts"]), { ok: true, value: 1 });
     const layerFile = path.join(tmp, "second.fff");
@@ -78,10 +78,10 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     const entries = Array.from({ length: 500 }, (_, i) => `gen/${i % 7}/m${i}.ts`);
     assert.ok(FileFinder.buildLayerFile(entries, built, "generated").ok);
 
-    const other = open();
+    const other = await open();
     try {
       assert.ok(other.loadBase(baseFile).ok);
-      assert.deepEqual(other.waitForScanBlocking(5000), { ok: true, value: true });
+      assert.deepEqual(await other.waitForIndexReady(5000), { ok: true, value: true });
       assert.deepEqual(other.loadLayer(layerFile), { ok: true, value: 2 });
       const id = other.loadLayer(built);
       assert.ok(id.ok);
