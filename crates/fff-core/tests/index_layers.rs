@@ -253,3 +253,28 @@ fn directory_search_survives_compaction() {
         assert!(dirs.contains(&expected), "{expected} missing from {dirs:?}");
     }
 }
+
+#[test]
+fn detached_paths_are_checked_after_compaction() {
+    let root = TempDir::new().unwrap();
+    let mut picker = picker(root.path());
+    for _ in 1..MAX_OVERLAY_LAYERS {
+        picker.create_layer(None);
+    }
+    let layer = picker.current_layer();
+    add(&mut picker, root.path(), "virtual/escaped.rs");
+    let file = picker.files_in_layer(layer)[0].clone();
+    let dir = picker.dirs_in_layer(layer)[0].clone();
+    assert_eq!(file.relative_path(&picker), "virtual/escaped.rs");
+    assert_eq!(dir.relative_path(&picker), "virtual/");
+
+    picker.create_layer(None);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.relative_path(&picker)))
+            .is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dir.relative_path(&picker)))
+            .is_err()
+    );
+}

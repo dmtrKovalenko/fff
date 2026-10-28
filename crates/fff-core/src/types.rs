@@ -20,6 +20,11 @@ pub trait FFFStringStorage {
     /// Resolve the arena for a [`FileItem`] (handles base vs overflow split).
     fn arena_for(&self, file: &FileItem) -> ArenaPtr;
 
+    /// Resolve the arena for a directory from this index.
+    fn arena_for_dir(&self, dir: &DirItem) -> ArenaPtr {
+        self.arena_for_layer(dir.layer_id())
+    }
+
     /// The base arena (scan-time paths).
     fn base_arena(&self) -> ArenaPtr;
     /// The overflow arena (paths added after the last full scan).
@@ -87,7 +92,8 @@ impl DirFlags {
     pub const LAYER: u8 = LAYER_MASK;
 }
 
-/// A directory in the file index. Shares chunk arena with file paths.
+/// A directory in the file index. Copy its path before mutating its picker
+/// if the path must outlive the index generation.
 #[derive(Debug)]
 pub struct DirItem {
     flags: u8,
@@ -207,7 +213,7 @@ impl DirItem {
     pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
         self.path
-            .write_to_string(arena.arena_for_layer(self.layer_id()), &mut out);
+            .write_to_string(arena.arena_for_dir(self), &mut out);
         out
     }
 
@@ -228,7 +234,7 @@ impl DirItem {
     /// The dirname (last segment) as an owned String. Cold path.
     pub fn dir_name(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
-        self.write_dir_name(arena.arena_for_layer(self.layer_id()), &mut out);
+        self.write_dir_name(arena.arena_for_dir(self), &mut out);
         out
     }
 
@@ -266,6 +272,8 @@ impl Constrainable for DirItem {
     }
 }
 
+/// A file in the index. Copy its path before mutating its picker if the
+/// path must outlive the index generation.
 #[derive(Debug)]
 pub struct FileItem {
     pub size: u64,

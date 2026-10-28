@@ -74,7 +74,7 @@ pub(crate) const MAX_PATH_CHUNKS: usize = PATH_BUF_SIZE.div_ceil(SIMD_CHUNK_BYTE
 
 /// A path stored as a run of chunk indices in the owning store's flat index
 /// table. 8 bytes; every read needs the store's `ArenaPtr`.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChunkedString {
     index_offset: u32,
     pub byte_len: u16,

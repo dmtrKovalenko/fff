@@ -681,7 +681,30 @@ impl std::fmt::Debug for FilePicker {
 impl FFFStringStorage for &FilePicker {
     #[inline]
     fn arena_for(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
+        let files = self.get_files();
+        if !files.as_ptr_range().contains(&std::ptr::from_ref(file)) {
+            assert!(
+                self.files_in_layer(file.layer_id())
+                    .iter()
+                    .any(|live| live.path == file.path),
+                "file path no longer belongs to this index"
+            );
+        }
         self.sync_data.arena_for_file(file)
+    }
+
+    #[inline]
+    fn arena_for_dir(&self, dir: &DirItem) -> crate::simd_path::ArenaPtr {
+        let dirs = &self.sync_data.dirs;
+        if !dirs.as_ptr_range().contains(&std::ptr::from_ref(dir)) {
+            assert!(
+                self.dirs_in_layer(dir.layer_id()).iter().any(|live| {
+                    live.path == dir.path && live.last_segment_offset() == dir.last_segment_offset()
+                }),
+                "directory path no longer belongs to this index"
+            );
+        }
+        self.arena_for_layer(dir.layer_id())
     }
 
     #[inline]
