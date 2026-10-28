@@ -693,20 +693,6 @@ jobs:
         id: version
         run: lua scripts/determine-version.lua
 
-      # Nightlies publish to a permanent per-sha tag (release_tag == version) so
-      # pinned/stale installs always fetch the binary built for their own commit.
-      # The rolling `nightly` tag is also moved to HEAD for "give me latest" tooling.
-      - name: Move rolling nightly tag to current commit
-        if: steps.version.outputs.is_release != 'true'
-        run: |
-          # Runs on main can finish out of order; only the current tip moves the tag.
-          if [ "$(git ls-remote origin refs/heads/main | cut -f1)" != "${{ github.sha }}" ]; then
-            echo "Not the tip of main, leaving the nightly tag alone"
-            exit 0
-          fi
-          git tag -f nightly "${{ github.sha }}"
-          git push -f origin refs/tags/nightly
-
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
@@ -742,6 +728,20 @@ jobs:
             ```sh
             curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff/main/install-mcp.sh | bash
             ```
+
+      # Nightlies publish to a permanent per-sha tag (release_tag == version) so
+      # pinned/stale installs always fetch the binary built for their own commit.
+      # The rolling `nightly` tag is also moved to HEAD for "give me latest" tooling.
+      - name: Move rolling nightly tag to current commit
+        if: steps.version.outputs.is_release != 'true'
+        run: |
+          # Runs on main can finish out of order; only the current tip moves the tag.
+          if [ "$(git ls-remote origin refs/heads/main | cut -f1)" != "${{ github.sha }}" ]; then
+            echo "Not the tip of main, leaving the nightly tag alone"
+            exit 0
+          fi
+          git tag -f nightly "${{ github.sha }}"
+          git push -f origin refs/tags/nightly
 
       - name: Bump Homebrew formula (uses local checksums)
         if: steps.version.outputs.is_release == 'true' && github.repository_owner == 'dmtrKovalenko'
