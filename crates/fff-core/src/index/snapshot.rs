@@ -461,26 +461,31 @@ impl LayerSnapshot {
         let mut dirs: Vec<DirItem> = Vec::new();
         dirs.try_reserve_exact(dir_count)
             .map_err(|_| Error::LayerFormat("directory table too large"))?;
-        let mut path_buf = [0u8; PATH_BUF_SIZE];
-        let mut other_buf = [0u8; PATH_BUF_SIZE];
+        // Rotate the buffers so comparisons can reuse the preceding record's bytes.
+        let (mut path_buf, mut previous_buf) =
+            (&mut [0u8; PATH_BUF_SIZE], &mut [0u8; PATH_BUF_SIZE]);
         for _ in 0..dir_count {
             let last_segment = cur.u16()?;
-            let (mut path, text) = read_chunked(&mut cur, &store, &mut path_buf)?;
+            let (mut path, text) = read_chunked(&mut cur, &store, path_buf)?;
             if !(text.is_empty() || text.strip_suffix('/').is_some_and(is_relative_file_path))
                 || last_segment != last_segment_offset(text)
             {
                 return Err(Error::LayerFormat("invalid directory path"));
             }
-            if dirs.last().is_some_and(|prev| {
-                prev.read_relative_path(store.as_arena_ptr(), &mut other_buf) >= text
-            }) {
+            if dirs
+                .last()
+                .is_some_and(|prev| &previous_buf[..prev.path.byte_len as usize] >= text.as_bytes())
+            {
                 return Err(Error::LayerFormat("directory table out of order"));
             }
             path.filename_offset = path.byte_len;
             dirs.push(DirItem::new(path, last_segment));
+            std::mem::swap(&mut path_buf, &mut previous_buf);
         }
 
-        let mut files = Vec::new();
+        let mut sorted = true;
+        let mut partitioned = true;
+        let mut files: Vec<FileItem> = Vec::new();
         files
             .try_reserve_exact(file_count)
             .map_err(|_| Error::LayerFormat("file table too large"))?;
@@ -497,24 +502,60 @@ impl LayerSnapshot {
             let parent = dirs
                 .get(parent_dir_index as usize)
                 .ok_or(Error::LayerFormat("parent dir out of range"))?;
-            let (mut path, text) = read_chunked(&mut cur, &store, &mut path_buf)?;
-            if !is_relative_file_path(text) || usize::from(offset) != filename_offset(text) {
+            let (mut path, text) = read_chunked(&mut cur, &store, path_buf)?;
+            let (prefix, name) = text
+                .split_at_checked(offset as usize)
+                .ok_or(Error::LayerFormat("invalid filename offset"))?;
+            if !is_file_name(name) || (offset == 0 && has_drive_prefix(name)) {
                 return Err(Error::LayerFormat("invalid file path"));
             }
-            if parent.read_relative_path(store.as_arena_ptr(), &mut other_buf)
-                != &text[..usize::from(offset)]
-            {
+            let previous = files.last();
+            let same_dir = previous.is_some_and(|prev| prev.parent_dir_index == parent_dir_index);
+            // The preceding file already established this prefix for a run in
+            // one directory. Read the directory record only when the run changes.
+            let parent_path = if same_dir {
+                &previous_buf[..parent.path.byte_len as usize]
+            } else {
+                parent
+                    .read_relative_path(store.as_arena_ptr(), previous_buf)
+                    .as_bytes()
+            };
+            if prefix.as_bytes() != parent_path {
                 return Err(Error::LayerFormat("parent directory does not match path"));
             }
+
             path.filename_offset = offset;
             let mut file = FileItem::new_raw(offset, size, modified, None, binary);
             file.mark_definition_language(text);
             file.set_path(path);
             file.parent_dir_index = parent_dir_index;
+            if let Some(prev) = previous {
+                let order = prev.parent_dir_index.cmp(&parent_dir_index).then_with(|| {
+                    previous_buf[offset as usize..prev.path.byte_len as usize].cmp(name.as_bytes())
+                });
+                if order.is_eq() {
+                    return Err(Error::LayerFormat("duplicate file path"));
+                }
+                sorted &= order.is_lt();
+                partitioned &= (!is_indexable(prev))
+                    .cmp(&!is_indexable(&file))
+                    .then(order)
+                    .is_lt();
+            }
             files.push(file);
+            std::mem::swap(&mut path_buf, &mut previous_buf);
         }
 
-        let layout = validated_layout(layout, &files, &store)?;
+        // A watcher may have changed a file's size or binary flag since the
+        // original scan. Never use a binary-search layout if its order changed.
+        if !sorted {
+            check_duplicate_paths(&files, &store, partitioned)?;
+        }
+        let layout = match layout {
+            SnapshotLayout::BasePartitioned if !partitioned => SnapshotLayout::Unsorted,
+            SnapshotLayout::Sorted if !sorted => SnapshotLayout::Unsorted,
+            other => other,
+        };
         Ok(Self {
             label,
             store: Arc::new(store),
@@ -600,13 +641,12 @@ fn read_chunked<'a>(
     Ok((path, text))
 }
 
-// A base file may have changed size or binary status since its initial scan.
-// Only take binary-search fast paths when the serialized order supports them.
-fn validated_layout(
-    layout: SnapshotLayout,
+// A strictly sorted stream has already proved uniqueness during decoding.
+fn check_duplicate_paths(
     files: &[FileItem],
     store: &ChunkedPathStore,
-) -> Result<SnapshotLayout, Error> {
+    partitioned: bool,
+) -> Result<(), Error> {
     let arena = store.as_arena_ptr();
     let mut left = [0u8; PATH_BUF_SIZE];
     let mut right = [0u8; PATH_BUF_SIZE];
@@ -617,20 +657,7 @@ fn validated_layout(
                 .cmp(b.path.read_to_buf(arena, &mut right))
         })
     };
-    let mut sorted = true;
-    let mut partitioned = true;
-    for pair in files.windows(2) {
-        let order = compare(&pair[0], &pair[1]);
-        if order.is_eq() {
-            return Err(Error::LayerFormat("duplicate file path"));
-        }
-        sorted &= order.is_lt();
-        partitioned &= (!is_indexable(&pair[0]))
-            .cmp(&!is_indexable(&pair[1]))
-            .then(order)
-            .is_lt();
-    }
-    if !sorted && partitioned {
+    if partitioned {
         // Both runs are sorted. Check for duplicates across the boundary
         // without storing another copy of the file paths.
         let mid = files.partition_point(is_indexable);
@@ -642,7 +669,7 @@ fn validated_layout(
                 std::cmp::Ordering::Equal => return Err(Error::LayerFormat("duplicate file path")),
             }
         }
-    } else if !sorted {
+    } else {
         let mut ordered: Vec<_> = files.iter().collect();
         ordered.sort_unstable_by(|a, b| compare(a, b));
         if ordered
@@ -652,18 +679,20 @@ fn validated_layout(
             return Err(Error::LayerFormat("duplicate file path"));
         }
     }
-    Ok(match layout {
-        SnapshotLayout::BasePartitioned if !partitioned => SnapshotLayout::Unsorted,
-        SnapshotLayout::Sorted if !sorted => SnapshotLayout::Unsorted,
-        other => other,
-    })
+    Ok(())
+}
+
+fn is_file_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && memchr::memchr3(b'/', b'\\', 0, name.as_bytes()).is_none()
+}
+
+fn has_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn is_relative_file_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    !(drive_prefix || path.contains(['\\', '\0']))
-        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+    !has_drive_prefix(path) && path.split('/').all(is_file_name)
 }
 
 pub(crate) fn normalize_relative_path(raw: &str) -> Option<String> {
@@ -892,6 +921,18 @@ mod tests {
             records + MIN_FILE_RECORD - 6..records + MIN_FILE_RECORD,
             end - 6,
         );
+        assert!(LayerSnapshot::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn nonadjacent_duplicates_across_two_sorted_partitions_are_rejected() {
+        let mut snap = snapshot(&["a", "b", "c"]);
+        snap.files[0].size = 1;
+        snap.files[2].size = 0;
+        snap.files[2].path = snap.files[0].path.clone();
+        snap.layout = SnapshotLayout::BasePartitioned;
+        let mut bytes = Vec::new();
+        snap.write_to(&mut bytes).unwrap();
         assert!(LayerSnapshot::from_bytes(&bytes).is_err());
     }
 
