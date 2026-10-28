@@ -513,6 +513,24 @@ mod tests {
     }
 
     #[test]
+    fn progress_tracks_post_scan_work_without_a_bigram_index() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source"), "hello").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: root.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        // SAFETY: the picker owns its files for the lifetime of this snapshot.
+        let snapshot = unsafe { picker.post_scan_snapshot() }.unwrap();
+        assert!(!picker.get_scan_progress().is_warmup_complete);
+        drop(snapshot);
+        assert!(picker.get_scan_progress().is_warmup_complete);
+    }
+
+    #[test]
     fn a_reserved_restore_cannot_replace_a_new_picker_at_the_same_root() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("old.txt");

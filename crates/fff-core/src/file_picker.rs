@@ -1566,14 +1566,18 @@ impl FilePicker {
     // Returns an ongoing or finisshed scan progress
     pub fn get_scan_progress(&self) -> ScanProgress {
         let scanned_count = self.scanned_files_count.load(Ordering::Relaxed);
-        let is_scanning = self.signals.scanning.load(Ordering::Relaxed);
+        let is_scanning = self.signals.scanning.load(Ordering::Acquire);
 
         ScanProgress {
             scanned_files_count: scanned_count,
             is_scanning,
             is_watcher_ready: self.signals.watcher_ready.load(Ordering::Relaxed),
-            is_warmup_complete: !self.enable_content_indexing
-                || self.sync_data.bigram_index.is_some(),
+            is_warmup_complete: !is_scanning
+                && !self
+                    .signals
+                    .post_scan_indexing_active
+                    .load(Ordering::Acquire)
+                && (!self.enable_content_indexing || self.sync_data.bigram_index.is_some()),
         }
     }
 

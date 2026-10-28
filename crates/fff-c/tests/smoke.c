@@ -254,6 +254,8 @@ static int layer_batch_smoke(void *picker) {
     }
     struct FffResult *r = fff_layer_add_paths(picker, paths, sizeof(paths), NULL, NULL, 2);
     int added = r->success && r->int_value == 2;
+    if (!added) fprintf(stderr, "layer add failed: %s (added %lld)\n",
+                        r->error ? r->error : "?", (long long)r->int_value);
     fff_free_result(r);
     return !added;
 }
@@ -280,9 +282,9 @@ int main(int argc, char **argv) {
     void *file_picker = create_result->handle;
     fff_free_result(create_result); // safe to drop now: handle outlives the envelope
 
-    struct FffResult *scan_result = fff_wait_for_scan(file_picker, 5000);
+    struct FffResult *scan_result = fff_wait_for_indexing_complete(file_picker, 5000);
     if (!scan_result->success) {
-        fprintf(stderr, "wait_for_scan failed: %s\n",
+        fprintf(stderr, "wait_for_indexing_complete failed: %s\n",
                 scan_result->error ? scan_result->error : "?");
         fff_free_result(scan_result);
         fff_destroy(file_picker);
@@ -290,7 +292,7 @@ int main(int argc, char **argv) {
     }
     // int_value: 1 = scan completed in time, 0 = timed out.
     if (scan_result->int_value == 0) {
-        fprintf(stderr, "wait_for_scan: timed out before initial scan finished\n");
+        fprintf(stderr, "wait_for_indexing_complete: timed out before initial indexing finished\n");
         fff_free_result(scan_result);
         fff_destroy(file_picker);
         return 1;
