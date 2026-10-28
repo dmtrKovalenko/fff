@@ -299,6 +299,7 @@ impl FileSync {
                 break;
             }
             let found = if sorted {
+                let mut dir_buf = [0; PATH_BUF_SIZE];
                 self.files[start..end]
                     .binary_search_by(|f| {
                         let path = f.path.read_to_buf(layer_arena, &mut dir_buf);
