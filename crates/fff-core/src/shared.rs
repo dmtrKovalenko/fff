@@ -216,8 +216,8 @@ impl SharedFilePicker {
 
     /// Installs a saved base scan instead of walking the filesystem, then
     /// runs the usual post-scan phases in the background. Fails with
-    /// [`Error::IndexBusy`] while another scan is active; wait with
-    /// [`wait_for_scan`](Self::wait_for_scan).
+    /// [`Error::IndexBusy`] while another scan or its post-scan indexing is
+    /// active. Use [`wait_for_indexing_complete`](Self::wait_for_indexing_complete) before retrying.
     pub fn import_base(
         &self,
         snapshot: crate::LayerSnapshot,
