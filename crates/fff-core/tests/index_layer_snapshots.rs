@@ -398,15 +398,21 @@ fn restored_base_reads_from_the_linked_worktree() {
         .unwrap()
         .save(&file)
         .unwrap();
+    let snapshot = LayerSnapshot::load(&file).unwrap();
+    let mut primary_picker = FilePicker::new(FilePickerOptions {
+        base_path: primary.to_str().unwrap().to_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    primary_picker.import_base(snapshot.clone(), None).unwrap();
     let mut restored = FilePicker::new(FilePickerOptions {
         base_path: linked.to_str().unwrap().to_owned(),
         watch: false,
         ..Default::default()
     })
     .unwrap();
-    restored
-        .import_base(LayerSnapshot::load(&file).unwrap(), None)
-        .unwrap();
+    restored.import_base(snapshot, None).unwrap();
     let hit = restored.get_file_by_path(linked.join("shared.rs")).unwrap();
     let resolved = hit.absolute_path(&restored, restored.base_path());
     assert_eq!(fs::read_to_string(resolved).unwrap(), "linked contents!\n");
@@ -416,6 +422,12 @@ fn restored_base_reads_from_the_linked_worktree() {
             .is_none()
     );
     assert_eq!(search_paths(&restored, "shared.rs"), vec!["shared.rs"]);
+    assert!(restored.remove_file_by_path(linked.join("shared.rs")));
+    assert!(search_paths(&restored, "shared.rs").is_empty());
+    assert_eq!(
+        search_paths(&primary_picker, "shared.rs"),
+        vec!["shared.rs"]
+    );
 }
 
 #[test]

@@ -589,7 +589,9 @@ impl FilePicker {
 
     /// Replaces the base scan with `snapshot`, keeping explicit overlay layers.
     /// Frecency is applied when a tracker is given; git status stays unset
-    /// until the next status refresh.
+    /// until the next status refresh. A snapshot contains root-relative names
+    /// and metadata. When reusing it in another worktree, the caller checks
+    /// that its file set and ignore policy match or applies the worktree's changes.
     pub fn import_base(
         &mut self,
         snapshot: LayerSnapshot,

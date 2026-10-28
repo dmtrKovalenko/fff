@@ -201,6 +201,9 @@ impl LayerBuilder {
 
 /// Self-contained, immutable copy of one index layer: files, dirs and the arena
 /// their paths point into. Round-trips through [`LayerSnapshot::save`].
+/// Clones share the immutable path arena. Each destination picker owns its
+/// file metadata and resolves paths relative to its own root.
+#[derive(Clone)]
 pub struct LayerSnapshot {
     pub(crate) label: Option<Box<str>>,
     pub(crate) store: Arc<ChunkedPathStore>,
