@@ -1488,7 +1488,9 @@ struct FffResult *fff_layer_save(void *fff_handle, uint8_t layer, const char *pa
 struct FffResult *fff_layer_load(void *fff_handle, const char *path);
 
 /**
- * Start a base scan from a snapshot and return its file count. Wait with `fff_wait_for_scan`.
+ * Start a base scan from a snapshot and return its file count.
+ * Use `fff_wait_for_scan` before searching.
+ * Use `fff_wait_for_indexing_complete` before changing layers.
  * # Safety
  * Provide a live instance and a NUL-terminated UTF-8 path.
  */
