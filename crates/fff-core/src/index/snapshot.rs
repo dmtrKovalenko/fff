@@ -294,7 +294,13 @@ impl LayerSnapshot {
             temp.as_file().set_permissions(mode).map_err(io_err)?;
         }
         temp.as_file().sync_all().map_err(io_err)?;
-        temp.persist(path).map_err(|error| io_err(error.error))?;
+        // Clear the temporary attribute before publishing. std's rename can replace
+        // an open Windows snapshot while its existing readers finish on the old file.
+        let source = temp.into_temp_path().keep().map_err(|e| io_err(e.error))?;
+        if let Err(error) = std::fs::rename(&source, path) {
+            let _ = std::fs::remove_file(source);
+            return Err(io_err(error));
+        }
         Ok(written)
     }
 
