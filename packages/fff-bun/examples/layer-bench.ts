@@ -17,14 +17,21 @@ import { performance } from "node:perf_hooks";
 import { mkdtempSync, rmSync, statSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileFinder } from "../src/index";
+import { FileFinder, type Result } from "../src/index";
 
 const fileCount = Number(process.argv[2] ?? 100_000);
 const iterations = Number(process.argv[3] ?? 5);
+if (![fileCount, iterations].every((n) => Number.isSafeInteger(n) && n > 0)) {
+  throw new Error("file_count and iterations must be positive integers");
+}
 const work = mkdtempSync(join(tmpdir(), "fff-layer-bench-"));
 const queries = ["handler", "pkg7 service", "idx99"];
 
 const paths = syntheticPaths(fileCount);
+function checked<T>(result: Result<T>): T {
+  if (!result.ok) throw new Error(result.error);
+  return result.value;
+}
 console.log(`files:      ${fileCount}`);
 console.log(`iterations: ${iterations}`);
 console.log();
@@ -62,49 +69,50 @@ const fresh = () => {
 heap("baseline rss");
 console.log("\n== fff (FFI) ==");
 
-bench("addPaths  one batch", () => fff.addPaths(paths), fresh);
+bench("addPaths  one batch", () => checked(fff.addPaths(paths)), fresh);
 bench(
   "addPaths  batches of 1k",
   () => {
-    for (let i = 0; i < paths.length; i += 1000) fff.addPaths(paths.slice(i, i + 1000));
+    for (let i = 0; i < paths.length; i += 1000)
+      checked(fff.addPaths(paths.slice(i, i + 1000)));
   },
   fresh,
 );
 bench(
   "addPaths  batches of 100",
   () => {
-    for (let i = 0; i < paths.length; i += 100) fff.addPaths(paths.slice(i, i + 100));
+    for (let i = 0; i < paths.length; i += 100)
+      checked(fff.addPaths(paths.slice(i, i + 100)));
   },
   fresh,
 );
 const trickle = 1000;
-bench(`addPaths  one at a time (${trickle} new files into 100k)`, () => {
-  for (let i = 0; i < trickle; i++) fff.addPaths([`trickle/${Math.random()}/file_${i}.ts`]);
+bench(`addPaths  one at a time (${trickle} new files into ${fileCount})`, () => {
+  for (let i = 0; i < trickle; i++)
+    checked(fff.addPaths([`trickle/${Math.random()}/file_${i}.ts`]));
 });
 
 const layerFile = join(work, "layer.fff");
 bench("buildLayerFile (off-instance)", () => {
-  FileFinder.buildLayerFile(paths, layerFile, "built");
+  checked(FileFinder.buildLayerFile(paths, layerFile, "built"));
 });
 console.log(`${"layer file size".padEnd(46)} ${fmtBytes(statSync(layerFile).size)}`);
-bench("loadLayer into empty instance", () => fff.loadLayer(layerFile), fresh);
-bench("loadLayer with all 100k already indexed (dedup)", () => fff.loadLayer(layerFile));
+bench("loadLayer into empty instance", () => checked(fff.loadLayer(layerFile)), fresh);
+bench(`loadLayer with all ${fileCount} already indexed (dedup)`, () =>
+  checked(fff.loadLayer(layerFile)));
 fresh();
-const loaded = fff.loadLayer(layerFile);
-bench("saveLayer (100k)", () => {
-  if (loaded.ok) fff.saveLayer(loaded.value, join(work, "resave.fff"));
+const loaded = checked(fff.loadLayer(layerFile));
+bench(`saveLayer (${fileCount})`, () => {
+  checked(fff.saveLayer(loaded, join(work, "resave.fff")));
 });
 
 heap("rss with layers");
-const layers = fff.listLayers();
-if (layers.ok) {
-  const total = layers.value.reduce((n, l) => n + l.liveFileCount, 0);
-  console.log(`${"live files across layers".padEnd(46)} ${total}`);
-}
+const total = checked(fff.listLayers()).reduce((n, l) => n + l.liveFileCount, 0);
+console.log(`${"live files across layers".padEnd(46)} ${total}`);
 
 for (const query of queries) {
   bench(`fileSearch "${query}"`, () => {
-    fff.fileSearch(query, { maxResults: 50 });
+    checked(fff.fileSearch(query, { pageSize: 50 }));
   });
 }
 
@@ -161,10 +169,10 @@ rmSync(work, { recursive: true, force: true });
 // --- utilities -----------------------------------------------------------
 
 function openFinder(): FileFinder {
-  const finder = FileFinder.create({ basePath: work, disableWatch: true });
-  if (!finder.ok) throw new Error(finder.error.message);
-  finder.value.waitForScanBlocking(5000);
-  return finder.value;
+  const finder = checked(FileFinder.create({ basePath: work, disableWatch: true }));
+  if (!checked(finder.waitForScanBlocking(5000)))
+    throw new Error("Initial scan timed out");
+  return finder;
 }
 
 function jsAdd(index: string[], seen: Set<string>, batch: string[]): void {
@@ -181,13 +189,16 @@ function syntheticPaths(n: number): string[] {
   const exts = ["ts", "rs", "go", "py"];
   const out: string[] = Array.from({ length: n }, () => "");
   for (let i = 0; i < n; i++) {
-    out[i] = `packages/pkg${i % 40}/src/${dirs[i % 4]}/${names[i % 5]}_${i}.${exts[i % 4]}`;
+    out[i] =
+      `packages/pkg${i % 40}/src/${dirs[i % 4]}/${names[i % 5]}_${i}.${exts[i % 4]}`;
   }
   return out;
 }
 
 function fmt(ms: number): string {
-  return ms < 1 ? `${(ms * 1000).toFixed(0).padStart(7)} µs` : `${ms.toFixed(2).padStart(7)} ms`;
+  return ms < 1
+    ? `${(ms * 1000).toFixed(0).padStart(7)} µs`
+    : `${ms.toFixed(2).padStart(7)} ms`;
 }
 
 function fmtBytes(n: number): string {

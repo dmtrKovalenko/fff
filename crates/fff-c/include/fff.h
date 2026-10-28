@@ -1410,52 +1410,38 @@ uint32_t fff_grep_result_get_next_file_offset(const struct FffGrepResult *r);
 const char *fff_grep_result_get_regex_fallback_error(const struct FffGrepResult *r);
 
 /**
- * Seal the writable index layer and open a new one. Returns the layer id in
- * `int_value`.
- *
- * ## Safety
- * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
- * * `label` must be NULL or a valid null-terminated UTF-8 string.
+ * Seal the writable layer and return the new layer ID in `int_value`.
+ * # Safety
+ * Provide a live instance and a NULL or NUL-terminated UTF-8 label.
  */
 struct FffResult *fff_layer_create(void *fff_handle, const char *label);
 
 /**
- * Id of the layer new files are currently written into, in `int_value`.
- *
- * ## Safety
- * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ * Return the writable layer ID in `int_value`.
+ * # Safety
+ * Provide a live instance.
  */
 struct FffResult *fff_layer_current(void *fff_handle);
 
 /**
- * Live file count of `layer` (0 = base scan) in `int_value`.
- *
- * ## Safety
- * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ * Return the number of live files in the layer (0 for the base scan).
+ * # Safety
+ * Provide a live instance.
  */
 struct FffResult *fff_layer_file_count(void *fff_handle, uint8_t layer);
 
 /**
- * JSON array describing every overlay layer (`id`, `label`, `file_count`,
- * `live_file_count`, `dir_count`, `arena_bytes`, `is_open`) as a heap C
- * string in `handle`; free it with `fff_free_string`.
- *
- * ## Safety
- * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ * Return overlay metadata as a JSON array in `handle`. Free it with `fff_free_string`.
+ * # Safety
+ * Provide a live instance.
  */
 struct FffResult *fff_layer_list(void *fff_handle);
 
 /**
- * Append base-relative paths to the writable layer without touching the
- * filesystem. `paths` is one `\n`-separated buffer of `paths_len` bytes (not
- * null-terminated); `sizes` / `modified` are optional parallel arrays of
- * `count` entries. Returns the number of files added in `int_value`.
- *
- * ## Safety
- * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
- * * `paths` must point to `paths_len` readable bytes of UTF-8.
- * * `sizes` and `modified` must each be NULL or point to `count` little-endian
- *   `u64`s (alignment not required).
+ * Append a batch of base-relative paths and return the number of files added.
+ * # Safety
+ * Provide a live instance and `paths_len` readable bytes containing exactly `count` NUL-terminated UTF-8 paths.
+ * For an empty batch `paths` may be NULL. Each metadata array is NULL or holds `count` readable little-endian u64s (unaligned allowed).
  */
 struct FffResult *fff_layer_add_paths(void *fff_handle,
                                       const char *paths,
@@ -1465,13 +1451,9 @@ struct FffResult *fff_layer_add_paths(void *fff_handle,
                                       uintptr_t count);
 
 /**
- * Build a layer file from `\n`-separated paths without an instance. Takes the
- * same buffers as `fff_layer_add_paths`. Returns bytes written in `int_value`.
- *
- * ## Safety
- * * `label` must be NULL or a valid null-terminated UTF-8 string.
- * * `paths`, `sizes`, `modified`: see `fff_layer_add_paths`.
- * * `out_path` must be a valid null-terminated UTF-8 string.
+ * Write a snapshot from a path batch and return the number of bytes written.
+ * # Safety
+ * Use the buffers specified by `fff_layer_add_paths`. Provide a NUL-terminated UTF-8 output path and an optional NUL-terminated UTF-8 label.
  */
 struct FffResult *fff_layer_build(const char *label,
                                   const char *paths,
@@ -1482,34 +1464,23 @@ struct FffResult *fff_layer_build(const char *label,
                                   const char *out_path);
 
 /**
- * Write `layer` (0 = base scan) to `path`. Returns bytes written in
- * `int_value`.
- *
- * ## Safety
- * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
- * * `path` must be a valid null-terminated UTF-8 string.
+ * Save a layer (0 for the base scan) and return the number of bytes written.
+ * # Safety
+ * Provide a live instance and a NUL-terminated UTF-8 path.
  */
 struct FffResult *fff_layer_save(void *fff_handle, uint8_t layer, const char *path);
 
 /**
- * Load a layer file and attach it as a new sealed overlay. Returns the layer
- * id in `int_value`.
- *
- * ## Safety
- * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
- * * `path` must be a valid null-terminated UTF-8 string.
+ * Load a sealed overlay and return its layer ID.
+ * # Safety
+ * Provide a live instance and a NUL-terminated UTF-8 path.
  */
 struct FffResult *fff_layer_load(void *fff_handle, const char *path);
 
 /**
- * Load a layer file and install it as the base scan in the background, the
- * way a rescan would (explicit overlays are kept, frecency and content
- * indexing are applied). Wait with `fff_wait_for_scan`. Returns the file
- * count in `int_value`; fails while another scan is active.
- *
- * ## Safety
- * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
- * * `path` must be a valid null-terminated UTF-8 string.
+ * Start a base scan from a snapshot and return its file count. Wait with `fff_wait_for_scan`.
+ * # Safety
+ * Provide a live instance and a NUL-terminated UTF-8 path.
  */
 struct FffResult *fff_base_load(void *fff_handle, const char *path);
 

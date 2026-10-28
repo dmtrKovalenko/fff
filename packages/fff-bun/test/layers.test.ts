@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,22 +8,23 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fff-layers-"));
 fs.writeFileSync(path.join(tmp, "scanned.ts"), "export {};\n");
 
 function open(): FileFinder {
-  const created = FileFinder.create({ basePath: tmp, watch: false });
+  const created = FileFinder.create({ basePath: tmp, disableWatch: true });
   if (!created.ok) throw new Error(created.error);
   const finder = created.value;
-  finder.waitForScanBlocking(5000);
+  expect(finder.waitForScanBlocking(5000)).toEqual({ ok: true, value: true });
   return finder;
 }
 
 describe("FileFinder - index layers", () => {
   let finder: FileFinder;
 
-  beforeAll(() => {
+  beforeEach(() => {
     finder = open();
   });
 
+  afterEach(() => finder.destroy());
+
   afterAll(() => {
-    finder.destroy();
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
@@ -48,11 +49,29 @@ describe("FileFinder - index layers", () => {
     }
   });
 
+  test("preserves newlines and metadata in a path batch", () => {
+    const path = "virtual/line\nbreak.ts";
+    const added = finder.addPaths([
+      { path, size: 11 },
+      { path: "virtual/tail.ts", size: 22 },
+    ]);
+    expect(added).toEqual({ ok: true, value: 2 });
+    const found = finder.fileSearch("virtual");
+    if (!found.ok) throw new Error(found.error);
+    expect(found.value.items.map((i) => [i.relativePath, i.size]).sort()).toEqual([
+      [path, 11],
+      ["virtual/tail.ts", 22],
+    ]);
+    const bad = finder.addPaths(["other.ts", "in\0valid.ts"]);
+    expect(bad.ok).toBe(false);
+    expect(finder.layerFileCount(1)).toEqual({ ok: true, value: 2 });
+  });
+
   test("createLayer / listLayers / currentLayer", () => {
     const id = finder.createLayer("second");
     expect(id).toEqual({ ok: true, value: 2 });
     expect(finder.currentLayer()).toEqual({ ok: true, value: 2 });
-    finder.addPaths(["second/x.ts"]);
+    expect(finder.addPaths(["second/x.ts"])).toEqual({ ok: true, value: 1 });
 
     const layers = finder.listLayers();
     expect(layers.ok).toBe(true);
@@ -64,6 +83,8 @@ describe("FileFinder - index layers", () => {
   });
 
   test("saveLayer / loadLayer round-trip", () => {
+    expect(finder.createLayer("second")).toEqual({ ok: true, value: 2 });
+    expect(finder.addPaths(["second/x.ts"])).toEqual({ ok: true, value: 1 });
     const file = path.join(tmp, "second.fff");
     const saved = finder.saveLayer(2, file);
     expect(saved.ok).toBe(true);
@@ -104,7 +125,7 @@ describe("FileFinder - index layers", () => {
     try {
       const loaded = other.loadBase(file);
       expect(loaded.ok).toBe(true);
-      expect(other.waitForScanBlocking(5000).ok).toBe(true);
+      expect(other.waitForScanBlocking(5000)).toEqual({ ok: true, value: true });
       const found = other.fileSearch("scanned");
       expect(found.ok && found.value.items[0]?.relativePath).toBe("scanned.ts");
     } finally {
@@ -113,6 +134,7 @@ describe("FileFinder - index layers", () => {
   });
 
   test("errors surface as Result", () => {
+    expect(finder.addPaths([{ path: "bad.ts", size: -1 }]).ok).toBe(false);
     expect(finder.loadLayer(path.join(tmp, "missing.fff")).ok).toBe(false);
     expect(finder.saveLayer(42, path.join(tmp, "nope.fff")).ok).toBe(false);
   });

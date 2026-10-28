@@ -1658,14 +1658,16 @@ export function ffiLayerList(handle: NativeHandle): Result<LayerInfo[]> {
 
 /**
  * Append paths to the writable layer. One FFI call per batch: paths travel
- * as a single newline-joined buffer, metadata as two u64 arrays.
+ * as a single NUL-terminated path list, metadata as two little-endian u64 arrays.
  */
 export function ffiLayerAddPaths(
   handle: NativeHandle,
   entries: Array<string | LayerEntry>,
 ): Result<number> {
   const library = loadLibrary();
-  const batch = encodeLayerBatch(entries);
+  const encoded = encodeLayerBatch(entries);
+  if (!encoded.ok) return encoded;
+  const batch = encoded.value;
   const resultPtr = library.symbols.fff_layer_add_paths(
     handle,
     batch.count === 0 ? null : ptr(batch.paths),
@@ -1686,7 +1688,9 @@ export function ffiLayerBuild(
   outPath: string,
 ): Result<number> {
   const library = loadLibrary();
-  const batch = encodeLayerBatch(entries);
+  const encoded = encodeLayerBatch(entries);
+  if (!encoded.ok) return encoded;
+  const batch = encoded.value;
   const resultPtr = library.symbols.fff_layer_build(
     label === undefined ? null : ptr(encodeString(label)),
     batch.count === 0 ? null : ptr(batch.paths),
@@ -1757,12 +1761,12 @@ export function isAvailable(): boolean {
 }
 
 /** Packs entries into the buffers `fff_layer_add_paths` / `fff_layer_build` take. */
-function encodeLayerBatch(entries: Array<string | LayerEntry>): {
+function encodeLayerBatch(entries: Array<string | LayerEntry>): Result<{
   paths: Uint8Array;
-  sizes: BigUint64Array | null;
-  modified: BigUint64Array | null;
+  sizes: Buffer | null;
+  modified: Buffer | null;
   count: number;
-} {
+}> {
   const count = entries.length;
   let hasMeta = false;
   const lines: string[] = Array.from({ length: count }, () => "");
@@ -1772,20 +1776,26 @@ function encodeLayerBatch(entries: Array<string | LayerEntry>): {
       lines[i] = entry;
     } else {
       lines[i] = entry.path;
-      if (entry.size !== undefined || entry.modified !== undefined) hasMeta = true;
+      for (const value of [entry.size, entry.modified]) {
+        if (value !== undefined) {
+          if (!Number.isSafeInteger(value) || value < 0)
+            return err("Layer size and modified must be nonnegative safe integers");
+          hasMeta = true;
+        }
+      }
     }
   }
 
-  const paths = new TextEncoder().encode(lines.join("\n"));
-  if (!hasMeta) return { paths, sizes: null, modified: null, count };
+  const paths = Buffer.from(count === 0 ? "" : lines.join("\0") + "\0");
+  if (!hasMeta) return { ok: true, value: { paths, sizes: null, modified: null, count } };
 
-  const sizes = new BigUint64Array(count);
-  const modified = new BigUint64Array(count);
+  const sizes = Buffer.alloc(count * 8);
+  const modified = Buffer.alloc(count * 8);
   for (let i = 0; i < count; i++) {
     const entry = entries[i];
     if (typeof entry === "string") continue;
-    sizes[i] = BigInt(entry.size ?? 0);
-    modified[i] = BigInt(entry.modified ?? 0);
+    sizes.writeBigUInt64LE(BigInt(entry.size ?? 0), i * 8);
+    modified.writeBigUInt64LE(BigInt(entry.modified ?? 0), i * 8);
   }
-  return { paths, sizes, modified, count };
+  return { ok: true, value: { paths, sizes, modified, count } };
 }

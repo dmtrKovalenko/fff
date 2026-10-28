@@ -7,12 +7,9 @@ use fff::{IndexEntry, LayerBuilder, LayerSnapshot};
 use crate::ffi_types::FffResult;
 use crate::{cstr_to_str, instance_ref, optional_cstr};
 
-/// Seal the writable index layer and open a new one. Returns the layer id in
-/// `int_value`.
-///
-/// ## Safety
-/// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
-/// * `label` must be NULL or a valid null-terminated UTF-8 string.
+/// Seal the writable layer and return the new layer ID in `int_value`.
+/// # Safety
+/// Provide a live instance and a NULL or NUL-terminated UTF-8 label.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_create(
     fff_handle: *mut c_void,
@@ -26,10 +23,9 @@ pub unsafe extern "C" fn fff_layer_create(
     }
 }
 
-/// Id of the layer new files are currently written into, in `int_value`.
-///
-/// ## Safety
-/// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+/// Return the writable layer ID in `int_value`.
+/// # Safety
+/// Provide a live instance.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_current(fff_handle: *mut c_void) -> *mut FffResult {
     unsafe {
@@ -39,10 +35,9 @@ pub unsafe extern "C" fn fff_layer_current(fff_handle: *mut c_void) -> *mut FffR
     }
 }
 
-/// Live file count of `layer` (0 = base scan) in `int_value`.
-///
-/// ## Safety
-/// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+/// Return the number of live files in the layer (0 for the base scan).
+/// # Safety
+/// Provide a live instance.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_file_count(
     fff_handle: *mut c_void,
@@ -60,12 +55,9 @@ pub unsafe extern "C" fn fff_layer_file_count(
     }
 }
 
-/// JSON array describing every overlay layer (`id`, `label`, `file_count`,
-/// `live_file_count`, `dir_count`, `arena_bytes`, `is_open`) as a heap C
-/// string in `handle`; free it with `fff_free_string`.
-///
-/// ## Safety
-/// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+/// Return overlay metadata as a JSON array in `handle`. Free it with `fff_free_string`.
+/// # Safety
+/// Provide a live instance.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_list(fff_handle: *mut c_void) -> *mut FffResult {
     unsafe {
@@ -90,16 +82,10 @@ pub unsafe extern "C" fn fff_layer_list(fff_handle: *mut c_void) -> *mut FffResu
     }
 }
 
-/// Append base-relative paths to the writable layer without touching the
-/// filesystem. `paths` is one `\n`-separated buffer of `paths_len` bytes (not
-/// null-terminated); `sizes` / `modified` are optional parallel arrays of
-/// `count` entries. Returns the number of files added in `int_value`.
-///
-/// ## Safety
-/// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
-/// * `paths` must point to `paths_len` readable bytes of UTF-8.
-/// * `sizes` and `modified` must each be NULL or point to `count` little-endian
-///   `u64`s (alignment not required).
+/// Append a batch of base-relative paths and return the number of files added.
+/// # Safety
+/// Provide a live instance and `paths_len` readable bytes containing exactly `count` NUL-terminated UTF-8 paths.
+/// For an empty batch `paths` may be NULL. Each metadata array is NULL or holds `count` readable little-endian u64s (unaligned allowed).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_add_paths(
     fff_handle: *mut c_void,
@@ -122,13 +108,9 @@ pub unsafe extern "C" fn fff_layer_add_paths(
     }
 }
 
-/// Build a layer file from `\n`-separated paths without an instance. Takes the
-/// same buffers as `fff_layer_add_paths`. Returns bytes written in `int_value`.
-///
-/// ## Safety
-/// * `label` must be NULL or a valid null-terminated UTF-8 string.
-/// * `paths`, `sizes`, `modified`: see `fff_layer_add_paths`.
-/// * `out_path` must be a valid null-terminated UTF-8 string.
+/// Write a snapshot from a path batch and return the number of bytes written.
+/// # Safety
+/// Use the buffers specified by `fff_layer_add_paths`. Provide a NUL-terminated UTF-8 output path and an optional NUL-terminated UTF-8 label.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_build(
     label: *const c_char,
@@ -159,12 +141,9 @@ pub unsafe extern "C" fn fff_layer_build(
     }
 }
 
-/// Write `layer` (0 = base scan) to `path`. Returns bytes written in
-/// `int_value`.
-///
-/// ## Safety
-/// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
-/// * `path` must be a valid null-terminated UTF-8 string.
+/// Save a layer (0 for the base scan) and return the number of bytes written.
+/// # Safety
+/// Provide a live instance and a NUL-terminated UTF-8 path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_save(
     fff_handle: *mut c_void,
@@ -192,12 +171,9 @@ pub unsafe extern "C" fn fff_layer_save(
     }
 }
 
-/// Load a layer file and attach it as a new sealed overlay. Returns the layer
-/// id in `int_value`.
-///
-/// ## Safety
-/// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
-/// * `path` must be a valid null-terminated UTF-8 string.
+/// Load a sealed overlay and return its layer ID.
+/// # Safety
+/// Provide a live instance and a NUL-terminated UTF-8 path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_layer_load(
     fff_handle: *mut c_void,
@@ -219,14 +195,9 @@ pub unsafe extern "C" fn fff_layer_load(
     }
 }
 
-/// Load a layer file and install it as the base scan in the background, the
-/// way a rescan would (explicit overlays are kept, frecency and content
-/// indexing are applied). Wait with `fff_wait_for_scan`. Returns the file
-/// count in `int_value`; fails while another scan is active.
-///
-/// ## Safety
-/// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
-/// * `path` must be a valid null-terminated UTF-8 string.
+/// Start a base scan from a snapshot and return its file count. Wait with `fff_wait_for_scan`.
+/// # Safety
+/// Provide a live instance and a NUL-terminated UTF-8 path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_base_load(
     fff_handle: *mut c_void,
@@ -300,31 +271,40 @@ unsafe fn entries_from_raw<'a>(
     modified: *const u64,
     count: usize,
 ) -> Result<Vec<IndexEntry<'a>>, *mut FffResult> {
-    if paths.is_null() && paths_len > 0 {
-        return Err(FffResult::err("Paths buffer is null"));
+    if count == 0 && paths_len == 0 {
+        return Ok(Vec::new());
     }
-    let bytes: &[u8] = if paths_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(paths as *const u8, paths_len) }
-    };
+    if paths.is_null() || paths_len > isize::MAX as usize || count > isize::MAX as usize / 8 {
+        return Err(FffResult::err(
+            "Invalid layer batch buffer length or pointer",
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(paths.cast::<u8>(), paths_len) };
     let text = std::str::from_utf8(bytes).map_err(|_| FffResult::err("Paths are not UTF-8"))?;
-    // Read unaligned: JS callers may hand over plain byte buffers.
+    let records = text
+        .strip_suffix('\0')
+        .ok_or_else(|| FffResult::err("Missing path terminator"))?;
+    if records.split('\0').count() != count {
+        return Err(FffResult::err(
+            "Layer path count does not match the batch count",
+        ));
+    }
+
     let field = |arr: *const u64, i: usize| {
-        if !arr.is_null() && i < count {
-            unsafe { arr.add(i).read_unaligned() }
-        } else {
+        if arr.is_null() {
             0
+        } else {
+            u64::from_le(unsafe { arr.add(i).read_unaligned() })
         }
     };
-
-    // Enumerate before dropping blanks: metadata is positional.
-    let entries = text
-        .split('\n')
+    records
+        .split('\0')
         .enumerate()
-        .filter(|(_, p)| !p.is_empty())
-        .map(|(i, path)| IndexEntry::new(path).with_metadata(field(sizes, i), field(modified, i)))
-        .collect();
-
-    Ok(entries)
+        .map(|(i, path)| {
+            if path.is_empty() {
+                return Err(FffResult::err("Layer paths must not be empty"));
+            }
+            Ok(IndexEntry::new(path).with_metadata(field(sizes, i), field(modified, i)))
+        })
+        .collect()
 }

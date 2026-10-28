@@ -893,14 +893,13 @@ FffResult *res = fff_glob(handle, "**/*.rs", "", 0, 0, 100);
 `fff_layer_save` writes any layer (0 = base scan) to a file and
 `fff_layer_load` attaches it back as a sealed overlay; `fff_base_load` installs
 it as the base scan in the background (wait with `fff_wait_for_scan`).
-`fff_layer_build` packs a layer file without an instance. Paths are passed newline-separated in one
-buffer, with optional parallel `sizes` / `modified` arrays (NULL to omit).
+`fff_layer_build` packs a layer file without an instance. Pass NUL-terminated UTF-8 paths in one buffer, with optional parallel `sizes` / `modified` arrays (NULL to omit).
 
 ```c
-FffResult *layer = fff_layer_create(handle, "generated");
-const char *paths = "build/out/a.js\nbuild/out/b.js";
-FffResult *added = fff_layer_add_paths(handle, paths, strlen(paths), NULL, NULL, 2);
-FffResult *saved = fff_layer_save(handle, 0, "/tmp/base.fff");
+const char paths[] = "build/out/a.js\0build/out/b.js";
+struct FffResult *added = fff_layer_add_paths(handle, paths, sizeof(paths), NULL, NULL, 2);
+if (!added->success) fprintf(stderr, "%s\n", added->error);
+fff_free_result(added);
 ```
 
 ### Notes

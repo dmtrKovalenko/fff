@@ -2,28 +2,29 @@ import { strict as assert } from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { FileFinder } from "../dist/index.js";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fff-node-layers-"));
 fs.writeFileSync(path.join(tmp, "scanned.ts"), "export {};\n");
 
 function open() {
-  const created = FileFinder.create({ basePath: tmp, watch: false });
+  const created = FileFinder.create({ basePath: tmp, disableWatch: true });
   assert.ok(created.ok, created.ok ? "" : created.error);
-  created.value.waitForScanBlocking(5000);
+  assert.deepEqual(created.value.waitForScanBlocking(5000), { ok: true, value: true });
   return created.value;
 }
 
 describe("fff-node index layers", { concurrency: 1 }, () => {
   let finder;
 
-  before(() => {
+  beforeEach(() => {
     finder = open();
   });
 
+  afterEach(() => finder.destroy());
+
   after(() => {
-    finder.destroy();
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
@@ -40,10 +41,23 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     assert.equal(found.value.items[0].size, 42);
   });
 
+  it("preserves newlines and metadata in a path batch", () => {
+    const path = "virtual/line\nbreak.ts";
+    const added = finder.addPaths([{ path, size: 11 }, { path: "virtual/tail.ts", size: 22 }]);
+    assert.deepEqual(added, { ok: true, value: 2 });
+    const found = finder.fileSearch("virtual");
+    if (!found.ok) throw new Error(found.error);
+    assert.deepEqual(found.value.items.map((i) => [i.relativePath, i.size]).sort(), [[path, 11], ["virtual/tail.ts", 22]]);
+    const bad = finder.addPaths(["other.ts", "in\0valid.ts"]);
+    assert.equal(bad.ok, false);
+    assert.equal(finder.addPaths([{ path: "bad.ts", size: -1 }]).ok, false);
+    assert.deepEqual(finder.layerFileCount(1), { ok: true, value: 2 });
+  });
+
   it("createLayer / listLayers", () => {
     assert.deepEqual(finder.createLayer("second"), { ok: true, value: 2 });
     assert.deepEqual(finder.currentLayer(), { ok: true, value: 2 });
-    finder.addPaths(["second/x.ts"]);
+    assert.deepEqual(finder.addPaths(["second/x.ts"]), { ok: true, value: 1 });
     const layers = finder.listLayers();
     assert.ok(layers.ok);
     assert.deepEqual(
@@ -53,6 +67,8 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
   });
 
   it("save / load layer and base", () => {
+    assert.deepEqual(finder.createLayer("second"), { ok: true, value: 2 });
+    assert.deepEqual(finder.addPaths(["second/x.ts"]), { ok: true, value: 1 });
     const layerFile = path.join(tmp, "second.fff");
     const baseFile = path.join(tmp, "base.fff");
     assert.ok(finder.saveLayer(2, layerFile).ok);
@@ -65,7 +81,7 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     const other = open();
     try {
       assert.ok(other.loadBase(baseFile).ok);
-      assert.ok(other.waitForScanBlocking(5000).ok);
+      assert.deepEqual(other.waitForScanBlocking(5000), { ok: true, value: true });
       assert.deepEqual(other.loadLayer(layerFile), { ok: true, value: 2 });
       const id = other.loadLayer(built);
       assert.ok(id.ok);

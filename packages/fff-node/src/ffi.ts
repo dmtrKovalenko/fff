@@ -1899,13 +1899,15 @@ export function ffiLayerList(handle: NativeHandle): Result<LayerInfo[]> {
 
 /**
  * Append paths to the writable layer. One FFI call per batch: paths travel
- * as a single newline-joined buffer, metadata as two little-endian u64 arrays.
+ * as a single NUL-terminated path list, metadata as two little-endian u64 arrays.
  */
 export function ffiLayerAddPaths(
   handle: NativeHandle,
   entries: Array<string | LayerEntry>,
 ): Result<number> {
-  const batch = encodeLayerBatch(entries);
+  const encoded = encodeLayerBatch(entries);
+  if (!encoded.ok) return encoded;
+  const batch = encoded.value;
   const [types, values] = layerBatchParams(batch);
   return callIntResult(
     "fff_layer_add_paths",
@@ -1922,7 +1924,9 @@ export function ffiLayerBuild(
   entries: Array<string | LayerEntry>,
   outPath: string,
 ): Result<number> {
-  const batch = encodeLayerBatch(entries);
+  const encoded = encodeLayerBatch(entries);
+  if (!encoded.ok) return encoded;
+  const batch = encoded.value;
   const [types, values] = layerBatchParams(batch);
   const labelType = label === undefined ? DataType.U64 : DataType.String;
   return callIntResult(
@@ -1977,7 +1981,7 @@ interface LayerBatch {
 }
 
 /** Packs entries into the buffers `fff_layer_add_paths` / `fff_layer_build` take. */
-function encodeLayerBatch(entries: Array<string | LayerEntry>): LayerBatch {
+function encodeLayerBatch(entries: Array<string | LayerEntry>): Result<LayerBatch> {
   const count = entries.length;
   let hasMeta = false;
   const lines: string[] = Array.from({ length: count }, () => "");
@@ -1987,12 +1991,18 @@ function encodeLayerBatch(entries: Array<string | LayerEntry>): LayerBatch {
       lines[i] = entry;
     } else {
       lines[i] = entry.path;
-      if (entry.size !== undefined || entry.modified !== undefined) hasMeta = true;
+      for (const value of [entry.size, entry.modified]) {
+        if (value !== undefined) {
+          if (!Number.isSafeInteger(value) || value < 0)
+            return err("Layer size and modified must be nonnegative safe integers");
+          hasMeta = true;
+        }
+      }
     }
   }
 
-  const paths = Buffer.from(lines.join("\n"), "utf8");
-  if (!hasMeta) return { paths, sizes: null, modified: null, count };
+  const paths = Buffer.from(count === 0 ? "" : lines.join("\0") + "\0", "utf8");
+  if (!hasMeta) return { ok: true, value: { paths, sizes: null, modified: null, count } };
 
   const sizes = Buffer.alloc(count * 8);
   const modified = Buffer.alloc(count * 8);
@@ -2002,7 +2012,7 @@ function encodeLayerBatch(entries: Array<string | LayerEntry>): LayerBatch {
     sizes.writeBigUInt64LE(BigInt(entry.size ?? 0), i * 8);
     modified.writeBigUInt64LE(BigInt(entry.modified ?? 0), i * 8);
   }
-  return { paths, sizes, modified, count };
+  return { ok: true, value: { paths, sizes, modified, count } };
 }
 
 /** `(paths, paths_len, sizes, modified, count)` params; U64(0) stands in for null. */
