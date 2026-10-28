@@ -602,12 +602,7 @@ impl FileItem {
     ) -> bool {
         let flags = self.flags.load(Ordering::Relaxed);
         flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
-            && crate::definition::is_definition_match(
-                self.definition_language,
-                line,
-                ranges,
-                fuzzy,
-            )
+            && crate::definition::is_definition_match(self.definition_language, line, ranges, fuzzy)
     }
 
     #[inline]

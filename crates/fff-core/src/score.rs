@@ -160,7 +160,9 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     overlay_ranges: &[(usize, usize, LayerId, ArenaPtr)],
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let base_end = base_count.min(files.len());
-    let slices = overlay_ranges.iter().rev()
+    let slices = overlay_ranges
+        .iter()
+        .rev()
         .map(|&(start, end, _, arena)| (&files[start..end], arena))
         .chain(std::iter::once((&files[..base_end], arenas.base())));
 
@@ -1455,8 +1457,13 @@ mod tests {
                 if text != "controller" {
                     continue;
                 }
-                let (all_items, all_scores, all_total) =
-                    fuzzy_match_and_score_files(&files, &context, files.len() / 3, LayerArenas::uniform(arena), &[(files.len() / 3, files.len(), 1, arena)]);
+                let (all_items, all_scores, all_total) = fuzzy_match_and_score_files(
+                    &files,
+                    &context,
+                    files.len() / 3,
+                    LayerArenas::uniform(arena),
+                    &[(files.len() / 3, files.len(), 1, arena)],
+                );
                 assert_eq!(all_total, parallel_total);
                 let cases: &[(usize, usize, usize)] = if current_file.is_some() {
                     &[(49, 50, 1), (49, 50, 4)]
@@ -1552,7 +1559,11 @@ mod tests {
             let (expected_items, expected_scores, expected_total) =
                 sort_and_paginate(parallel, &context, |score| score.total);
             let (items, scores, total) = rank_by_frecency(
-                [(&files[count / 2..count], ArenaPtr::null()), (&files[..count / 2], ArenaPtr::null())].into_iter(),
+                [
+                    (&files[count / 2..count], ArenaPtr::null()),
+                    (&files[..count / 2], ArenaPtr::null()),
+                ]
+                .into_iter(),
                 &context,
                 LayerArenas::uniform(ArenaPtr::null()),
             );
@@ -1727,8 +1738,13 @@ mod tests {
             (matched.end_col as usize)
                 < files[matched.index as usize].filename_offset_in_relative_path()
         }));
-        let (expected, expected_scores, total) =
-            fuzzy_match_and_score_files(&files, &context, files.len() / 2, LayerArenas::uniform(arena), &[(files.len() / 2, files.len(), 1, arena)]);
+        let (expected, expected_scores, total) = fuzzy_match_and_score_files(
+            &files,
+            &context,
+            files.len() / 2,
+            LayerArenas::uniform(arena),
+            &[(files.len() / 2, files.len(), 1, arena)],
+        );
         assert_eq!(total, files.len());
         assert!(
             expected_scores.iter().all(|score| {
@@ -1744,8 +1760,13 @@ mod tests {
             context.pagination = PaginationArgs { offset, limit: 50 };
             for max_threads in [1, 4] {
                 context.max_threads = max_threads;
-                let (items, scores, matched) =
-                    fuzzy_match_and_score_files(&files, &context, files.len() / 2, LayerArenas::uniform(arena), &[(files.len() / 2, files.len(), 1, arena)]);
+                let (items, scores, matched) = fuzzy_match_and_score_files(
+                    &files,
+                    &context,
+                    files.len() / 2,
+                    LayerArenas::uniform(arena),
+                    &[(files.len() / 2, files.len(), 1, arena)],
+                );
                 assert_eq!(matched, total);
                 assert_eq!(items.len(), 50);
                 assert!(
@@ -1991,7 +2012,7 @@ mod filename_bonus_tests {
         let (mut overflow, _) = make_files(&[overflow_path]);
         let mut layers = crate::index::layers::LayerStack::new(1, 0);
         overflow[0].set_path(layers.top_builder().add_file_immediate(overflow_path, 6));
-        overflow[0].set_overflow(true);
+        overflow[0].set_layer(crate::SESSION_LAYER);
         let parser = QueryParser::default();
         let query = parser.parse("controller");
         let ranges = fuzzy_match_byte_offsets_for_page(

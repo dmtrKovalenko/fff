@@ -69,6 +69,7 @@ impl ScanJob {
     pub fn new_rescan(
         shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
+        snapshot: Option<LayerSnapshot>,
     ) -> Result<Option<Self>, Error> {
         let guard = shared_picker.write()?;
         let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
@@ -79,6 +80,9 @@ impl ScanJob {
                 .post_scan_indexing_active
                 .load(Ordering::Acquire)
         {
+            if snapshot.is_none() {
+                picker.signals.rescan_pending.store(true, Ordering::Release);
+            }
             return Ok(None);
         }
 
@@ -111,13 +115,8 @@ impl ScanJob {
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
             trace_span,
-            source: None,
+            source: snapshot,
         }))
-    }
-
-    pub fn with_source(mut self, snapshot: LayerSnapshot) -> Self {
-        self.source = Some(snapshot);
-        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -173,7 +172,7 @@ impl ScanJob {
             source,
         } = self;
 
-        let scanning = ScanningGuard { signals: &signals };
+        let scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system (or unpack the saved base) into a file list
@@ -302,10 +301,12 @@ impl ScanJob {
 
         // 6. Drain any rescan that arrived while we were busy.
         // if user initiated a new rescan we had no way to cancel current post scan, so do it again
-        if !signals.cancelled.load(Ordering::Acquire)
-            && signals.rescan_pending.swap(false, Ordering::AcqRel)
-        {
-            match Self::new_rescan(&shared_picker, &shared_frecency) {
+        let pending = shared_picker.read().is_ok_and(|_guard| {
+            !signals.cancelled.load(Ordering::Acquire)
+                && signals.rescan_pending.swap(false, Ordering::AcqRel)
+        });
+        if pending {
+            match Self::new_rescan(&shared_picker, &shared_frecency, None) {
                 Ok(Some(follow_up)) => {
                     info!("Rescheduling deferred rescan after current scan finished");
                     follow_up.spawn();
@@ -397,13 +398,18 @@ impl ScanJob {
 }
 
 // Ensures early returns clear the scanning signal.
-struct ScanningGuard<'a> {
-    signals: &'a ScanSignals,
+pub(crate) struct ScanningGuard(Arc<AtomicBool>);
+
+impl ScanningGuard {
+    pub(crate) fn new(signals: &ScanSignals) -> Self {
+        signals.scanning.store(true, Ordering::Release);
+        Self(Arc::clone(&signals.scanning))
+    }
 }
 
-impl Drop for ScanningGuard<'_> {
+impl Drop for ScanningGuard {
     fn drop(&mut self) {
-        self.signals.scanning.store(false, Ordering::Release);
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -444,6 +450,57 @@ mod tests {
         .unwrap();
         picker.collect_files().unwrap();
         picker
+    }
+
+    #[test]
+    fn only_one_restore_can_reserve_the_picker_and_a_busy_rescan_is_queued() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = SharedFilePicker::default();
+        let picker = collected(root.path());
+        let snapshot = picker.export_layer(0).unwrap();
+        *shared.write().unwrap() = Some(picker);
+        let frecency = SharedFrecency::default();
+        let job = ScanJob::new_rescan(&shared, &frecency, Some(snapshot))
+            .unwrap()
+            .unwrap();
+
+        let snapshot = shared
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .export_layer(0)
+            .unwrap();
+        assert!(matches!(
+            shared.import_base(snapshot, &frecency),
+            Err(Error::IndexBusy)
+        ));
+        shared.trigger_full_rescan_async(&frecency).unwrap();
+        assert!(job.signals.rescan_pending.load(Ordering::Acquire));
+        job.run();
+        assert!(shared.wait_for_indexing_complete(std::time::Duration::from_secs(10)));
+    }
+
+    #[cfg(feature = "zlob")]
+    #[test]
+    fn restoring_a_base_preserves_the_target_ignore_rules() {
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.path().join("keep.rs"), "").unwrap();
+        let picker = collected(root.path());
+        let snapshot = picker.export_layer(0).unwrap();
+        let shared = SharedFilePicker::default();
+        *shared.write().unwrap() = Some(picker);
+        let frecency = SharedFrecency::default();
+        ScanJob::new_rescan(&shared, &frecency, Some(snapshot))
+            .unwrap()
+            .unwrap()
+            .run();
+        let guard = shared.read().unwrap();
+        let rules = guard.as_ref().unwrap().ignore_rules().unwrap();
+        assert!(rules.is_ignored(std::path::Path::new("debug.log")));
+        assert!(!rules.is_ignored(std::path::Path::new("keep.rs")));
     }
 
     #[test]

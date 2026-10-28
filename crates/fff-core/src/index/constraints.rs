@@ -1068,8 +1068,12 @@ mod tests {
         assert!(glob_paths.contains(&"src/main.rs"));
         assert!(glob_paths.contains(&"src/lib.ts"));
         assert_eq!(glob_paths.len(), 2);
-        let sparse_plan =
-            ConstraintPlan::build_with_prefilter(&pure_glob, &items, LayerArenas::uniform(arena_ptr), true);
+        let sparse_plan = ConstraintPlan::build_with_prefilter(
+            &pure_glob,
+            &items,
+            LayerArenas::uniform(arena_ptr),
+            true,
+        );
         assert!(matches!(sparse_plan.glob, GlobStrategy::Inline(_)));
         let sparse_paths: Vec<_> = sparse_plan
             .run(&items, LayerArenas::uniform(arena_ptr))

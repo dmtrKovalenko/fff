@@ -457,15 +457,24 @@ impl FileSync {
         if let Some(frecency) = frecency {
             let dirs_ref = &dirs;
             BACKGROUND_THREAD_POOL.install(|| {
-                files.par_iter_mut().for_each_init(|| frecency.reader(), |reader, file| {
-                    let _ = file.update_frecency_scores(reader, arena, base_path, shared_base.as_deref(), mode);
-                    let score = file.access_frecency_score as i32;
-                    if score > 0
-                        && let Some(dir) = dirs_ref.get(file.parent_dir_index as usize)
-                    {
-                        dir.update_frecency_if_larger(score);
-                    }
-                });
+                files.par_iter_mut().for_each_init(
+                    || frecency.reader(),
+                    |reader, file| {
+                        let _ = file.update_frecency_scores(
+                            reader,
+                            arena,
+                            base_path,
+                            shared_base.as_deref(),
+                            mode,
+                        );
+                        let score = file.access_frecency_score as i32;
+                        if score > 0
+                            && let Some(dir) = dirs_ref.get(file.parent_dir_index as usize)
+                        {
+                            dir.update_frecency_if_larger(score);
+                        }
+                    },
+                );
             });
         }
 
@@ -585,12 +594,23 @@ impl FilePicker {
         snapshot: LayerSnapshot,
         frecency: Option<&FrecencyTracker>,
     ) -> Result<(), Error> {
-        if self.is_scan_active() || self.signals.post_scan_indexing_active.load(Ordering::Acquire) {
+        if self.is_scan_active()
+            || self
+                .signals
+                .post_scan_indexing_active
+                .load(Ordering::Acquire)
+        {
             return Err(Error::IndexBusy);
         }
 
         let started = std::time::Instant::now();
-        let mut sync = FileSync::from_snapshot(snapshot, &self.base_path, FileSync::discover_git(&self.base_path), frecency, self.mode);
+        let mut sync = FileSync::from_snapshot(
+            snapshot,
+            &self.base_path,
+            FileSync::discover_git(&self.base_path),
+            frecency,
+            self.mode,
+        );
         sync.ignore_rules = self.ignore_rules();
         let file_count = sync.files.len();
         self.commit_new_sync(sync);
@@ -619,7 +639,12 @@ impl FilePicker {
     }
 
     fn reserve_index(&mut self, files: usize, dirs: usize) -> Result<(), Error> {
-        if self.is_scan_active() || self.signals.post_scan_indexing_active.load(Ordering::Acquire) {
+        if self.is_scan_active()
+            || self
+                .signals
+                .post_scan_indexing_active
+                .load(Ordering::Acquire)
+        {
             return Err(Error::IndexBusy);
         }
 

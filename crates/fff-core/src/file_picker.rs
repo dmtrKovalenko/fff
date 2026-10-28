@@ -1118,7 +1118,15 @@ impl FilePicker {
     /// // picker.get_files() is now populated
     /// ```
     pub fn collect_files(&mut self) -> Result<(), Error> {
-        self.signals.scanning.store(true, Ordering::Relaxed);
+        if self.is_scan_active()
+            || self
+                .signals
+                .post_scan_indexing_active
+                .load(Ordering::Acquire)
+        {
+            return Err(Error::IndexBusy);
+        }
+        let _scanning = crate::scan::ScanningGuard::new(&self.signals);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
         let git = FileSync::discover_git(&self.base_path);
@@ -1167,7 +1175,6 @@ impl FilePicker {
             self.apply_git_recency(recency.as_ref());
         }
 
-        self.signals.scanning.store(false, Ordering::Relaxed);
         Ok(())
     }
 

@@ -223,15 +223,12 @@ impl SharedFilePicker {
         snapshot: crate::LayerSnapshot,
         shared_frecency: &SharedFrecency,
     ) -> Result<(), Error> {
+        let job =
+            ScanJob::new_rescan(self, shared_frecency, Some(snapshot))?.ok_or(Error::IndexBusy)?;
         self.0.rescan_throttle.note_explicit_scan();
         self.0.rescans.record(RescanReason::Explicit);
-        match ScanJob::new_rescan(self, shared_frecency)? {
-            Some(job) => {
-                job.with_source(snapshot).spawn();
-                Ok(())
-            }
-            None => Err(Error::IndexBusy),
-        }
+        job.spawn();
+        Ok(())
     }
 
     /// Returns admitted and throttled rescan requests by reason.
@@ -263,25 +260,8 @@ impl SharedFilePicker {
 
         self.0.rescans.record(reason);
 
-        match ScanJob::new_rescan(self, shared_frecency)? {
-            Some(job) => {
-                job.spawn();
-            }
-            None => {
-                // we can not abort the ongoing sync, but if the events
-                if let Ok(guard) = self.read()
-                    && let Some(picker) = guard.as_ref()
-                {
-                    picker
-                        .scan_signals()
-                        .rescan_pending
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    tracing::info!(
-                        "Full rescan requested while another scan is active — \
-                         deferred via rescan_pending flag"
-                    );
-                }
-            }
+        if let Some(job) = ScanJob::new_rescan(self, shared_frecency, None)? {
+            job.spawn();
         }
         Ok(true)
     }

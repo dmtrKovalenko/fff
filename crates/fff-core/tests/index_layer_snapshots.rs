@@ -183,7 +183,9 @@ fn imported_layer_is_searchable_and_sealed_lookups_work() {
     let path = base.join("out/pkg7/mod2999.ts");
     fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
     fs::write(&path, "changed\n").expect("write");
-    picker.handle_create_or_modify(&path).expect("update indexed file");
+    picker
+        .handle_create_or_modify(&path)
+        .expect("update indexed file");
     assert_eq!(layer_paths(&picker, layer).len(), 3000, "no duplicate row");
     assert_eq!(
         picker.get_file_by_path(&path).map(|f| f.size),
@@ -195,7 +197,9 @@ fn imported_layer_is_searchable_and_sealed_lookups_work() {
     let fresh = base.join("out/pkg0/new.ts");
     fs::create_dir_all(fresh.parent().unwrap()).expect("mkdir");
     fs::write(&fresh, "new\n").expect("write");
-    picker.handle_create_or_modify(&fresh).expect("update indexed file");
+    picker
+        .handle_create_or_modify(&fresh)
+        .expect("update indexed file");
     assert_eq!(picker.current_layer(), layer + 1);
     assert_eq!(layer_paths(&picker, layer).len(), 3000);
     assert_eq!(layer_paths(&picker, layer + 1), vec!["out/pkg0/new.ts"]);
@@ -368,6 +372,50 @@ fn base_scan_round_trips_through_a_file() {
     fs::write(&created, "new\n").expect("write");
     restored.handle_create_or_modify(&created);
     assert_eq!(layer_paths(&restored, SESSION_LAYER), vec!["src/m0/new.rs"]);
+}
+
+#[test]
+fn restored_base_reads_from_the_linked_worktree() {
+    let tmp = TempDir::new().unwrap();
+    let primary = tmp.path().join("primary");
+    let linked = tmp.path().join("linked");
+    let repository = git2::Repository::init(&primary).unwrap();
+    fs::write(primary.join("shared.rs"), "primary contents\n").unwrap();
+    let mut index = repository.index().unwrap();
+    index.add_path(std::path::Path::new("shared.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("FFF Test", "test@example.invalid").unwrap();
+    repository
+        .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .unwrap();
+    repository.worktree("linked", &linked, None).unwrap();
+    fs::write(linked.join("shared.rs"), "linked contents!\n").unwrap();
+
+    let file = tmp.path().join("base.fff");
+    picker(&primary)
+        .export_layer(0)
+        .unwrap()
+        .save(&file)
+        .unwrap();
+    let mut restored = FilePicker::new(FilePickerOptions {
+        base_path: linked.to_str().unwrap().to_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    restored
+        .import_base(LayerSnapshot::load(&file).unwrap(), None)
+        .unwrap();
+    let hit = restored.get_file_by_path(linked.join("shared.rs")).unwrap();
+    let resolved = hit.absolute_path(&restored, restored.base_path());
+    assert_eq!(fs::read_to_string(resolved).unwrap(), "linked contents!\n");
+    assert!(
+        restored
+            .get_file_by_path(primary.join("shared.rs"))
+            .is_none()
+    );
+    assert_eq!(search_paths(&restored, "shared.rs"), vec!["shared.rs"]);
 }
 
 #[test]
