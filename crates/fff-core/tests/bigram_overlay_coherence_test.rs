@@ -1099,7 +1099,7 @@ fn bigram_overlay_coherence_fuzzy_search_base_overflow_and_deleted() {
         );
         file.set_deleted(false);
         assert!(
-            fuzzy_search_paths(picker, "contro")
+            fuzzy_search_paths(picker, "control")
                 .iter()
                 .any(|p| p == "controller_auth.rs")
         );
