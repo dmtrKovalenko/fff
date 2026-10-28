@@ -183,6 +183,7 @@ impl LayerBuilder {
                 None,
                 entry.binary,
             );
+            file.mark_definition_language(&entry.path);
             file.set_path(store.add_file_immediate(&entry.path, entry.filename_offset));
             file.parent_dir_index = dir_idx;
             files.push(file);
@@ -507,6 +508,7 @@ impl LayerSnapshot {
             }
             path.filename_offset = offset;
             let mut file = FileItem::new_raw(offset, size, modified, None, binary);
+            file.mark_definition_language(text);
             file.set_path(path);
             file.parent_dir_index = parent_dir_index;
             files.push(file);
