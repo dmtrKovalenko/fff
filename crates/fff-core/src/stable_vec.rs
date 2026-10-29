@@ -122,6 +122,29 @@ impl<T> StableVec<T> {
         unsafe { Some(&mut *self.inner.ptr.as_ptr().add(index)) }
     }
 
+    // Borrow only the writable overlay. A post-scan reader can still hold the base prefix.
+    pub fn range_mut(&mut self, range: std::ops::Range<usize>) -> &mut [T] {
+        assert!(range.start <= range.end && range.end <= self.len());
+        // SAFETY: the checked range lies in the initialized buffer and has a single writer.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.inner.ptr.as_ptr().add(range.start), range.len())
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.cap
+    }
+
+    /// Fresh allocation holding a clone of every element plus `extra` slots.
+    /// The old buffer stays alive for any outstanding Arc clones.
+    pub fn reallocate_with_reserve(&self, extra: usize) -> Self
+    where
+        T: Clone,
+    {
+        Self::from_vec_with_reserve(self.to_vec(), extra)
+    }
+
     #[inline]
     pub fn last(&self) -> Option<&T> {
         let len = self.len();

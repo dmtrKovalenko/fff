@@ -74,7 +74,7 @@ pub(crate) const MAX_PATH_CHUNKS: usize = PATH_BUF_SIZE.div_ceil(SIMD_CHUNK_BYTE
 
 /// A path stored as a run of chunk indices in the owning store's flat index
 /// table. 8 bytes; every read needs the store's `ArenaPtr`.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChunkedString {
     index_offset: u32,
     pub byte_len: u16,
@@ -173,6 +173,11 @@ impl ChunkedString {
     }
 
     #[inline]
+    pub fn index_offset(&self) -> u32 {
+        self.index_offset
+    }
+
+    #[inline]
     pub fn resolve_ptrs<'a>(&self, arena: ArenaPtr, buf: &'a mut [*const u8]) -> &'a [*const u8] {
         let indices = self.indices(arena);
         let count = indices.len().min(buf.len());
@@ -252,7 +257,13 @@ impl ChunkedString {
             }
         }
 
-        unsafe { core::str::from_utf8_unchecked(&buf[..total]) }
+        // A shorter caller-owned buffer can end in the middle of a code point.
+        let len = if total < self.byte_len as usize {
+            core::str::from_utf8(&buf[..total]).map_or_else(|error| error.valid_up_to(), str::len)
+        } else {
+            total
+        };
+        unsafe { core::str::from_utf8_unchecked(&buf[..len]) }
     }
 
     #[inline]
@@ -346,6 +357,27 @@ unsafe impl Send for ChunkedPathStore {}
 unsafe impl Sync for ChunkedPathStore {}
 
 impl ChunkedPathStore {
+    pub fn empty() -> Self {
+        Self {
+            arena: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    pub fn from_parts(arena: Vec<SimdChunk>, indices: Vec<u32>) -> Self {
+        Self { arena, indices }
+    }
+
+    #[inline]
+    pub fn chunks(&self) -> &[SimdChunk] {
+        &self.arena
+    }
+
+    #[inline]
+    pub fn indices(&self) -> &[u32] {
+        &self.indices
+    }
+
     pub fn heap_bytes(&self) -> usize {
         self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
     }
@@ -361,6 +393,9 @@ impl ChunkedPathStore {
     }
 }
 
+// Most paths fit into 64 bytes = 4 chunks; dedup keeps the arena well below that.
+const EST_CHUNKS_PER_PATH: usize = 4;
+
 /// At runtime the builder should be split out from the store after `finish()`.
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkedPathStoreBuilder {
@@ -371,12 +406,33 @@ pub(crate) struct ChunkedPathStoreBuilder {
 
 impl ChunkedPathStoreBuilder {
     pub fn new(estimated_files: usize) -> Self {
-        // most paths fit into 64 bytes = 4 chunks; dedup keeps the arena well below that
-        let est_indices = estimated_files * 4;
+        let est_indices = estimated_files * EST_CHUNKS_PER_PATH;
         Self {
             arena: Vec::with_capacity(est_indices / 2),
             indices: Vec::with_capacity(est_indices),
             chunk_dedup: AHashMap::with_capacity(est_indices / 2),
+        }
+    }
+
+    // Reopens a sealed store: rebuilds the dedup table from its chunks so new
+    // paths keep sharing prefixes with the existing ones.
+    pub fn from_store(store: ChunkedPathStore, extra_files: usize) -> Self {
+        let ChunkedPathStore {
+            mut arena,
+            mut indices,
+        } = store;
+        let extra = extra_files * EST_CHUNKS_PER_PATH;
+        arena.reserve(extra / 2);
+        indices.reserve(extra);
+        let mut chunk_dedup = AHashMap::with_capacity(arena.len() + extra / 2);
+        for (idx, chunk) in arena.iter().enumerate() {
+            chunk_dedup.entry(chunk.0).or_insert(idx as u32);
+        }
+
+        Self {
+            arena,
+            indices,
+            chunk_dedup,
         }
     }
 
@@ -393,6 +449,12 @@ impl ChunkedPathStoreBuilder {
 
     pub fn as_arena_ptr(&self) -> ArenaPtr {
         ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
+    }
+
+    /// Chunks + index table, like [`ChunkedPathStore::heap_bytes`]; the dedup
+    /// table is transient and dropped by `finish`.
+    pub fn heap_bytes(&self) -> usize {
+        self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
     }
 
     /// Like [`add_file_immediate`] but for directory paths where the entire
@@ -492,6 +554,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn short_path_buffers_stop_at_a_character_boundary() {
+        let (store, paths, _) = build_test_store(&["a/é.rs"]);
+        let mut buf = [0; 3];
+        assert_eq!(paths[0].read_to_buf(store.as_arena_ptr(), &mut buf), "a/");
     }
 
     fn make_file_item(path: &str) -> crate::types::FileItem {

@@ -203,8 +203,7 @@ pub(crate) fn grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     let result = grep_search_parsed(
         files,
@@ -216,8 +215,7 @@ pub(crate) fn grep_search<'a>(
         bigram_overlay,
         abort_signal,
         base_path,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     // Constraint parsing can swallow tokens the user meant literally (e.g. `!=`
@@ -252,8 +250,7 @@ pub(crate) fn grep_search<'a>(
             bigram_overlay,
             abort_signal,
             base_path,
-            arena,
-            overflow_arena,
+            arenas,
         );
         if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
             return result;
@@ -292,8 +289,7 @@ pub(crate) fn grep_search<'a>(
         bigram_overlay,
         abort_signal,
         base_path,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     if fallback.matches.is_empty() {
@@ -315,8 +311,7 @@ fn grep_search_parsed<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     let constraints_from_query = &query.constraints[..];
 
@@ -336,14 +331,13 @@ fn grep_search_parsed<'a>(
         GrepMode::Fuzzy => {
             let bigram_candidates = fuzzy_candidates(bigram_index, bigram_overlay, &grep_text);
 
-            let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+            let (mut files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
                 files,
                 constraints_from_query,
                 bigram_candidates.as_deref(),
                 base_count,
                 options,
-                arena,
-                overflow_arena,
+                arenas,
             );
 
             if files_to_search.is_empty() {
@@ -352,7 +346,7 @@ fn grep_search_parsed<'a>(
 
             return super::fuzzy_grep::fuzzy_grep_search(
                 &grep_text,
-                &files_to_search,
+                &mut files_to_search,
                 options,
                 total_files,
                 filtered_file_count,
@@ -360,8 +354,7 @@ fn grep_search_parsed<'a>(
                 budget,
                 abort_signal,
                 base_path,
-                arena,
-                overflow_arena,
+                arenas,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, casing)
@@ -403,14 +396,13 @@ fn grep_search_parsed<'a>(
         regex_candidates(bigram_index, bigram_overlay, &effective_pattern)
     };
 
-    let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+    let (mut files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
         files,
         constraints_from_query,
         bigram_candidates.as_deref(),
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     if files_to_search.is_empty() {
@@ -433,15 +425,14 @@ fn grep_search_parsed<'a>(
 
     let should_prefilter = regex.is_none();
     let mut result = perform_grep(
-        &files_to_search,
+        &mut files_to_search,
         options,
         &GrepContext {
             total_files,
             filtered_file_count,
             budget,
             base_path,
-            arena,
-            overflow_arena,
+            arenas,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
         },
@@ -560,8 +551,7 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) filtered_file_count: usize,
     pub(super) budget: &'a ContentCacheBudget,
     pub(super) base_path: &'a Path,
-    pub(super) arena: crate::simd_path::ArenaPtr,
-    pub(super) overflow_arena: crate::simd_path::ArenaPtr,
+    pub(super) arenas: crate::index::layers::LayerArenas,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
 }
@@ -569,11 +559,7 @@ pub(super) struct GrepContext<'a, 'b> {
 impl GrepContext<'_, '_> {
     #[inline]
     fn arena_for_file(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
-        if file.is_overflow() {
-            self.overflow_arena
-        } else {
-            self.arena
-        }
+        self.arenas.get(file.layer_id())
     }
 }
 
@@ -583,7 +569,7 @@ impl GrepContext<'_, '_> {
     fields(prefiltered_count = files_to_search.len())
 )]
 pub(super) fn perform_grep<'a, F>(
-    files_to_search: &[&'a FileItem],
+    files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
     ctx: &GrepContext<'_, '_>,
     search_file: F,
@@ -627,7 +613,7 @@ where
 
     while chunk_start < files_to_search.len() {
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
-        let chunk = &files_to_search[chunk_start..chunk_end];
+        let chunk = files_to_search.batch(chunk_start..chunk_end);
         chunk_start = chunk_end;
         let chunk_offset = files_consumed;
 

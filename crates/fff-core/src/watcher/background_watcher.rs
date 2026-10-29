@@ -650,7 +650,7 @@ pub(crate) fn handle_debounced_events(
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
         let mut landed_renames = ahash::AHashSet::with_capacity(renames.len());
         for path in &paths_to_add_or_modify {
-            if picker.get_overflow_files().len() >= MAX_OVERFLOW_FILES
+            if picker.open_layer_file_count() >= MAX_OVERFLOW_FILES
                 && picker.get_file_by_path(path).is_none()
             {
                 index_update_rejected = true;
@@ -687,7 +687,7 @@ pub(crate) fn handle_debounced_events(
             }
         }
 
-        overflow_count = picker.get_overflow_files().len();
+        overflow_count = picker.open_layer_file_count();
     }
 
     info!(

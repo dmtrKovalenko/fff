@@ -3,8 +3,8 @@ use ahash::AHashMap;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSlice;
 use std::cell::UnsafeCell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::index::ColumnSlab;
 use crate::{FileItem, constants};
@@ -64,7 +64,7 @@ pub struct BigramIndexBuilder {
     /// Flat bitset data, materialised on first use. Stays `None` when the OS
     /// refuses the mapping: the index then compresses to nothing (no prefilter).
     col_data: OnceLock<Option<UnsafeCell<ColumnSlab>>>,
-    next_column: AtomicU16,
+    next_column: Mutex<u16>,
     words: usize,
     file_count: usize,
     populated: AtomicUsize,
@@ -83,7 +83,7 @@ impl BigramIndexBuilder {
         Self {
             lookup,
             col_data: OnceLock::new(),
-            next_column: AtomicU16::new(0),
+            next_column: Mutex::new(0),
             words,
             file_count,
             populated: AtomicUsize::new(0),
@@ -123,20 +123,18 @@ impl BigramIndexBuilder {
         if current != NO_COLUMN {
             return current;
         }
-        let new_col = self.next_column.fetch_add(1, Ordering::Relaxed);
-        if new_col >= MAX_BIGRAM_COLUMNS as u16 {
+        let mut next = self.next_column.lock().expect("bigram column lock");
+        let current = self.lookup[slot].load(Ordering::Relaxed);
+        if current != NO_COLUMN {
+            return current;
+        }
+        if *next == MAX_BIGRAM_COLUMNS as u16 {
             return NO_COLUMN;
         }
-
-        match self.lookup[slot].compare_exchange(
-            NO_COLUMN,
-            new_col,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => new_col,
-            Err(existing) => existing,
-        }
+        let column = *next;
+        *next += 1;
+        self.lookup[slot].store(column, Ordering::Relaxed);
+        column
     }
 
     /// Test/bench accessor for a column's raw bitset words. Assumes the
@@ -419,9 +417,7 @@ impl BigramIndexBuilder {
     }
 
     pub fn columns_used(&self) -> u16 {
-        self.next_column
-            .load(Ordering::Relaxed)
-            .min(MAX_BIGRAM_COLUMNS as u16)
+        *self.next_column.lock().expect("bigram column lock")
     }
 
     /// Compress the dense builder into a compact `BigramFilter`.
@@ -1048,7 +1044,7 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
 pub struct BigramOverlay {
     /// Per-file bigram sets for files modified since the base was built.
     /// Key = file index in the base `Vec<FileItem>`.
-    modified: AHashMap<usize, Vec<u16>>,
+    modified: AHashMap<usize, Option<Vec<u16>>>,
 
     /// Tombstone bitset — one bit per base file. Set bits are excluded
     /// from base query results.
@@ -1069,7 +1065,13 @@ impl BigramOverlay {
     }
 
     pub(crate) fn modify_file(&mut self, file_idx: usize, content: &[u8]) {
-        self.modified.insert(file_idx, extract_bigrams(content));
+        self.modified
+            .insert(file_idx, Some(extract_bigrams(content)));
+    }
+
+    // Metadata-only imports have no content to index. Keep this slot in every candidate set.
+    pub(crate) fn invalidate_file(&mut self, file_idx: usize) {
+        self.modified.insert(file_idx, None);
     }
 
     pub(crate) fn delete_file(&mut self, file_idx: usize) {
@@ -1089,9 +1091,9 @@ impl BigramOverlay {
         self.modified
             .iter()
             .filter_map(|(&file_idx, bigrams)| {
-                pattern_bigrams
-                    .iter()
-                    .all(|pb| bigrams.contains(pb))
+                bigrams
+                    .as_ref()
+                    .is_none_or(|bigrams| pattern_bigrams.iter().all(|pb| bigrams.contains(pb)))
                     .then_some(file_idx)
             })
             .collect()
@@ -1280,7 +1282,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
         }
 
         let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
-        file.detect_binary_per_byte(abs, &mut chunk);
+        file.detect_binary_per_byte(&abs, &mut chunk);
     }
 }
 
@@ -1464,6 +1466,20 @@ mod tests {
                 "file {i}"
             );
         }
+    }
+
+    #[test]
+    fn exhausted_column_ids_never_alias_existing_columns() {
+        let builder = BigramIndexBuilder::new(64);
+        let mut keys = (32..=126).flat_map(|a| (32..=126).map(move |b| u16::from_be_bytes([a, b])));
+        for id in 0..MAX_BIGRAM_COLUMNS as u16 {
+            assert_eq!(builder.get_or_alloc_column(keys.next().unwrap()), id);
+        }
+        let absent = keys.next().unwrap();
+        for _ in 0..=u16::MAX {
+            assert_eq!(builder.get_or_alloc_column(absent), NO_COLUMN);
+        }
+        assert_eq!(builder.columns_used() as usize, MAX_BIGRAM_COLUMNS);
     }
 
     /// Build a key the same way `add_file_content` does: two printable-ASCII

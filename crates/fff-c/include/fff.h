@@ -38,6 +38,7 @@
  * | `fff_health_check`         | `handle`      | `*mut c_char` (JSON string)   |
  * | `fff_get_historical_query` | `handle`      | `*mut c_char` (string or null)|
  * | `fff_wait_for_scan`        | `int_value`   | 1 = completed, 0 = timed out  |
+ * | `fff_wait_for_indexing_complete` | `int_value` | 1 = completed, 0 = timed out |
  * | `fff_track_query`          | `int_value`   | 1 = success, 0 = failure      |
  * | `fff_refresh_git_status`   | `int_value`   | number of files updated       |
  * | `fff_scan_files`           | (none)        | success flag only             |
@@ -756,6 +757,15 @@ struct FffResult *fff_get_scan_progress(void *fff_handle);
 struct FffResult *fff_wait_for_scan(void *fff_handle, uint64_t timeout_ms);
 
 /**
+ * Wait for the filesystem walk and post-scan indexing before changing index layers.
+ * Returns 1 if the picker is ready, or 0 on timeout.
+ *
+ * # Safety
+ * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
+ */
+struct FffResult *fff_wait_for_indexing_complete(void *fff_handle, uint64_t timeout_ms);
+
+/**
  * Wait for the background file watcher to be ready.
  *
  * ## Safety
@@ -1408,6 +1418,83 @@ uint32_t fff_grep_result_get_next_file_offset(const struct FffGrepResult *r);
  * `r` must be a valid `FffGrepResult` pointer or null.
  */
 const char *fff_grep_result_get_regex_fallback_error(const struct FffGrepResult *r);
+
+/**
+ * Seal the writable layer and return the new layer ID in `int_value`.
+ * # Safety
+ * Provide a live instance and a NULL or NUL-terminated UTF-8 label.
+ */
+struct FffResult *fff_layer_create(void *fff_handle, const char *label);
+
+/**
+ * Return the writable layer ID in `int_value`.
+ * # Safety
+ * Provide a live instance.
+ */
+struct FffResult *fff_layer_current(void *fff_handle);
+
+/**
+ * Return the number of live files in the layer (0 for the base scan).
+ * # Safety
+ * Provide a live instance.
+ */
+struct FffResult *fff_layer_file_count(void *fff_handle, uint8_t layer);
+
+/**
+ * Return overlay metadata as a JSON array in `handle`. Free it with `fff_free_string`.
+ * # Safety
+ * Provide a live instance.
+ */
+struct FffResult *fff_layer_list(void *fff_handle);
+
+/**
+ * Append a batch of base-relative paths and return the number of files added.
+ * # Safety
+ * Provide a live instance and `paths_len` readable bytes containing exactly `count` NUL-terminated UTF-8 paths.
+ * For an empty batch `paths` may be NULL. Each metadata array is NULL or holds `count` readable little-endian u64s (unaligned allowed).
+ */
+struct FffResult *fff_layer_add_paths(void *fff_handle,
+                                      const char *paths,
+                                      uintptr_t paths_len,
+                                      const uint64_t *sizes,
+                                      const uint64_t *modified,
+                                      uintptr_t count);
+
+/**
+ * Write a snapshot from a path batch and return the number of bytes written.
+ * # Safety
+ * Use the buffers specified by `fff_layer_add_paths`. Provide a NUL-terminated UTF-8 output path and an optional NUL-terminated UTF-8 label.
+ */
+struct FffResult *fff_layer_build(const char *label,
+                                  const char *paths,
+                                  uintptr_t paths_len,
+                                  const uint64_t *sizes,
+                                  const uint64_t *modified,
+                                  uintptr_t count,
+                                  const char *out_path);
+
+/**
+ * Save a layer (0 for the base scan) and return the number of bytes written.
+ * # Safety
+ * Provide a live instance and a NUL-terminated UTF-8 path.
+ */
+struct FffResult *fff_layer_save(void *fff_handle, uint8_t layer, const char *path);
+
+/**
+ * Load a sealed overlay and return its layer ID.
+ * # Safety
+ * Provide a live instance and a NUL-terminated UTF-8 path.
+ */
+struct FffResult *fff_layer_load(void *fff_handle, const char *path);
+
+/**
+ * Start a base scan from a snapshot and return its file count.
+ * Use `fff_wait_for_scan` before searching.
+ * Use `fff_wait_for_indexing_complete` before changing layers.
+ * # Safety
+ * Provide a live instance and a NUL-terminated UTF-8 path.
+ */
+struct FffResult *fff_base_load(void *fff_handle, const char *path);
 
 /**
  * Register the instance-wide watch callback used by all `fff_watch`

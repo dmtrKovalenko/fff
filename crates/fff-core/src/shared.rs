@@ -214,6 +214,23 @@ impl SharedFilePicker {
             .map(|_| ())
     }
 
+    /// Installs a saved base scan instead of walking the filesystem, then
+    /// runs the usual post-scan phases in the background. Fails with
+    /// [`Error::IndexBusy`] while another scan or its post-scan indexing is
+    /// active. Use [`wait_for_indexing_complete`](Self::wait_for_indexing_complete) before retrying.
+    pub fn import_base(
+        &self,
+        snapshot: crate::LayerSnapshot,
+        shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        let job =
+            ScanJob::new_rescan(self, shared_frecency, Some(snapshot))?.ok_or(Error::IndexBusy)?;
+        self.0.rescan_throttle.note_explicit_scan();
+        self.0.rescans.record(RescanReason::Explicit);
+        job.spawn();
+        Ok(())
+    }
+
     /// Returns admitted and throttled rescan requests by reason.
     /// Counters start at picker creation or the last reset.
     pub fn rescan_stats(&self) -> RescanStats {
@@ -243,25 +260,8 @@ impl SharedFilePicker {
 
         self.0.rescans.record(reason);
 
-        match ScanJob::new_rescan(self, shared_frecency)? {
-            Some(job) => {
-                job.spawn();
-            }
-            None => {
-                // we can not abort the ongoing sync, but if the events
-                if let Ok(guard) = self.read()
-                    && let Some(picker) = guard.as_ref()
-                {
-                    picker
-                        .scan_signals()
-                        .rescan_pending
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    tracing::info!(
-                        "Full rescan requested while another scan is active — \
-                         deferred via rescan_pending flag"
-                    );
-                }
-            }
+        if let Some(job) = ScanJob::new_rescan(self, shared_frecency, None)? {
+            job.spawn();
         }
         Ok(true)
     }
@@ -421,7 +421,7 @@ impl SharedFilePicker {
         });
 
         let git_status = repo.as_ref().and_then(|repo| {
-            GitStatusCache::read_status(repo, &mut crate::git::default_status_options())
+            GitStatusCache::read_full_status(repo)
                 .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
                 .ok()
         });
