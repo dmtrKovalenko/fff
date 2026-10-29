@@ -78,11 +78,9 @@ impl FileItemFlags {
     /// Tombstone: file was deleted but index slot is preserved so
     /// bigram indices for other files stay valid.
     pub const DELETED: u8 = 1 << 1;
-    /// File was added after the last full reindex; its indices point
-    /// into an overlay layer arena, not the base arena.
-    pub const OVERFLOW: u8 = 1 << 2;
-    /// Bits 3..5 hold the arena layer id (0 = base scan).
-    pub const LAYER: u8 = LAYER_MASK;
+    /// Mask for files owned by any overlay.
+    pub const OVERFLOW: u8 = LAYER_MASK;
+    pub(crate) const LANGUAGE_SHIFT: u8 = 4;
 }
 
 pub struct DirFlags;
@@ -90,8 +88,6 @@ pub struct DirFlags;
 impl DirFlags {
     pub const OVERFLOW: u8 = 1 << 0;
     pub const DELETED: u8 = 1 << 1;
-    /// Bits 3..5 hold the arena layer id (0 = base scan).
-    pub const LAYER: u8 = LAYER_MASK;
 }
 
 /// A directory in the file index. Copy its path before mutating its picker
@@ -169,7 +165,7 @@ impl DirItem {
 
     /// Arena layer owning this dir's path. `0` is the base scan.
     #[inline(always)]
-    pub fn layer_id(&self) -> LayerId {
+    pub(crate) fn layer_id(&self) -> LayerId {
         (self.flags & LAYER_MASK) >> LAYER_SHIFT
     }
 
@@ -287,7 +283,6 @@ pub struct FileItem {
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
-    definition_language: u8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
@@ -313,7 +308,6 @@ impl Clone for FileItem {
             git_recency_score: self.git_recency_score,
             git_status: self.git_status,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
-            definition_language: self.definition_language,
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
@@ -359,7 +353,6 @@ impl FileItem {
             git_recency_score: 0,
             git_status,
             flags: AtomicU8::new(flags),
-            definition_language: 0,
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -578,20 +571,16 @@ impl FileItem {
     }
 
     pub(crate) fn mark_definition_language(&mut self, filename: &str) {
-        self.definition_language = crate::definition::Language::from_filename(filename) as u8;
+        let language = crate::definition::Language::from_filename(filename) as u8;
+        let flags = self.flags.get_mut();
+        *flags = (*flags & ((1 << FileItemFlags::LANGUAGE_SHIFT) - 1))
+            | (language << FileItemFlags::LANGUAGE_SHIFT);
     }
 
     /// Classify a returned match using the language recorded during indexing.
     /// Lines longer than 256 bytes are not classified as definitions.
     pub fn is_definition_match(&self, line: &str, ranges: &[(u32, u32)]) -> bool {
-        let flags = self.flags.load(Ordering::Relaxed);
-        flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
-            && crate::definition::is_definition_match(
-                self.definition_language,
-                line.as_bytes(),
-                ranges,
-                false,
-            )
+        self.classify_definition_match(line.as_bytes(), ranges, false)
     }
 
     pub(crate) fn classify_definition_match(
@@ -602,12 +591,17 @@ impl FileItem {
     ) -> bool {
         let flags = self.flags.load(Ordering::Relaxed);
         flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
-            && crate::definition::is_definition_match(self.definition_language, line, ranges, fuzzy)
+            && crate::definition::is_definition_match(
+                flags >> FileItemFlags::LANGUAGE_SHIFT,
+                line,
+                ranges,
+                fuzzy,
+            )
     }
 
     #[inline]
     pub(crate) fn supports_definitions(&self) -> bool {
-        self.definition_language != 0
+        self.flags.load(Ordering::Relaxed) >> FileItemFlags::LANGUAGE_SHIFT != 0
     }
 
     #[inline]
@@ -679,53 +673,26 @@ impl FileItem {
         }
     }
 
+    /// Returns true when this file belongs to an overlay above the base index.
     #[inline]
     pub fn is_overflow(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & FileItemFlags::OVERFLOW != 0
-    }
-
-    #[inline]
-    pub fn set_overflow(&self, val: bool) {
-        // The public overflow flag does not transfer ownership of the path arena.
-        if val {
-            self.flags
-                .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
-        } else {
-            self.flags
-                .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
-        }
+        self.layer_id() != 0
     }
 
     /// Arena layer owning this file's path. `0` is the base scan, higher ids
     /// are overlay layers stacked in creation order.
     #[inline(always)]
-    pub fn layer_id(&self) -> LayerId {
+    pub(crate) fn layer_id(&self) -> LayerId {
         (self.flags.load(Ordering::Relaxed) & LAYER_MASK) >> LAYER_SHIFT
     }
 
     /// Moves the file onto `layer`. Only the picker may call this — the path
     /// indices must already point into that layer's arena.
     #[inline]
-    pub(crate) fn set_layer(&self, layer: LayerId) {
-        let bits = (layer << LAYER_SHIFT) & LAYER_MASK;
-        let overflow = if layer == 0 {
-            0
-        } else {
-            FileItemFlags::OVERFLOW
-        };
-        let mut current = self.flags.load(Ordering::Relaxed);
-        loop {
-            let next = (current & !(LAYER_MASK | FileItemFlags::OVERFLOW)) | bits | overflow;
-            match self.flags.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+    pub(crate) fn set_layer(&mut self, layer: LayerId) {
+        debug_assert!((layer as usize) < crate::MAX_INDEX_LAYERS);
+        let flags = self.flags.get_mut();
+        *flags = (*flags & !LAYER_MASK) | (layer << LAYER_SHIFT);
     }
 }
 
@@ -1316,35 +1283,35 @@ mod definition_flag_tests {
     fn language_and_existing_flags_preserve_each_other() {
         for binary in [false, true] {
             for deleted in [false, true] {
-                for overflow in [false, true] {
+                for layer in 0..crate::MAX_INDEX_LAYERS as u8 {
                     let mut file = FileItem::new_raw(0, 0, 0, None, binary);
                     file.set_deleted(deleted);
-                    file.set_overflow(overflow);
+                    file.set_layer(layer);
                     assert!(!file.supports_definitions());
-                    for filename in ["file.rs", "file.py", "file.txt", "file.hs", "file.rs"] {
+                    for filename in ["file.rs", "file.py", "file.txt", "file.ml", "file.rs"] {
                         file.mark_definition_language(filename);
                         assert_eq!(file.is_binary(), binary);
                         assert_eq!(file.is_deleted(), deleted);
-                        assert_eq!(file.is_overflow(), overflow);
+                        assert_eq!(file.layer_id(), layer);
                         assert_eq!(file.supports_definitions(), filename != "file.txt");
                     }
 
-                    let clone = file.clone();
+                    let mut clone = file.clone();
                     assert_eq!(clone.is_binary(), binary);
                     assert_eq!(clone.is_deleted(), deleted);
-                    assert_eq!(clone.is_overflow(), overflow);
+                    assert_eq!(clone.layer_id(), layer);
                     assert!(clone.supports_definitions());
                     clone.set_binary(!binary);
                     clone.set_deleted(!deleted);
-                    clone.set_overflow(!overflow);
+                    clone.set_layer((layer + 1) % crate::MAX_INDEX_LAYERS as u8);
                     assert!(clone.supports_definitions());
                     clone.set_binary(false);
                     clone.set_deleted(false);
-                    clone.set_overflow(false);
+                    clone.set_layer(0);
                     assert!(clone.is_definition_match("fn needle() {}", &[(3, 9)]));
                     assert_eq!(file.is_binary(), binary);
                     assert_eq!(file.is_deleted(), deleted);
-                    assert_eq!(file.is_overflow(), overflow);
+                    assert_eq!(file.layer_id(), layer);
                 }
             }
         }

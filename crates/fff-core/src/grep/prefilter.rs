@@ -317,7 +317,9 @@ mod tests {
                 let mut file = FileItem::new_raw(0, size, 1000 - idx, None, idx == 6);
                 file.mark_definition_language(["file.rs", "file.txt", "file.py"][idx as usize % 3]);
                 file.set_deleted(idx == 8);
-                file.set_overflow(idx >= 65);
+                if idx >= 65 {
+                    file.set_layer(crate::SESSION_LAYER);
+                }
                 file
             })
             .collect();

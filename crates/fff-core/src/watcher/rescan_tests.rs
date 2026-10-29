@@ -637,6 +637,16 @@ fn ambiguous_batch_falls_back_to_remove_and_create() {
     let f = Fixture::new();
     f.write("src/a.rs", "same");
     f.write("src/b.rs", "same");
+    let mtime = std::fs::metadata(f.path("src/a.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(f.path("src/b.rs"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
     f.index();
     let events = f.subscribe("**");
 

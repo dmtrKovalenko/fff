@@ -700,7 +700,7 @@ export class FileFinder implements FileFinderApi {
 
   /**
    * Seal the writable index layer and open a new one. Returns its id.
-   * At most 4 overlays exist; past that the two newest are merged.
+   * At most three overlays exist. Opening a fourth merges the two newest first.
    */
   createLayer(label?: string): Result<number> {
     const guard = this.ensureAlive();

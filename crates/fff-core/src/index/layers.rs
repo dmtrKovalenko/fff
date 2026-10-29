@@ -7,8 +7,10 @@ use crate::simd_path::{ArenaPtr, ChunkedPathStore, ChunkedPathStoreBuilder};
 /// Index of an arena layer. `0` is the base scan, `1..` are overlays.
 pub type LayerId = u8;
 
-/// Base scan plus four append-only overlays.
-pub const MAX_INDEX_LAYERS: usize = 5;
+const LAYER_ID_MASK: u8 = 0b11;
+
+/// Base scan plus three append-only overlays.
+pub const MAX_INDEX_LAYERS: usize = LAYER_ID_MASK as usize + 1;
 
 /// How many overlays can exist on top of the base scan.
 pub const MAX_OVERLAY_LAYERS: usize = MAX_INDEX_LAYERS - 1;
@@ -19,17 +21,13 @@ pub const SESSION_LAYER: LayerId = 1;
 /// Label given to [`SESSION_LAYER`] when the stack is created.
 pub const SESSION_LAYER_LABEL: &str = "session";
 
-// Layer id occupies three flag bits, so the arena table is padded to 8 slots
-// and indexed with a mask — no bounds branch on the scoring hot path.
-const LAYER_SLOTS: usize = 8;
-
-pub(crate) const LAYER_SHIFT: u8 = 3;
-pub(crate) const LAYER_MASK: u8 = 0b111 << LAYER_SHIFT;
+pub(crate) const LAYER_SHIFT: u8 = 2;
+pub(crate) const LAYER_MASK: u8 = LAYER_ID_MASK << LAYER_SHIFT;
 
 /// Arena pointer per layer, resolved once per search and copied into workers.
 #[derive(Clone, Copy, Debug)]
 pub struct LayerArenas {
-    ptrs: [ArenaPtr; LAYER_SLOTS],
+    ptrs: [ArenaPtr; MAX_INDEX_LAYERS],
 }
 
 impl LayerArenas {
@@ -38,7 +36,7 @@ impl LayerArenas {
     #[inline]
     pub fn uniform(arena: ArenaPtr) -> Self {
         Self {
-            ptrs: [arena; LAYER_SLOTS],
+            ptrs: [arena; MAX_INDEX_LAYERS],
         }
     }
 
@@ -49,7 +47,7 @@ impl LayerArenas {
 
     #[inline]
     pub fn get(&self, layer: LayerId) -> ArenaPtr {
-        self.ptrs[(layer & 0b111) as usize]
+        self.ptrs[(layer & LAYER_ID_MASK) as usize]
     }
 }
 
@@ -498,8 +496,7 @@ mod tests {
         let base = [0u8; 16];
         let arenas = LayerArenas::uniform(ArenaPtr::new(base.as_ptr(), std::ptr::null()));
 
-        // Layer id comes from three flag bits, so ids up to 7 must not panic.
-        for layer in 0..=7u8 {
+        for layer in 0..=u8::MAX {
             assert_eq!(arenas.get(layer).as_ptr(), base.as_ptr());
         }
     }

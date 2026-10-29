@@ -271,19 +271,39 @@ fn imported_entry_refreshes_tombstoned_base_metadata() {
 }
 
 #[test]
-fn toggling_overflow_preserves_the_owning_arena() {
-    let tmp = TempDir::new().unwrap();
-    let mut picker = picker(tmp.path());
-    let layer = picker.create_layer(None);
-    picker
-        .add_entries([IndexEntry::new("overlay/only.rs")])
+fn grammar_survives_snapshot_import_and_layer_compaction() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("base.ml"), "let base = 1").unwrap();
+    let mut source = picker(root.path());
+    let path = "lib/needle.ml";
+    source.create_layer(Some("grammar"));
+    source.add_entries([IndexEntry::new(path)]).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .export_layer(source.current_layer())
+        .unwrap()
+        .write_to(&mut bytes)
         .unwrap();
-    let file = &picker.files_in_layer(layer)[0];
-    for overflow in [false, true] {
-        file.set_overflow(overflow);
-        assert_eq!(file.is_overflow(), overflow);
-        assert_eq!(file.layer_id(), layer);
-        assert_eq!(file.relative_path(&picker), "overlay/only.rs");
+
+    let mut target = picker(root.path());
+    let base = target
+        .get_file_by_path(root.path().join("base.ml"))
+        .unwrap();
+    assert!(!base.is_overflow());
+    target.create_layer(None);
+    let id = target
+        .import_layer(LayerSnapshot::from_bytes(&bytes).unwrap())
+        .unwrap();
+    assert_eq!(id, 3);
+    for expected in [3, 2] {
+        if expected == 2 {
+            target.create_layer(None);
+        }
+        let file = target.get_file_by_path(root.path().join(path)).unwrap();
+        assert_eq!(layer_paths(&target, expected), [path]);
+        assert!(file.is_overflow());
+        assert_eq!(file.relative_path(&target), path);
+        assert!(file.is_definition_match("let needle = 1", &[(4, 10)]));
     }
 }
 
