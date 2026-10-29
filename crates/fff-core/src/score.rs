@@ -38,18 +38,14 @@ impl<'a> FileItems<'a> {
 }
 
 /// Resolve a FileItem's chunked path into frizbee's pointer buffer.
-/// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
 #[inline]
 fn resolve_file_chunks(
     file: &FileItem,
     arena: ArenaPtr,
     buf: &mut [*const u8; MAX_PATH_CHUNKS],
-) -> Option<(usize, u16)> {
-    if file.is_deleted() {
-        return None;
-    }
+) -> (usize, u16) {
     let ptrs = file.path.resolve_ptrs(arena, buf);
-    Some((ptrs.len(), file.path.byte_len))
+    (ptrs.len(), file.path.byte_len)
 }
 
 #[inline]
@@ -85,7 +81,11 @@ fn match_fuzzy_parts(
         valid_parts[first_part],
         working_files.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_file_chunks(working_files.index(index as usize), arena, buf)
+            Some(resolve_file_chunks(
+                working_files.index(index as usize),
+                arena,
+                buf,
+            ))
         },
         &first_options,
         max_threads,
@@ -115,7 +115,7 @@ fn match_fuzzy_parts(
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
                 let file = working_files.index(survivors[index as usize].index as usize);
-                resolve_file_chunks(file, arena, buf)
+                Some(resolve_file_chunks(file, arena, buf))
             },
             &part_options,
             max_threads,
@@ -158,25 +158,45 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     base_count: usize,
     arenas: LayerArenas,
     overlay_ranges: &[(usize, usize, LayerId, ArenaPtr)],
+    cache: &mut Option<FuzzyMatchCache>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let base_end = base_count.min(files.len());
     let slices = overlay_ranges
         .iter()
         .rev()
-        .map(|&(start, end, _, arena)| (&files[start..end], arena))
-        .chain(std::iter::once((&files[..base_end], arenas.base())));
+        .map(|&(start, end, id, arena)| (id, &files[start..end], arena))
+        .chain(std::iter::once((0, &files[..base_end], arenas.base())));
 
     if fuzzy_parts(context.query).is_none() {
-        return rank_by_frecency(slices, context, arenas);
+        return rank_by_frecency(
+            slices.map(|(_, files, arena)| (files, arena)),
+            context,
+            arenas,
+        );
     }
+
+    let needle = reusable_needle(context.query);
+    let prev = cache.take().filter(|prev| {
+        needle.is_some_and(|needle| prev.covers(needle, context.max_typos, files.len(), base_count))
+    });
+    let mut next = needle
+        .map(|needle| FuzzyMatchCache::new(needle, context.max_typos, files.len(), base_count));
 
     let mut results = Vec::new();
     let mut total_matched = 0;
-    for (slice, arena) in slices {
-        let (matches, count) = match_and_score_in_arena(slice, context, arena);
+    for (id, slice, arena) in slices {
+        let i = usize::from(id);
+        let (matches, count) = match_and_score_in_arena(
+            slice,
+            context,
+            arena,
+            prev.as_ref().map(|entry| entry.by_layer[i].as_slice()),
+            next.as_mut().map(|entry| &mut entry.by_layer[i]),
+        );
         results.extend(matches);
         total_matched += count;
     }
+    *cache = next;
 
     let (items, scores, _) = sort_and_paginate(results, context, |score| score.total);
     (items, scores, total_matched)
@@ -684,15 +704,18 @@ fn sort_and_paginate_dirs<'a>(
     (items, scores, total_matched)
 }
 
+// `prev` restricts matching to files an earlier query matched; `next` collects this query's matches.
 fn match_and_score_in_arena<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    prev: Option<&[u32]>,
+    next: Option<&mut Vec<u32>>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if context.current_file.is_some() {
-        match_and_score_in_arena_inner::<true>(files, context, arena)
+        match_and_score_in_arena_inner::<true>(files, context, arena, prev, next)
     } else {
-        match_and_score_in_arena_inner::<false>(files, context, arena)
+        match_and_score_in_arena_inner::<false>(files, context, arena, prev, next)
     }
 }
 
@@ -700,6 +723,8 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    prev: Option<&[u32]>,
+    next: Option<&mut Vec<u32>>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.is_empty() {
         return (vec![], 0);
@@ -734,13 +759,30 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
         ..Default::default()
     };
 
-    let path_matches = match_fuzzy_parts(
-        fuzzy_parts,
-        &working_files,
-        &options,
-        context.max_threads,
-        arena,
-    );
+    let mut path_matches = match prev {
+        Some(candidates) => match_candidates(
+            fuzzy_parts[0],
+            candidates,
+            &working_files,
+            &options,
+            context.max_threads,
+            arena,
+        ),
+        None => match_fuzzy_parts(
+            fuzzy_parts,
+            &working_files,
+            &options,
+            context.max_threads,
+            arena,
+        ),
+    };
+    if let Some(next) = next {
+        next.extend(path_matches.iter().map(|m| m.index));
+    }
+
+    // A caller can restore a tombstone through FileItem::set_deleted between queries.
+    // Save the path match for the next prefix, but only score currently live files.
+    path_matches.retain(|m| !working_files.index(m.index as usize).is_deleted());
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
@@ -1221,6 +1263,70 @@ fn sort_and_paginate<'a, S>(
     (items, scores, total_matched)
 }
 
+// Files a single-text query matched, reused by the next query that extends it.
+pub(crate) struct FuzzyMatchCache {
+    needle: String,
+    max_typos: u16,
+    files_len: usize,
+    base_count: usize,
+    by_layer: [Vec<u32>; crate::MAX_INDEX_LAYERS],
+}
+
+impl FuzzyMatchCache {
+    fn new(needle: &str, max_typos: u16, files_len: usize, base_count: usize) -> Self {
+        Self {
+            needle: needle.to_owned(),
+            max_typos,
+            files_len,
+            base_count,
+            by_layer: Default::default(),
+        }
+    }
+
+    // A path matching `needle` within the same typo budget also matches any prefix of it.
+    fn covers(&self, needle: &str, max_typos: u16, files_len: usize, base_count: usize) -> bool {
+        self.max_typos == max_typos
+            && self.files_len == files_len
+            && self.base_count == base_count
+            && needle.starts_with(self.needle.as_str())
+    }
+}
+
+// Constraints and multi-part queries change the matched index space, so only plain text is reused.
+fn reusable_needle<'q>(query: &'q FFFQuery<'q>) -> Option<&'q str> {
+    match &query.fuzzy_query {
+        FuzzyQuery::Text(text) if text.len() >= 2 && query.constraints.is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+fn match_candidates(
+    needle: &str,
+    candidates: &[u32],
+    working_files: &FileItems<'_>,
+    options: &neo_frizbee::Config,
+    max_threads: usize,
+    arena: ArenaPtr,
+) -> Vec<neo_frizbee::Match> {
+    let mut matches = match_file_range(
+        needle,
+        candidates.len(),
+        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+            Some(resolve_file_chunks(
+                working_files.index(candidates[index as usize] as usize),
+                arena,
+                buf,
+            ))
+        },
+        options,
+        max_threads,
+    );
+    for m in &mut matches {
+        m.index = candidates[m.index as usize];
+    }
+    matches
+}
+
 fn match_file_range<F>(
     needle: &str,
     len: usize,
@@ -1424,10 +1530,10 @@ mod tests {
                     },
                 };
                 let (mut parallel, parallel_total) =
-                    match_and_score_in_arena(&files, &context, arena);
+                    match_and_score_in_arena(&files, &context, arena, None, None);
                 context.max_threads = 1;
                 let (mut sequential, sequential_total) =
-                    match_and_score_in_arena(&files, &context, arena);
+                    match_and_score_in_arena(&files, &context, arena, None, None);
                 parallel.sort_unstable_by_key(|(file, _)| file.modified);
                 sequential.sort_unstable_by_key(|(file, _)| file.modified);
                 assert_eq!(parallel_total, sequential_total);
@@ -1463,6 +1569,7 @@ mod tests {
                     files.len() / 3,
                     LayerArenas::uniform(arena),
                     &[(files.len() / 3, files.len(), 1, arena)],
+                    &mut None,
                 );
                 assert_eq!(all_total, parallel_total);
                 let cases: &[(usize, usize, usize)] = if current_file.is_some() {
@@ -1490,6 +1597,7 @@ mod tests {
                         files.len() / 3,
                         LayerArenas::uniform(arena),
                         &[(files.len() / 3, files.len(), 1, arena)],
+                        &mut None,
                     );
                     assert_eq!(
                         total, parallel_total,
@@ -1504,6 +1612,107 @@ mod tests {
                     );
                     assert_eq!(format!("{scores:?}"), format!("{expected_scores:?}"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_typing_matches_full_search() {
+        let words = [
+            "controller",
+            "omnibox",
+            "view",
+            "browser",
+            "util",
+            "frame",
+            "render",
+            "test",
+        ];
+        let paths: Vec<_> = (0..40_000)
+            .map(|i| {
+                let (a, b, c) = (words[i % 8], words[i / 8 % 8], words[i / 64 % 8]);
+                format!("src/{a}/{b}_{c}/{c}_{a}_{i}.rs")
+            })
+            .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let mut file = FileItem::new_raw(
+                    path.rfind('/').unwrap() as u16 + 1,
+                    0,
+                    i as u64,
+                    None,
+                    false,
+                );
+                file.access_frecency_score = (i % 31) as i16;
+                file
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let base_count = files.len() - 3_000;
+        let parser = QueryParser::default();
+        let mut cache = None;
+        for typed in [
+            "omnibox_view_controller_1",
+            "omnibx_vewi",
+            "renderframe_test",
+            "rendr",
+            "browser_util_frame_99",
+        ] {
+            let mut steps: Vec<&str> = (2..=typed.len()).map(|end| &typed[..end]).collect();
+            steps.push(&typed[..typed.len() - 1]);
+            for text in steps {
+                let query = parser.parse(text);
+                let context = ScoringContext {
+                    query: &query,
+                    max_threads: 4,
+                    max_typos: (text.len() as u16 / 4).clamp(2, 6),
+                    project_path: None,
+                    current_file: None,
+                    last_same_query_match: None,
+                    combo_boost_score_multiplier: 100,
+                    min_combo_count: 3,
+                    pagination: PaginationArgs {
+                        offset: 0,
+                        limit: 200,
+                    },
+                };
+                let incremental = fuzzy_match_and_score_files(
+                    &files,
+                    &context,
+                    base_count,
+                    LayerArenas::uniform(arena),
+                    &[(base_count, files.len(), 1, arena)],
+                    &mut cache,
+                );
+                let full = fuzzy_match_and_score_files(
+                    &files,
+                    &context,
+                    base_count,
+                    LayerArenas::uniform(arena),
+                    &[(base_count, files.len(), 1, arena)],
+                    &mut None,
+                );
+                assert_eq!(incremental.2, full.2, "{text}");
+                assert!(
+                    incremental
+                        .0
+                        .iter()
+                        .zip(&full.0)
+                        .all(|(a, b)| std::ptr::eq(*a, *b)),
+                    "{text}"
+                );
+                assert_eq!(
+                    format!("{:?}", incremental.1),
+                    format!("{:?}", full.1),
+                    "{text}"
+                );
             }
         }
     }
@@ -1744,6 +1953,7 @@ mod tests {
             files.len() / 2,
             LayerArenas::uniform(arena),
             &[(files.len() / 2, files.len(), 1, arena)],
+            &mut None,
         );
         assert_eq!(total, files.len());
         assert!(
@@ -1766,6 +1976,7 @@ mod tests {
                     files.len() / 2,
                     LayerArenas::uniform(arena),
                     &[(files.len() / 2, files.len(), 1, arena)],
+                    &mut None,
                 );
                 assert_eq!(matched, total);
                 assert_eq!(items.len(), 50);
@@ -2055,7 +2266,7 @@ mod filename_bonus_tests {
                 limit: 50,
             },
         };
-        let (results, _) = match_and_score_in_arena(&files, &context, arena);
+        let (results, _) = match_and_score_in_arena(&files, &context, arena, None, None);
         assert_eq!(results.len(), files.len());
         for (file, score) in results {
             assert_eq!(
@@ -2133,8 +2344,14 @@ mod filename_bonus_tests {
                 limit: 100,
             },
         };
-        let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), LayerArenas::uniform(arena), &[]);
+        let (items, scores, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            LayerArenas::uniform(arena),
+            &[],
+            &mut None,
+        );
         items
             .iter()
             .zip(scores.iter())
@@ -2375,8 +2592,14 @@ mod git_recency_scoring_tests {
                 limit: 100,
             },
         };
-        let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), LayerArenas::uniform(arena), &[]);
+        let (items, scores, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            LayerArenas::uniform(arena),
+            &[],
+            &mut None,
+        );
         items
             .iter()
             .zip(scores)
@@ -2464,8 +2687,14 @@ mod typo_resistance_tests {
                 limit: 100,
             },
         };
-        let (items, _, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), LayerArenas::uniform(arena), &[]);
+        let (items, _, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            LayerArenas::uniform(arena),
+            &[],
+            &mut None,
+        );
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
@@ -2580,6 +2809,7 @@ mod constraint_only_query_tests {
             files.len(),
             LayerArenas::uniform(arena),
             &[],
+            &mut None,
         );
 
         assert_eq!(
@@ -2636,6 +2866,7 @@ mod constraint_only_query_tests {
             files.len(),
             LayerArenas::uniform(arena),
             &[],
+            &mut None,
         );
 
         assert_eq!(total_matched, 1);

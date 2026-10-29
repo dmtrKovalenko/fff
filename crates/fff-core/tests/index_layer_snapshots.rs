@@ -508,3 +508,50 @@ fn export_base_before_scan_is_none_and_unknown_layer_fails() {
     assert!(picker.export_layer(0).is_none());
     assert!(picker.save_layer(42, tmp.path().join("x.fff")).is_err());
 }
+
+#[test]
+fn incremental_search_tracks_matches_across_layer_compaction() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("needles_base.rs"), "").unwrap();
+    let mut picker = picker(tmp.path());
+    let mut expected = vec!["needles_base.rs".to_string()];
+    for index in 1..=fff_search::MAX_OVERLAY_LAYERS {
+        if index > 1 {
+            picker.create_layer(None);
+        }
+        let path = format!("needles_{index}.rs");
+        let other = format!("a_{index}.rs");
+        picker
+            .add_entries([IndexEntry::new(&path), IndexEntry::new(&other)])
+            .unwrap();
+        expected.push(path);
+    }
+
+    expected.sort();
+    let mut initial = search_paths(&picker, "needl");
+    initial.sort();
+    assert_eq!(initial, expected);
+    let before = picker.get_files().len();
+    picker.create_layer(None);
+    assert_eq!(picker.get_files().len(), before);
+    let mut after = search_paths(&picker, "needles");
+    after.sort();
+    assert_eq!(after, expected);
+}
+
+#[test]
+fn incremental_search_tracks_same_length_base_replacement_and_rescan() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("zzzzzz.rs"), "").unwrap();
+    let mut picker = picker(tmp.path());
+    assert!(search_paths(&picker, "needl").is_empty());
+
+    let mut replacement = LayerBuilder::new(None);
+    assert!(replacement.push(&IndexEntry::new("needles_restored.rs")));
+    picker.import_base(replacement.finish(), None).unwrap();
+    assert_eq!(search_paths(&picker, "needle"), ["needles_restored.rs"]);
+
+    assert!(search_paths(&picker, "zzzzz").is_empty());
+    picker.collect_files().unwrap();
+    assert_eq!(search_paths(&picker, "zzzzzz"), ["zzzzzz.rs"]);
+}

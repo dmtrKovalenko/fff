@@ -40,7 +40,9 @@ use crate::index::path_index::PathIndex;
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+use crate::score::{
+    FuzzyMatchCache, fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page,
+};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
@@ -660,6 +662,8 @@ pub struct FilePicker {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     git_recency_config: GitRecencyConfig,
+    // Cleared whenever files are added, restored or replaced.
+    fuzzy_cache: parking_lot::Mutex<Option<FuzzyMatchCache>>,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -800,6 +804,7 @@ impl FilePicker {
     }
 
     pub fn get_file_mut(&mut self, index: usize) -> Option<(ArenaPtr, &mut FileItem)> {
+        *self.fuzzy_cache.get_mut() = None;
         self.sync_data.get_file_mut(index)
     }
 
@@ -1036,6 +1041,7 @@ impl FilePicker {
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             git_recency_config: options.git_recency,
+            fuzzy_cache: parking_lot::Mutex::new(None),
             trace_span,
             trace_id,
         })
@@ -1254,13 +1260,16 @@ impl FilePicker {
         let arenas = self.sync_data.layer_arenas();
         let overlay_ranges = self.sync_data.layers.file_ranges(files.len());
 
+        let mut cache = self.fuzzy_cache.lock().take();
         let (items, scores, total_matched) = fuzzy_match_and_score_files(
             files,
             &context,
             self.sync_data.base_count,
             arenas,
             &overlay_ranges,
+            &mut cache,
         );
+        *self.fuzzy_cache.lock() = cache;
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, arenas);
 
@@ -1633,6 +1642,7 @@ impl FilePicker {
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
         let mut old = std::mem::replace(&mut self.sync_data, sync);
         self.sync_data.adopt_overlays(&mut old);
+        *self.fuzzy_cache.get_mut() = None;
         self.cache_budget.reset();
     }
 
@@ -1776,7 +1786,7 @@ impl FilePicker {
     ) -> Option<(ArenaPtr, &mut FileItem)> {
         let path = path.as_ref();
         let index = self.sync_data.find_file_index(path, &self.base_path);
-        index.and_then(|i| self.sync_data.get_file_mut(i))
+        index.and_then(|i| self.get_file_mut(i))
     }
 
     /// Handle the event of certain file being modified or adds a neww file if it is not added
@@ -1892,6 +1902,7 @@ impl FilePicker {
             &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
         );
 
+        *self.fuzzy_cache.get_mut() = None;
         let layer = self.sync_data.ensure_open_top();
         let chunked = self
             .sync_data
