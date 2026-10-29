@@ -628,7 +628,7 @@ pub struct FilePicker {
     /// Single serialized writer for all git-status updates (scan, watcher,
     /// FFI). Owned by the picker so it exists before the first scan; its
     /// consumer thread is spawned lazily once a git workdir is discovered.
-    pub(crate) git_status_worker: Arc<crate::git_status_worker::GitStatusWorker>,
+    pub(crate) scm_status_worker: Arc<crate::scm::status_worker::ScmStatusWorker>,
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
@@ -776,7 +776,7 @@ impl FilePicker {
     /// Main checkout twin of `path` when the picker indexes a linked git worktree.
     pub fn shared_path_for(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
         let shared_base = self.sync_data.shared_base.as_deref()?;
-        crate::git::shared_twin(path.as_ref(), &self.base_path, shared_base)
+        crate::scm::shared_twin(path.as_ref(), &self.base_path, shared_base)
     }
 
     pub(crate) fn worktree_shared_base(&self) -> Option<&Path> {
@@ -968,7 +968,7 @@ impl FilePicker {
 
         Ok(FilePicker {
             background_watcher: None,
-            git_status_worker: crate::git_status_worker::GitStatusWorker::new(),
+            scm_status_worker: crate::scm::status_worker::ScmStatusWorker::new(),
             base_path: path,
             cache_budget: Arc::new(initial_budget),
             has_explicit_cache_budget: has_explicit_budget,
@@ -996,7 +996,7 @@ impl FilePicker {
         options: FilePickerOptions,
     ) -> Result<(), Error> {
         let mut picker = Self::new(options)?;
-        picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
+        picker.scm_status_worker = crate::scm::status_worker::ScmStatusWorker::with_pause_flag(
             shared_picker.git_status_pause_flag(),
         );
 
@@ -1076,7 +1076,7 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git = FileSync::discover_git(&self.base_path);
+        let git = FileSync::discover_scm(&self.base_path);
         let git_handle = git
             .as_ref()
             .map(|git| FileSync::spawn_git_status(git.clone()));
@@ -2072,7 +2072,7 @@ impl Drop for FilePicker {
         self.signals.cancelled.store(true, Ordering::Release);
         // Wake the git-status consumer so it exits; never joined (it takes
         // the picker write lock, a blocking join here could deadlock).
-        self.git_status_worker.signal_shutdown();
+        self.scm_status_worker.signal_shutdown();
     }
 }
 
@@ -2137,7 +2137,7 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_git(base_path: &Path) -> Option<ScmWorkspace> {
+    pub(crate) fn discover_scm(base_path: &Path) -> Option<ScmWorkspace> {
         let git = ScmWorkspace::discover(base_path);
         match &git {
             Some(git) => {

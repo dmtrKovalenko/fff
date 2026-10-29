@@ -116,12 +116,12 @@ pub use file_picker::*;
 pub mod dbs;
 pub use dbs::*;
 
-pub mod git;
+pub use scm::git;
 /// Git status caching and repository detection utilities.
 mod scm;
 
-pub mod git_recency;
 pub use git_recency::GitRecencyConfig;
+pub use scm::git::recency as git_recency;
 
 mod definition;
 
@@ -158,7 +158,6 @@ pub mod simd_string_utils;
 // ==================================
 
 mod error;
-mod git_status_worker;
 mod ignore;
 mod scan;
 mod score;

@@ -7,11 +7,11 @@ use crate::dbs::lmdb::{LmdbStore, spawn_lmdb_gc};
 use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
-use crate::git_status_worker::GitStatusWorker;
 use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
 use crate::rescan_throttle::RescanThrottle;
 use crate::scan::ScanJob;
+use crate::scm::status_worker::ScmStatusWorker;
 use crate::watch::{WatchEvent, WatchId, WatchOptions, WatchRegistry};
 
 /// Poll `done` every 10ms until it returns `true`, or until `timeout` elapses.
@@ -325,7 +325,7 @@ impl SharedFilePicker {
     /// pausing before [`FilePicker::new_with_shared_state`] skips the initial status read.
     pub fn pause_git_status(&self) {
         self.0.git_status_paused.store(true, Ordering::Release);
-        if let Some(worker) = self.git_status_worker() {
+        if let Some(worker) = self.scm_status_worker() {
             worker.drop_pending();
         }
     }
@@ -334,7 +334,7 @@ impl SharedFilePicker {
     /// Use [`Self::wait_for_git_status`] to know when it has been applied.
     pub fn resume_git_status(&self) {
         self.0.git_status_paused.store(false, Ordering::Release);
-        if let Some(worker) = self.git_status_worker() {
+        if let Some(worker) = self.scm_status_worker() {
             worker.request_full_rescan();
         }
     }
@@ -346,7 +346,7 @@ impl SharedFilePicker {
     /// Block until queued background git status work is applied.
     /// Returns `false` on timeout. A zero timeout makes it a non-blocking check.
     pub fn wait_for_git_status(&self, timeout: Duration) -> bool {
-        let Some(worker) = self.git_status_worker() else {
+        let Some(worker) = self.scm_status_worker() else {
             return true;
         };
 
@@ -357,11 +357,11 @@ impl SharedFilePicker {
         Arc::clone(&self.0.git_status_paused)
     }
 
-    fn git_status_worker(&self) -> Option<Arc<GitStatusWorker>> {
+    fn scm_status_worker(&self) -> Option<Arc<ScmStatusWorker>> {
         let guard = self.0.picker.read();
         guard
             .as_ref()
-            .map(|picker| Arc::clone(&picker.git_status_worker))
+            .map(|picker| Arc::clone(&picker.scm_status_worker))
     }
 
     /// Refresh git statuses for all indexed files

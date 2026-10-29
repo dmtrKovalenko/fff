@@ -22,7 +22,7 @@ impl Pending {
 }
 
 /// Condvar based queue that is used for batch processing events
-pub(crate) struct GitStatusWorker {
+pub(crate) struct ScmStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
@@ -30,7 +30,7 @@ pub(crate) struct GitStatusWorker {
     paused: Arc<AtomicBool>,
 }
 
-impl GitStatusWorker {
+impl ScmStatusWorker {
     pub(crate) fn new() -> Arc<Self> {
         Self::with_pause_flag(Arc::default())
     }
@@ -126,7 +126,7 @@ impl GitStatusWorker {
     // spawn a separate thread to guartee that notify handler is unlocked even if git update takes a
     // lot of time on every event burst (pretty cheap as this thread is going to sleep 99.9% of time)
     fn spawn_consumer(
-        mailbox: Arc<GitStatusWorker>,
+        mailbox: Arc<ScmStatusWorker>,
         weak_picker: WeakFilePicker,
         frecency: SharedFrecency,
     ) {
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn stays_busy_until_the_taken_batch_is_applied() {
-        let worker = GitStatusWorker::new();
+        let worker = ScmStatusWorker::new();
         worker.consumer_spawned.store(true, Ordering::Release);
         assert!(worker.is_idle());
 

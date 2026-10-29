@@ -1,7 +1,10 @@
 use crate::error::Result;
-use crate::git::GitBackend;
+pub mod git;
+pub(crate) mod status_worker;
+
 use crate::git_recency::GitRecencyConfig;
 use ahash::AHashMap;
+use git::GitBackend;
 use git2::Status;
 use std::path::{Path, PathBuf};
 
@@ -93,4 +96,9 @@ impl ScmStatusCache {
     pub fn lookup_status(&self, full_path: &Path) -> Option<Status> {
         self.0.get(full_path).copied()
     }
+}
+
+// Main checkout twin of `path` for a picker at `base_path` keyed by `shared_base`
+pub(crate) fn shared_twin(path: &Path, base_path: &Path, shared_base: &Path) -> Option<PathBuf> {
+    Some(shared_base.join(path.strip_prefix(base_path).ok()?))
 }

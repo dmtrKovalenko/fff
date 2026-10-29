@@ -1,6 +1,7 @@
 mod backend;
 #[cfg(feature = "gitoxide-status")]
 mod gitoxide;
+pub mod recency;
 use crate::scm::ScmStatusCache;
 pub(crate) use backend::GitBackend;
 
@@ -196,11 +197,6 @@ pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
 
 pub fn format_git_status(status: Option<Status>) -> &'static str {
     format_git_status_opt(status).unwrap_or("unknown")
-}
-
-// Main checkout twin of `path` for a picker at `base_path` keyed by `shared_base`
-pub(crate) fn shared_twin(path: &Path, base_path: &Path, shared_base: &Path) -> Option<PathBuf> {
-    Some(shared_base.join(path.strip_prefix(base_path).ok()?))
 }
 
 // Same as git's main worktree: the common dir without its `.git` suffix, so bare

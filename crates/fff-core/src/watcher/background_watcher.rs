@@ -1,8 +1,8 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
-use crate::git_status_worker::GitStatusWorker;
 use crate::rescan_stats::RescanReason;
+use crate::scm::status_worker::ScmStatusWorker;
 use crate::scm::{ScmRepository, ScmWorkspace};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
@@ -51,7 +51,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         enable_fs_root_scanning: bool,
         enable_home_dir_scanning: bool,
-        git_status_worker: Arc<GitStatusWorker>,
+        scm_status_worker: Arc<ScmStatusWorker>,
         trace_span: tracing::Span,
     ) -> Result<Self, Error> {
         info!(
@@ -93,7 +93,7 @@ impl BackgroundWatcher {
         let owner_weak_picker = shared_picker.weaken();
         let owner_frecency = shared_frecency.clone();
         let owner_git_workdir = git.clone();
-        let owner_git_worker = Arc::clone(&git_status_worker);
+        let owner_git_worker = Arc::clone(&scm_status_worker);
 
         let debouncer = Self::create_debouncer(
             base_path,
@@ -103,7 +103,7 @@ impl BackgroundWatcher {
             mode,
             use_recursive,
             watch_tx_for_debouncer,
-            git_status_worker,
+            scm_status_worker,
         )?;
 
         info!("Background file watcher initialized successfully");
@@ -182,7 +182,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         use_recursive: bool,
         watch_tx: mpsc::Sender<WatchTask>,
-        git_status_worker: Arc<GitStatusWorker>,
+        scm_status_worker: Arc<ScmStatusWorker>,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
             .with_follow_symlinks(false)
@@ -211,7 +211,7 @@ impl BackgroundWatcher {
                             &git_workdir_for_handler,
                             &file_picker,
                             &shared_frecency,
-                            &git_status_worker,
+                            &scm_status_worker,
                         );
 
                         // every new directory created has to be reflected in the picker state
@@ -334,7 +334,7 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, scm_status_worker), level = Level::DEBUG)]
 pub(crate) fn handle_debounced_events(
     mode: FFFMode,
     events: Vec<DebouncedEvent>,
@@ -342,7 +342,7 @@ pub(crate) fn handle_debounced_events(
     git_workdir: &Option<ScmWorkspace>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
-    git_status_worker: &Arc<GitStatusWorker>,
+    scm_status_worker: &Arc<ScmStatusWorker>,
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| p.open().ok());
@@ -764,7 +764,7 @@ pub(crate) fn handle_debounced_events(
 
                 let shared = shared_base
                     .as_deref()
-                    .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
+                    .and_then(|shared_base| crate::scm::shared_twin(path, base_path, shared_base));
                 if let Err(e) = frecency.track_access_shared(path, shared.as_deref()) {
                     error!("Failed to track frecency for {:?}: {:?}", path, e);
                 } else {
@@ -795,9 +795,9 @@ pub(crate) fn handle_debounced_events(
         if need_full_git_rescan {
             // A full git rescan re-reads every tracked path (including ones that just
             // went clean after a commit), so it already subsumes the per-path update.
-            git_status_worker.request_full_rescan();
+            scm_status_worker.request_full_rescan();
         } else if !files_to_update_git_status.is_empty() {
-            git_status_worker.enqueue_paths(files_to_update_git_status);
+            scm_status_worker.enqueue_paths(files_to_update_git_status);
         }
     }
 
@@ -809,7 +809,7 @@ fn index_new_directory(
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_workdir: &Option<ScmWorkspace>,
-    git_status_worker: &Arc<GitStatusWorker>,
+    scm_status_worker: &Arc<ScmStatusWorker>,
 ) -> Vec<PathBuf> {
     let repo = git_workdir.as_ref().and_then(|p| p.open().ok());
     // Prefer the walker's ignore rules; read base_path + rules from the picker.
@@ -918,7 +918,7 @@ fn index_new_directory(
     }
 
     if !rescan_started && repo.is_some() {
-        git_status_worker.enqueue_paths(indexed_files);
+        scm_status_worker.enqueue_paths(indexed_files);
     }
 
     debug!(
@@ -1211,7 +1211,7 @@ mod tests {
             &shared_picker,
             &SharedFrecency::noop(),
             &None,
-            &GitStatusWorker::new(),
+            &ScmStatusWorker::new(),
         );
         {
             let guard = shared_picker.read().unwrap();
@@ -1303,7 +1303,7 @@ mod tests {
             &None,
             &shared_picker,
             &shared_frecency,
-            &GitStatusWorker::new(),
+            &ScmStatusWorker::new(),
         );
 
         let received = receiver.recv_timeout(Duration::from_secs(1)).unwrap();

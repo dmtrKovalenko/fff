@@ -165,7 +165,7 @@ impl ScanJob {
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
-        let git = FileSync::discover_git(&base_path);
+        let git = FileSync::discover_scm(&base_path);
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git.clone(),
@@ -182,7 +182,7 @@ impl ScanJob {
         };
 
         // 2. Populate the file list
-        let git_status_worker;
+        let scm_status_worker;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
@@ -193,7 +193,7 @@ impl ScanJob {
 
             let live_count = sync.live_count;
             picker.commit_new_sync(sync);
-            git_status_worker = Arc::clone(&picker.git_status_worker);
+            scm_status_worker = Arc::clone(&picker.scm_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
                 picker.set_cache_budget(ContentCacheBudget::new_for_repo(live_count));
@@ -206,8 +206,8 @@ impl ScanJob {
         // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
         // which is a real use case we need to have a way to start the git worker background thread dynamically
         if git.is_some() && !signals.cancelled.load(Ordering::Acquire) {
-            git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
-            git_status_worker.request_full_rescan(); // this runs anyway
+            scm_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
+            scm_status_worker.request_full_rescan(); // this runs anyway
         }
 
         // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
@@ -253,7 +253,7 @@ impl ScanJob {
                 mode,
                 config.enable_fs_root_scanning,
                 config.enable_home_dir_scanning,
-                git_status_worker,
+                scm_status_worker,
                 tracing::Span::current(),
             ) {
                 Ok(watcher) => {
