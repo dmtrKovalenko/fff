@@ -604,6 +604,8 @@ Caveat: the chosen file replaces the buffer in the invoking window even if it's 
 
 ### Git status highlighting
 
+Source builds can opt into gitoxide for repository-wide status scans with `cargo build --release -p fff-nvim --features gitoxide-status`. This experimental backend can reduce scan time on large repositories but can increase peak memory. Targeted watcher updates use libgit2. Repository-wide scans fall back to libgit2 if gitoxide cannot represent a status or complete the scan.
+
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
 
 ### Float colors

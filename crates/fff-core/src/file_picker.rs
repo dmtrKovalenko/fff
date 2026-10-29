@@ -2149,12 +2149,7 @@ impl FileSync {
     }
 
     pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
-        std::thread::spawn(move || {
-            GitStatusCache::read_git_status(
-                Some(git_workdir.as_path()),
-                &mut crate::git::initial_scan_status_options(),
-            )
-        })
+        std::thread::spawn(move || GitStatusCache::read_git_status(&git_workdir))
     }
 
     /// Returns files immediately (searchable) and a handle to the in-progress

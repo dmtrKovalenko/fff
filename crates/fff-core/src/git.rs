@@ -1,3 +1,6 @@
+#[cfg(feature = "gitoxide-status")]
+mod gitoxide;
+
 use crate::error::Result;
 use ahash::AHashMap;
 use git2::{Repository, Status, StatusOptions};
@@ -142,6 +145,10 @@ impl GitStatusCache {
     /// Keep clean entries out of libgit2's two diff lists on large, case-sensitive
     /// working trees. Status flags for changes still come directly from libgit2.
     pub(crate) fn read_full_status(repo: &Repository) -> Result<Self> {
+        #[cfg(feature = "gitoxide-status")]
+        if let Some(cache) = gitoxide::scan(repo, true) {
+            return Ok(cache);
+        }
         let full = || Self::read_status(repo, &mut default_status_options());
         let Some(root) = repo.workdir() else {
             return full();
@@ -176,14 +183,13 @@ impl GitStatusCache {
         Ok(cache)
     }
 
-    pub fn read_git_status(
-        git_workdir: Option<&Path>,
-        status_options: &mut StatusOptions,
-    ) -> Option<Self> {
-        let git_workdir = git_workdir.as_ref()?;
+    pub fn read_git_status(git_workdir: &Path) -> Option<Self> {
         let repository = Repository::open(git_workdir).ok()?;
-
-        let status = Self::read_status(&repository, status_options);
+        #[cfg(feature = "gitoxide-status")]
+        if let Some(cache) = gitoxide::scan(&repository, false) {
+            return Some(cache);
+        }
+        let status = Self::read_status(&repository, &mut initial_scan_status_options());
 
         match status {
             Ok(status) => Some(status),
@@ -337,7 +343,22 @@ mod tests {
         fs::write(root.join("staged"), "changed").unwrap();
         git(root, &["add", "staged"]);
         git(root, &["mv", "old", "renamed"]);
+        fs::write(root.join("staged"), "changed again").unwrap();
+        fs::create_dir_all(root.join("new/nested")).unwrap();
+        fs::write(root.join("new/nested/file"), "new").unwrap();
+        git(root, &["config", "status.showUntrackedFiles", "no"]);
         let repo = Repository::open(root).unwrap();
+        #[cfg(feature = "gitoxide-status")]
+        for full in [false, true] {
+            let mut opts = if full {
+                default_status_options()
+            } else {
+                initial_scan_status_options()
+            };
+            let expected = GitStatusCache::read_status(&repo, &mut opts).unwrap();
+            let actual = gitoxide::scan(&repo, full).expect("fixture must use gitoxide");
+            assert_eq!(actual.0, expected.0);
+        }
         let expected = GitStatusCache::read_status(&repo, &mut default_status_options()).unwrap();
         let actual = GitStatusCache::read_status_from_index(
             &repo,

@@ -11,6 +11,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+gitoxide-status = ["fff/gitoxide-status"]
 # Pure-Rust walker by default; zlob is opt-in (needs Zig).
 default = ["ripgrep"]
 ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep", "dep:ignore"]
