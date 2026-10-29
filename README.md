@@ -604,7 +604,7 @@ Caveat: the chosen file replaces the buffer in the invoking window even if it's 
 
 ### Git status highlighting
 
-Source builds can opt into gitoxide for repository-wide status scans with `cargo build --release -p fff-nvim --features gitoxide-status`. This experimental backend can reduce scan time on large repositories but can increase peak memory. Targeted watcher updates use libgit2. Repository-wide scans fall back to libgit2 if gitoxide cannot represent a status or complete the scan.
+Build with `cargo build --release -p fff-nvim --features gitoxide-status` to include both SCM backends. Set `FFF_SCM_BACKEND=gitoxide` before starting Neovim to select gitoxide for repository-wide status scans. Leave it unset or set it to `libgit2` to use libgit2. FFF selects the backend when it discovers a workspace. Gitoxide can reduce scan time on large repositories but can increase peak memory. It shares Git discovery, targeted status updates, ignore rules, and commit history with the libgit2 backend. If a gitoxide scan fails or encounters an unsupported status, FFF retries with libgit2.
 
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
 

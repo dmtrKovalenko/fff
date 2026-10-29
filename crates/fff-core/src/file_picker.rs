@@ -32,12 +32,13 @@ use crate::FFFStringStorage;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
-use crate::git::{GitDiscovery, GitStatusCache};
-use crate::git_recency::{self, GitRecencyConfig};
+use crate::git_recency::GitRecencyConfig;
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
+use crate::scm::ScmStatusCache;
+use crate::scm::ScmWorkspace;
 use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
@@ -50,7 +51,7 @@ use crate::walk::WalkOutput;
 use crate::watch::BackgroundWatcher;
 use ahash::AHashMap;
 use fff_query_parser::FFFQuery;
-use git2::{Repository, Status};
+use git2::Status;
 use rayon::prelude::*;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
@@ -94,7 +95,7 @@ pub struct FuzzySearchOptions<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileSync {
-    pub(crate) git: Option<GitDiscovery>,
+    pub(crate) git: Option<ScmWorkspace>,
     // Base path re-rooted into the main checkout when indexing a linked git worktree,
     // frecency and query history are keyed by it so all worktrees share one history
     shared_base: Option<PathBuf>,
@@ -753,6 +754,10 @@ impl FilePicker {
         self.sync_data.get_file_mut(index)
     }
 
+    pub(crate) fn scm_workspace(&self) -> Option<&ScmWorkspace> {
+        self.sync_data.git.as_ref()
+    }
+
     /// Absolute path to the repository root if the indexed tree lives
     /// inside a git working directory. `None` for non-git bases.
     pub fn git_root(&self) -> Option<&Path> {
@@ -923,8 +928,6 @@ impl FilePicker {
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
-        crate::git::tune_libgit2_for_local_reads();
-
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
             error!("Base path does not exist: {}", options.base_path);
@@ -1076,7 +1079,7 @@ impl FilePicker {
         let git = FileSync::discover_git(&self.base_path);
         let git_handle = git
             .as_ref()
-            .map(|git| FileSync::spawn_git_status(git.workdir.clone()));
+            .map(|git| FileSync::spawn_git_status(git.clone()));
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
@@ -1112,12 +1115,10 @@ impl FilePicker {
             }
         }
 
-        if let Some(workdir) = self.git_root().map(Path::to_path_buf)
-            && let Ok(repo) = Repository::open(&workdir)
-                .inspect_err(|e| debug!(?e, ?workdir, "git recency: failed to open repo"))
+        if let Some(workspace) = self.scm_workspace()
+            && let Ok(repo) = workspace.open()
         {
-            let recency =
-                git_recency::compute_git_recency(&repo, &self.git_recency_config, &self.base_path);
+            let recency = repo.recency(&self.git_recency_config, &self.base_path);
             self.apply_git_recency(recency.as_ref());
         }
 
@@ -1587,7 +1588,7 @@ impl FilePicker {
     /// Update git statuses for files, using the provided shared frecency tracker.
     pub(crate) fn update_git_statuses(
         &mut self,
-        status_cache: GitStatusCache,
+        status_cache: ScmStatusCache,
         shared_frecency: &SharedFrecency,
     ) -> Result<(), Error> {
         debug!(
@@ -2136,11 +2137,11 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_git(base_path: &Path) -> Option<GitDiscovery> {
-        let git = GitDiscovery::discover(base_path);
+    pub(crate) fn discover_git(base_path: &Path) -> Option<ScmWorkspace> {
+        let git = ScmWorkspace::discover(base_path);
         match &git {
             Some(git) => {
-                debug!(workdir = ?git.workdir, git_dir = ?git.git_dir, "Git repository found")
+                debug!(workdir = ?git.workdir, metadata = ?git.metadata, "Git repository found")
             }
             None => warn!("No git repository found for path: {}", base_path.display()),
         }
@@ -2148,8 +2149,14 @@ impl FileSync {
         git
     }
 
-    pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
-        std::thread::spawn(move || GitStatusCache::read_git_status(&git_workdir))
+    pub(crate) fn spawn_git_status(workspace: ScmWorkspace) -> JoinHandle<Option<ScmStatusCache>> {
+        std::thread::spawn(move || {
+            workspace
+                .open()
+                .and_then(|repo| repo.status(false))
+                .inspect_err(|e| tracing::error!(?e, "Failed to read SCM status"))
+                .ok()
+        })
     }
 
     /// Returns files immediately (searchable) and a handle to the in-progress
@@ -2158,7 +2165,7 @@ impl FileSync {
     #[tracing::instrument(skip_all, name = "walk_filesystem", level = Level::INFO)]
     pub(crate) fn walk_filesystem(
         base_path: &Path,
-        git: Option<GitDiscovery>,
+        git: Option<ScmWorkspace>,
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,

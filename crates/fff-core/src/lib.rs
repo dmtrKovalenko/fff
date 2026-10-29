@@ -116,8 +116,9 @@ pub use file_picker::*;
 pub mod dbs;
 pub use dbs::*;
 
-/// Git status caching and repository detection utilities.
 pub mod git;
+/// Git status caching and repository detection utilities.
+mod scm;
 
 pub mod git_recency;
 pub use git_recency::GitRecencyConfig;

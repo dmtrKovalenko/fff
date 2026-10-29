@@ -1,5 +1,8 @@
+mod backend;
 #[cfg(feature = "gitoxide-status")]
 mod gitoxide;
+use crate::scm::ScmStatusCache;
+pub(crate) use backend::GitBackend;
 
 use crate::error::Result;
 use ahash::AHashMap;
@@ -22,54 +25,6 @@ pub(crate) fn tune_libgit2_for_local_reads() {
         let _ =
             unsafe { git2::opts::set_cache_object_limit(git2::ObjectType::Tree, 8 * 1024 * 1024) };
     });
-}
-
-// Repository layout resolved from a single `Repository::discover`
-#[derive(Debug, Clone)]
-pub(crate) struct GitDiscovery {
-    pub(crate) workdir: PathBuf,
-    // Per-worktree git dir holding HEAD, index and logs
-    pub(crate) git_dir: PathBuf,
-    // Checkout owning the history shared by every worktree, set only for linked worktrees
-    shared_root: Option<PathBuf>,
-}
-
-impl GitDiscovery {
-    pub(crate) fn discover(base_path: &Path) -> Option<Self> {
-        let repo = Repository::discover(base_path).ok()?;
-        let workdir = crate::path_utils::normalize(repo.workdir()?.to_path_buf());
-        let shared_root = repo
-            .is_worktree()
-            .then(|| main_checkout_root(&repo))
-            .map(crate::path_utils::normalize);
-
-        Some(Self {
-            workdir,
-            git_dir: repo.path().to_path_buf(),
-            shared_root,
-        })
-    }
-
-    // `base_path` re-rooted into the shared checkout, `None` outside linked worktrees
-    pub(crate) fn shared_base(&self, base_path: &Path) -> Option<PathBuf> {
-        let shared_root = self.shared_root.as_ref()?;
-        let relative = match base_path.strip_prefix(&self.workdir) {
-            Ok(relative) => relative.to_path_buf(),
-            // libgit2 reports a symlink-free workdir
-            Err(_) => crate::path_utils::canonicalize(base_path)
-                .ok()?
-                .strip_prefix(&self.workdir)
-                .ok()?
-                .to_path_buf(),
-        };
-
-        // `join("")` appends a separator, changing the history key of the main checkout
-        Some(if relative.as_os_str().is_empty() {
-            shared_root.clone()
-        } else {
-            shared_root.join(relative)
-        })
-    }
 }
 
 pub(crate) fn default_status_options() -> StatusOptions {
@@ -95,28 +50,7 @@ pub(crate) fn initial_scan_status_options() -> StatusOptions {
     opts
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct GitStatusCache(AHashMap<PathBuf, Status>);
-
-impl IntoIterator for GitStatusCache {
-    type Item = (PathBuf, Status);
-    type IntoIter = <AHashMap<PathBuf, Status> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-impl GitStatusCache {
-    pub fn statuses_len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    pub fn lookup_status(&self, full_path: &Path) -> Option<Status> {
-        self.0.get(full_path).copied()
-    }
-
+impl ScmStatusCache {
     #[tracing::instrument(skip(repo, status_options))]
     pub(crate) fn read_status(
         repo: &Repository,
@@ -145,10 +79,6 @@ impl GitStatusCache {
     /// Keep clean entries out of libgit2's two diff lists on large, case-sensitive
     /// working trees. Status flags for changes still come directly from libgit2.
     pub(crate) fn read_full_status(repo: &Repository) -> Result<Self> {
-        #[cfg(feature = "gitoxide-status")]
-        if let Some(cache) = gitoxide::scan(repo, true) {
-            return Ok(cache);
-        }
         let full = || Self::read_status(repo, &mut default_status_options());
         let Some(root) = repo.workdir() else {
             return full();
@@ -181,24 +111,6 @@ impl GitStatusCache {
             }
         }
         Ok(cache)
-    }
-
-    pub fn read_git_status(git_workdir: &Path) -> Option<Self> {
-        let repository = Repository::open(git_workdir).ok()?;
-        #[cfg(feature = "gitoxide-status")]
-        if let Some(cache) = gitoxide::scan(&repository, false) {
-            return Some(cache);
-        }
-        let status = Self::read_status(&repository, &mut initial_scan_status_options());
-
-        match status {
-            Ok(status) => Some(status),
-            Err(e) => {
-                tracing::error!(?e, "Failed to read git status");
-
-                None
-            }
-        }
     }
 
     #[tracing::instrument(skip(repo), fields(paths_count = paths.len()), level = tracing::Level::DEBUG)]
@@ -355,12 +267,19 @@ mod tests {
             } else {
                 initial_scan_status_options()
             };
-            let expected = GitStatusCache::read_status(&repo, &mut opts).unwrap();
+            let expected = ScmStatusCache::read_status(&repo, &mut opts).unwrap();
             let actual = gitoxide::scan(&repo, full).expect("fixture must use gitoxide");
+            for name in ["libgit2", "gitoxide"] {
+                let workspace = crate::scm::select_backend(Some(name))
+                    .discover(root)
+                    .unwrap();
+                let session = workspace.open().unwrap();
+                assert_eq!(session.status(full).unwrap().0, expected.0);
+            }
             assert_eq!(actual.0, expected.0);
         }
-        let expected = GitStatusCache::read_status(&repo, &mut default_status_options()).unwrap();
-        let actual = GitStatusCache::read_status_from_index(
+        let expected = ScmStatusCache::read_status(&repo, &mut default_status_options()).unwrap();
+        let actual = ScmStatusCache::read_status_from_index(
             &repo,
             &repo.index().unwrap(),
             repo.workdir().unwrap(),
@@ -440,7 +359,7 @@ mod tests {
 
         let repo = Repository::open(&base).unwrap();
         let paths: Vec<PathBuf> = names.iter().map(|n| base.join(n)).collect();
-        let cache = GitStatusCache::git_status_for_paths(&repo, &paths).unwrap();
+        let cache = ScmStatusCache::git_status_for_paths(&repo, &paths).unwrap();
 
         for (n, abs) in names.iter().zip(paths.iter()) {
             let status = cache.lookup_status(abs);
@@ -482,7 +401,7 @@ mod tests {
             .iter()
             .map(|n| base.join(n))
             .collect();
-        let cache = GitStatusCache::git_status_for_paths(&repo, &paths).unwrap();
+        let cache = ScmStatusCache::git_status_for_paths(&repo, &paths).unwrap();
 
         let status = |n: &str| cache.lookup_status(&base.join(n));
         assert!(status("app/[id]/page.tsx").is_some_and(|s| s.contains(Status::WT_MODIFIED)));

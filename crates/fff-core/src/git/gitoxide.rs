@@ -1,10 +1,10 @@
-use super::GitStatusCache;
+use super::ScmStatusCache;
 use git2::{Repository, Status};
 use gix::diff::index::Change;
 use gix::index::entry::Mode;
 use gix::status::{Item, index_worktree::iter::Summary};
 
-pub(super) fn scan(repo: &Repository, full: bool) -> Option<GitStatusCache> {
+pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
     let root = repo.workdir()?;
     match read(root, full) {
         Ok(cache) => Some(cache),
@@ -15,7 +15,7 @@ pub(super) fn scan(repo: &Repository, full: bool) -> Option<GitStatusCache> {
     }
 }
 
-fn read(root: &std::path::Path, full: bool) -> Result<GitStatusCache, Box<dyn std::error::Error>> {
+fn read(root: &std::path::Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::Error>> {
     let options = gix::open::Options::default().config_overrides(["status.showUntrackedFiles=all"]);
     let repo = gix::open_opts(root, options)?;
     let platform = repo
@@ -24,7 +24,7 @@ fn read(root: &std::path::Path, full: bool) -> Result<GitStatusCache, Box<dyn st
         .index_worktree_options_mut(|opts| opts.thread_limit = Some(4))
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
     let mut items = platform.into_iter(std::iter::empty())?;
-    let mut cache = GitStatusCache::default();
+    let mut cache = ScmStatusCache::default();
     for item in items.by_ref() {
         let item = item?;
         let status = match &item {

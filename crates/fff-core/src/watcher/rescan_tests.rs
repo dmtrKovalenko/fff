@@ -780,7 +780,10 @@ impl Fixture {
             FFFMode::Neovim,
             events.into_iter().collect(),
             &self.base,
-            &self.git_workdir,
+            &self
+                .git_workdir
+                .as_deref()
+                .and_then(crate::scm::ScmWorkspace::discover),
             &self.picker,
             &self.frecency,
             &self.git_worker,
