@@ -328,6 +328,7 @@ export default function fffExtension(pi: ExtensionAPI) {
   // base path at a time — otherwise parallel tool calls would race and
   // deadlock at the native layer (issue #403).
   let finderPromise: Promise<FileFinderApi> | null = null;
+  let lifecycleId = 0;
   let activeCwd = process.cwd();
 
   const config = loadConfig();
@@ -506,7 +507,8 @@ export default function fffExtension(pi: ExtensionAPI) {
 
     if (finderPromise) return finderPromise;
 
-    finderPromise = (async () => {
+    const generation = lifecycleId;
+    const pending = (async () => {
       if (mainFinder && !mainFinder.isDestroyed) {
         mainFinder.destroy();
         mainFinder = null;
@@ -516,19 +518,25 @@ export default function fffExtension(pi: ExtensionAPI) {
       // if the dbs can't be opened the factory falls back to a db-less picker,
       // e.g. when some other process corrupts the lock
       if (!pickers) throw new Error("FFF picker factory is not initialized");
-      mainFinder = await pickers.create({
+      const created = await pickers.create({
         basePath: cwd,
         enableHomeDirScanning,
         enableFsRootScanning,
         followSymlinks,
       });
+      if (generation !== lifecycleId) {
+        created.destroy();
+        throw new Error("FFF session ended during initialization");
+      }
+      mainFinder = created;
       finderCwd = cwd;
-      return mainFinder;
+      return created;
     })().finally(() => {
-      finderPromise = null;
+      if (finderPromise === pending) finderPromise = null;
     });
+    finderPromise = pending;
 
-    return finderPromise;
+    return pending;
   }
 
   function stopHomeScanStatus(): void {
@@ -564,6 +572,8 @@ export default function fffExtension(pi: ExtensionAPI) {
   }
 
   function destroyFinder() {
+    lifecycleId++;
+    finderPromise = null;
     if (mainFinder && !mainFinder.isDestroyed) {
       mainFinder.destroy();
       mainFinder = null;
@@ -841,8 +851,6 @@ export default function fffExtension(pi: ExtensionAPI) {
         return;
       }
 
-      await ensureFinder(activeCwd);
-
       // Warn when launched from $HOME with home scanning on: indexing a large
       // home tree can run for a long time in the background (issue #743).
       const atHome = enableHomeDirScanning && isHomeDir(activeCwd);
@@ -854,9 +862,17 @@ export default function fffExtension(pi: ExtensionAPI) {
         );
       }
 
-      // waitForScan() also resolves on timeout, so poll until the scan really
-      // settles before clearing the footer.
-      if (atHome) trackHomeScanStatus();
+      const generation = lifecycleId;
+      void ensureFinder(activeCwd)
+        .then(() => {
+          if (generation === lifecycleId && atHome) trackHomeScanStatus();
+        })
+        .catch((error: unknown) => {
+          if (generation === lifecycleId) {
+            if (atHome) stopHomeScanStatus();
+            reportInitFailure(ctx, error);
+          }
+        });
     } catch (error: unknown) {
       reportInitFailure(ctx, error);
     }

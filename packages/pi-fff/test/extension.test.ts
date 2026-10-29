@@ -21,11 +21,12 @@ let fileSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
 let grepImpl: ((query: string, options: unknown) => unknown) | undefined;
 let multiGrepImpl: ((options: unknown) => unknown) | undefined;
 let scanProgressImpl: (() => unknown) | undefined;
+let scanWaitImpl: (() => Promise<void>) | undefined;
 
 function createMockFinder(): MockFinder {
   return {
     isDestroyed: false,
-    waitForScan: mock(async () => undefined),
+    waitForScan: mock(async () => scanWaitImpl?.()),
     getScanProgress: mock(() => {
       if (scanProgressImpl) return scanProgressImpl();
       return {
@@ -218,6 +219,7 @@ async function start(mode?: string, cwd?: string, flags: Record<string, unknown>
   const sessionStart = setup.events.get("session_start");
   expect(sessionStart).toBeDefined();
   await sessionStart?.({ reason: "startup" }, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
   return { ...setup, ctx };
 }
@@ -266,6 +268,7 @@ beforeEach(() => {
   grepImpl = undefined;
   multiGrepImpl = undefined;
   scanProgressImpl = undefined;
+  scanWaitImpl = undefined;
 
   for (const key of CONFIG_ENV_KEYS) delete process.env[key];
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -279,6 +282,72 @@ afterAll(() => {
     else process.env[key] = value;
   }
   fs.rmSync(agentDir, { recursive: true, force: true });
+});
+
+describe("pi-fff startup warmup", () => {
+  test("startup returns while scanning and tools await the same finder", async () => {
+    let finishScan!: () => void;
+    scanWaitImpl = () =>
+      new Promise<void>((resolve) => {
+        finishScan = resolve;
+      });
+    const setup = await start("tools-only");
+    expect(finders).toHaveLength(1);
+    expect(finders[0].waitForScan).toHaveBeenCalledTimes(1);
+
+    const tool = setup.pi.registerTool.mock.calls
+      .map(([tool]) => tool)
+      .find((tool) => tool.name === "ffgrep");
+    let completed = false;
+    const search = tool
+      .execute("test", { pattern: "file" }, new AbortController().signal)
+      .then(() => {
+        completed = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(completed).toBe(false);
+    expect(createCalls).toHaveLength(1);
+
+    finishScan();
+    await search;
+    expect(completed).toBe(true);
+    await shutdown(setup);
+  });
+
+  test("shutdown destroys a finder that finishes warming later", async () => {
+    let finishScan!: () => void;
+    scanWaitImpl = () =>
+      new Promise<void>((resolve) => {
+        finishScan = resolve;
+      });
+    const setup = await start("tools-only", os.homedir());
+    await shutdown(setup);
+    const notifications = setup.ctx.ui.notify.mock.calls.length;
+    const statusUpdates = setup.ctx.ui.setStatus.mock.calls.length;
+
+    finishScan();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(finders[0].destroy).toHaveBeenCalledTimes(1);
+    expect(setup.ctx.ui.notify.mock.calls).toHaveLength(notifications);
+    expect(setup.ctx.ui.setStatus.mock.calls).toHaveLength(statusUpdates);
+  });
+
+  test("background initialization failures clear the home-scan footer", async () => {
+    scanWaitImpl = async () => {
+      throw new Error("scan failed");
+    };
+    const setup = await start("tools-only", os.homedir());
+    expect(setup.ctx.ui.notify).toHaveBeenCalledWith(
+      "FFF init failed: scan failed",
+      "error",
+    );
+    expect(setup.ctx.ui.setStatus).toHaveBeenCalledWith(
+      "fff",
+      "Agent is indexing $HOME, this can lead to high CPU",
+    );
+    expect(setup.ctx.ui.setStatus).toHaveBeenLastCalledWith("fff", undefined);
+    await shutdown(setup);
+  });
 });
 
 describe("pi-fff global config", () => {
