@@ -4,7 +4,7 @@ pub(crate) mod status_worker;
 
 use crate::git_recency::GitRecencyConfig;
 use ahash::AHashMap;
-use git::GitBackend;
+use git::LibGit2;
 use git2::Status;
 use std::path::{Path, PathBuf};
 
@@ -64,13 +64,18 @@ impl ScmWorkspace {
 }
 
 pub(crate) fn select_backend(name: Option<&str>) -> &'static dyn ScmBackend {
-    match name {
+    let default = if cfg!(feature = "gitoxide-status") {
+        "gitoxide"
+    } else {
+        "libgit2"
+    };
+    match name.unwrap_or(default) {
         #[cfg(feature = "gitoxide-status")]
-        Some("gitoxide") => &GitBackend::Gitoxide,
-        None | Some("libgit2") => &GitBackend::Libgit2,
-        Some(name) => {
+        "gitoxide" => &git::gitoxide::GitOxide,
+        "libgit2" => &LibGit2,
+        name => {
             tracing::warn!(name, "Unavailable SCM backend, using libgit2");
-            &GitBackend::Libgit2
+            &LibGit2
         }
     }
 }

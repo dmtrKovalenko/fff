@@ -1,9 +1,9 @@
 mod backend;
 #[cfg(feature = "gitoxide-status")]
-mod gitoxide;
+pub(crate) mod gitoxide;
 pub mod recency;
 use crate::scm::ScmStatusCache;
-pub(crate) use backend::GitBackend;
+pub(crate) use backend::LibGit2;
 
 use crate::error::Result;
 use ahash::AHashMap;

@@ -7,35 +7,16 @@ use git2::Repository;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Copy, Clone)]
-pub(crate) enum GitBackend {
-    Libgit2,
-    #[cfg(feature = "gitoxide-status")]
-    Gitoxide,
-}
+#[derive(Debug)]
+pub(crate) struct LibGit2;
 
-impl ScmBackend for GitBackend {
+impl ScmBackend for LibGit2 {
     fn discover(&'static self, path: &Path) -> Option<ScmWorkspace> {
-        super::tune_libgit2_for_local_reads();
-        let repo = Repository::discover(path).ok()?;
-        let workdir = crate::path_utils::normalize(repo.workdir()?.to_owned());
-        let shared_root = repo
-            .is_worktree()
-            .then(|| main_checkout_root(&repo))
-            .map(crate::path_utils::normalize);
-        Some(ScmWorkspace {
-            workdir,
-            metadata: repo.path().to_owned(),
-            shared_root,
-            backend: self,
-        })
+        discover_git(self, path)
     }
 
     fn open(&self, root: &Path) -> Result<Box<dyn ScmRepository>> {
-        Ok(Box::new(GitRepository {
-            repo: Repository::open(root)?,
-            backend: *self,
-        }))
+        open_git(root, libgit2_status)
     }
 
     fn status_metadata_changed(&self, path: &Path) -> bool {
@@ -54,25 +35,12 @@ impl ScmBackend for GitBackend {
 
 struct GitRepository {
     repo: Repository,
-    backend: GitBackend,
+    scan: fn(&Repository, bool) -> Result<ScmStatusCache>,
 }
 
 impl ScmRepository for GitRepository {
     fn status(&self, full: bool) -> Result<ScmStatusCache> {
-        match self.backend {
-            GitBackend::Libgit2 => (),
-            #[cfg(feature = "gitoxide-status")]
-            GitBackend::Gitoxide => {
-                if let Some(cache) = super::gitoxide::scan(&self.repo, full) {
-                    return Ok(cache);
-                }
-            }
-        }
-        if full {
-            ScmStatusCache::read_full_status(&self.repo)
-        } else {
-            ScmStatusCache::read_status(&self.repo, &mut initial_scan_status_options())
-        }
+        (self.scan)(&self.repo, full)
     }
 
     fn status_for_paths(&self, paths: &[PathBuf]) -> Result<ScmStatusCache> {
@@ -111,5 +79,39 @@ fn wait_for_git_index_lock_release(git_dir: &Path) {
              .git/index.lock at {} — will retry once it clears",
             lock.display()
         );
+    }
+}
+
+pub(super) fn discover_git(backend: &'static dyn ScmBackend, path: &Path) -> Option<ScmWorkspace> {
+    super::tune_libgit2_for_local_reads();
+    let repo = Repository::discover(path).ok()?;
+    let workdir = crate::path_utils::normalize(repo.workdir()?.to_owned());
+    let shared_root = repo
+        .is_worktree()
+        .then(|| main_checkout_root(&repo))
+        .map(crate::path_utils::normalize);
+    Some(ScmWorkspace {
+        workdir,
+        metadata: repo.path().to_owned(),
+        shared_root,
+        backend,
+    })
+}
+
+pub(super) fn open_git(
+    root: &Path,
+    scan: fn(&Repository, bool) -> Result<ScmStatusCache>,
+) -> Result<Box<dyn ScmRepository>> {
+    Ok(Box::new(GitRepository {
+        repo: Repository::open(root)?,
+        scan,
+    }))
+}
+
+pub(super) fn libgit2_status(repo: &Repository, full: bool) -> Result<ScmStatusCache> {
+    if full {
+        ScmStatusCache::read_full_status(repo)
+    } else {
+        ScmStatusCache::read_status(repo, &mut initial_scan_status_options())
     }
 }

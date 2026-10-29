@@ -1,8 +1,10 @@
 use super::ScmStatusCache;
+use crate::scm::{ScmBackend, ScmRepository, ScmWorkspace};
 use git2::{Repository, Status};
 use gix::diff::index::Change;
 use gix::index::entry::Mode;
 use gix::status::{Item, index_worktree::iter::Summary};
+use std::path::{Path, PathBuf};
 
 pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
     let root = repo.workdir()?;
@@ -15,7 +17,7 @@ pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
     }
 }
 
-fn read(root: &std::path::Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::Error>> {
+fn read(root: &Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::Error>> {
     let options = gix::open::Options::default().config_overrides(["status.showUntrackedFiles=all"]);
     let repo = gix::open_opts(root, options)?;
     let platform = repo
@@ -79,4 +81,32 @@ fn read(root: &std::path::Path, full: bool) -> Result<ScmStatusCache, Box<dyn st
         }
     }
     Ok(cache)
+}
+
+#[derive(Debug)]
+pub(crate) struct GitOxide;
+
+impl ScmBackend for GitOxide {
+    fn discover(&'static self, path: &Path) -> Option<ScmWorkspace> {
+        super::backend::discover_git(self, path)
+    }
+
+    fn open(&self, root: &Path) -> crate::error::Result<Box<dyn ScmRepository>> {
+        super::backend::open_git(root, gitoxide_status)
+    }
+
+    fn status_metadata_changed(&self, path: &Path) -> bool {
+        super::LibGit2.status_metadata_changed(path)
+    }
+
+    fn watch_dirs(&self, metadata: &Path) -> Vec<PathBuf> {
+        super::LibGit2.watch_dirs(metadata)
+    }
+}
+
+fn gitoxide_status(repo: &Repository, full: bool) -> crate::error::Result<ScmStatusCache> {
+    match scan(repo, full) {
+        Some(cache) => Ok(cache),
+        None => super::backend::libgit2_status(repo, full),
+    }
 }
