@@ -93,11 +93,13 @@ local function render_grep_empty_state(ctx)
     table.insert(content, '  Start typing to search file contents...')
   end
   table.insert(content, '')
-  table.insert(content, '  Tips:')
-  table.insert(content, '    "pattern *.rs"    search only in Rust files')
-  table.insert(content, '    "pattern /src/"   limit search to src/ directory')
-  table.insert(content, '    "!test pattern"   exclude test files')
-  table.insert(content, '')
+  if not S.refine then
+    table.insert(content, '  Tips:')
+    table.insert(content, '    "pattern *.rs"    search only in Rust files')
+    table.insert(content, '    "pattern /src/"   limit search to src/ directory')
+    table.insert(content, '    "!test pattern"   exclude test files')
+    table.insert(content, '')
+  end
 
   if prompt_position == 'bottom' then
     local empty_needed = math.max(0, win_height - #content)
