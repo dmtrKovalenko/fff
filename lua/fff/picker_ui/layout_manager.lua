@@ -137,6 +137,7 @@ function M.close()
   S.grep_config = nil
   S.grep_mode = 'plain'
   S.grep_regex_fallback_error = nil
+  S.refine = nil
   S.suggestion_items = nil
   S.suggestion_source = nil
   S.renderer = nil
