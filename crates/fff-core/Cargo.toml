@@ -43,7 +43,6 @@ name = "fuzzy_search_bench"
 harness = false
 
 [features]
-gitoxide-status = ["dep:gix"]
 # `ripgrep` is the pure-Rust walker/glob backend and is on by default so
 # consumers build without a Zig toolchain. CI/release opt into zlob via
 # `--no-default-features --features zlob`.
@@ -75,7 +74,7 @@ blake3 = { workspace = true }
 dirs = { workspace = true }
 libc = "0.2"
 git2 = { workspace = true }
-gix = { version = "0.81", optional = true, default-features = false, features = ["status", "parallel", "sha1"] }
+gitoxide = { package = "gix", version = "0.81", optional = true, default-features = false, features = ["status", "parallel", "sha1"] }
 glidesort = { workspace = true }
 globset = { workspace = true, optional = true }
 fff-grep = { workspace = true , version = "0.9.0" }

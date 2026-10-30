@@ -64,13 +64,13 @@ impl ScmWorkspace {
 }
 
 pub(crate) fn select_backend(name: Option<&str>) -> &'static dyn ScmBackend {
-    let default = if cfg!(feature = "gitoxide-status") {
+    let default = if cfg!(feature = "gitoxide") {
         "gitoxide"
     } else {
         "libgit2"
     };
     match name.unwrap_or(default) {
-        #[cfg(feature = "gitoxide-status")]
+        #[cfg(feature = "gitoxide")]
         "gitoxide" => &git::gitoxide::GitOxide,
         "libgit2" => &LibGit2,
         name => {

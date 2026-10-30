@@ -1,5 +1,5 @@
 mod backend;
-#[cfg(feature = "gitoxide-status")]
+#[cfg(feature = "gitoxide")]
 pub(crate) mod gitoxide;
 pub mod recency;
 use crate::scm::ScmStatusCache;
@@ -256,7 +256,7 @@ mod tests {
         fs::write(root.join("new/nested/file"), "new").unwrap();
         git(root, &["config", "status.showUntrackedFiles", "no"]);
         let repo = Repository::open(root).unwrap();
-        #[cfg(feature = "gitoxide-status")]
+        #[cfg(feature = "gitoxide")]
         for full in [false, true] {
             let mut opts = if full {
                 default_status_options()

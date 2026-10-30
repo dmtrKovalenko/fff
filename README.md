@@ -604,7 +604,7 @@ Caveat: the chosen file replaces the buffer in the invoking window even if it's 
 
 ### Git status highlighting
 
-The default build uses libgit2. Build with `cargo build --release -p fff-nvim --features gitoxide-status` to use gitoxide for repository-wide status scans. Set `FFF_SCM_BACKEND=libgit2` before starting Neovim to switch back without rebuilding. Gitoxide can reduce scan time on large repositories but can increase peak memory. It shares Git discovery, targeted status updates, ignore rules, and commit history with the libgit2 backend. If a gitoxide scan fails or encounters an unsupported status, FFF retries with libgit2.
+The default build uses libgit2. Build with `cargo build --release -p fff-nvim --features gitoxide` to use gitoxide for repository-wide status scans. Set `FFF_SCM_BACKEND=libgit2` before starting Neovim to switch back without rebuilding. Gitoxide can reduce scan time on large repositories but can increase peak memory. It shares Git discovery, targeted status updates, ignore rules, and commit history with the libgit2 backend. If a gitoxide scan fails or encounters an unsupported status, FFF retries with libgit2.
 
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
 

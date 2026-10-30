@@ -1,9 +1,9 @@
 use super::ScmStatusCache;
 use crate::scm::{ScmBackend, ScmRepository, ScmWorkspace};
 use git2::{Repository, Status};
-use gix::diff::index::Change;
-use gix::index::entry::Mode;
-use gix::status::{Item, index_worktree::iter::Summary};
+use gitoxide::diff::index::Change;
+use gitoxide::index::entry::Mode;
+use gitoxide::status::{Item, index_worktree::iter::Summary};
 use std::path::{Path, PathBuf};
 
 pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
@@ -18,13 +18,14 @@ pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
 }
 
 fn read(root: &Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::Error>> {
-    let options = gix::open::Options::default().config_overrides(["status.showUntrackedFiles=all"]);
-    let repo = gix::open_opts(root, options)?;
+    let options =
+        gitoxide::open::Options::default().config_overrides(["status.showUntrackedFiles=all"]);
+    let repo = gitoxide::open_opts(root, options)?;
     let platform = repo
-        .status(gix::progress::Discard)?
+        .status(gitoxide::progress::Discard)?
         .index_worktree_submodules(None)
         .index_worktree_options_mut(|opts| opts.thread_limit = Some(4))
-        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
+        .tree_index_track_renames(gitoxide::status::tree_index::TrackRenames::Disabled);
     let mut items = platform.into_iter(std::iter::empty())?;
     let mut cache = ScmStatusCache::default();
     for item in items.by_ref() {
