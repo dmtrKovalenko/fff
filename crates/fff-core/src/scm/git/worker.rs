@@ -1,3 +1,4 @@
+use crate::scm::{ScmStatusCache, ScmStatusWorker, ScmWorkspace};
 use crate::shared::{SharedFrecency, WeakFilePicker};
 use ahash::AHashSet;
 use parking_lot::{Condvar, Mutex};
@@ -22,7 +23,7 @@ impl Pending {
 }
 
 /// Condvar based queue that is used for batch processing events
-pub(crate) struct GitStatusWorker {
+pub(super) struct GitStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
@@ -31,77 +32,18 @@ pub(crate) struct GitStatusWorker {
 }
 
 impl GitStatusWorker {
-    pub(crate) fn new() -> Arc<Self> {
+    #[cfg(test)]
+    fn new() -> Arc<Self> {
         Self::with_pause_flag(Arc::default())
     }
 
-    pub(crate) fn with_pause_flag(paused: Arc<AtomicBool>) -> Arc<Self> {
+    pub(super) fn with_pause_flag(paused: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             consumer_spawned: AtomicBool::new(false),
             paused,
         })
-    }
-
-    pub(crate) fn spawn_once(
-        self: &Arc<Self>,
-        weak_picker: WeakFilePicker,
-        frecency: SharedFrecency,
-    ) {
-        if self
-            .consumer_spawned
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            Self::spawn_consumer(Arc::clone(self), weak_picker, frecency);
-        }
-    }
-
-    pub(crate) fn enqueue_paths<I>(&self, paths: I)
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let mut guard = self.state.lock();
-        if self.paused.load(Ordering::Acquire) {
-            return;
-        }
-        guard.paths.extend(paths);
-        drop(guard);
-        self.cv.notify_one();
-    }
-
-    pub(crate) fn request_full_rescan(&self) {
-        let mut guard = self.state.lock();
-        if self.paused.load(Ordering::Acquire) {
-            return;
-        }
-        guard.full_rescan = true;
-        drop(guard);
-        self.cv.notify_one();
-    }
-
-    // the caller flips `paused` first, so nothing can be queued after this
-    pub(crate) fn drop_pending(&self) {
-        let mut guard = self.state.lock();
-        guard.paths.clear();
-        guard.full_rescan = false;
-    }
-
-    // without a consumer nothing will ever run, so there is nothing to wait for
-    pub(crate) fn is_idle(&self) -> bool {
-        if !self.consumer_spawned.load(Ordering::Acquire) {
-            return true;
-        }
-        let guard = self.state.lock();
-        guard.shutdown || (!guard.has_work() && !guard.running)
-    }
-
-    pub(crate) fn signal_shutdown(&self) {
-        let mut guard = self.state.lock();
-        guard.shutdown = true;
-        drop(guard);
-        self.cv.notify_one();
     }
 
     fn wait_and_take(&self) -> Option<Pending> {
@@ -121,16 +63,13 @@ impl GitStatusWorker {
         self.state.lock().running = false;
     }
 
-    // the problem: git status update can take a lot of time especially on big repositories
-    // and there is unpredictable wait time on the lock file if huge commit is going so we have to
-    // spawn a separate thread to guartee that notify handler is unlocked even if git update takes a
-    // lot of time on every event burst (pretty cheap as this thread is going to sleep 99.9% of time)
+    // Keep slow status reads off the filesystem watcher thread.
     fn spawn_consumer(
         mailbox: Arc<GitStatusWorker>,
         weak_picker: WeakFilePicker,
         frecency: SharedFrecency,
-    ) {
-        let _ = std::thread::Builder::new()
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new()
             .name("fff-git-status".into())
             .spawn(move || {
                 while let Some(work) = mailbox.wait_and_take() {
@@ -154,8 +93,78 @@ impl GitStatusWorker {
 
                 tracing::info!("git-status worker stopped");
             })
-            .inspect_err(|err| tracing::error!(?err, "Failed to spawn git status worker"));
     }
+}
+
+impl ScmStatusWorker for GitStatusWorker {
+    fn on_workspace_scan(self: Arc<Self>, weak_picker: WeakFilePicker, frecency: SharedFrecency) {
+        if self
+            .consumer_spawned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && let Err(error) = Self::spawn_consumer(Arc::clone(&self), weak_picker, frecency)
+        {
+            self.consumer_spawned.store(false, Ordering::Release);
+            tracing::error!(?error, "Failed to spawn Git status worker");
+            return;
+        }
+        self.request_full_rescan();
+    }
+
+    fn enqueue_paths(&self, paths: Vec<PathBuf>) {
+        let mut guard = self.state.lock();
+        if self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        guard.paths.extend(paths);
+        drop(guard);
+        self.cv.notify_one();
+    }
+
+    fn request_full_rescan(&self) {
+        let mut guard = self.state.lock();
+        if self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        guard.full_rescan = true;
+        drop(guard);
+        self.cv.notify_one();
+    }
+
+    // the caller flips `paused` first, so nothing can be queued after this
+    fn drop_pending(&self) {
+        let mut guard = self.state.lock();
+        guard.paths.clear();
+        guard.full_rescan = false;
+    }
+
+    // without a consumer nothing will ever run, so there is nothing to wait for
+    fn is_idle(&self) -> bool {
+        if !self.consumer_spawned.load(Ordering::Acquire) {
+            return true;
+        }
+        let guard = self.state.lock();
+        guard.shutdown || (!guard.has_work() && !guard.running)
+    }
+
+    fn signal_shutdown(&self) {
+        let mut guard = self.state.lock();
+        guard.shutdown = true;
+        drop(guard);
+        self.cv.notify_one();
+    }
+}
+
+pub(super) fn spawn_initial_status(
+    workspace: ScmWorkspace,
+) -> std::thread::JoinHandle<Option<ScmStatusCache>> {
+    std::thread::spawn(move || {
+        workspace
+            .open()
+            .and_then(|repo| repo.status(false))
+            .inspect_err(|e| tracing::error!(?e, "Failed to read SCM status"))
+            .ok()
+    })
 }
 
 #[cfg(test)]
