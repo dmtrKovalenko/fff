@@ -2,6 +2,11 @@
 rustflags = [
   "-C", "link-arg=-undefined",
   "-C", "link-arg=dynamic_lookup",
+  # rust-objcopy (rustc strip) before LLVM 22.1.8 leaves the LINKEDIT string
+  # pool 4-byte aligned, which macOS 27 dyld rejects; let ld strip instead.
+  "-C", "strip=none",
+  "-C", "link-arg=-Wl,-x",
+  "-C", "link-arg=-Wl,-S",
 ]
 
 [target.x86_64-unknown-linux-musl]
