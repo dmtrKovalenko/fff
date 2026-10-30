@@ -39,6 +39,7 @@ use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
 use crate::scm::ScmStatusCache;
 use crate::scm::ScmWorkspace;
+use crate::scm::{ScmBackend, ScmStatusWorker};
 use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
@@ -60,7 +61,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
@@ -628,7 +628,8 @@ pub struct FilePicker {
     /// Single serialized writer for all git-status updates (scan, watcher,
     /// FFI). Owned by the picker so it exists before the first scan; its
     /// consumer thread is spawned lazily once a git workdir is discovered.
-    pub(crate) scm_status_worker: Arc<crate::scm::status_worker::ScmStatusWorker>,
+    pub(crate) scm_backend: &'static dyn ScmBackend,
+    pub(crate) scm_status_worker: Arc<dyn ScmStatusWorker>,
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
@@ -928,6 +929,10 @@ impl FilePicker {
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
+        Self::with_scm_pause(options, Arc::default())
+    }
+
+    fn with_scm_pause(options: FilePickerOptions, paused: Arc<AtomicBool>) -> Result<Self, Error> {
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
             error!("Base path does not exist: {}", options.base_path);
@@ -966,9 +971,11 @@ impl FilePicker {
         let trace_id = crate::log::generate_trace_id();
         let trace_span = crate::log::trace_span(&trace_id, "picker");
 
+        let scm_backend = crate::scm::configured_backend();
         Ok(FilePicker {
+            scm_backend,
             background_watcher: None,
-            scm_status_worker: crate::scm::status_worker::ScmStatusWorker::new(),
+            scm_status_worker: scm_backend.create_worker(paused),
             base_path: path,
             cache_budget: Arc::new(initial_budget),
             has_explicit_cache_budget: has_explicit_budget,
@@ -995,10 +1002,8 @@ impl FilePicker {
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let mut picker = Self::new(options)?;
-        picker.scm_status_worker = crate::scm::status_worker::ScmStatusWorker::with_pause_flag(
-            shared_picker.git_status_pause_flag(),
-        );
+        let picker = Self::with_scm_pause(options, shared_picker.git_status_pause_flag())?;
+        let backend = picker.scm_backend;
 
         info!(
             "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
@@ -1041,6 +1046,7 @@ impl FilePicker {
         }
 
         ScanJob::new_initial(
+            backend,
             shared_picker,
             shared_frecency,
             path,
@@ -1076,10 +1082,10 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git = FileSync::discover_scm(&self.base_path);
+        let git = FileSync::discover_scm(self.scm_backend, &self.base_path);
         let git_handle = git
             .as_ref()
-            .map(|git| FileSync::spawn_git_status(git.clone()));
+            .map(|git| git.backend.spawn_initial_status(git.clone()));
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
@@ -2137,8 +2143,11 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_scm(base_path: &Path) -> Option<ScmWorkspace> {
-        let git = ScmWorkspace::discover(base_path);
+    pub(crate) fn discover_scm(
+        backend: &'static dyn ScmBackend,
+        base_path: &Path,
+    ) -> Option<ScmWorkspace> {
+        let git = backend.discover(base_path);
         match &git {
             Some(git) => {
                 debug!(workdir = ?git.workdir, metadata = ?git.metadata, "Git repository found")
@@ -2147,16 +2156,6 @@ impl FileSync {
         }
 
         git
-    }
-
-    pub(crate) fn spawn_git_status(workspace: ScmWorkspace) -> JoinHandle<Option<ScmStatusCache>> {
-        std::thread::spawn(move || {
-            workspace
-                .open()
-                .and_then(|repo| repo.status(false))
-                .inspect_err(|e| tracing::error!(?e, "Failed to read SCM status"))
-                .ok()
-        })
     }
 
     /// Returns files immediately (searchable) and a handle to the in-progress
@@ -2175,7 +2174,6 @@ impl FileSync {
         info!("SCAN: Starting filesystem walk and git status (async)");
 
         // Walk files (the fast part, typically 2-3s even on huge repos).
-        let is_git_repo = git.is_some();
         let shared_base = git.as_ref().and_then(|git| git.shared_base(base_path));
         if let Some(shared_base) = &shared_base {
             info!(
@@ -2191,7 +2189,7 @@ impl FileSync {
             ignore_rules,
         } = crate::walk::walk_collect_files(
             base_path,
-            is_git_repo,
+            git.as_ref().map(|workspace| workspace.backend),
             follow_symlinks,
             bg_threads,
             synced_files_count,

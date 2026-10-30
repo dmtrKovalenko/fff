@@ -16,7 +16,7 @@ use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
 use crate::frecency::FrecencyTracker;
 use crate::rescan_stats::{RescanReason, RescanStats};
-use crate::scm::status_worker::ScmStatusWorker;
+use crate::scm::ScmStatusWorker;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
 use std::sync::mpsc;
@@ -663,7 +663,7 @@ struct Fixture {
     picker: SharedFilePicker,
     frecency: SharedFrecency,
     git_workdir: Option<PathBuf>,
-    git_worker: Arc<ScmStatusWorker>,
+    git_worker: Arc<dyn ScmStatusWorker>,
     // Dropped last so background work started by a triggered rescan still
     // sees the tree it was asked to walk.
     _tmp: TempDir,
@@ -714,7 +714,7 @@ impl Fixture {
             picker: SharedFilePicker::default(),
             frecency: shared_frecency,
             git_workdir,
-            git_worker: ScmStatusWorker::new(),
+            git_worker: crate::scm::configured_backend().create_worker(Arc::default()),
             _tmp: tmp,
             _frecency_tmp: frecency_tmp,
         }

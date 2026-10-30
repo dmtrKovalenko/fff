@@ -2,7 +2,7 @@ use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
 use crate::rescan_stats::RescanReason;
-use crate::scm::status_worker::ScmStatusWorker;
+use crate::scm::ScmStatusWorker;
 use crate::scm::{ScmRepository, ScmWorkspace};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
@@ -51,7 +51,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         enable_fs_root_scanning: bool,
         enable_home_dir_scanning: bool,
-        scm_status_worker: Arc<ScmStatusWorker>,
+        scm_status_worker: Arc<dyn ScmStatusWorker>,
         trace_span: tracing::Span,
     ) -> Result<Self, Error> {
         info!(
@@ -182,7 +182,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         use_recursive: bool,
         watch_tx: mpsc::Sender<WatchTask>,
-        scm_status_worker: Arc<ScmStatusWorker>,
+        scm_status_worker: Arc<dyn ScmStatusWorker>,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
             .with_follow_symlinks(false)
@@ -342,7 +342,7 @@ pub(crate) fn handle_debounced_events(
     git_workdir: &Option<ScmWorkspace>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
-    scm_status_worker: &Arc<ScmStatusWorker>,
+    scm_status_worker: &Arc<dyn ScmStatusWorker>,
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| p.open().ok());
@@ -452,10 +452,12 @@ pub(crate) fn handle_debounced_events(
             }
 
             // bare repos keep worktree git dirs outside of any `.git` component
-            if is_git_file(path)
-                || git_workdir
-                    .as_ref()
-                    .is_some_and(|workspace| path.starts_with(&workspace.metadata))
+            if crate::scm::is_metadata_path(
+                path,
+                git_workdir.as_ref().map(|workspace| workspace.backend),
+            ) || git_workdir
+                .as_ref()
+                .is_some_and(|workspace| path.starts_with(&workspace.metadata))
             {
                 continue;
             }
@@ -809,7 +811,7 @@ fn index_new_directory(
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_workdir: &Option<ScmWorkspace>,
-    scm_status_worker: &Arc<ScmStatusWorker>,
+    scm_status_worker: &Arc<dyn ScmStatusWorker>,
 ) -> Vec<PathBuf> {
     let repo = git_workdir.as_ref().and_then(|p| p.open().ok());
     // Prefer the walker's ignore rules; read base_path + rules from the picker.
@@ -828,7 +830,7 @@ fn index_new_directory(
 
     let walk = match crate::walk::walk_collect_files(
         dir,
-        repo.is_some(),
+        git_workdir.as_ref().map(|workspace| workspace.backend),
         follow_symlinks,
         1,
         &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -995,13 +997,6 @@ impl<'a> IgnoreFilter<'a> {
             ),
         }
     }
-}
-
-#[inline]
-pub(crate) fn is_git_file(path: &Path) -> bool {
-    // it could be in submodule
-    path.components()
-        .any(|component| component.as_os_str() == ".git")
 }
 
 fn is_dotgit_change_affecting_status(changed: &Path, workspace: &Option<ScmWorkspace>) -> bool {
@@ -1211,7 +1206,7 @@ mod tests {
             &shared_picker,
             &SharedFrecency::noop(),
             &None,
-            &ScmStatusWorker::new(),
+            &crate::scm::configured_backend().create_worker(Arc::default()),
         );
         {
             let guard = shared_picker.read().unwrap();
@@ -1303,7 +1298,7 @@ mod tests {
             &None,
             &shared_picker,
             &shared_frecency,
-            &ScmStatusWorker::new(),
+            &crate::scm::configured_backend().create_worker(Arc::default()),
         );
 
         let received = receiver.recv_timeout(Duration::from_secs(1)).unwrap();

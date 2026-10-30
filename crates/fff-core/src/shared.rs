@@ -11,7 +11,7 @@ use crate::query_tracker::QueryTracker;
 use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
 use crate::rescan_throttle::RescanThrottle;
 use crate::scan::ScanJob;
-use crate::scm::status_worker::ScmStatusWorker;
+use crate::scm::ScmStatusWorker;
 use crate::watch::{WatchEvent, WatchId, WatchOptions, WatchRegistry};
 
 /// Poll `done` every 10ms until it returns `true`, or until `timeout` elapses.
@@ -357,7 +357,7 @@ impl SharedFilePicker {
         Arc::clone(&self.0.git_status_paused)
     }
 
-    fn scm_status_worker(&self) -> Option<Arc<ScmStatusWorker>> {
+    fn scm_status_worker(&self) -> Option<Arc<dyn ScmStatusWorker>> {
         let guard = self.0.picker.read();
         guard
             .as_ref()

@@ -1,10 +1,13 @@
 use super::{ScmStatusCache, initial_scan_status_options, main_checkout_root};
 use crate::error::Result;
 use crate::git_recency::{self, GitRecencyConfig};
+use crate::scm::ScmStatusWorker;
 use crate::scm::{ScmBackend, ScmRepository, ScmWorkspace};
 use ahash::AHashMap;
 use git2::Repository;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -19,6 +22,10 @@ impl ScmBackend for LibGit2 {
         open_git(root, libgit2_status)
     }
 
+    fn metadata_dir_name(&self) -> &'static str {
+        ".git"
+    }
+
     fn status_metadata_changed(&self, path: &Path) -> bool {
         matches!(path.to_str(), Some("index" | "index.lock" | "HEAD"))
             || path == Path::new("logs/HEAD")
@@ -26,6 +33,14 @@ impl ScmBackend for LibGit2 {
                 path.file_name().and_then(|n| n.to_str()),
                 Some("MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD")
             )
+    }
+
+    fn create_worker(&self, paused: Arc<AtomicBool>) -> Arc<dyn ScmStatusWorker> {
+        super::worker::GitStatusWorker::with_pause_flag(paused)
+    }
+
+    fn spawn_initial_status(&self, workspace: ScmWorkspace) -> JoinHandle<Option<ScmStatusCache>> {
+        super::worker::spawn_initial_status(workspace)
     }
 
     fn watch_dirs(&self, metadata: &Path) -> Vec<PathBuf> {

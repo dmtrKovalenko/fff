@@ -1,6 +1,8 @@
 use crate::error::Result;
 pub mod git;
-pub(crate) mod status_worker;
+use crate::shared::{SharedFrecency, WeakFilePicker};
+use std::sync::{Arc, atomic::AtomicBool};
+use std::thread::JoinHandle;
 
 use crate::git_recency::GitRecencyConfig;
 use ahash::AHashMap;
@@ -11,8 +13,20 @@ use std::path::{Path, PathBuf};
 pub(crate) trait ScmBackend: std::fmt::Debug + Sync {
     fn discover(&'static self, path: &Path) -> Option<ScmWorkspace>;
     fn open(&self, root: &Path) -> Result<Box<dyn ScmRepository>>;
+    fn metadata_dir_name(&self) -> &'static str;
     fn status_metadata_changed(&self, relative: &Path) -> bool;
+    fn create_worker(&self, paused: Arc<AtomicBool>) -> Arc<dyn ScmStatusWorker>;
+    fn spawn_initial_status(&self, workspace: ScmWorkspace) -> JoinHandle<Option<ScmStatusCache>>;
     fn watch_dirs(&self, metadata: &Path) -> Vec<PathBuf>;
+}
+
+pub(crate) trait ScmStatusWorker: Send + Sync {
+    fn on_workspace_scan(self: Arc<Self>, picker: WeakFilePicker, frecency: SharedFrecency);
+    fn enqueue_paths(&self, paths: Vec<PathBuf>);
+    fn request_full_rescan(&self);
+    fn drop_pending(&self);
+    fn is_idle(&self) -> bool;
+    fn signal_shutdown(&self);
 }
 
 pub(crate) trait ScmRepository {
@@ -32,9 +46,9 @@ pub(crate) struct ScmWorkspace {
 }
 
 impl ScmWorkspace {
+    #[cfg(test)]
     pub(crate) fn discover(path: &Path) -> Option<Self> {
-        let requested = std::env::var("FFF_SCM_BACKEND").ok();
-        select_backend(requested.as_deref()).discover(path)
+        configured_backend().discover(path)
     }
 
     pub(crate) fn open(&self) -> Result<Box<dyn ScmRepository>> {
@@ -61,6 +75,16 @@ impl ScmWorkspace {
             shared_root.join(relative)
         })
     }
+}
+
+pub(crate) fn is_metadata_path(path: &Path, backend: Option<&dyn ScmBackend>) -> bool {
+    let name = backend.unwrap_or(&LibGit2).metadata_dir_name();
+    path.components()
+        .any(|component| component.as_os_str() == name)
+}
+
+pub(crate) fn configured_backend() -> &'static dyn ScmBackend {
+    select_backend(std::env::var("FFF_SCM_BACKEND").ok().as_deref())
 }
 
 pub(crate) fn select_backend(name: Option<&str>) -> &'static dyn ScmBackend {

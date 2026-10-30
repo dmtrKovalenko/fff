@@ -2,6 +2,7 @@ mod backend;
 #[cfg(feature = "gitoxide")]
 pub(crate) mod gitoxide;
 pub mod recency;
+mod worker;
 use crate::scm::ScmStatusCache;
 pub(crate) use backend::LibGit2;
 

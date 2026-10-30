@@ -1,10 +1,13 @@
 use super::ScmStatusCache;
+use crate::scm::ScmStatusWorker;
 use crate::scm::{ScmBackend, ScmRepository, ScmWorkspace};
 use git2::{Repository, Status};
 use gitoxide::diff::index::Change;
 use gitoxide::index::entry::Mode;
 use gitoxide::status::{Item, index_worktree::iter::Summary};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
+use std::thread::JoinHandle;
 
 pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
     let root = repo.workdir()?;
@@ -96,8 +99,20 @@ impl ScmBackend for GitOxide {
         super::backend::open_git(root, gitoxide_status)
     }
 
+    fn metadata_dir_name(&self) -> &'static str {
+        ".git"
+    }
+
     fn status_metadata_changed(&self, path: &Path) -> bool {
         super::LibGit2.status_metadata_changed(path)
+    }
+
+    fn create_worker(&self, paused: Arc<AtomicBool>) -> Arc<dyn ScmStatusWorker> {
+        super::worker::GitStatusWorker::with_pause_flag(paused)
+    }
+
+    fn spawn_initial_status(&self, workspace: ScmWorkspace) -> JoinHandle<Option<ScmStatusCache>> {
+        super::worker::spawn_initial_status(workspace)
     }
 
     fn watch_dirs(&self, metadata: &Path) -> Vec<PathBuf> {
