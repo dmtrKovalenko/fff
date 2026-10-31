@@ -90,11 +90,11 @@ fn each_layer_owns_the_files_added_after_it_was_created() {
     let mut picker = picker(base);
     add(&mut picker, base, "one.rs");
 
-    let second = picker.create_layer(Some("second"));
+    let second = picker.create_layer(Some("second")).expect("create layer");
     assert_eq!(second, SESSION_LAYER + 1);
     add(&mut picker, base, "two.rs");
 
-    let third = picker.create_layer(None);
+    let third = picker.create_layer(None).expect("create layer");
     add(&mut picker, base, "three.rs");
 
     let names = |id| -> Vec<String> {
@@ -126,9 +126,9 @@ fn search_resolves_paths_from_every_layer() {
 
     let mut picker = picker(base);
     add(&mut picker, base, "alpha_session.rs");
-    picker.create_layer(Some("second"));
+    picker.create_layer(Some("second")).expect("create layer");
     add(&mut picker, base, "alpha_second.rs");
-    picker.create_layer(Some("third"));
+    picker.create_layer(Some("third")).expect("create layer");
     add(&mut picker, base, "nested/alpha_third.rs");
 
     let found = search_paths(&picker, "alpha");
@@ -158,7 +158,7 @@ fn exceeding_the_layer_cap_compacts_without_losing_files() {
     for i in 0..total {
         add(&mut picker, base, &format!("dir{i}/alpha_{i}.rs"));
         if i + 1 < total {
-            picker.create_layer(None);
+            picker.create_layer(None).expect("create layer");
         }
     }
 
@@ -199,7 +199,7 @@ fn grep_reads_content_of_files_in_compacted_layers() {
     let mut picker = picker(base);
     for i in 0..MAX_OVERLAY_LAYERS + 2 {
         add(&mut picker, base, &format!("dir{i}/needle_{i}.rs"));
-        picker.create_layer(None);
+        picker.create_layer(None).expect("create layer");
     }
 
     let query = FFFQuery::parse("contents of", fff_search::AiGrepConfig);
@@ -225,7 +225,7 @@ fn directory_search_survives_compaction() {
     let mut picker = picker(base);
     for i in 0..MAX_OVERLAY_LAYERS + 2 {
         add(&mut picker, base, &format!("widget{i}/file.rs"));
-        picker.create_layer(None);
+        picker.create_layer(None).expect("create layer");
     }
 
     let parser = QueryParser::default();
@@ -259,7 +259,7 @@ fn detached_paths_are_checked_after_compaction() {
     let root = TempDir::new().unwrap();
     let mut picker = picker(root.path());
     for _ in 1..MAX_OVERLAY_LAYERS {
-        picker.create_layer(None);
+        picker.create_layer(None).expect("create layer");
     }
     let layer = picker.current_layer();
     add(&mut picker, root.path(), "virtual/escaped.rs");
@@ -268,7 +268,7 @@ fn detached_paths_are_checked_after_compaction() {
     assert_eq!(file.relative_path(&picker), "virtual/escaped.rs");
     assert_eq!(dir.relative_path(&picker), "virtual/");
 
-    picker.create_layer(None);
+    picker.create_layer(None).expect("create layer");
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.relative_path(&picker)))
             .is_err()

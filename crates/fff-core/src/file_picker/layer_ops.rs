@@ -554,11 +554,14 @@ impl FilePicker {
     /// overlays; past that the two newest are compacted into one, so
     /// [`SESSION_LAYER`](crate::SESSION_LAYER) — every file added since the
     /// picker started — always survives.
-    pub fn create_layer(&mut self, label: Option<&str>) -> LayerId {
+    ///
+    /// Returns [`Error::IndexBusy`] during a scan or post-scan indexing.
+    pub fn create_layer(&mut self, label: Option<&str>) -> Result<LayerId, Error> {
+        self.ensure_index_idle()?;
         let id = self.sync_data.create_layer(label);
         debug!(layer = id, ?label, "Opened new index layer");
 
-        id
+        Ok(id)
     }
 
     /// Layer new files are currently written into.
@@ -641,14 +644,7 @@ impl FilePicker {
         snapshot: LayerSnapshot,
         frecency: Option<&FrecencyTracker>,
     ) -> Result<(), Error> {
-        if self.is_scan_active()
-            || self
-                .signals
-                .post_scan_indexing_active
-                .load(Ordering::Acquire)
-        {
-            return Err(Error::IndexBusy);
-        }
+        self.ensure_index_idle()?;
 
         let started = std::time::Instant::now();
         let mut sync = FileSync::from_snapshot(
@@ -686,6 +682,16 @@ impl FilePicker {
     }
 
     fn reserve_index(&mut self, files: usize, dirs: usize) -> Result<(), Error> {
+        self.ensure_index_idle()?;
+        if self.sync_data.ensure_capacity(files, dirs) {
+            self.cache_budget.reset();
+        }
+
+        Ok(())
+    }
+
+    // Layer mutations are refused while a scan or post-scan indexing owns the tables.
+    fn ensure_index_idle(&self) -> Result<(), Error> {
         if self.is_scan_active()
             || self
                 .signals
@@ -693,10 +699,6 @@ impl FilePicker {
                 .load(Ordering::Acquire)
         {
             return Err(Error::IndexBusy);
-        }
-
-        if self.sync_data.ensure_capacity(files, dirs) {
-            self.cache_budget.reset();
         }
 
         Ok(())
@@ -729,9 +731,9 @@ mod tests {
         picker.collect_files().unwrap();
 
         // A root-level entry makes the layer's only dir foreign (it lives in the base arena).
-        let kept = picker.create_layer(Some("kept"));
+        let kept = picker.create_layer(Some("kept")).unwrap();
         picker.add_entries([IndexEntry::new("virtual.rs")]).unwrap();
-        picker.create_layer(None);
+        picker.create_layer(None).unwrap();
         let before = picker.sync_data.layer_arenas().get(kept).as_ptr();
 
         picker.collect_files().unwrap();
@@ -744,5 +746,29 @@ mod tests {
             .expect("explicit layer survives the rescan");
         assert_eq!(picker.sync_data.layer_arenas().get(kept).as_ptr(), before);
         assert_eq!(picker.files_in_layer(kept).len(), 1);
+    }
+
+    #[test]
+    fn creating_a_layer_is_refused_during_post_scan_indexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: tmp.path().to_string_lossy().into_owned(),
+            watch: false,
+            enable_home_dir_scanning: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        picker
+            .signals
+            .post_scan_indexing_active
+            .store(true, Ordering::Release);
+        assert!(matches!(picker.create_layer(None), Err(Error::IndexBusy)));
+        picker
+            .signals
+            .post_scan_indexing_active
+            .store(false, Ordering::Release);
+        assert_eq!(picker.create_layer(None).unwrap(), SESSION_LAYER + 1);
     }
 }

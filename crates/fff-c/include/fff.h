@@ -1421,6 +1421,7 @@ const char *fff_grep_result_get_regex_fallback_error(const struct FffGrepResult 
 
 /**
  * Seal the writable layer and return the new layer ID in `int_value`.
+ * Fails while a scan or post-scan indexing is running.
  * # Safety
  * Provide a live instance and a NULL or NUL-terminated UTF-8 label.
  */

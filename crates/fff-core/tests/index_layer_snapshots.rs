@@ -276,7 +276,7 @@ fn grammar_survives_snapshot_import_and_layer_compaction() {
     fs::write(root.path().join("base.ml"), "let base = 1").unwrap();
     let mut source = picker(root.path());
     let path = "lib/needle.ml";
-    source.create_layer(Some("grammar"));
+    source.create_layer(Some("grammar")).expect("create layer");
     source.add_entries([IndexEntry::new(path)]).unwrap();
     let mut bytes = Vec::new();
     source
@@ -290,14 +290,14 @@ fn grammar_survives_snapshot_import_and_layer_compaction() {
         .get_file_by_path(root.path().join("base.ml"))
         .unwrap();
     assert!(!base.is_overflow());
-    target.create_layer(None);
+    target.create_layer(None).expect("create layer");
     let id = target
         .import_layer(LayerSnapshot::from_bytes(&bytes).unwrap())
         .unwrap();
     assert_eq!(id, 3);
     for expected in [3, 2] {
         if expected == 2 {
-            target.create_layer(None);
+            target.create_layer(None).expect("create layer");
         }
         let file = target.get_file_by_path(root.path().join(path)).unwrap();
         assert_eq!(layer_paths(&target, expected), [path]);
@@ -314,7 +314,9 @@ fn overlay_round_trips_through_a_file() {
     fs::write(base.join("scanned.rs"), "scanned\n").expect("write");
 
     let mut picker = picker(base);
-    picker.create_layer(Some("persisted"));
+    picker
+        .create_layer(Some("persisted"))
+        .expect("create layer");
     let paths: Vec<String> = (0..500)
         .map(|i| format!("cache/{}/x{i}.js", i % 5))
         .collect();
@@ -462,7 +464,7 @@ fn explicit_layers_survive_a_rescan() {
     picker
         .add_entries([IndexEntry::new("session_only.rs")])
         .expect("add");
-    let kept = picker.create_layer(Some("kept"));
+    let kept = picker.create_layer(Some("kept")).expect("create layer");
     picker
         .add_entries([
             IndexEntry::new("virtual/kept.rs"),

@@ -8,6 +8,7 @@ use crate::ffi_types::FffResult;
 use crate::{cstr_to_str, instance_ref, optional_cstr};
 
 /// Seal the writable layer and return the new layer ID in `int_value`.
+/// Fails while a scan or post-scan indexing is running.
 /// # Safety
 /// Provide a live instance and a NULL or NUL-terminated UTF-8 label.
 #[unsafe(no_mangle)]
@@ -17,8 +18,9 @@ pub unsafe extern "C" fn fff_layer_create(
 ) -> *mut FffResult {
     let label = unsafe { optional_cstr(label) };
     unsafe {
-        with_picker_mut(fff_handle, |picker| {
-            FffResult::ok_int(picker.create_layer(label) as i64)
+        with_picker_mut(fff_handle, |picker| match picker.create_layer(label) {
+            Ok(id) => FffResult::ok_int(id as i64),
+            Err(e) => FffResult::err(&format!("Failed to create layer: {}", e)),
         })
     }
 }
