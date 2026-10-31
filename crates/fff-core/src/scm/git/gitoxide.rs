@@ -29,7 +29,7 @@ fn read(root: &Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::E
     let platform = repo
         .status(gitoxide::progress::Discard)?
         .index_worktree_submodules(None)
-        .index_worktree_options_mut(|opts| opts.thread_limit = Some(4))
+        .index_worktree_options_mut(|opts| opts.thread_limit = Some(status_threads()))
         .tree_index_track_renames(gitoxide::status::tree_index::TrackRenames::Disabled);
     let mut items = platform.into_iter(std::iter::empty())?;
     let mut cache = ScmStatusCache::default();
@@ -145,4 +145,11 @@ fn gitoxide_status(repo: &Repository, full: bool) -> crate::error::Result<ScmSta
         return Ok(cache);
     }
     super::backend::libgit2_status(repo, full)
+}
+
+// gix adds two producer threads on top of the worker limit
+fn status_threads() -> usize {
+    crate::parallelism::background_thread_count()
+        .saturating_sub(2)
+        .max(1)
 }

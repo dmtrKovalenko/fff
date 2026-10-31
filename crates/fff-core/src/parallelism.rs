@@ -2,15 +2,8 @@ use std::sync::LazyLock;
 
 /// Dedicated thread pool for background work (scan, warmup, bigram build).
 pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let total = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-
-    // Background work is mostly syscall-bound; halving parallelism leaves
-    // cores for search/UI at negligible throughput cost.
-    let bg_threads = (total / 2).max(2);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(bg_threads)
+        .num_threads(background_thread_count())
         .thread_name(|i| format!("fff-bg-{i}"))
         .start_handler(|_| {
             // Request user-initiated scheduling priority.
@@ -50,6 +43,15 @@ pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("failed to create search rayon pool")
 });
+
+/// Background work is mostly syscall-bound; halving parallelism leaves
+/// cores for search/UI at negligible throughput cost.
+pub fn background_thread_count() -> usize {
+    let total = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    (total / 2).max(2)
+}
 
 #[cfg(target_os = "macos")]
 fn non_efficiency_core_count() -> usize {
