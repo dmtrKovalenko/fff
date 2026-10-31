@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -70,9 +71,8 @@ impl FileSync {
         }
 
         let arenas = self.layer_arenas();
+        let (mut buf_a, mut buf_b) = ([0u8; PATH_BUF_SIZE], [0u8; PATH_BUF_SIZE]);
         self.files.range_mut(start..end).sort_unstable_by(|a, b| {
-            let mut buf_a = [0u8; PATH_BUF_SIZE];
-            let mut buf_b = [0u8; PATH_BUF_SIZE];
             let pa = a.path.read_to_buf(arenas.get(a.layer_id()), &mut buf_a);
             let pb = b.path.read_to_buf(arenas.get(b.layer_id()), &mut buf_b);
             dir_name_key(pa, a.path.filename_offset).cmp(&dir_name_key(pb, b.path.filename_offset))
@@ -438,13 +438,14 @@ impl FileSync {
             SnapshotLayout::Sorted => files.sort_by_key(|f| !is_indexable(f)),
             SnapshotLayout::Unsorted => BACKGROUND_THREAD_POOL.install(|| {
                 files.par_sort_unstable_by(|a, b| {
-                    let mut buf_a = [0u8; PATH_BUF_SIZE];
-                    let mut buf_b = [0u8; PATH_BUF_SIZE];
                     (!is_indexable(a)).cmp(&!is_indexable(b)).then_with(|| {
-                        let pa = a.path.read_to_buf(arena, &mut buf_a);
-                        let pb = b.path.read_to_buf(arena, &mut buf_b);
-                        dir_name_key(pa, a.path.filename_offset)
-                            .cmp(&dir_name_key(pb, b.path.filename_offset))
+                        COMPARE_BUFS.with_borrow_mut(|bufs| {
+                            let [buf_a, buf_b] = &mut **bufs;
+                            let pa = a.path.read_to_buf(arena, buf_a);
+                            let pb = b.path.read_to_buf(arena, buf_b);
+                            dir_name_key(pa, a.path.filename_offset)
+                                .cmp(&dir_name_key(pb, b.path.filename_offset))
+                        })
                     })
                 });
             }),
@@ -657,4 +658,11 @@ impl FilePicker {
 
         Ok(())
     }
+}
+
+thread_local! {
+    // Heap-backed scratch for parallel path comparisons: zeroing two 4 KiB
+    // stack buffers per compare dominated the sort.
+    static COMPARE_BUFS: RefCell<Box<[[u8; PATH_BUF_SIZE]; 2]>> =
+        RefCell::new(Box::new([[0; PATH_BUF_SIZE]; 2]));
 }
