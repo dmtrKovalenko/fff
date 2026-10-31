@@ -15,8 +15,6 @@ pub(super) enum Fallback {
     Methods,
     Assignment,
     CFunction,
-    Shell,
-    Haskell,
 }
 
 macro_rules! languages {
@@ -71,7 +69,9 @@ macro_rules! languages {
 
         $(super::rules::declaration!($language, $attributes, $fallback, [$($modifier),*], {$($($keyword)|+ => $rule),*});)+
 
-        const _: () = { $(assert!((Language::$language as u8) < 32);)+ };
+        const _: () = { $(assert!(
+            Language::$language as u8 <= u8::MAX >> crate::types::FileItemFlags::LANGUAGE_SHIFT
+        );)+ };
     };
 }
 
@@ -210,40 +210,12 @@ languages! {
         modifiers: [b"private", b"protected", b"public"],
         rules: { b"def" | b"class" | b"module" => Qualified }
     },
-    Elixir {
-        extensions: [b"ex", b"exs"],
-        attributes: None,
-        fallback: None,
-        modifiers: [],
-        rules: {
-            b"def" | b"defp" | b"defn" | b"defmacro" | b"defmacrop" | b"defguard" | b"defguardp"
-                | b"defdelegate" | b"defmodule" | b"defprotocol" => Qualified,
-            b"defimpl" | b"defstruct" | b"defexception" => Reject
-        }
-    },
     Zig {
         extensions: [b"zig"],
         attributes: None,
         fallback: None,
         modifiers: [b"pub", b"export", b"inline", b"noinline", b"threadlocal"],
         rules: { b"extern" => Abi, b"fn" => Function, b"const" | b"var" => Name }
-    },
-    Php {
-        extensions: [b"php"],
-        attributes: Hash,
-        fallback: None,
-        modifiers: [b"public", b"private", b"protected", b"static", b"abstract", b"final", b"readonly"],
-        rules: {
-            b"function" => Function, b"namespace" => Qualified,
-            b"class" | b"interface" | b"trait" | b"enum" => Name
-        }
-    },
-    Shell {
-        extensions: [b"sh", b"bash", b"zsh", b"fish", b"ksh", b"bashrc", b"zshrc"],
-        attributes: None,
-        fallback: Shell,
-        modifiers: [],
-        rules: { b"function" => Qualified }
     },
     Ml {
         extensions: [b"ml", b"mli", b"re", b"rei", b"res", b"resi", b"fs", b"fsi", b"fsx"],
@@ -255,16 +227,6 @@ languages! {
             b"type" => MlType
         }
     },
-    Haskell {
-        extensions: [b"hs"],
-        attributes: None,
-        fallback: Haskell,
-        modifiers: [],
-        rules: {
-            b"data" | b"newtype" | b"type" | b"class" => Name,
-            b"module" => Qualified, b"instance" => Reject
-        }
-    }
 }
 
 #[cfg(test)]

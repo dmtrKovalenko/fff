@@ -69,7 +69,7 @@ import type {
   WatchUnsubscribe,
 } from "./fff-api";
 
-import { err } from "./fff-api";
+import { checkLayerId, err } from "./fff-api";
 
 /**
  * FileFinder - Fast file finder with fuzzy search
@@ -732,7 +732,7 @@ export class FileFinder implements FileFinderApi {
 
   /**
    * Seal the writable index layer and open a new one. Returns its id.
-   * At most 4 overlays exist; past that the two newest are merged.
+   * At most three overlays exist. Opening a fourth merges the two newest first.
    */
   createLayer(label?: string): Result<number> {
     const guard = this.ensureAlive();
@@ -758,7 +758,9 @@ export class FileFinder implements FileFinderApi {
   layerFileCount(layer: number): Result<number> {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
-    return ffiLayerFileCount(guard.value, layer);
+    const id = checkLayerId(layer);
+    if (!id.ok) return id;
+    return ffiLayerFileCount(guard.value, id.value);
   }
 
   /**
@@ -775,7 +777,9 @@ export class FileFinder implements FileFinderApi {
   saveLayer(layer: number, filePath: string): Result<number> {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
-    return ffiLayerSave(guard.value, layer, filePath);
+    const id = checkLayerId(layer);
+    if (!id.ok) return id;
+    return ffiLayerSave(guard.value, id.value, filePath);
   }
 
   /** Load a layer file as a new sealed overlay. Returns its id. */

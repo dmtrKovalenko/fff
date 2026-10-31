@@ -49,17 +49,10 @@ mod tests {
             ("names.swift", "extension user_file {", false),
             ("names.rb", "def self.user_file?", true),
             ("names.rb", "def user_file.other", false),
-            ("names.ex", "defp user_file?(arg) do", true),
-            ("names.ex", "defimpl user_file, for: Other do", false),
             ("names.zig", "pub const user_file = struct {", true),
             ("names.zig", "fn other(value: user_file) void {", false),
-            ("names.php", "#[Attribute] class user_file {", true),
-            ("names.php", "class Other extends user_file {", false),
-            ("names.sh", "user_file() {", true),
-            ("names.sh", "echo user_file", false),
             ("names.ml", "type 'a user_file = 'a list", true),
             ("names.ml", "let other = user_file value", false),
-            ("names.hs", "user_file :: Int -> Int", true),
         ] {
             let start = line.find("user_file").unwrap() as u32;
             let ranges = [(start, start + 9)];

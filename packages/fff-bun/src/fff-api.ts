@@ -690,7 +690,7 @@ export interface FileFinderApi {
 
   /**
    * Seal the writable index layer and open a new one. Returns its id.
-   * At most 4 overlays exist; past that the two newest are merged.
+   * At most three overlays exist. Opening a fourth merges the two newest first.
    */
   createLayer(label?: string): Result<number>;
 
@@ -722,6 +722,14 @@ export interface FileFinderApi {
    * Wait with `waitForIndexReady` before changing layers or loading another base.
    */
   loadBase(filePath: string): Result<number>;
+}
+
+/** @internal The C API addresses layers with a u8. */
+export function checkLayerId(layer: number): Result<number> {
+  if (!Number.isInteger(layer) || layer < 0 || layer > 255) {
+    return err(`layer must be an integer in 0..255, got ${layer}`);
+  }
+  return ok(layer);
 }
 
 /** @internal Convert the public mode to the C integer argument. */

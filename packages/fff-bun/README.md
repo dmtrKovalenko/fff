@@ -165,7 +165,7 @@ Notes:
 ## Index layers
 
 The path index is a stack: layer 0 is the base scan, on top of it sit up to
-four append-only overlays. Layer 1 is opened automatically and collects
+three append-only overlays. Layer 1 is opened automatically and collects
 everything the watcher indexes during the session. Layers only hold paths;
 file contents are never layered.
 

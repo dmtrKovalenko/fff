@@ -858,16 +858,10 @@ impl FilePicker {
         self.sync_data.overflow_files()
     }
 
-    // Files appended to the writable top layer; imported layers grow the
-    // tables themselves and never count against the watcher cap.
-    pub(crate) fn open_layer_file_count(&self) -> usize {
-        let sync = &self.sync_data;
-        if !sync.layers.top_is_open() {
-            return 0;
-        }
-        sync.layers
-            .file_range(sync.layers.top_id(), sync.files.len())
-            .map_or(0, |(start, end)| end - start)
+    // Files the watcher appended since the last scan; imported entries grow
+    // the tables themselves and never count against the watcher cap.
+    pub(crate) fn watcher_additions(&self) -> usize {
+        self.sync_data.watcher_additions
     }
 
     /// Get the directory table (sorted by path).
@@ -1640,8 +1634,8 @@ impl FilePicker {
 
     // Explicit layers outlive a rescan; the base and session layer are rebuilt.
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        let mut old = std::mem::replace(&mut self.sync_data, sync);
-        self.sync_data.adopt_overlays(&mut old);
+        let old = std::mem::replace(&mut self.sync_data, sync);
+        self.sync_data.adopt_overlays(old);
         *self.fuzzy_cache.get_mut() = None;
         self.cache_budget.reset();
     }

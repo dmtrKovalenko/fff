@@ -73,6 +73,8 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     const baseFile = path.join(tmp, "base.fff");
     assert.ok(finder.saveLayer(2, layerFile).ok);
     assert.ok(finder.saveLayer(0, baseFile).ok);
+    assert.equal(finder.saveLayer(256, layerFile).ok, false);
+    assert.equal(finder.layerFileCount(-1).ok, false);
 
     const built = path.join(tmp, "built.fff");
     const entries = Array.from({ length: 500 }, (_, i) => `gen/${i % 7}/m${i}.ts`);

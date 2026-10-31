@@ -16,6 +16,7 @@ use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
 use crate::frecency::FrecencyTracker;
 use crate::git_status_worker::GitStatusWorker;
+use crate::index::snapshot::IndexEntry;
 use crate::rescan_stats::{RescanReason, RescanStats};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
@@ -355,6 +356,30 @@ fn batch_at_the_overflow_boundary_stays_incremental() {
 }
 
 #[test]
+fn imported_entries_do_not_count_toward_the_watcher_cap() {
+    let f = Fixture::new();
+    f.write("src/main.rs", "fn main() {}");
+    f.index();
+
+    let entries: Vec<String> = (0..MAX_OVERFLOW_FILES * 2)
+        .map(|i| format!("virtual/entry{i}.rs"))
+        .collect();
+    {
+        let mut guard = f.picker.write().unwrap();
+        let picker = guard.as_mut().unwrap();
+        picker
+            .add_entries(entries.iter().map(|path| IndexEntry::new(path)))
+            .expect("add entries");
+    }
+
+    f.write("src/created.rs", "");
+    let delta = f.feed([create(f.path("src/created.rs"))]);
+    f.assert_no_rescan(&delta, "a created file after a bulk import");
+    assert!(f.is_indexed("src/created.rs"));
+    assert!(f.is_indexed("virtual/entry0.rs"));
+}
+
+#[test]
 fn event_batch_at_four_times_index_capacity_stays_incremental() {
     let f = Fixture::new();
     f.write("src/main.rs", "fn main() {}");
@@ -637,6 +662,16 @@ fn ambiguous_batch_falls_back_to_remove_and_create() {
     let f = Fixture::new();
     f.write("src/a.rs", "same");
     f.write("src/b.rs", "same");
+    let mtime = std::fs::metadata(f.path("src/a.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(f.path("src/b.rs"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
     f.index();
     let events = f.subscribe("**");
 

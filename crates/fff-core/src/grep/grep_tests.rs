@@ -114,6 +114,15 @@ fn definition_only_keeps_unknown_language_files_out_of_fallbacks() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("docs.txt"), "Needle\n").unwrap();
     std::fs::write(dir.path().join("definition.rs"), "fn Needle() {}\n").unwrap();
+    let ordinary_files = [
+        ("ordinary.ex", "def Needle() do"),
+        ("ordinary.hs", "data Needle = Value"),
+        ("ordinary.php", "class Needle {}"),
+        ("ordinary.sh", "Needle() { :; }"),
+    ];
+    for (name, line) in ordinary_files {
+        std::fs::write(dir.path().join(name), line).unwrap();
+    }
     let mut picker = FilePicker::new(FilePickerOptions {
         base_path: dir.path().to_string_lossy().into_owned(),
         enable_content_indexing: false,
@@ -124,6 +133,36 @@ fn definition_only_keeps_unknown_language_files_out_of_fallbacks() {
     .unwrap();
     picker.collect_files().unwrap();
     let parser = fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig);
+    let matches = picker.fuzzy_search(
+        &fff_query_parser::QueryParser::default().parse("ordinary"),
+        None,
+        Default::default(),
+    );
+    let mut names: Vec<_> = matches
+        .items
+        .iter()
+        .map(|f| f.relative_path(&picker))
+        .collect();
+    names.sort();
+    assert_eq!(names, ordinary_files.map(|(name, _)| name));
+    let result = picker.grep(&parser.parse("Needle"), &GrepSearchOptions::default());
+    let mut names: Vec<_> = result
+        .files
+        .iter()
+        .map(|file| file.relative_path(&picker))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "definition.rs",
+            "docs.txt",
+            "ordinary.ex",
+            "ordinary.hs",
+            "ordinary.php",
+            "ordinary.sh"
+        ]
+    );
     for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
         let options = GrepSearchOptions {
             mode,

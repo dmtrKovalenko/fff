@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -9,14 +10,14 @@ use super::{FilePicker, FileSync, is_indexable};
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
-use crate::index::layers::{LayerId, LayerInfo, LayerStack};
+use crate::index::layers::{LayerId, LayerInfo, LayerStack, SESSION_LAYER};
 use crate::index::path_index::PathIndex;
 use crate::index::snapshot::{
-    IndexEntry, LayerSnapshot, SnapshotLayout, dir_name_key, filename_offset,
+    IndexEntry, LayerSnapshot, SnapshotLayout, dir_name_key, filename_offset, last_segment_offset,
     normalize_relative_path,
 };
 use crate::parallelism::BACKGROUND_THREAD_POOL;
-use crate::simd_path::ChunkedPathStoreBuilder;
+use crate::simd_path::{ChunkedPathStore, ChunkedPathStoreBuilder};
 use crate::stable_vec::StableVec;
 use crate::types::{ContentCacheBudget, DirItem, FileItem};
 
@@ -70,9 +71,8 @@ impl FileSync {
         }
 
         let arenas = self.layer_arenas();
+        let (mut buf_a, mut buf_b) = ([0u8; PATH_BUF_SIZE], [0u8; PATH_BUF_SIZE]);
         self.files.range_mut(start..end).sort_unstable_by(|a, b| {
-            let mut buf_a = [0u8; PATH_BUF_SIZE];
-            let mut buf_b = [0u8; PATH_BUF_SIZE];
             let pa = a.path.read_to_buf(arenas.get(a.layer_id()), &mut buf_a);
             let pb = b.path.read_to_buf(arenas.get(b.layer_id()), &mut buf_b);
             dir_name_key(pa, a.path.filename_offset).cmp(&dir_name_key(pb, b.path.filename_offset))
@@ -279,6 +279,12 @@ impl FileSync {
             return self.export_base();
         }
 
+        let export = self.export_layer_parts(layer)?;
+        let store = self.layers.store_snapshot(layer)?;
+        Some(export.into_snapshot(store, &self.dirs))
+    }
+
+    fn export_layer_parts(&self, layer: LayerId) -> Option<LayerExport> {
         let (start, end) = self.layers.file_range(layer, self.files.len())?;
         let (dir_start, dir_end) = self.layers.dir_range(layer, self.dirs.len())?;
         let arenas = self.layer_arenas();
@@ -325,44 +331,17 @@ impl FileSync {
         let foreign = order
             .iter()
             .any(|&i| self.dirs[local_dirs[i as usize].1 as usize].layer_id() != layer);
-        let store = self.layers.store_snapshot(layer)?;
-        let (store, dirs) = if foreign {
-            let owned = Arc::try_unwrap(store).unwrap_or_else(|arc| (*arc).clone());
-            let mut builder = ChunkedPathStoreBuilder::from_store(owned, 0);
-            let dirs = order
-                .iter()
-                .map(|&i| {
-                    let (path, _) = &local_dirs[i as usize];
-                    DirItem::new(
-                        builder.add_dir_immediate(path),
-                        crate::index::snapshot::last_segment_offset(path),
-                    )
-                })
-                .collect();
-            (Arc::new(builder.finish()), dirs)
-        } else {
-            let dirs = order
-                .iter()
-                .map(|&i| {
-                    let mut dir = self.dirs[local_dirs[i as usize].1 as usize].clone();
-                    dir.set_layer(0);
-                    dir.set_deleted(false);
-                    dir
-                })
-                .collect();
-            (store, dirs)
-        };
+        let dirs = order
+            .iter()
+            .map(|&i| std::mem::take(&mut local_dirs[i as usize]))
+            .collect();
 
-        Some(LayerSnapshot {
+        Some(LayerExport {
             label: self.layers.label(layer),
-            store,
             files,
             dirs,
-            layout: if self.layers.is_sorted(layer) {
-                SnapshotLayout::Sorted
-            } else {
-                SnapshotLayout::Unsorted
-            },
+            foreign,
+            sorted: self.layers.is_sorted(layer),
         })
     }
 
@@ -400,15 +379,19 @@ impl FileSync {
 
     // Moves every explicit overlay of `old` onto this sync. The session layer
     // is left behind: a rescan re-discovers its files.
-    pub(super) fn adopt_overlays(&mut self, old: &mut FileSync) {
+    pub(super) fn adopt_overlays(&mut self, old: FileSync) {
         let top = old.layers.top_id();
-        for id in (crate::index::layers::SESSION_LAYER + 1)..=top {
-            let Some(snapshot) = old.export_layer(id) else {
+        let exports: Vec<Option<LayerExport>> = (1..=top)
+            .map(|id| (id > SESSION_LAYER).then(|| old.export_layer_parts(id))?)
+            .collect();
+        // Consuming the stack leaves each arena uniquely owned, so a layer with
+        // foreign dirs reopens it in place instead of copying it.
+        let stores = old.layers.into_stores();
+        for (export, store) in exports.into_iter().zip(stores) {
+            let Some(export) = export.filter(|export| !export.is_empty()) else {
                 continue;
             };
-            if snapshot.files.is_empty() && snapshot.label.is_none() {
-                continue;
-            }
+            let snapshot = export.into_snapshot(store, &old.dirs);
             self.ensure_capacity(snapshot.files.len(), snapshot.dirs.len());
             let (layer, added) = self.append_snapshot(snapshot);
             debug!(layer, added, "Adopted index layer across rescan");
@@ -438,13 +421,14 @@ impl FileSync {
             SnapshotLayout::Sorted => files.sort_by_key(|f| !is_indexable(f)),
             SnapshotLayout::Unsorted => BACKGROUND_THREAD_POOL.install(|| {
                 files.par_sort_unstable_by(|a, b| {
-                    let mut buf_a = [0u8; PATH_BUF_SIZE];
-                    let mut buf_b = [0u8; PATH_BUF_SIZE];
                     (!is_indexable(a)).cmp(&!is_indexable(b)).then_with(|| {
-                        let pa = a.path.read_to_buf(arena, &mut buf_a);
-                        let pb = b.path.read_to_buf(arena, &mut buf_b);
-                        dir_name_key(pa, a.path.filename_offset)
-                            .cmp(&dir_name_key(pb, b.path.filename_offset))
+                        COMPARE_BUFS.with_borrow_mut(|bufs| {
+                            let [buf_a, buf_b] = &mut **bufs;
+                            let pa = a.path.read_to_buf(arena, buf_a);
+                            let pb = b.path.read_to_buf(arena, buf_b);
+                            dir_name_key(pa, a.path.filename_offset)
+                                .cmp(&dir_name_key(pb, b.path.filename_offset))
+                        })
                     })
                 });
             }),
@@ -502,6 +486,66 @@ impl FileSync {
     }
 }
 
+// An exported layer minus its arena, so the arena can be handed over once
+// the source stack has been consumed.
+struct LayerExport {
+    label: Option<Box<str>>,
+    files: Vec<FileItem>,
+    // `(path, global dir index)` sorted by path.
+    dirs: Vec<(String, u32)>,
+    foreign: bool,
+    sorted: bool,
+}
+
+impl LayerExport {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.label.is_none()
+    }
+
+    fn into_snapshot(
+        self,
+        store: Arc<ChunkedPathStore>,
+        dirs: &StableVec<DirItem>,
+    ) -> LayerSnapshot {
+        let (store, dirs) = if self.foreign {
+            let owned = Arc::try_unwrap(store).unwrap_or_else(|arc| (*arc).clone());
+            let mut builder = ChunkedPathStoreBuilder::from_store(owned, 0);
+            let dirs = self
+                .dirs
+                .iter()
+                .map(|(path, _)| {
+                    DirItem::new(builder.add_dir_immediate(path), last_segment_offset(path))
+                })
+                .collect();
+            (Arc::new(builder.finish()), dirs)
+        } else {
+            let dirs = self
+                .dirs
+                .iter()
+                .map(|&(_, global)| {
+                    let mut dir = dirs[global as usize].clone();
+                    dir.set_layer(0);
+                    dir.set_deleted(false);
+                    dir
+                })
+                .collect();
+            (store, dirs)
+        };
+
+        LayerSnapshot {
+            label: self.label,
+            store,
+            files: self.files,
+            dirs,
+            layout: if self.sorted {
+                SnapshotLayout::Sorted
+            } else {
+                SnapshotLayout::Unsorted
+            },
+        }
+    }
+}
+
 impl FilePicker {
     /// Seals the writable overlay and opens a new one, returning its id.
     ///
@@ -510,12 +554,15 @@ impl FilePicker {
     /// overlays; past that the two newest are compacted into one, so
     /// [`SESSION_LAYER`](crate::SESSION_LAYER) — every file added since the
     /// picker started — always survives.
-    pub fn create_layer(&mut self, label: Option<&str>) -> LayerId {
+    ///
+    /// Returns [`Error::IndexBusy`] during a scan or post-scan indexing.
+    pub fn create_layer(&mut self, label: Option<&str>) -> Result<LayerId, Error> {
+        self.ensure_index_idle()?;
         *self.fuzzy_cache.get_mut() = None;
         let id = self.sync_data.create_layer(label);
         debug!(layer = id, ?label, "Opened new index layer");
 
-        id
+        Ok(id)
     }
 
     /// Layer new files are currently written into.
@@ -600,14 +647,7 @@ impl FilePicker {
         snapshot: LayerSnapshot,
         frecency: Option<&FrecencyTracker>,
     ) -> Result<(), Error> {
-        if self.is_scan_active()
-            || self
-                .signals
-                .post_scan_indexing_active
-                .load(Ordering::Acquire)
-        {
-            return Err(Error::IndexBusy);
-        }
+        self.ensure_index_idle()?;
 
         let started = std::time::Instant::now();
         let mut sync = FileSync::from_snapshot(
@@ -645,6 +685,16 @@ impl FilePicker {
     }
 
     fn reserve_index(&mut self, files: usize, dirs: usize) -> Result<(), Error> {
+        self.ensure_index_idle()?;
+        if self.sync_data.ensure_capacity(files, dirs) {
+            self.cache_budget.reset();
+        }
+
+        Ok(())
+    }
+
+    // Layer mutations are refused while a scan or post-scan indexing owns the tables.
+    fn ensure_index_idle(&self) -> Result<(), Error> {
         if self.is_scan_active()
             || self
                 .signals
@@ -654,10 +704,74 @@ impl FilePicker {
             return Err(Error::IndexBusy);
         }
 
-        if self.sync_data.ensure_capacity(files, dirs) {
-            self.cache_budget.reset();
-        }
-
         Ok(())
+    }
+}
+
+thread_local! {
+    // Heap-backed scratch for parallel path comparisons: zeroing two 4 KiB
+    // stack buffers per compare dominated the sort.
+    static COMPARE_BUFS: RefCell<Box<[[u8; PATH_BUF_SIZE]; 2]>> =
+        RefCell::new(Box::new([[0; PATH_BUF_SIZE]; 2]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_picker::FilePickerOptions;
+
+    #[test]
+    fn adopting_a_layer_across_a_rescan_keeps_its_arena() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("scanned.rs"), "").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: tmp.path().to_string_lossy().into_owned(),
+            watch: false,
+            enable_home_dir_scanning: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        // A root-level entry makes the layer's only dir foreign (it lives in the base arena).
+        let kept = picker.create_layer(Some("kept")).unwrap();
+        picker.add_entries([IndexEntry::new("virtual.rs")]).unwrap();
+        picker.create_layer(None).unwrap();
+        let before = picker.sync_data.layer_arenas().get(kept).as_ptr();
+
+        picker.collect_files().unwrap();
+
+        let kept = picker
+            .layers()
+            .iter()
+            .find(|layer| layer.label.as_deref() == Some("kept"))
+            .map(|layer| layer.id)
+            .expect("explicit layer survives the rescan");
+        assert_eq!(picker.sync_data.layer_arenas().get(kept).as_ptr(), before);
+        assert_eq!(picker.files_in_layer(kept).len(), 1);
+    }
+
+    #[test]
+    fn creating_a_layer_is_refused_during_post_scan_indexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: tmp.path().to_string_lossy().into_owned(),
+            watch: false,
+            enable_home_dir_scanning: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        picker
+            .signals
+            .post_scan_indexing_active
+            .store(true, Ordering::Release);
+        assert!(matches!(picker.create_layer(None), Err(Error::IndexBusy)));
+        picker
+            .signals
+            .post_scan_indexing_active
+            .store(false, Ordering::Release);
+        assert_eq!(picker.create_layer(None).unwrap(), SESSION_LAYER + 1);
     }
 }
