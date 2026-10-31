@@ -552,7 +552,7 @@ Definition filtering occurs before page and per-file result limits. A timed-out 
 
 Definition classification accepts source lines up to 256 bytes, including indentation and excluding line endings. Longer lines stay ordinary matches and are excluded from `definition_only`. The limit uses the original source bytes, regardless of display truncation or whitespace trimming. For multiline regex matches, it applies to the first physical line.
 
-Supported language families are Rust, Python, Go, JavaScript/TypeScript, Lua, C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Elixir, Zig, PHP, shell, OCaml/ReScript/F#, and Haskell. The byte-keyword rules in [`definition/languages.rs`](crates/fff-core/src/definition/languages.rs) compile into per-language checkers. Each checker has fixed grammar constants and returns a boolean without a runtime rule dispatcher. Language detection checks at most the last eight filename bytes against a compile-time suffix table. Unknown extensions and extensionless filenames are not classified. `definition_only` excludes them before sorting, pagination, or content reads, and preserves explicit file constraints on empty results.
+Supported language families are Rust, Python, Go, JavaScript/TypeScript, Lua, C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Zig, and OCaml/Reason/ReScript/F#. The byte-keyword rules in [`definition/languages.rs`](crates/fff-core/src/definition/languages.rs) compile into per-language checkers. Each checker has fixed grammar constants and returns a boolean without a runtime rule dispatcher. Language detection checks at most the last eight filename bytes against a compile-time suffix table. Unknown extensions and extensionless filenames are not classified. `definition_only` excludes them before sorting, pagination, or content reads, and preserves explicit file constraints on empty results.
 
 Identifier scanning uses compile-time byte tables for short tokens, then checks 16 bytes at a time with NEON on little-endian ARM64 or SSE2 on x86-64. Other targets use the scalar table. Loads stay within the source slice, including the final partial block. The parser uses `memchr` for quotes and bracket groups and does not allocate.
 
@@ -703,6 +703,12 @@ const hits = finder.value.grep("GetOffTheRecordProfile", {
 
 // Run extremely fast glob matching which is significantly (10-100 times) faster than Bun's and Node implementation
 const rustFiles = finder.value.glob("**/*.rs", { pageSize: 100 });
+
+// Index layers: append paths the scanner can't see and persist any layer (0 = base scan) to a file
+finder.value.createLayer("generated");
+finder.value.addPaths(["build/out/a.js", "build/out/b.js"]);
+finder.value.saveLayer(0, "/tmp/base.fff");   // later: loadBase(...) skips the rescan
+finder.value.loadLayer("/tmp/prebuilt.fff");  // built with FileFinder.buildLayerFile(paths, out)
 
 finder.value.destroy();
 ```
@@ -879,6 +885,21 @@ fuzzy matching layered on top.
 ```c
 FffResult *res = fff_glob(handle, "**/*.rs", "", 0, 0, 100);
 // FffSearchResult in res->handle, free with fff_free_search_result.
+```
+
+### Index layers
+
+`fff_layer_create` / `fff_layer_add_paths` append paths the scanner can't see;
+`fff_layer_save` writes any layer (0 = base scan) to a file and
+`fff_layer_load` attaches it back as a sealed overlay; `fff_base_load` installs
+it as the base scan in the background (wait with `fff_wait_for_scan`).
+`fff_layer_build` packs a layer file without an instance. Pass NUL-terminated UTF-8 paths in one buffer, with optional parallel `sizes` / `modified` arrays (NULL to omit).
+
+```c
+const char paths[] = "build/out/a.js\0build/out/b.js";
+struct FffResult *added = fff_layer_add_paths(handle, paths, sizeof(paths), NULL, NULL, 2);
+if (!added->success) fprintf(stderr, "%s\n", added->error);
+fff_free_result(added);
 ```
 
 ### Notes

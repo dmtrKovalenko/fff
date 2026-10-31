@@ -142,6 +142,12 @@ mod match_offsets;
 
 pub mod constants;
 
+/// Layered index arenas: the immutable base scan plus stacked overlays.
+pub use index::layers::{
+    LayerArenas, LayerId, LayerInfo, MAX_INDEX_LAYERS, MAX_OVERLAY_LAYERS, SESSION_LAYER,
+};
+pub use index::snapshot::{IndexEntry, LayerBuilder, LayerSnapshot, SnapshotLayout};
+
 /// Watcher rescan request accounting.
 pub mod rescan_stats;
 pub use rescan_stats::{RESCAN_STATS_ENABLED, RescanReason, RescanStats};

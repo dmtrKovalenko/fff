@@ -6,7 +6,8 @@ use tracing::{error, info};
 
 use crate::FileSync;
 use crate::error::Error;
-use crate::file_picker::FFFMode;
+use crate::file_picker::{FFFMode, FilePicker};
+use crate::index::snapshot::LayerSnapshot;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::indexing_pool;
 use crate::shared::{SharedFilePicker, SharedFrecency};
@@ -27,6 +28,14 @@ pub(crate) struct ScanSignals {
     /// DO NOT set or clear this manually — it is managed exclusively by the
     /// PostScanSnapshot lifecycle.
     pub(crate) post_scan_indexing_active: Arc<AtomicBool>,
+}
+
+impl ScanSignals {
+    // A replacement picker can use the same root while the former picker is still alive.
+    fn owns(&self, picker: &FilePicker) -> bool {
+        Arc::ptr_eq(&self.scanning, &picker.signals.scanning)
+            && !self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 /// Which optional phases a scan should run.
@@ -59,23 +68,43 @@ pub(crate) struct ScanJob {
     /// walker. Shared `Arc` so the UI polls the same atomic.
     scanned_files_counter: Arc<AtomicUsize>,
     trace_span: tracing::Span,
+    // A saved base scan replaces the filesystem walk; every later phase
+    // (git, post-scan indexing, watcher) runs the same way.
+    source: Option<LayerSnapshot>,
 }
 
 impl ScanJob {
     pub fn new_rescan(
         shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
+        snapshot: Option<LayerSnapshot>,
     ) -> Result<Option<Self>, Error> {
-        let guard = shared_picker.read()?;
+        let guard = shared_picker.write()?;
         let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+        Ok(Self::reserve_rescan(
+            picker,
+            shared_picker,
+            shared_frecency,
+            snapshot,
+        ))
+    }
 
+    fn reserve_rescan(
+        picker: &FilePicker,
+        shared_picker: &SharedFilePicker,
+        shared_frecency: &SharedFrecency,
+        snapshot: Option<LayerSnapshot>,
+    ) -> Option<Self> {
         if picker.is_scan_active()
             || picker
                 .signals
                 .post_scan_indexing_active
                 .load(Ordering::Acquire)
         {
-            return Ok(None);
+            if snapshot.is_none() {
+                picker.signals.rescan_pending.store(true, Ordering::Release);
+            }
+            return None;
         }
 
         let mode = picker.mode();
@@ -95,9 +124,9 @@ impl ScanJob {
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
         };
 
-        drop(guard); // just a sanity check
+        signals.scanning.store(true, Ordering::Release);
 
-        Ok(Some(Self {
+        Some(Self {
             mode,
             signals,
             base_path,
@@ -106,7 +135,8 @@ impl ScanJob {
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
             trace_span,
-        }))
+            source: snapshot,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -129,6 +159,7 @@ impl ScanJob {
             scanned_files_counter,
             config,
             trace_span,
+            source: None,
         }
     }
 
@@ -141,7 +172,6 @@ impl ScanJob {
     /// the kernel drifts those workers onto E-cores. On chromium that turns a
     /// ~800 ms walk into ~3 s.
     pub fn spawn(self) {
-        self.signals.scanning.store(true, Ordering::Release);
         let span = self.trace_span.clone();
         indexing_pool(self.mode).spawn(move || {
             let _g = span.enter();
@@ -159,26 +189,42 @@ impl ScanJob {
             scanned_files_counter,
             config,
             trace_span: _,
+            source,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals);
+        let scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
 
-        // 1. Walk the file system and collect the list of files
+        // 1. Walk the file system (or unpack the saved base) into a file list
         let git = FileSync::discover_git(&base_path);
-        let sync = match FileSync::walk_filesystem(
-            &base_path,
-            git.clone(),
-            &scanned_files_counter,
-            &shared_frecency,
-            mode,
-            config.follow_symlinks,
-        ) {
-            Ok(sync) => sync,
-            Err(e) => {
-                error!(?e, "scan walk failed");
-                return;
+        let restored = source.is_some();
+        let mut sync = match source {
+            Some(snapshot) => {
+                let frecency = shared_frecency.read().ok();
+                let sync = FileSync::from_snapshot(
+                    snapshot,
+                    &base_path,
+                    git.clone(),
+                    frecency.as_deref().and_then(Option::as_ref),
+                    mode,
+                );
+                scanned_files_counter.store(sync.live_count, Ordering::Relaxed);
+                sync
             }
+            None => match FileSync::walk_filesystem(
+                &base_path,
+                git.clone(),
+                &scanned_files_counter,
+                &shared_frecency,
+                mode,
+                config.follow_symlinks,
+            ) {
+                Ok(sync) => sync,
+                Err(e) => {
+                    error!(?e, "scan walk failed");
+                    return;
+                }
+            },
         };
 
         // 2. Populate the file list
@@ -186,11 +232,14 @@ impl ScanJob {
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
-            if signals.cancelled.load(Ordering::Acquire) {
-                info!("scan cancelled between walk and commit, discarding");
+            if !signals.owns(picker) {
+                info!("picker replaced between walk and commit, discarding scan");
                 return;
             }
 
+            if restored {
+                sync.ignore_rules = picker.ignore_rules();
+            }
             let live_count = sync.live_count;
             picker.commit_new_sync(sync);
             git_status_worker = Arc::clone(&picker.git_status_worker);
@@ -216,18 +265,19 @@ impl ScanJob {
             shared_picker.read().ok().and_then(|guard| {
                 guard
                     .as_ref()
+                    .filter(|picker| signals.owns(picker))
                     .and_then(|picker| unsafe { picker.post_scan_snapshot() })
             })
         } else {
             None
         };
 
-        signals.scanning.store(false, Ordering::Relaxed); // file are searchable
+        drop(scanning);
 
         // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
         // all the already watched directories are not going to be resubscribed (this is internally deduped)
         if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
-            rescubscribe_watcher_post_scan(&shared_picker);
+            resubscribe_watcher_post_scan(&shared_picker, &signals);
         }
 
         // 3. Runs post scna in parallel with git status collection
@@ -260,7 +310,7 @@ impl ScanJob {
                     if let Ok(mut guard) = shared_picker.write()
                         && let Some(picker) = guard.as_mut()
                         && picker.base_path() == base_path
-                        && !signals.cancelled.load(Ordering::Acquire)
+                        && signals.owns(picker)
                     {
                         picker.background_watcher = Some(watcher);
                         signals.watcher_ready.store(true, Ordering::Release);
@@ -270,26 +320,16 @@ impl ScanJob {
             };
         }
 
-        // 6. Drain any rescan that arrived while we were busy.
-        // if user initiated a new rescan we had no way to cancel current post scan, so do it again
-        if !signals.cancelled.load(Ordering::Acquire)
-            && signals.rescan_pending.swap(false, Ordering::AcqRel)
-        {
-            match Self::new_rescan(&shared_picker, &shared_frecency) {
-                Ok(Some(follow_up)) => {
-                    info!("Rescheduling deferred rescan after current scan finished");
-                    follow_up.spawn();
-                }
-                Ok(None) => {
-                    // this should be practically impossible because we do not have any
-                    // queue, but if somehow a new rescan was triggered JUST IN THIS MOMENT
-                    // just ignore it because the ongoing one is fresh enough
-                    tracing::warn!("Post scan was re-triggered, ignoring");
-                }
-                Err(e) => {
-                    error!(?e, "Failed to reschedule deferred rescan");
-                }
+        // Drain and reserve under the same lock so pending work stays with its picker.
+        let follow_up = shared_picker.write().ok().and_then(|guard| {
+            let picker = guard.as_ref()?;
+            if !signals.owns(picker) || !signals.rescan_pending.swap(false, Ordering::AcqRel) {
+                return None;
             }
+            Self::reserve_rescan(picker, &shared_picker, &shared_frecency, None)
+        });
+        if let Some(job) = follow_up {
+            job.spawn();
         }
     }
 
@@ -330,7 +370,7 @@ impl ScanJob {
             // A root change may have replaced the picker while this index was building.
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
-                && !signals.cancelled.load(Ordering::Acquire)
+                && signals.owns(picker)
                 && picker.base_path() == unsafe_snapshot.base_path
             {
                 picker.set_bigram_index(index);
@@ -367,20 +407,18 @@ impl ScanJob {
 }
 
 // Ensures early returns clear the scanning signal.
-struct ScanningGuard<'a> {
-    signals: &'a ScanSignals,
-}
+pub(crate) struct ScanningGuard(Arc<AtomicBool>);
 
-impl<'a> ScanningGuard<'a> {
-    fn new(signals: &'a ScanSignals) -> Self {
-        signals.scanning.store(true, Ordering::Relaxed);
-        Self { signals }
+impl ScanningGuard {
+    pub(crate) fn new(signals: &ScanSignals) -> Self {
+        signals.scanning.store(true, Ordering::Release);
+        Self(Arc::clone(&signals.scanning))
     }
 }
 
-impl Drop for ScanningGuard<'_> {
+impl Drop for ScanningGuard {
     fn drop(&mut self) {
-        self.signals.scanning.store(false, Ordering::Relaxed);
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -388,11 +426,11 @@ impl Drop for ScanningGuard<'_> {
 /// this is fine because the watcher does deduplicate the entries and doesn't add a lot of
 /// garbage notify watchers / fs events streams
 #[tracing::instrument(skip_all)]
-fn rescubscribe_watcher_post_scan(shared_picker: &SharedFilePicker) {
+fn resubscribe_watcher_post_scan(shared_picker: &SharedFilePicker, signals: &ScanSignals) {
     let Ok(guard) = shared_picker.read() else {
         return;
     };
-    let Some(picker) = guard.as_ref() else {
+    let Some(picker) = guard.as_ref().filter(|picker| signals.owns(picker)) else {
         return;
     };
     let Some(watcher) = picker.background_watcher.as_ref() else {
@@ -424,13 +462,102 @@ mod tests {
     }
 
     #[test]
+    fn only_one_restore_can_reserve_the_picker_and_a_busy_rescan_is_queued() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = SharedFilePicker::default();
+        let picker = collected(root.path());
+        let snapshot = picker.export_layer(0).unwrap();
+        *shared.write().unwrap() = Some(picker);
+        let frecency = SharedFrecency::default();
+        let job = ScanJob::new_rescan(&shared, &frecency, Some(snapshot))
+            .unwrap()
+            .unwrap();
+
+        let snapshot = shared
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .export_layer(0)
+            .unwrap();
+        assert!(matches!(
+            shared.import_base(snapshot, &frecency),
+            Err(Error::IndexBusy)
+        ));
+        shared.trigger_full_rescan_async(&frecency).unwrap();
+        assert!(job.signals.rescan_pending.load(Ordering::Acquire));
+        job.run();
+        assert!(shared.wait_for_indexing_complete(std::time::Duration::from_secs(10)));
+    }
+
+    #[cfg(feature = "zlob")]
+    #[test]
+    fn restoring_a_base_preserves_the_target_ignore_rules() {
+        let root = tempfile::tempdir().unwrap();
+        git2::Repository::init(root.path()).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.path().join("keep.rs"), "").unwrap();
+        let picker = collected(root.path());
+        let snapshot = picker.export_layer(0).unwrap();
+        let shared = SharedFilePicker::default();
+        *shared.write().unwrap() = Some(picker);
+        let frecency = SharedFrecency::default();
+        ScanJob::new_rescan(&shared, &frecency, Some(snapshot))
+            .unwrap()
+            .unwrap()
+            .run();
+        let guard = shared.read().unwrap();
+        let rules = guard.as_ref().unwrap().ignore_rules().unwrap();
+        assert!(rules.is_ignored(std::path::Path::new("debug.log")));
+        assert!(!rules.is_ignored(std::path::Path::new("keep.rs")));
+    }
+
+    #[test]
+    fn progress_tracks_post_scan_work_without_a_bigram_index() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source"), "hello").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: root.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        // SAFETY: the picker owns its files for the lifetime of this snapshot.
+        let snapshot = unsafe { picker.post_scan_snapshot() }.unwrap();
+        assert!(!picker.get_scan_progress().is_warmup_complete);
+        drop(snapshot);
+        assert!(picker.get_scan_progress().is_warmup_complete);
+    }
+
+    #[test]
+    fn a_reserved_restore_cannot_replace_a_new_picker_at_the_same_root() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("old.txt");
+        std::fs::write(&path, "old").unwrap();
+        let picker = collected(root.path());
+        let snapshot = picker.export_layer(0).unwrap();
+        let shared = SharedFilePicker::default();
+        *shared.write().unwrap() = Some(picker);
+        let job = ScanJob::new_rescan(&shared, &SharedFrecency::default(), Some(snapshot))
+            .unwrap()
+            .unwrap();
+
+        std::fs::rename(path, root.path().join("new.txt")).unwrap();
+        let old = shared.write().unwrap().replace(collected(root.path()));
+        job.run();
+        drop(old);
+
+        let guard = shared.read().unwrap();
+        let base = guard.as_ref().unwrap().export_layer(0).unwrap();
+        assert_eq!(base.relative_paths().collect::<Vec<_>>(), ["new.txt"]);
+    }
+
+    #[test]
     fn replaced_picker_does_not_install_its_bigram_index_into_the_successor() {
         let old_root = tempfile::tempdir().unwrap();
-        // The stale index tracks the marker, but only for a file the new root does not have.
         std::fs::write(old_root.path().join("a.txt"), "unrelated words").unwrap();
         std::fs::write(old_root.path().join("b.txt"), "isolated_marker").unwrap();
-        let new_root = tempfile::tempdir().unwrap();
-        std::fs::write(new_root.path().join("new.txt"), "isolated_marker").unwrap();
 
         let shared = SharedFilePicker::default();
         let old = collected(old_root.path());
@@ -442,8 +569,11 @@ mod tests {
             .as_ref()
             .and_then(|picker| unsafe { picker.post_scan_snapshot() })
             .unwrap();
-        // The root changes while the old post-scan is still building its index.
-        let old = shared.write().unwrap().replace(collected(new_root.path()));
+        // Keep the old picker alive while replacing it at the same root.
+        std::fs::remove_file(old_root.path().join("a.txt")).unwrap();
+        std::fs::remove_file(old_root.path().join("b.txt")).unwrap();
+        std::fs::write(old_root.path().join("new.txt"), "isolated_marker").unwrap();
+        let old = shared.write().unwrap().replace(collected(old_root.path()));
         let config = ScanConfig {
             warmup: false,
             content_indexing: true,
@@ -460,6 +590,7 @@ mod tests {
 
         let guard = shared.read().unwrap();
         let picker = guard.as_ref().unwrap();
+        assert!(picker.bigram_index().is_none());
         let query = crate::grep::parse_grep_query("isolated_marker");
         let options = crate::grep::GrepSearchOptions {
             time_budget_ms: 0,

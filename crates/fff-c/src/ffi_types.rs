@@ -495,6 +495,7 @@ impl FffGrepResult {
 /// | `fff_health_check`         | `handle`      | `*mut c_char` (JSON string)   |
 /// | `fff_get_historical_query` | `handle`      | `*mut c_char` (string or null)|
 /// | `fff_wait_for_scan`        | `int_value`   | 1 = completed, 0 = timed out  |
+/// | `fff_wait_for_indexing_complete` | `int_value` | 1 = completed, 0 = timed out |
 /// | `fff_track_query`          | `int_value`   | 1 = success, 0 = failure      |
 /// | `fff_refresh_git_status`   | `int_value`   | number of files updated       |
 /// | `fff_scan_files`           | (none)        | success flag only             |

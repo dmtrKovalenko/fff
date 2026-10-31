@@ -1,5 +1,4 @@
 use crate::match_offsets::char_indices_to_byte_offsets;
-use crate::simd_path::ArenaPtr;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::lines::LineStep;
 use rayon::prelude::*;
@@ -12,7 +11,7 @@ use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fuzzy_grep_search<'a>(
     grep_text: &str,
-    files_to_search: &[&'a FileItem],
+    files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
     total_files: usize,
     filtered_file_count: usize,
@@ -20,8 +19,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     budget: &ContentCacheBudget,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     #[cfg(unix)]
     let base_dir = std::fs::File::open(base_path).ok();
@@ -136,7 +134,7 @@ pub(super) fn fuzzy_grep_search<'a>(
 
     while chunk_start < files_to_search.len() {
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
-        let chunk = &files_to_search[chunk_start..chunk_end];
+        let chunk = files_to_search.batch(chunk_start..chunk_end);
         let chunk_offset = chunk_start;
         chunk_start = chunk_end;
         chunk_size = (chunk_size * growth).min(max_chunk);
@@ -167,11 +165,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                         return None;
                     }
 
-                    let file_arena = if file.is_overflow() {
-                        overflow_arena
-                    } else {
-                        arena
-                    };
+                    let file_arena = arenas.get(file.layer_id());
 
                     let file_bytes = file.get_content_for_search(
                         buf,

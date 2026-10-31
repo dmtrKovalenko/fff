@@ -12,6 +12,7 @@ import { FFIType, JSCallback, type Pointer } from "bun:ffi";
 
 import {
   ensureLoaded,
+  ffiBaseLoad,
   ffiCreate,
   ffiDestroy,
   ffiGetBasePath,
@@ -20,6 +21,14 @@ import {
   ffiGlob,
   ffiHealthCheck,
   ffiIsScanning,
+  ffiLayerAddPaths,
+  ffiLayerBuild,
+  ffiLayerCreate,
+  ffiLayerCurrent,
+  ffiLayerFileCount,
+  ffiLayerList,
+  ffiLayerLoad,
+  ffiLayerSave,
   ffiLiveGrep,
   ffiMultiGrep,
   ffiRefreshGitStatus,
@@ -47,6 +56,8 @@ import type {
   GrepOptions,
   GrepResult,
   HealthCheck,
+  LayerEntry,
+  LayerInfo,
   MixedSearchResult,
   MultiGrepOptions,
   Result,
@@ -58,7 +69,7 @@ import type {
   WatchUnsubscribe,
 } from "./fff-api";
 
-import { err } from "./fff-api";
+import { checkLayerId, err } from "./fff-api";
 
 /**
  * FileFinder - Fast file finder with fuzzy search
@@ -717,6 +728,87 @@ export class FileFinder implements FileFinderApi {
    */
   healthCheck(testPath?: string): Result<HealthCheck> {
     return ffiHealthCheck(this.handle, testPath || "") as Result<HealthCheck>;
+  }
+
+  /**
+   * Seal the writable index layer and open a new one. Returns its id.
+   * At most three overlays exist. Opening a fourth merges the two newest first.
+   */
+  createLayer(label?: string): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    return ffiLayerCreate(guard.value, label);
+  }
+
+  /** Id of the layer new files are currently written into. */
+  currentLayer(): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    return ffiLayerCurrent(guard.value);
+  }
+
+  /** Every overlay layer, oldest first. The base scan (layer 0) is not listed. */
+  listLayers(): Result<LayerInfo[]> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    return ffiLayerList(guard.value);
+  }
+
+  /** Live file count of `layer` (0 = base scan). */
+  layerFileCount(layer: number): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    const id = checkLayerId(layer);
+    if (!id.ok) return id;
+    return ffiLayerFileCount(guard.value, id.value);
+  }
+
+  /**
+   * Append paths to the writable layer without touching the filesystem.
+   * Paths already indexed are skipped. Returns the number added.
+   */
+  addPaths(entries: Array<string | LayerEntry>): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    return ffiLayerAddPaths(guard.value, entries);
+  }
+
+  /** Write `layer` (0 = base scan) to a file. Returns bytes written. */
+  saveLayer(layer: number, filePath: string): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    const id = checkLayerId(layer);
+    if (!id.ok) return id;
+    return ffiLayerSave(guard.value, id.value, filePath);
+  }
+
+  /** Load a layer file as a new sealed overlay. Returns its id. */
+  loadLayer(filePath: string): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    return ffiLayerLoad(guard.value, filePath);
+  }
+
+  /**
+   * Load a layer file as the base scan, replacing the current one while
+   * keeping explicit overlays. Returns the file count.
+   */
+  loadBase(filePath: string): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    return ffiBaseLoad(guard.value, filePath);
+  }
+
+  /**
+   * Build a layer file from `entries` without an instance; load it later with
+   * `loadLayer`. Returns bytes written.
+   */
+  static buildLayerFile(
+    entries: Array<string | LayerEntry>,
+    outPath: string,
+    label?: string,
+  ): Result<number> {
+    return ffiLayerBuild(label, entries, outPath);
   }
 
   /**

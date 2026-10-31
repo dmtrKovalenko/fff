@@ -139,6 +139,43 @@ impl GitStatusCache {
         Ok(Self(entries))
     }
 
+    /// Keep clean entries out of libgit2's two diff lists on large, case-sensitive
+    /// working trees. Status flags for changes still come directly from libgit2.
+    pub(crate) fn read_full_status(repo: &Repository) -> Result<Self> {
+        let full = || Self::read_status(repo, &mut default_status_options());
+        let Some(root) = repo.workdir() else {
+            return full();
+        };
+        let Ok(index) = repo.index() else {
+            return full();
+        };
+        if !cfg!(target_os = "linux")
+            || index.len() < 16_384
+            || index.has_conflicts()
+            || repo.config()?.get_bool("core.ignorecase").unwrap_or(false)
+        {
+            return full();
+        }
+        Self::read_status_from_index(repo, &index, root)
+    }
+
+    fn read_status_from_index(repo: &Repository, index: &git2::Index, root: &Path) -> Result<Self> {
+        let mut cache = Self::read_status(repo, &mut initial_scan_status_options())?;
+        let additional = index.len().saturating_sub(cache.0.len());
+        cache.0.reserve(additional);
+        let root = crate::path_utils::normalize(root.to_owned());
+        for entry in index.iter() {
+            // A gitlink is a submodule. The full refresh excludes submodules.
+            if entry.mode != 0o160000
+                && let Ok(path) = std::str::from_utf8(&entry.path)
+            {
+                let path = crate::path_utils::normalize(root.join(path));
+                cache.0.entry(path).or_insert(Status::CURRENT);
+            }
+        }
+        Ok(cache)
+    }
+
     pub fn read_git_status(
         git_workdir: Option<&Path>,
         status_options: &mut StatusOptions,
@@ -278,6 +315,37 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn index_and_changed_entries_match_the_full_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        git(root, &["init"]);
+        git(root, &["config", "user.name", "FFF Test"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+        for path in ["clean", "modified", "deleted", "old", "staged"] {
+            fs::write(root.join(path), path).unwrap();
+        }
+        fs::write(root.join(".gitignore"), "ignored\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "seed", "--no-gpg-sign"]);
+        fs::write(root.join("modified"), "changed").unwrap();
+        fs::remove_file(root.join("deleted")).unwrap();
+        fs::write(root.join("untracked"), "new").unwrap();
+        fs::write(root.join("ignored"), "ignored").unwrap();
+        fs::write(root.join("staged"), "changed").unwrap();
+        git(root, &["add", "staged"]);
+        git(root, &["mv", "old", "renamed"]);
+        let repo = Repository::open(root).unwrap();
+        let expected = GitStatusCache::read_status(&repo, &mut default_status_options()).unwrap();
+        let actual = GitStatusCache::read_status_from_index(
+            &repo,
+            &repo.index().unwrap(),
+            repo.workdir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual.0, expected.0);
     }
 
     #[test]
