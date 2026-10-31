@@ -1284,6 +1284,7 @@ impl FuzzyMatchCache {
     }
 
     // A path matching `needle` within the same typo budget also matches any prefix of it.
+    // Holds only while frizbee accepts on its prefilter alone, never on a score threshold.
     fn covers(&self, needle: &str, max_typos: u16, files_len: usize, base_count: usize) -> bool {
         self.max_typos == max_typos
             && self.files_len == files_len
