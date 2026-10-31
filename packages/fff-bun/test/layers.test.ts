@@ -137,5 +137,8 @@ describe("FileFinder - index layers", () => {
     expect(finder.addPaths([{ path: "bad.ts", size: -1 }]).ok).toBe(false);
     expect(finder.loadLayer(path.join(tmp, "missing.fff")).ok).toBe(false);
     expect(finder.saveLayer(42, path.join(tmp, "nope.fff")).ok).toBe(false);
+    expect(finder.saveLayer(256, path.join(tmp, "nope.fff")).ok).toBe(false);
+    expect(finder.layerFileCount(-1).ok).toBe(false);
+    expect(finder.layerFileCount(1.5).ok).toBe(false);
   });
 });

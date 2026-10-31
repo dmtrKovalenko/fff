@@ -724,6 +724,14 @@ export interface FileFinderApi {
   loadBase(filePath: string): Result<number>;
 }
 
+/** @internal The C API addresses layers with a u8. */
+export function checkLayerId(layer: number): Result<number> {
+  if (!Number.isInteger(layer) || layer < 0 || layer > 255) {
+    return err(`layer must be an integer in 0..255, got ${layer}`);
+  }
+  return ok(layer);
+}
+
 /** @internal Convert the public mode to the C integer argument. */
 export function definitionModeToInt(
   mode: DefinitionMode | boolean | undefined,
