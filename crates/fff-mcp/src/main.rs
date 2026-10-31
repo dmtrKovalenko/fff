@@ -376,7 +376,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Discovery is optional and may precede the first tool request by any amount of time.
     // Start lifecycle monitoring before the SDK waits for that request.
     let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
-    match server.serve(HarnessTransport::new(stdio)).await {
+    let (first_message_tx, first_message_rx) = tokio::sync::oneshot::channel();
+    let served = tokio::select! {
+        served = server.serve(HarnessTransport::new(stdio, first_message_tx)) => served,
+        _ = eager_startup_guard(eager, first_message_rx) => {
+            return Err("No MCP request arrived within 60s; releasing the eager index".into());
+        }
+    };
+    match served {
         Ok(service) => {
             service.waiting().await?;
         }
@@ -391,6 +398,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// A lazy server holds no index, so only an eager one exits when the host never talks.
+async fn eager_startup_guard(eager: bool, first_message: tokio::sync::oneshot::Receiver<()>) {
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+    if eager
+        && tokio::time::timeout(STARTUP_TIMEOUT, first_message)
+            .await
+            .is_err()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 // Tracing appender is non blocking, to get full log give it some time before hard exit
