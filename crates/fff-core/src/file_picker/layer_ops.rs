@@ -558,6 +558,7 @@ impl FilePicker {
     /// Returns [`Error::IndexBusy`] during a scan or post-scan indexing.
     pub fn create_layer(&mut self, label: Option<&str>) -> Result<LayerId, Error> {
         self.ensure_index_idle()?;
+        *self.fuzzy_cache.get_mut() = None;
         let id = self.sync_data.create_layer(label);
         debug!(layer = id, ?label, "Opened new index layer");
 
@@ -614,6 +615,7 @@ impl FilePicker {
     ) -> Result<usize, Error> {
         let entries: Vec<IndexEntry<'a>> = entries.into_iter().collect();
         self.reserve_index(entries.len(), entries.len())?;
+        *self.fuzzy_cache.get_mut() = None;
         let added = self.sync_data.add_entries(&entries);
         debug!(
             added,
@@ -628,6 +630,7 @@ impl FilePicker {
     /// returns its id. Files already present in the index are skipped.
     pub fn import_layer(&mut self, snapshot: LayerSnapshot) -> Result<LayerId, Error> {
         self.reserve_index(snapshot.files.len(), snapshot.dirs.len())?;
+        *self.fuzzy_cache.get_mut() = None;
         let (layer, added) = self.sync_data.append_snapshot(snapshot);
         info!(layer, added, "Imported index layer");
 
