@@ -283,6 +283,19 @@ impl LayerStack {
         })
     }
 
+    // Consumes the stack, sealing the open top. Each arena comes out uniquely
+    // owned unless a snapshot clone of it is still alive.
+    pub fn into_stores(self) -> Vec<Arc<ChunkedPathStore>> {
+        self.layers
+            .into_iter()
+            .map(|layer| match layer.store {
+                LayerStore::Sealed(store) => store,
+                LayerStore::Open(Some(builder)) => Arc::new(builder.finish()),
+                LayerStore::Open(None) => Arc::new(ChunkedPathStore::empty()),
+            })
+            .collect()
+    }
+
     #[inline]
     pub fn is_full(&self) -> bool {
         self.layers.len() >= MAX_OVERLAY_LAYERS

@@ -1625,8 +1625,8 @@ impl FilePicker {
 
     // Explicit layers outlive a rescan; the base and session layer are rebuilt.
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        let mut old = std::mem::replace(&mut self.sync_data, sync);
-        self.sync_data.adopt_overlays(&mut old);
+        let old = std::mem::replace(&mut self.sync_data, sync);
+        self.sync_data.adopt_overlays(old);
         self.cache_budget.reset();
     }
 
