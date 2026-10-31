@@ -736,7 +736,8 @@ jobs:
         if: steps.version.outputs.is_release != 'true'
         run: |
           # Runs on main can finish out of order; only the current tip moves the tag.
-          if [ "$(git ls-remote origin refs/heads/main | cut -f1)" != "${{ github.sha }}" ]; then
+          main_ref=$(git ls-remote --exit-code origin refs/heads/main)
+          if [ "${main_ref%%[[:space:]]*}" != "${{ github.sha }}" ]; then
             echo "Not the tip of main, leaving the nightly tag alone"
             exit 0
           fi
