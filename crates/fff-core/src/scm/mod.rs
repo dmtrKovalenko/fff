@@ -1,7 +1,7 @@
 use crate::error::Result;
 pub mod git;
 use crate::shared::{SharedFrecency, WeakFilePicker};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, LazyLock, atomic::AtomicBool};
 use std::thread::JoinHandle;
 
 use crate::git_recency::GitRecencyConfig;
@@ -84,7 +84,9 @@ pub(crate) fn is_metadata_path(path: &Path, backend: Option<&dyn ScmBackend>) ->
 }
 
 pub(crate) fn configured_backend() -> &'static dyn ScmBackend {
-    select_backend(std::env::var("FFF_SCM_BACKEND").ok().as_deref())
+    static BACKEND: LazyLock<&'static dyn ScmBackend> =
+        LazyLock::new(|| select_backend(std::env::var("FFF_SCM_BACKEND").ok().as_deref()));
+    *BACKEND
 }
 
 pub(crate) fn select_backend(name: Option<&str>) -> &'static dyn ScmBackend {
