@@ -1,4 +1,5 @@
 local M = {}
+local declares_exact_name
 
 M.state = { initialized = false }
 
@@ -721,6 +722,7 @@ function M.go_to_definition(opts)
       and #(result.items[1].match_ranges or {}) == 1
       and result.next_file_offset == 0
       and (not root or vim.uv.fs_realpath(result.base_path) == root)
+      and declares_exact_name(result.items[1], opts.query)
     then
       local item = result.items[1]
       local path = vim.fs.joinpath(result.base_path, item.relative_path)
@@ -740,6 +742,19 @@ function M.go_to_definition(opts)
     grep = opts.grep,
   })
   return false
+end
+
+local function is_identifier_byte(byte) return byte ~= nil and (byte >= 128 or string.char(byte):match('[%w_]') ~= nil) end
+
+-- The matcher is a substring search, so `len` also finds `fn length()`.
+-- A direct jump requires the declared identifier to equal the query.
+function declares_exact_name(item, query)
+  local line, range = item.line_content, item.match_ranges[1]
+  if type(line) ~= 'string' or type(range) ~= 'table' then return false end
+  local start, stop = range[1], range[2]
+  if type(start) ~= 'number' or type(stop) ~= 'number' then return false end
+  if line:sub(start + 1, stop) ~= query then return false end
+  return not is_identifier_byte(line:byte(start)) and not is_identifier_byte(line:byte(stop + 1))
 end
 
 return M

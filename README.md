@@ -305,9 +305,9 @@ require('fff').content_search(query, opts)         -- programmatic grep
 
 #### `go_to_definition(opts)`
 
-Searches saved files in the active FFF index for declarations that match the word under the cursor. Pass `cwd` to search another directory. If the search completes with exactly one match, it jumps there. Otherwise, it opens the definition-only picker with the query filled in. An incomplete index or search opens the picker too.
+Searches saved files in the active FFF index for declarations that match the word under the cursor. Pass `cwd` to search another directory. If the search completes with exactly one match that declares the query as a whole name, it jumps there. Otherwise, it opens the definition-only picker with the query filled in. An incomplete index or search opens the picker too.
 
-Uses FFF's declaration matcher without an LSP server. Matches can include part of a name, so `user_file` can find `fn test_user_file`. Returns `true` for a direct jump and `false` otherwise.
+Uses FFF's declaration matcher without an LSP server. Picker matches can include part of a name, so `user_file` can find `fn test_user_file`; a direct jump never targets a longer name such as `fn length()` for `len`. Returns `true` for a direct jump and `false` otherwise.
 
 ```lua
 vim.keymap.set('n', '<D-g>', function() require('fff').go_to_definition() end, { desc = 'FFF go to definition' })
