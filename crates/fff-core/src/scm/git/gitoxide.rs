@@ -34,32 +34,42 @@ fn read(root: &Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::E
     for item in items.by_ref() {
         let item = item?;
         let status = match &item {
-            Item::TreeIndex(Change::Addition { entry_mode, .. }) if *entry_mode != Mode::COMMIT => {
-                Status::INDEX_NEW
-            }
-            Item::TreeIndex(Change::Deletion { entry_mode, .. }) if *entry_mode != Mode::COMMIT => {
-                Status::INDEX_DELETED
-            }
+            // libgit2 runs with `exclude_submodules`, so gitlinks are skipped
+            Item::TreeIndex(change) if change.entry_mode() == Mode::COMMIT => match change {
+                Change::Modification {
+                    previous_entry_mode,
+                    ..
+                } if *previous_entry_mode != Mode::COMMIT => Status::INDEX_TYPECHANGE,
+                _ => continue,
+            },
+            Item::TreeIndex(Change::Addition { .. }) => Status::INDEX_NEW,
+            Item::TreeIndex(Change::Deletion { .. }) => Status::INDEX_DELETED,
             Item::TreeIndex(Change::Modification {
                 entry_mode,
                 previous_entry_mode,
                 ..
-            }) if *entry_mode != Mode::COMMIT && *previous_entry_mode != Mode::COMMIT => {
+            }) => {
                 if entry_mode.bits() >> 12 != previous_entry_mode.bits() >> 12 {
                     Status::INDEX_TYPECHANGE
                 } else {
                     Status::INDEX_MODIFIED
                 }
             }
+            Item::TreeIndex(Change::Rewrite { .. }) => {
+                return Err("use libgit2 for rewrites".into());
+            }
             Item::IndexWorktree(change) => match change.summary() {
                 Some(Summary::Added) => Status::WT_NEW,
                 Some(Summary::Modified) => Status::WT_MODIFIED,
                 Some(Summary::Removed) => Status::WT_DELETED,
                 Some(Summary::TypeChange) => Status::WT_TYPECHANGE,
+                Some(Summary::Conflict) => Status::CONFLICTED,
+                Some(Summary::IntentToAdd) => Status::INDEX_NEW | Status::WT_MODIFIED,
+                Some(Summary::Renamed | Summary::Copied) => {
+                    return Err("use libgit2 for worktree rewrites".into());
+                }
                 None => continue,
-                _ => return Err("use libgit2 for uncommon worktree status".into()),
             },
-            _ => return Err("use libgit2 for gitlinks or rewrites".into()),
         };
         if let Ok(path) = std::str::from_utf8(item.location()) {
             let path = crate::path_utils::normalize(root.join(path));

@@ -220,7 +220,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        assert!(git_status(dir, args), "git {args:?} failed");
+    }
+
+    fn git_status(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -228,23 +232,43 @@ mod tests {
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
             .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?} failed");
+            .unwrap()
+            .status
+            .success()
     }
 
     #[test]
     fn index_and_changed_entries_match_the_full_refresh() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        git(root, &["init"]);
+        git(root, &["init", "-b", "main"]);
         git(root, &["config", "user.name", "FFF Test"]);
         git(root, &["config", "user.email", "test@example.invalid"]);
-        for path in ["clean", "modified", "deleted", "old", "staged"] {
+        for path in [
+            "clean",
+            "modified",
+            "deleted",
+            "old",
+            "staged",
+            "conflicted",
+        ] {
             fs::write(root.join(path), path).unwrap();
         }
         fs::write(root.join(".gitignore"), "ignored\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-m", "seed", "--no-gpg-sign"]);
+        git(root, &["checkout", "-b", "theirs"]);
+        fs::write(root.join("conflicted"), "theirs").unwrap();
+        git(root, &["commit", "-am", "theirs", "--no-gpg-sign"]);
+        git(root, &["checkout", "main"]);
+        fs::write(root.join("conflicted"), "ours").unwrap();
+        git(root, &["commit", "-am", "ours", "--no-gpg-sign"]);
+        assert!(
+            !git_status(root, &["merge", "theirs"]),
+            "merge must conflict"
+        );
+        fs::write(root.join("intent"), "intent").unwrap();
+        git(root, &["add", "-N", "intent"]);
         fs::write(root.join("modified"), "changed").unwrap();
         fs::remove_file(root.join("deleted")).unwrap();
         fs::write(root.join("untracked"), "new").unwrap();
@@ -265,6 +289,9 @@ mod tests {
                 initial_scan_status_options()
             };
             let expected = ScmStatusCache::read_status(&repo, &mut opts).unwrap();
+            let statuses: Vec<_> = expected.0.values().copied().collect();
+            assert!(statuses.contains(&Status::CONFLICTED));
+            assert!(statuses.contains(&(Status::INDEX_NEW | Status::WT_MODIFIED)));
             let actual = gitoxide::scan(&repo, full).expect("fixture must use gitoxide");
             for name in ["libgit2", "gitoxide"] {
                 let workspace = crate::scm::select_backend(Some(name))
