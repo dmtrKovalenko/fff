@@ -409,20 +409,26 @@ impl ChunkedPathStoreBuilder {
         ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
     }
 
-    pub fn add_file_with_parent(
+    // `parent` must be a byte prefix of `relative_path` already stored in this builder.
+    pub(crate) fn add_file_with_parent(
         &mut self,
-        rel_path: &str,
+        relative_path: &str,
         parent: &ChunkedString,
     ) -> ChunkedString {
         let index_offset = self.indices.len() as u32;
         let parent_chunks = usize::from(parent.byte_len) / SIMD_CHUNK_BYTES;
         let parent_start = parent.index_offset as usize;
+        debug_assert!(usize::from(parent.byte_len) <= relative_path.len());
+        debug_assert!(parent.equals(
+            self.as_arena_ptr(),
+            &relative_path[..usize::from(parent.byte_len)]
+        ));
         // Only complete parent chunks match; the boundary chunk also contains filename bytes.
         self.indices
             .extend_from_within(parent_start..parent_start + parent_chunks);
-        self.add_chunks(&rel_path.as_bytes()[parent_chunks * SIMD_CHUNK_BYTES..]);
+        self.add_chunks(&relative_path.as_bytes()[parent_chunks * SIMD_CHUNK_BYTES..]);
 
-        ChunkedString::new(index_offset, rel_path.len() as u16, parent.byte_len)
+        ChunkedString::new(index_offset, relative_path.len() as u16, parent.byte_len)
     }
 
     fn add_chunks(&mut self, path_bytes: &[u8]) {

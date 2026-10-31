@@ -1487,19 +1487,15 @@ mod tests {
                 let (all_items, all_scores, all_total) =
                     fuzzy_match_and_score_files(&files, &context, files.len() / 3, arena, arena);
                 assert_eq!(all_total, parallel_total);
-                let cases: &[(usize, usize, usize)] = if current_file.is_some() {
-                    &[(49, 50, 1), (49, 50, 4)]
-                } else {
-                    &[
-                        (0, 1, 1),
-                        (0, 1, 4),
-                        (49, 50, 1),
-                        (49, 50, 4),
-                        (0, usize::MAX, 4),
-                        (usize::MAX, 50, 4),
-                    ]
-                };
-                for &(offset, limit, max_threads) in cases {
+                let cases = [
+                    (0, 1, 1),
+                    (0, 1, 4),
+                    (49, 50, 1),
+                    (49, 50, 4),
+                    (0, usize::MAX, 4),
+                    (usize::MAX, 50, 4),
+                ];
+                for (offset, limit, max_threads) in cases {
                     context.pagination = PaginationArgs { offset, limit };
                     context.max_threads = max_threads;
                     let expected_items: Vec<_> =
