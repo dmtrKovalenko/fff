@@ -66,6 +66,12 @@ jobs:
         # fff-python requires full python o3 machinery which is very slow
         run: cargo test --no-default-features --features zlob --workspace --exclude fff-nvim --exclude fff-python
 
+      - name: Test gitoxide backend
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo test -p fff-search --no-default-features --features zlob,gitoxide --lib -- scm::
+
   stress-test:
     name: Fuzz Tests
     runs-on: ${{ matrix.os }}
