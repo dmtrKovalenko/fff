@@ -21,6 +21,7 @@ describe('go_to_definition', function()
       'fn RepeatedTargetExtra() {}',
       'fn test_partial_name() {}',
       'fn TwinOne() {} fn TwinTwo() {}',
+      'fn length() {}',
     }, root .. '/definitions.rs')
     vim.fn.writefile({ 'UniqueTarget();', 'RepeatedTarget();', 'NoDefinition();' }, root .. '/usage.rs')
     vim.cmd('noautocmd cd ' .. vim.fn.fnameescape(root))
@@ -125,9 +126,23 @@ describe('go_to_definition', function()
     assert.are.same({ 'definition_only' }, fallback.grep.modes)
   end)
 
-  it('allows a query to match part of the declared name', function()
-    assert.is_true(fff.go_to_definition({ query = 'partial_name' }))
-    assert.are.same({ 6, 8 }, vim.api.nvim_win_get_cursor(0))
+  it('opens the picker when the only match is part of a longer declared name', function()
+    assert.is_false(fff.go_to_definition({ query = 'len' }))
+    assert.are.equal('len', fallback.query)
+    assert.are.same({ 'definition_only' }, fallback.grep.modes)
+    assert.are.equal('usage.rs', vim.fn.expand('%:t'))
+  end)
+
+  it('opens the picker when the query is a suffix of the declared name', function()
+    assert.is_false(fff.go_to_definition({ query = 'partial_name' }))
+    assert.are.equal('partial_name', fallback.query)
+    assert.are.equal('usage.rs', vim.fn.expand('%:t'))
+  end)
+
+  it('jumps when the single match is the whole declared name', function()
+    assert.is_true(fff.go_to_definition({ query = 'length' }))
+    assert.is_nil(fallback)
+    assert.are.same({ 8, 3 }, vim.api.nvim_win_get_cursor(0))
   end)
 
   it('does not treat one result on an incomplete page as unique', function()
