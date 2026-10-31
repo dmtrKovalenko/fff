@@ -1598,6 +1598,90 @@ mod tests {
     }
 
     #[test]
+    fn frecency_fast_path_matches_full_sort() {
+        let paths: Vec<_> = (0..140_000)
+            .map(|index| format!("src/group_{}/file_{index}.rs", index / 100))
+            .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = FileItem::new_raw(
+                    path.rfind('/').unwrap() as u16 + 1,
+                    0,
+                    index as u64,
+                    Some(git2::Status::WT_MODIFIED),
+                    false,
+                );
+                file.access_frecency_score = (index % 97) as i16;
+                file.modification_frecency_score = (index % 29) as i16;
+                file.git_recency_score = (index % 13) as i16;
+                // The tail leaves chunks with fewer live files than any tested page.
+                file.set_deleted(index % 11 == 0 || (index >= 138_000 && index % 50 != 0));
+                file
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        let base_count = files.len() / 2;
+        let pages = [
+            (0, 1),
+            (30, 50),
+            (78, 50),
+            (127, 1),
+            (1, 128),
+            (100, 29),
+            (0, 129),
+        ];
+        for current_file in [None, Some(paths[3].as_str())] {
+            for (offset, limit) in pages {
+                for max_threads in [1, 4] {
+                    let context = ScoringContext {
+                        query: &query,
+                        max_threads,
+                        max_typos: 0,
+                        project_path: None,
+                        current_file,
+                        last_same_query_match: None,
+                        combo_boost_score_multiplier: 0,
+                        min_combo_count: 0,
+                        pagination: PaginationArgs { offset, limit },
+                    };
+                    let mut full = Vec::new();
+                    for slice in [&files[base_count..], &files[..base_count]] {
+                        full.extend(frecency_scores(&FileItems::All(slice), &context, arena));
+                    }
+                    let (expected_items, expected_scores, expected_total) =
+                        sort_and_paginate(full, &context, |score| score.total);
+                    let (items, scores, total) =
+                        rank_by_frecency(&files, &context, base_count, arena, arena);
+                    let case = format!("{current_file:?}, {offset}+{limit}, threads={max_threads}");
+                    assert_eq!(total, expected_total, "{case}");
+                    assert_eq!(items.len(), expected_items.len(), "{case}");
+                    assert!(
+                        items
+                            .iter()
+                            .zip(&expected_items)
+                            .all(|(a, b)| std::ptr::eq(*a, *b)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        format!("{scores:?}"),
+                        format!("{expected_scores:?}"),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pagination_matches_full_ranking() {
         let files: Vec<_> = (0..257)
             .map(|i| FileItem::new_raw(0, 0, i as u64, None, false))
