@@ -16,7 +16,7 @@ const PROGRESS_STEP: usize = 13;
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
-    is_git_repo: bool,
+    backend: Option<&dyn crate::scm::ScmBackend>,
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
@@ -24,7 +24,7 @@ pub(crate) fn walk_collect_files(
     // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
     // ~/.cache, ~/.config, etc.); optionally follow symlinks.
     let mut flags = WalkFlags::GITIGNORE;
-    if !is_git_repo {
+    if backend.is_none() {
         flags |= WalkFlags::SKIP_HIDDEN;
     }
     if follow_symlinks {
@@ -39,7 +39,7 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
+    if backend.is_none()
         && !IGNORED_DIRS.is_empty()
         && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
     {
@@ -53,7 +53,19 @@ pub(crate) fn walk_collect_files(
     // dir, so this keeps one mutex acquisition per entry.
     let collected = Mutex::new((Vec::new(), Vec::new()));
 
+    // zlob already excludes .git during traversal.
+    let extra_metadata = backend
+        .map(|backend| backend.metadata_dir_name())
+        .filter(|name| *name != ".git");
     let outcome = match builder.run(|entry| {
+        if extra_metadata.is_some_and(|name| {
+            entry
+                .path()
+                .components()
+                .any(|component| component.as_os_str() == name)
+        }) {
+            return WalkState::Continue;
+        }
         // Followed links keep the Symlink kind and lstat metadata, so stat
         // the target to index the ones resolving to files (#912).
         let target = if entry.is_file() {
