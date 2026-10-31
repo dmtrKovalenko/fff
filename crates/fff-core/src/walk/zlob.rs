@@ -5,6 +5,7 @@ use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
 use crate::walk::{WalkIgnoreRules, WalkOutput};
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,7 +79,14 @@ pub(crate) fn walk_collect_files(
             if entry.is_dir() {
                 let relative_path = entry.relative_path_lossy();
                 if !relative_path.is_empty() {
-                    let mut relative_path = relative_path.into_owned();
+                    let mut relative_path = match relative_path {
+                        Cow::Borrowed(path) => {
+                            let mut relative_path = String::with_capacity(path.len() + 1);
+                            relative_path.push_str(path);
+                            relative_path
+                        }
+                        Cow::Owned(path) => path,
+                    };
                     relative_path.push('/');
                     collected.lock().dirs.push(relative_path);
                 }

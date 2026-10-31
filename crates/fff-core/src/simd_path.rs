@@ -404,7 +404,34 @@ impl ChunkedPathStoreBuilder {
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
         let index_offset = self.indices.len() as u32;
+        self.add_chunks(path_bytes);
 
+        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
+    }
+
+    // `parent` must be a byte prefix of `relative_path` already stored in this builder.
+    pub(crate) fn add_file_with_parent(
+        &mut self,
+        relative_path: &str,
+        parent: &ChunkedString,
+    ) -> ChunkedString {
+        let index_offset = self.indices.len() as u32;
+        let parent_chunks = usize::from(parent.byte_len) / SIMD_CHUNK_BYTES;
+        let parent_start = parent.index_offset as usize;
+        debug_assert!(usize::from(parent.byte_len) <= relative_path.len());
+        debug_assert!(parent.equals(
+            self.as_arena_ptr(),
+            &relative_path[..usize::from(parent.byte_len)]
+        ));
+        // Only complete parent chunks match; the boundary chunk also contains filename bytes.
+        self.indices
+            .extend_from_within(parent_start..parent_start + parent_chunks);
+        self.add_chunks(&relative_path.as_bytes()[parent_chunks * SIMD_CHUNK_BYTES..]);
+
+        ChunkedString::new(index_offset, relative_path.len() as u16, parent.byte_len)
+    }
+
+    fn add_chunks(&mut self, path_bytes: &[u8]) {
         for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
             chunk_bytes[..chunk.len()].copy_from_slice(chunk);
@@ -421,8 +448,6 @@ impl ChunkedPathStoreBuilder {
 
             self.indices.push(arena_idx);
         }
-
-        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
     }
 }
 
@@ -498,6 +523,57 @@ mod tests {
             file.set_path(strings[i].clone());
         }
         (store, strings, files)
+    }
+
+    #[test]
+    fn file_paths_reuse_complete_parent_chunks() {
+        let mut expected = ChunkedPathStoreBuilder::new(0);
+        let mut actual = ChunkedPathStoreBuilder::new(0);
+        let mut paths = Vec::new();
+        for length in 0..=64 {
+            for suffix in ["", "é/", "日本語/🦀/"] {
+                let parent = if length == 0 {
+                    suffix.to_string()
+                } else {
+                    format!("{}/{suffix}", "d".repeat(length))
+                };
+                expected.add_dir_immediate(&parent);
+                let directory = actual.add_dir_immediate(&parent);
+                for filename in ["file.rs", "filename_beyond_one_chunk.txt", "é🦀.rs"] {
+                    let path = format!("{parent}{filename}");
+                    let expected_string = expected.add_file_immediate(&path, parent.len() as u16);
+                    let actual_string = actual.add_file_with_parent(&path, &directory);
+                    assert_eq!(
+                        (
+                            actual_string.index_offset,
+                            actual_string.byte_len,
+                            actual_string.filename_offset,
+                        ),
+                        (
+                            expected_string.index_offset,
+                            expected_string.byte_len,
+                            expected_string.filename_offset,
+                        ),
+                    );
+                    paths.push((path, actual_string));
+                }
+            }
+        }
+        let expected = expected.finish();
+        let actual = actual.finish();
+        assert_eq!(actual.indices, expected.indices);
+        assert_eq!(
+            actual.arena.iter().map(|chunk| chunk.0).collect::<Vec<_>>(),
+            expected
+                .arena
+                .iter()
+                .map(|chunk| chunk.0)
+                .collect::<Vec<_>>(),
+        );
+        let mut buffer = [0; PATH_BUF_SIZE];
+        for (path, string) in paths {
+            assert_eq!(string.read_to_buf(actual.as_arena_ptr(), &mut buffer), path);
+        }
     }
 
     #[test]
