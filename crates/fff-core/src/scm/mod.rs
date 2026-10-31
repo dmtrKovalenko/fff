@@ -95,7 +95,7 @@ pub(crate) fn select_backend(name: Option<&str>) -> &'static dyn ScmBackend {
     };
     match name.unwrap_or(default) {
         #[cfg(feature = "gitoxide")]
-        "gitoxide" => &git::gitoxide::GitOxide,
+        "gitoxide" => &git::gitoxide::GITOXIDE,
         "libgit2" => &LibGit2,
         name => {
             tracing::warn!(name, "Unavailable SCM backend, using libgit2");

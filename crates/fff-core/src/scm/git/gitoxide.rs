@@ -6,7 +6,8 @@ use gitoxide::diff::index::Change;
 use gitoxide::index::entry::Mode;
 use gitoxide::status::{Item, index_worktree::iter::Summary};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
@@ -14,7 +15,8 @@ pub(super) fn scan(repo: &Repository, full: bool) -> Option<ScmStatusCache> {
     match read(root, full) {
         Ok(cache) => Some(cache),
         Err(error) => {
-            tracing::debug!(%error, "Falling back to libgit2 status");
+            tracing::warn!(%error, "Gitoxide status failed, using libgit2 from now on");
+            GITOXIDE.use_libgit2.store(true, Ordering::Relaxed);
             None
         }
     }
@@ -98,7 +100,13 @@ fn read(root: &Path, full: bool) -> Result<ScmStatusCache, Box<dyn std::error::E
 }
 
 #[derive(Debug)]
-pub(crate) struct GitOxide;
+pub(crate) struct GitOxide {
+    use_libgit2: AtomicBool,
+}
+
+pub(crate) static GITOXIDE: GitOxide = GitOxide {
+    use_libgit2: AtomicBool::new(false),
+};
 
 impl ScmBackend for GitOxide {
     fn discover(&'static self, path: &Path) -> Option<ScmWorkspace> {
@@ -131,8 +139,10 @@ impl ScmBackend for GitOxide {
 }
 
 fn gitoxide_status(repo: &Repository, full: bool) -> crate::error::Result<ScmStatusCache> {
-    match scan(repo, full) {
-        Some(cache) => Ok(cache),
-        None => super::backend::libgit2_status(repo, full),
+    if !GITOXIDE.use_libgit2.load(Ordering::Relaxed)
+        && let Some(cache) = scan(repo, full)
+    {
+        return Ok(cache);
     }
+    super::backend::libgit2_status(repo, full)
 }
