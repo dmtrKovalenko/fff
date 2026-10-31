@@ -1,17 +1,20 @@
 use rmcp::model::{ClientRequest, GetMeta, Implementation, JsonRpcMessage};
 use rmcp::service::{RoleServer, RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
+use tokio::sync::oneshot;
 
 pub(crate) struct HarnessTransport<T> {
     inner: T,
     legacy_client: Option<(String, Implementation)>,
+    first_message: Option<oneshot::Sender<()>>,
 }
 
 impl<T> HarnessTransport<T> {
-    pub(crate) fn new(inner: T) -> Self {
+    pub(crate) fn new(inner: T, first_message: oneshot::Sender<()>) -> Self {
         Self {
             inner,
             legacy_client: None,
+            first_message: Some(first_message),
         }
     }
 }
@@ -28,6 +31,9 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for HarnessTransport<T> {
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
         let message = self.inner.receive().await?;
+        if let Some(first_message) = self.first_message.take() {
+            let _ = first_message.send(());
+        }
         if let JsonRpcMessage::Request(request) = &message {
             if let ClientRequest::InitializeRequest(initialize) = &request.request {
                 self.legacy_client = Some((
