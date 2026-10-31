@@ -853,16 +853,10 @@ impl FilePicker {
         self.sync_data.overflow_files()
     }
 
-    // Files appended to the writable top layer; imported layers grow the
-    // tables themselves and never count against the watcher cap.
-    pub(crate) fn open_layer_file_count(&self) -> usize {
-        let sync = &self.sync_data;
-        if !sync.layers.top_is_open() {
-            return 0;
-        }
-        sync.layers
-            .file_range(sync.layers.top_id(), sync.files.len())
-            .map_or(0, |(start, end)| end - start)
+    // Files the watcher appended since the last scan; imported entries grow
+    // the tables themselves and never count against the watcher cap.
+    pub(crate) fn watcher_additions(&self) -> usize {
+        self.sync_data.watcher_additions
     }
 
     /// Get the directory table (sorted by path).

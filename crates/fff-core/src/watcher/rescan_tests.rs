@@ -16,6 +16,7 @@ use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
 use crate::frecency::FrecencyTracker;
 use crate::git_status_worker::GitStatusWorker;
+use crate::index::snapshot::IndexEntry;
 use crate::rescan_stats::{RescanReason, RescanStats};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
@@ -352,6 +353,30 @@ fn batch_at_the_overflow_boundary_stays_incremental() {
 
     let delta = f.feed(events);
     f.assert_no_rescan(&delta, "a batch exactly at the overflow limit");
+}
+
+#[test]
+fn imported_entries_do_not_count_toward_the_watcher_cap() {
+    let f = Fixture::new();
+    f.write("src/main.rs", "fn main() {}");
+    f.index();
+
+    let entries: Vec<String> = (0..MAX_OVERFLOW_FILES * 2)
+        .map(|i| format!("virtual/entry{i}.rs"))
+        .collect();
+    {
+        let mut guard = f.picker.write().unwrap();
+        let picker = guard.as_mut().unwrap();
+        picker
+            .add_entries(entries.iter().map(|path| IndexEntry::new(path)))
+            .expect("add entries");
+    }
+
+    f.write("src/created.rs", "");
+    let delta = f.feed([create(f.path("src/created.rs"))]);
+    f.assert_no_rescan(&delta, "a created file after a bulk import");
+    assert!(f.is_indexed("src/created.rs"));
+    assert!(f.is_indexed("virtual/entry0.rs"));
 }
 
 #[test]
