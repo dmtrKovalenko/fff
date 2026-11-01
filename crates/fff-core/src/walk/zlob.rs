@@ -39,10 +39,17 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
-    {
+    // zlob reads only in-tree .gitignore/.ignore, so git's info/exclude rides
+    // in as root extra rules; the watcher reuses them via `ignore_rules` (#982).
+    let extra_ignore = if is_git_repo {
+        git_info_exclude(base_path).map(|rules| builder.extra_ignore(&[rules]).map(drop))
+    } else if !IGNORED_DIRS.is_empty() {
+        Some(builder.extra_ignore(IGNORED_DIRS).map(drop))
+    } else {
+        None
+    };
+
+    if let Some(Err(e)) = extra_ignore {
         // Interior NUL in one of the extra_ignore patterns would fail
         // here — treat as if no extras were supplied rather than
         // aborting the whole walk.
@@ -149,4 +156,21 @@ pub(crate) fn walk_collect_files(
         dirs,
         ignore_rules,
     })
+}
+
+// Only at a worktree root, where git anchors these patterns. Lives in the
+// common git dir, so linked worktrees share the main checkout's file.
+fn git_info_exclude(base_path: &Path) -> Option<String> {
+    if !base_path.join(".git").exists() {
+        return None;
+    }
+
+    let repo = git2::Repository::open(base_path).ok()?;
+    let rules = std::fs::read_to_string(repo.commondir().join("info").join("exclude")).ok()?;
+    // `git init` writes a comments-only template; keep the no-rules fast path.
+    rules
+        .lines()
+        .map(str::trim)
+        .any(|line| !line.is_empty() && !line.starts_with('#'))
+        .then_some(rules)
 }

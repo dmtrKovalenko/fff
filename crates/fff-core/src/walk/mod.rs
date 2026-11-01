@@ -179,4 +179,66 @@ mod tests {
         assert!(rules.is_ignored(Path::new("debug.log")));
         assert!(!rules.is_ignored(Path::new("Cargo.toml")));
     }
+
+    // Both backends must honor `info/exclude`, which linked worktrees read from
+    // the common git dir (#982).
+    #[test]
+    fn honors_git_info_exclude() {
+        use std::path::Path;
+        use std::process::Command;
+
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::write(root.join("src/a.txt"), "a").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        fs::write(root.join("excluded/b.txt"), "b").unwrap();
+        fs::write(root.join(".git/info/exclude"), "# comment\nexcluded/\n").unwrap();
+
+        let worktree = dir.path().join("wt");
+        git(
+            &root,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        fs::create_dir_all(worktree.join("excluded")).unwrap();
+        fs::write(worktree.join("excluded/c.txt"), "c").unwrap();
+
+        for base in [&root, &worktree] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let out = walk_collect_files(base, true, false, 1, &counter).unwrap();
+            let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+
+            assert!(names.iter().any(|n| n == "src/a.txt"), "{names:?}");
+            assert!(
+                !names.iter().any(|n| n.starts_with("excluded")),
+                "{names:?}"
+            );
+
+            // The watcher filters incremental updates with these rules.
+            #[cfg(feature = "zlob")]
+            {
+                let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+                assert!(rules.is_ignored(Path::new("excluded/later/new.txt")));
+                assert!(rules.is_ignored(Path::new("debug.log")));
+                assert!(!rules.is_ignored(Path::new("src/a.txt")));
+            }
+        }
+    }
 }
