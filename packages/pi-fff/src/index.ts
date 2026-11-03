@@ -5,7 +5,6 @@
  * @-mention autocomplete suggestions to the interactive editor.
  */
 
-import nodePath from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -585,16 +584,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     const route = routePathConstraint(pathParam, activeCwd);
     if (!route) return null;
     if (!auxPool) throw new Error("FFF auxiliary finder pool is not initialized");
-    let aux = await auxPool.acquire(route.root);
-    let rebase = nodePath.relative(aux.root, route.root).replaceAll(nodePath.sep, "/");
-    // A covering finder may have skipped the target subtree (node_modules,
-    // gitignore); only then pay for an exact-root finder (#711).
-    if (rebase && !indexesSubtree(aux.finder, rebase)) {
-      aux = await auxPool.acquire(route.root, { exact: true });
-      rebase = "";
-    }
-    const suffix = [rebase, route.suffix].filter(Boolean).join("/");
-    const query = buildQuery(suffix || undefined, pattern, exclude, aux.root);
+    // Exact root: a broader cached finder may have excluded the target subtree (#711).
+    const aux = await auxPool.acquire(route.root, { exact: true });
+    const query = buildQuery(route.suffix || undefined, pattern, exclude, aux.root);
     return { finder: aux.finder, query, root: aux.root };
   }
 
@@ -1785,9 +1777,4 @@ function isWordByte(byte: number | undefined): boolean {
   return (
     byte === 0x5f || (byte >= 0x30 && byte <= 0x39) || (lower >= 0x61 && lower <= 0x7a)
   );
-}
-
-function indexesSubtree(finder: FileFinderApi, rebase: string): boolean {
-  const probe = finder.fileSearch(`${rebase}/`, { pageSize: 1 });
-  return probe.ok && probe.value.items.length > 0;
 }
