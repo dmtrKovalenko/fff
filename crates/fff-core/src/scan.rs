@@ -11,7 +11,7 @@ use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
-use crate::watch::BackgroundWatcher;
+use crate::watch::{BackgroundWatcher, WatcherOptions};
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanSignals {
@@ -253,9 +253,13 @@ impl ScanJob {
                 git,
                 shared_picker.clone(),
                 shared_frecency.clone(),
-                mode,
-                config.enable_fs_root_scanning,
-                config.enable_home_dir_scanning,
+                WatcherOptions {
+                    mode,
+                    follow_symlinks: config.follow_symlinks,
+                    ignore_options: config.ignore_options,
+                    enable_fs_root_scanning: config.enable_fs_root_scanning,
+                    enable_home_dir_scanning: config.enable_home_dir_scanning,
+                },
                 git_status_worker,
                 tracing::Span::current(),
             ) {
