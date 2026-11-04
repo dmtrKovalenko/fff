@@ -1,6 +1,6 @@
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::WalkOutput;
+use crate::walk::{WalkIgnoreRules, WalkOutput};
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -82,6 +82,10 @@ pub(crate) fn walk_collect_files(
     Ok(WalkOutput {
         pairs,
         dirs,
-        ignore_rules: None,
+        // Same builder config, so the watcher classifies paths exactly like this walk
+        ignore_rules: Some(WalkIgnoreRules {
+            builder: walk_builder,
+            matcher: std::sync::OnceLock::new(),
+        }),
     })
 }

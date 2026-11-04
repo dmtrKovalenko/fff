@@ -28,13 +28,18 @@ pub(crate) struct WalkOutput {
 pub(crate) struct WalkIgnoreRules {
     #[cfg(feature = "zlob")]
     inner: ::zlob::walk::WalkerOutcomeRules,
+    // Built on first query so walks without a watcher consumer never pay for it
     #[cfg(not(feature = "zlob"))]
-    _never: std::convert::Infallible,
+    builder: ::ignore::WalkBuilder,
+    #[cfg(not(feature = "zlob"))]
+    matcher: std::sync::OnceLock<Option<parking_lot::Mutex<::ignore::IncrementalIgnore>>>,
 }
 
 // SAFETY: the underlying storage is immutable, heap-owned, and thread-safe to
 // read from concurrently (mirrors zlob's `IgnoreRules: Send + Sync`).
+#[cfg(feature = "zlob")]
 unsafe impl Send for WalkIgnoreRules {}
+#[cfg(feature = "zlob")]
 unsafe impl Sync for WalkIgnoreRules {}
 
 impl std::fmt::Debug for WalkIgnoreRules {
@@ -43,24 +48,29 @@ impl std::fmt::Debug for WalkIgnoreRules {
     }
 }
 
-// In ripgrep builds `WalkIgnoreRules` is never constructed (the `_never`
-// field is uninhabited), so its methods are legitimately dead there.
-#[cfg_attr(not(feature = "zlob"), allow(dead_code))]
 impl WalkIgnoreRules {
     /// Returns `true` if the provided path is ignored by the collected rule set
     ///
     /// `relative_path` has to be relative to the walker's provided base path
-    pub(crate) fn is_ignored(&self, relative_path: &Path) -> bool {
+    pub(crate) fn is_ignored(&self, relative_path: &Path, is_dir: bool) -> bool {
         #[cfg(feature = "zlob")]
         {
+            let _ = is_dir;
             self.inner
                 .rules()
                 .is_some_and(|rules| rules.is_ignored(relative_path))
         }
         #[cfg(not(feature = "zlob"))]
         {
-            let _ = relative_path;
-            match self._never {}
+            self.matcher
+                .get_or_init(|| {
+                    self.builder
+                        .build_matchers()
+                        .pop()
+                        .map(parking_lot::Mutex::new)
+                })
+                .as_ref()
+                .is_some_and(|m| m.lock().matched(relative_path, is_dir).is_ignore())
         }
     }
 
@@ -158,9 +168,8 @@ mod tests {
         assert_eq!(names, ["projects.toml"]);
     }
 
-    // Only the zlob backend surfaces reusable ignore rules; they must match
-    // the same tree the walk respected.
-    #[cfg(feature = "zlob")]
+    // Both backends surface reusable ignore rules; they must match the same
+    // tree the walk respected.
     #[test]
     fn surfaces_reusable_ignore_rules() {
         use std::path::Path;
@@ -174,9 +183,9 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
 
-        let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
-        assert!(rules.is_ignored(Path::new("target/")));
-        assert!(rules.is_ignored(Path::new("debug.log")));
-        assert!(!rules.is_ignored(Path::new("Cargo.toml")));
+        let rules = out.ignore_rules.expect("walker surfaces ignore rules");
+        assert!(rules.is_ignored(Path::new("target/out.bin"), false));
+        assert!(rules.is_ignored(Path::new("debug.log"), false));
+        assert!(!rules.is_ignored(Path::new("Cargo.toml"), false));
     }
 }

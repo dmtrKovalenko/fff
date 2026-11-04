@@ -855,3 +855,54 @@ fn modify(path: PathBuf) -> DebouncedEvent {
 fn remove_file(path: PathBuf) -> DebouncedEvent {
     event(EventKind::Remove(RemoveKind::File), path)
 }
+
+#[test]
+fn dot_ignore_negation_keeps_gitignored_dir_live() {
+    let f = Fixture::with_git();
+    f.write(".gitignore", "projects/\n");
+    f.write(".ignore", "!projects/\n");
+    f.write("projects/a/src/main.rs", "fn main() {}");
+    f.write("projects/a/target/out.o", "binary");
+    f.write("projects/a/.gitignore", "target/\n");
+    f.index();
+    assert!(
+        f.is_indexed("projects/a/src/main.rs"),
+        "walker honours .ignore"
+    );
+    assert!(
+        !f.is_indexed("projects/a/target/out.o"),
+        "nested .gitignore still applies"
+    );
+
+    f.write("projects/a/src/added.rs", "pub fn added() {}");
+    let delta = f.feed([create(f.path("projects/a/src/added.rs"))]);
+    f.assert_no_rescan(&delta, "creating a file under an un-ignored dir");
+    assert!(
+        f.is_indexed("projects/a/src/added.rs"),
+        "watcher must index it like the walker"
+    );
+
+    f.write("projects/a/target/new.o", "binary");
+    f.feed([create(f.path("projects/a/target/new.o"))]);
+    assert!(
+        !f.is_indexed("projects/a/target/new.o"),
+        "watcher must keep nested ignores"
+    );
+}
+
+#[test]
+fn dot_ignore_exclusion_is_kept_by_watcher() {
+    let f = Fixture::with_git();
+    f.write(".ignore", "scratch/\n");
+    f.write("src/main.rs", "fn main() {}");
+    f.write("scratch/old.txt", "x");
+    f.index();
+    assert!(!f.is_indexed("scratch/old.txt"), "walker honours .ignore");
+
+    f.write("scratch/new.txt", "x");
+    f.feed([create(f.path("scratch/new.txt"))]);
+    assert!(
+        !f.is_indexed("scratch/new.txt"),
+        "watcher must skip it like the walker"
+    );
+}
