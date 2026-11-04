@@ -27,9 +27,9 @@ use fff::query_tracker::QueryTracker;
 use fff::{DbHealthChecker, FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser};
 use fff::{SharedFilePicker, SharedFrecency};
 use ffi_types::{
-    FFF_CREATE_OPTIONS_VERSION, FffCreateOptions, FffDirItem, FffDirSearchResult, FffFileItem,
-    FffGrepMatch, FffGrepResult, FffMixedItem, FffMixedSearchResult, FffResult, FffScanProgress,
-    FffScore, FffSearchResult,
+    FFF_CREATE_OPTIONS_V3_VERSION, FffCreateOptions, FffCreateOptionsV3, FffDirItem,
+    FffDirSearchResult, FffFileItem, FffGrepMatch, FffGrepResult, FffMixedItem,
+    FffMixedSearchResult, FffResult, FffScanProgress, FffScore, FffSearchResult,
 };
 
 /// Opaque handle holding all per-instance state; freed by `fff_destroy`.
@@ -166,42 +166,22 @@ pub unsafe extern "C" fn fff_create_instance2(
     unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
 }
 
-/// Create a new file finder instance from a versioned [`FffCreateOptions`] struct.
-///
-/// Populate the struct, set `version` to [`FFF_CREATE_OPTIONS_VERSION`], pass by
-/// pointer. New fields are only appended; older `version` values keep working.
-/// FFI bindings needing struct-by-value should use [`fff_create_instance_with_value`].
-///
-/// `opts.base_path` is required (non-NULL, non-empty). Zero `cache_budget_*`
-/// values are auto-computed from repo size after the initial scan.
-///
-/// ## Safety
-/// * `opts` must be a valid pointer to an `FffCreateOptions` whose `version`
-///   is in the range `1..=FFF_CREATE_OPTIONS_VERSION`.
-/// * All string pointers inside `opts` must be valid null-terminated UTF-8
-///   or NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions) -> *mut FffResult {
-    unsafe { fff_create_instance_with_extra_ignore(opts, std::ptr::null()) }
-}
-
-/// Creates a finder with extra `.gitignore` rules separated by newlines (zlob only).
+/// Create a file finder from versioned options. `base_path` is required.
 ///
 /// # Safety
-/// `opts` follows `fff_create_instance_with`. `extra_ignore` must be a NUL-terminated UTF-8 string or NULL.
+/// Pass an `FffCreateOptions` (V1/V2) or cast a pointer to the whole `FffCreateOptionsV3` (V3).
+/// String pointers must be NUL-terminated UTF-8 or NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fff_create_instance_with_extra_ignore(
-    opts: *const FffCreateOptions,
-    extra_ignore: *const c_char,
+pub unsafe extern "C" fn fff_create_instance_with(
+    options: *const FffCreateOptions,
 ) -> *mut FffResult {
-    if opts.is_null() {
+    let Some(opts) = (unsafe { options.as_ref() }) else {
         return FffResult::err("opts is null");
-    }
-    let opts = unsafe { &*opts };
-    if opts.version == 0 || opts.version > FFF_CREATE_OPTIONS_VERSION {
+    };
+    if opts.version == 0 || opts.version > FFF_CREATE_OPTIONS_V3_VERSION {
         return FffResult::err(&format!(
             "Unsupported FffCreateOptions version {} (library understands up to {})",
-            opts.version, FFF_CREATE_OPTIONS_VERSION
+            opts.version, FFF_CREATE_OPTIONS_V3_VERSION
         ));
     }
 
@@ -210,10 +190,15 @@ pub unsafe extern "C" fn fff_create_instance_with_extra_ignore(
         _ => return FffResult::err("opts.base_path is null or empty"),
     };
 
-    let extra_ignore = if extra_ignore.is_null() {
+    let rules = if opts.version == FFF_CREATE_OPTIONS_V3_VERSION {
+        unsafe { (*options.cast::<FffCreateOptionsV3>()).extra_ignore }
+    } else {
+        std::ptr::null()
+    };
+    let extra_ignore = if rules.is_null() {
         Arc::default()
     } else {
-        let Some(rules) = (unsafe { cstr_to_str(extra_ignore) }) else {
+        let Some(rules) = (unsafe { cstr_to_str(rules) }) else {
             return FffResult::err("extra_ignore is not valid UTF-8");
         };
         rules.lines().map(str::to_owned).collect()
@@ -306,14 +291,16 @@ pub unsafe extern "C" fn fff_create_instance_with_extra_ignore(
     FffResult::ok_handle(fff_handle)
 }
 
-/// [`fff_create_instance_with`] adapter taking [`FffCreateOptions`] **by value**,
-/// for FFI libraries that pass native structs by value (e.g. Node's `ffi-rs`).
+/// [`fff_create_instance_with`] adapter taking V1 or V2 options by value.
 ///
 /// ## Safety
 /// All `*const c_char` fields inside `opts` must be valid null-terminated
 /// UTF-8 or NULL. The struct itself is consumed by value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance_with_value(opts: FffCreateOptions) -> *mut FffResult {
+    if opts.version == FFF_CREATE_OPTIONS_V3_VERSION {
+        return FffResult::err("FffCreateOptions V3 must be passed by pointer");
+    }
     unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
 }
 

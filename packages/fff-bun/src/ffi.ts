@@ -336,17 +336,9 @@ const ffiDefinition = {
   },
 } as const;
 
-const extraIgnoreDefinition = {
-  fff_create_instance_with_extra_ignore: {
-    args: [FFIType.ptr, FFIType.cstring],
-    returns: FFIType.ptr,
-  },
-} as const;
-
-type FFFLibrary = ReturnType<typeof dlopen<typeof ffiDefinition>> & { path: string };
+type FFFLibrary = ReturnType<typeof dlopen<typeof ffiDefinition>>;
 
 let lib: FFFLibrary | null = null;
-let extraIgnoreLib: ReturnType<typeof dlopen<typeof extraIgnoreDefinition>> | null = null;
 
 /**
  * Load the native library
@@ -360,7 +352,7 @@ function loadLibrary(): FFFLibrary {
     throw new Error(libNotFoundMessage());
   }
 
-  lib = Object.assign(dlopen(binaryPath, ffiDefinition), { path: binaryPath });
+  lib = dlopen(binaryPath, ffiDefinition);
   return lib;
 }
 
@@ -425,9 +417,10 @@ const RES_ERROR = 8; // *mut c_char (8)
 const RES_HANDLE = 16; // *mut c_void (8)
 const RES_INT_VALUE = 24; // i64         (8)
 
-// MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
+// MUST match `FffCreateOptions` and `FffCreateOptionsV3` in ffi_types.rs.
 const FFF_CREATE_OPTIONS_VERSION = 1;
-const FFF_CREATE_OPTIONS_SIZE = 88;
+const FFF_CREATE_OPTIONS_V3_VERSION = 3;
+const FFF_CREATE_OPTIONS_SIZE = 96;
 const FCO_VERSION = 0;
 const FCO_BASE_PATH = 8;
 const FCO_FRECENCY_DB_PATH = 16;
@@ -443,6 +436,7 @@ const FCO_CACHE_BUDGET_MAX_BYTES = 64;
 const FCO_CACHE_BUDGET_MAX_FILE_SIZE = 72;
 const FCO_ENABLE_FS_ROOT_SCANNING = 80;
 const FCO_ENABLE_HOME_DIR_SCANNING = 81;
+const FCO_EXTRA_IGNORE = 88;
 
 function readResultEnvelope(
   resultPtr: Pointer | null,
@@ -529,16 +523,7 @@ export type NativeHandle = Pointer;
 /**
  * Create a new file finder instance.
  *
- * Hand-encodes a [`FffCreateOptions`] struct (88 bytes, locked offsets — see
- * `crates/fff-c/src/ffi_types.rs::options_layout_tests`) into a Buffer and
- * passes its pointer to `fff_create_instance_with`. Inner cstring addresses
- * come from Bun's native `ptr(buffer)` primitive — no round-trip helpers,
- * no struct support gaps.
- *
- * Adding new options later means: (1) appending the field to
- * `FffCreateOptions` in Rust, (2) bumping `FFF_CREATE_OPTIONS_VERSION`,
- * (3) extending `FFF_CREATE_OPTIONS_SIZE` + offsets here. The C entry point
- * never changes.
+ * Encodes the versioned create options and passes them to `fff_create_instance_with`.
  */
 export function ffiCreate(
   basePath: string,
@@ -568,9 +553,13 @@ export function ffiCreate(
   const historyCStr = encodeCStringBuf(historyDbPath);
   const logFileCStr = encodeCStringBuf(logFilePath);
   const logLevelCStr = encodeCStringBuf(logLevel);
+  const extraIgnoreCStr = encodeCStringBuf(extraIgnore);
 
   const opts = Buffer.alloc(FFF_CREATE_OPTIONS_SIZE);
-  opts.writeUInt32LE(FFF_CREATE_OPTIONS_VERSION, FCO_VERSION);
+  opts.writeUInt32LE(
+    extraIgnoreCStr ? FFF_CREATE_OPTIONS_V3_VERSION : FFF_CREATE_OPTIONS_VERSION,
+    FCO_VERSION,
+  );
   writePtrLE(opts, FCO_BASE_PATH, basePathCStr);
   writePtrLE(opts, FCO_FRECENCY_DB_PATH, frecencyCStr);
   writePtrLE(opts, FCO_HISTORY_DB_PATH, historyCStr);
@@ -585,22 +574,9 @@ export function ffiCreate(
   opts.writeBigUInt64LE(cacheBudgetMaxFileSize, FCO_CACHE_BUDGET_MAX_FILE_SIZE);
   opts.writeUInt8(enableFsRootScanning ? 1 : 0, FCO_ENABLE_FS_ROOT_SCANNING);
   opts.writeUInt8(enableHomeDirScanning ? 1 : 0, FCO_ENABLE_HOME_DIR_SCANNING);
+  writePtrLE(opts, FCO_EXTRA_IGNORE, extraIgnoreCStr);
 
-  let resultPtr: Pointer | null;
-  if (extraIgnore) {
-    try {
-      extraIgnoreLib ??= dlopen(library.path, extraIgnoreDefinition);
-      const rules = encodeString(extraIgnore);
-      resultPtr = extraIgnoreLib.symbols.fff_create_instance_with_extra_ignore(
-        ptr(opts),
-        ptr(rules),
-      );
-    } catch (error) {
-      return err(`Failed to load native extraIgnore support: ${error}`);
-    }
-  } else {
-    resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
-  }
+  const resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
 
   if (resultPtr === null) {
     return err("FFI returned null pointer");

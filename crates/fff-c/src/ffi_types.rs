@@ -13,11 +13,10 @@ use fff::{
 
 /// Current used version of [`FffCreateOptions`].
 pub const FFF_CREATE_OPTIONS_VERSION: u32 = 2;
+/// Version of [`FffCreateOptionsV3`].
+pub const FFF_CREATE_OPTIONS_V3_VERSION: u32 = 3;
 
-/// Options for `fff_create_instance_with`.
-///
-/// Versioned struct: the layout is stable across releases, new fields are
-/// only appended.
+/// V1 and V2 options for the pointer and by-value constructors.
 #[repr(C)]
 pub struct FffCreateOptions {
     /// Set to [`FFF_CREATE_OPTIONS_VERSION`] when allocating; tells the
@@ -57,7 +56,6 @@ pub struct FffCreateOptions {
     /// Follow symlinks during scan and watcher walks. Off by default: without
     /// external loop protection cyclic symlinks can wedge the watcher.
     pub follow_symlinks: bool,
-    // ----- new version 3+ fields go here, ALWAYS appended -----
 }
 
 impl FffCreateOptions {
@@ -82,6 +80,15 @@ impl FffCreateOptions {
             follow_symlinks: false,
         }
     }
+}
+
+/// V3 options for `fff_create_instance_with`. Pass a pointer cast from the whole struct.
+#[repr(C)]
+pub struct FffCreateOptionsV3 {
+    /// Set `base.version` to [`FFF_CREATE_OPTIONS_V3_VERSION`].
+    pub base: FffCreateOptions,
+    /// Additional newline-separated `.gitignore` rules. NULL for none. Requires zlob.
+    pub extra_ignore: *const c_char,
 }
 
 /// Allocate a heap CString from a `&str`, returning a raw pointer.
@@ -778,7 +785,7 @@ impl From<fff::file_picker::ScanProgress> for FffScanProgress {
 
 #[cfg(test)]
 mod options_layout_tests {
-    use super::FffCreateOptions;
+    use super::{FffCreateOptions, FffCreateOptionsV3};
     use std::mem::{align_of, offset_of, size_of};
 
     // THIS TEST HAVE TO BE NEVER UPDATED ONLY ADDED NEW FIELDS
@@ -805,5 +812,14 @@ mod options_layout_tests {
         assert_eq!(offset_of!(FffCreateOptions, enable_fs_root_scanning), 80);
         assert_eq!(offset_of!(FffCreateOptions, enable_home_dir_scanning), 81);
         assert_eq!(offset_of!(FffCreateOptions, follow_symlinks), 82);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn fff_create_options_v3_extends_v2_layout() {
+        assert_eq!(size_of::<FffCreateOptionsV3>(), 96);
+        assert_eq!(align_of::<FffCreateOptionsV3>(), 8);
+        assert_eq!(offset_of!(FffCreateOptionsV3, base), 0);
+        assert_eq!(offset_of!(FffCreateOptionsV3, extra_ignore), 88);
     }
 }

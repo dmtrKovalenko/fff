@@ -88,10 +88,12 @@ const FFF_CREATE_OPTIONS_STRUCT = {
   enable_fs_root_scanning: DataType.U8,
   enable_home_dir_scanning: DataType.U8,
   follow_symlinks: DataType.U8,
+  extra_ignore: DataType.String,
 };
 
 // ALWAYS KEEP IN SYNC WITH fff.h
 const FFF_CREATE_OPTIONS_VERSION = 2;
+const FFF_CREATE_OPTIONS_V3_VERSION = 3;
 
 /** Grep mode constants matching the C API (u8). */
 const GREP_MODE_PLAIN = 0;
@@ -376,7 +378,7 @@ export function ffiCreate(
   loadLibrary();
 
   const optsValue = {
-    version: FFF_CREATE_OPTIONS_VERSION,
+    version: extraIgnore ? FFF_CREATE_OPTIONS_V3_VERSION : FFF_CREATE_OPTIONS_VERSION,
     base_path: basePath,
     frecency_db_path: frecencyDbPath,
     history_db_path: historyDbPath,
@@ -392,26 +394,17 @@ export function ffiCreate(
     enable_fs_root_scanning: enableFsRootScanning ? 1 : 0,
     enable_home_dir_scanning: enableHomeDirScanning ? 1 : 0,
     follow_symlinks: followSymlinks ? 1 : 0,
+    extra_ignore: extraIgnore,
   };
 
-  let rawPtr: JsExternal;
-  try {
-    rawPtr = load({
-      library: LIBRARY_KEY,
-      funcName: extraIgnore
-        ? "fff_create_instance_with_extra_ignore"
-        : "fff_create_instance_with",
-      retType: DataType.External,
-      paramsType: extraIgnore
-        ? [FFF_CREATE_OPTIONS_STRUCT, DataType.String]
-        : [FFF_CREATE_OPTIONS_STRUCT],
-      paramsValue: extraIgnore ? [optsValue, extraIgnore] : [optsValue],
-      freeResultMemory: false,
-    }) as JsExternal;
-  } catch (error) {
-    if (!extraIgnore) throw error;
-    return err(`Failed to load native extraIgnore support: ${error}`);
-  }
+  const rawPtr = load({
+    library: LIBRARY_KEY,
+    funcName: "fff_create_instance_with",
+    retType: DataType.External,
+    paramsType: [FFF_CREATE_OPTIONS_STRUCT],
+    paramsValue: [optsValue],
+    freeResultMemory: false,
+  }) as JsExternal;
 
   const [structData] = restorePointer({
     retType: [FFF_RESULT_STRUCT],
