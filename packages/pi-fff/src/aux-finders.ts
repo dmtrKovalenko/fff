@@ -25,8 +25,8 @@ export interface AuxOpts {
 export class AuxFinderPool {
   private entries: AuxPicker[] = [];
   // In-flight creations keyed by root. Concurrent acquire() calls for the same
-  // (or a covering) root share one finder/scan instead of each starting a full
-  // duplicate traversal — issue #746. Mirrors the main finder's finderPromise.
+  // root share one finder/scan instead of each starting a full duplicate
+  // traversal — issue #746. Mirrors the main finder's finderPromise.
   private pending = new Map<string, Promise<AuxPicker>>();
   constructor(private opts: AuxOpts) {}
 

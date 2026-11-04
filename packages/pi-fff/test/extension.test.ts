@@ -240,6 +240,12 @@ function abortOptions() {
   return { signal: new AbortController().signal };
 }
 
+function finderFor(basePath: string): MockFinder {
+  const index = createCalls.findIndex((options: any) => options.basePath === basePath);
+  expect(index).toBeGreaterThanOrEqual(0);
+  return finders[index];
+}
+
 const CONFIG_ENV_KEYS = [
   "PI_CODING_AGENT_DIR",
   "PI_FFF_MODE",
@@ -1535,6 +1541,34 @@ test("definition search resolves excludes against an outside-workspace finder", 
   );
   expect(queries.length).toBeGreaterThan(0);
   expect(queries.every((query) => query.includes("!vendor/"))).toBe(true);
+  await shutdown(setup);
+});
+
+test("outside-workspace path gets an exact finder instead of a broader cached one", async () => {
+  const broad = fs.mkdtempSync(path.join(agentDir, "outside-broad-"));
+  const nested = path.join(broad, "node_modules", "pkg", "src");
+  fs.mkdirSync(nested, { recursive: true });
+  const queries: string[] = [];
+  grepImpl = (query) => {
+    queries.push(query);
+    return grepPage();
+  };
+  const setup = await start("tools-and-ui");
+  const tool = setup.pi.registerTool.mock.calls
+    .map(([tool]) => tool)
+    .find((tool) => tool.name === "ffgrep");
+  expect(tool).toBeDefined();
+  await tool.execute("warmup", { pattern: "Needle", path: broad }, abortOptions().signal);
+  const broadFinder = finderFor(broad);
+  const warmupGreps = broadFinder.grep.mock.calls.length;
+  await tool.execute(
+    "nested",
+    { pattern: "Needle", path: nested },
+    abortOptions().signal,
+  );
+  expect(broadFinder.grep).toHaveBeenCalledTimes(warmupGreps);
+  expect(finderFor(nested).grep.mock.calls.length).toBeGreaterThan(0);
+  expect(queries.some((query) => query.includes("node_modules"))).toBe(false);
   await shutdown(setup);
 });
 
