@@ -20,6 +20,11 @@
 #define FFF_CREATE_OPTIONS_V3_VERSION 3
 
 /**
+ * Version of [`FffCreateOptionsV4`].
+ */
+#define FFF_CREATE_OPTIONS_V4_VERSION 4
+
+/**
  * Current version of [`FffWatchOptions`].
  */
 #define FFF_WATCH_OPTIONS_VERSION 1
@@ -486,6 +491,24 @@ typedef struct FffCreateOptionsV3 {
 } FffCreateOptionsV3;
 
 /**
+ * V4 options for `fff_create_instance_with`. Pass a pointer cast from the whole struct.
+ */
+typedef struct FffCreateOptionsV4 {
+  /**
+   * Set `base.base.version` to [`FFF_CREATE_OPTIONS_V4_VERSION`].
+   */
+  struct FffCreateOptionsV3 base;
+  /**
+   * Skip Git integration and Git ignore rules.
+   */
+  bool disable_git;
+  /**
+   * Skip rules from `.ignore` files.
+   */
+  bool disable_ignore_files;
+} FffCreateOptionsV4;
+
+/**
  * Create a new file finder instance (legacy 8-arg positional signature).
  *
  * @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
@@ -532,7 +555,7 @@ struct FffResult *fff_create_instance2(const char *base_path,
  * Create a file finder from versioned options. `base_path` is required.
  *
  * # Safety
- * Pass an `FffCreateOptions` (V1/V2) or cast a pointer to the whole `FffCreateOptionsV3` (V3).
+ * Pass an `FffCreateOptions` (V1/V2) or cast a pointer to the whole V3/V4 options struct.
  * String pointers must be NUL-terminated UTF-8 or NULL.
  */
 struct FffResult *fff_create_instance_with(const struct FffCreateOptions *options);

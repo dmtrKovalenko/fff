@@ -618,6 +618,17 @@ impl Default for FilePickerOptions {
     }
 }
 
+/// Controls which ignore rules a picker applies while indexing.
+#[derive(Clone, Debug, Default)]
+pub struct FilePickerIgnoreOptions {
+    /// Extra root-relative rules. Requires the zlob walker.
+    pub extra_ignore: Arc<[String]>,
+    /// Skip Git integration and Git ignore rules.
+    pub disable_git: bool,
+    /// Skip rules from `.ignore` files.
+    pub disable_ignore_files: bool,
+}
+
 pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
@@ -635,7 +646,7 @@ pub struct FilePicker {
     enable_content_indexing: bool,
     watch: bool,
     follow_symlinks: bool,
-    extra_ignore: Arc<[String]>,
+    ignore_options: FilePickerIgnoreOptions,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     git_recency_config: GitRecencyConfig,
@@ -716,7 +727,12 @@ impl FilePicker {
 
     /// Returns the caller-supplied ignore rules for this picker.
     pub fn extra_ignore(&self) -> Arc<[String]> {
-        Arc::clone(&self.extra_ignore)
+        Arc::clone(&self.ignore_options.extra_ignore)
+    }
+
+    /// Returns the ignore options for this picker.
+    pub fn ignore_options(&self) -> &FilePickerIgnoreOptions {
+        &self.ignore_options
     }
 
     pub fn fs_root_scanning_enabled(&self) -> bool {
@@ -929,7 +945,16 @@ impl FilePicker {
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
-        crate::git::tune_libgit2_for_local_reads();
+        Self::new_with_ignore_options(options, FilePickerIgnoreOptions::default())
+    }
+
+    fn new_with_ignore_options(
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+    ) -> Result<Self, Error> {
+        if !ignore_options.disable_git {
+            crate::git::tune_libgit2_for_local_reads();
+        }
 
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
@@ -983,7 +1008,7 @@ impl FilePicker {
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
             follow_symlinks: options.follow_symlinks,
-            extra_ignore: Arc::default(),
+            ignore_options,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             git_recency_config: options.git_recency,
@@ -998,11 +1023,11 @@ impl FilePicker {
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        Self::new_with_shared_state_and_extra_ignore(
+        Self::new_with_shared_state_and_ignore_options(
             shared_picker,
             shared_frecency,
             options,
-            Arc::default(),
+            FilePickerIgnoreOptions::default(),
         )
     }
 
@@ -1013,9 +1038,35 @@ impl FilePicker {
         options: FilePickerOptions,
         extra_ignore: Arc<[String]>,
     ) -> Result<(), Error> {
+        Self::new_with_shared_state_and_ignore_options(
+            shared_picker,
+            shared_frecency,
+            options,
+            FilePickerIgnoreOptions {
+                extra_ignore,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Starts background indexing with the supplied ignore options.
+    pub fn new_with_shared_state_and_ignore_options(
+        shared_picker: SharedFilePicker,
+        shared_frecency: SharedFrecency,
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+    ) -> Result<(), Error> {
+        let extra_ignore = &ignore_options.extra_ignore;
         if !cfg!(feature = "zlob") && !extra_ignore.is_empty() {
             return Err(Error::WalkFailed(
                 "extra ignore rules require the zlob walker".into(),
+            ));
+        }
+        if !cfg!(feature = "zlob")
+            && (ignore_options.disable_git || ignore_options.disable_ignore_files)
+        {
+            return Err(Error::WalkFailed(
+                "disabling Git or .ignore files requires the zlob walker".into(),
             ));
         }
         if extra_ignore.iter().any(|rule| rule.contains('\0')) {
@@ -1024,8 +1075,7 @@ impl FilePicker {
             ));
         }
 
-        let mut picker = Self::new(options)?;
-        picker.extra_ignore = Arc::clone(&extra_ignore);
+        let mut picker = Self::new_with_ignore_options(options, ignore_options.clone())?;
         picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
             shared_picker.git_status_pause_flag(),
         );
@@ -1085,7 +1135,7 @@ impl FilePicker {
                 auto_cache_budget: true,
                 install_watcher: true,
                 follow_symlinks,
-                extra_ignore,
+                ignore_options,
                 enable_fs_root_scanning,
                 enable_home_dir_scanning,
             },
@@ -1107,7 +1157,7 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git = FileSync::discover_git(&self.base_path);
+        let git = FileSync::discover_git(&self.base_path, self.ignore_options.disable_git);
         let git_handle = git
             .as_ref()
             .map(|git| FileSync::spawn_git_status(git.workdir.clone()));
@@ -1120,7 +1170,7 @@ impl FilePicker {
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
-            &self.extra_ignore,
+            &self.ignore_options,
         )?;
 
         self.sync_data = sync;
@@ -2171,7 +2221,10 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_git(base_path: &Path) -> Option<GitDiscovery> {
+    pub(crate) fn discover_git(base_path: &Path, disabled: bool) -> Option<GitDiscovery> {
+        if disabled {
+            return None;
+        }
         let git = GitDiscovery::discover(base_path);
         match &git {
             Some(git) => {
@@ -2203,7 +2256,7 @@ impl FileSync {
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
-        extra_ignore: &[String],
+        ignore_options: &FilePickerIgnoreOptions,
     ) -> Result<FileSync, Error> {
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
@@ -2229,7 +2282,7 @@ impl FileSync {
             follow_symlinks,
             bg_threads,
             synced_files_count,
-            extra_ignore,
+            ignore_options,
             None,
         )?;
         let ignore_rules = ignore_rules.map(Arc::new);

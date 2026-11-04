@@ -1,3 +1,4 @@
+use crate::file_picker::FilePickerIgnoreOptions;
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
 use crate::walk::WalkOutput;
@@ -16,7 +17,7 @@ pub(crate) fn walk_collect_files(
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
-    _extra_ignore: &[String],
+    _ignore_options: &FilePickerIgnoreOptions,
     _scope: Option<&Path>,
 ) -> crate::Result<WalkOutput> {
     let mut walk_builder = WalkBuilder::new(base_path);

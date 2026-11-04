@@ -21,15 +21,16 @@ mod accessors;
 mod ffi_types;
 mod watch;
 
-use fff::file_picker::FilePicker;
+use fff::file_picker::{FilePicker, FilePickerIgnoreOptions};
 use fff::frecency::FrecencyTracker;
 use fff::query_tracker::QueryTracker;
 use fff::{DbHealthChecker, FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser};
 use fff::{SharedFilePicker, SharedFrecency};
 use ffi_types::{
-    FFF_CREATE_OPTIONS_V3_VERSION, FffCreateOptions, FffCreateOptionsV3, FffDirItem,
-    FffDirSearchResult, FffFileItem, FffGrepMatch, FffGrepResult, FffMixedItem,
-    FffMixedSearchResult, FffResult, FffScanProgress, FffScore, FffSearchResult,
+    FFF_CREATE_OPTIONS_V3_VERSION, FFF_CREATE_OPTIONS_V4_VERSION, FffCreateOptions,
+    FffCreateOptionsV3, FffCreateOptionsV4, FffDirItem, FffDirSearchResult, FffFileItem,
+    FffGrepMatch, FffGrepResult, FffMixedItem, FffMixedSearchResult, FffResult, FffScanProgress,
+    FffScore, FffSearchResult,
 };
 
 /// Opaque handle holding all per-instance state; freed by `fff_destroy`.
@@ -169,7 +170,7 @@ pub unsafe extern "C" fn fff_create_instance2(
 /// Create a file finder from versioned options. `base_path` is required.
 ///
 /// # Safety
-/// Pass an `FffCreateOptions` (V1/V2) or cast a pointer to the whole `FffCreateOptionsV3` (V3).
+/// Pass an `FffCreateOptions` (V1/V2) or cast a pointer to the whole V3/V4 options struct.
 /// String pointers must be NUL-terminated UTF-8 or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance_with(
@@ -178,10 +179,10 @@ pub unsafe extern "C" fn fff_create_instance_with(
     let Some(opts) = (unsafe { options.as_ref() }) else {
         return FffResult::err("opts is null");
     };
-    if opts.version == 0 || opts.version > FFF_CREATE_OPTIONS_V3_VERSION {
+    if opts.version == 0 || opts.version > FFF_CREATE_OPTIONS_V4_VERSION {
         return FffResult::err(&format!(
             "Unsupported FffCreateOptions version {} (library understands up to {})",
-            opts.version, FFF_CREATE_OPTIONS_V3_VERSION
+            opts.version, FFF_CREATE_OPTIONS_V4_VERSION
         ));
     }
 
@@ -190,7 +191,7 @@ pub unsafe extern "C" fn fff_create_instance_with(
         _ => return FffResult::err("opts.base_path is null or empty"),
     };
 
-    let rules = if opts.version == FFF_CREATE_OPTIONS_V3_VERSION {
+    let rules = if opts.version >= FFF_CREATE_OPTIONS_V3_VERSION {
         unsafe { (*options.cast::<FffCreateOptionsV3>()).extra_ignore }
     } else {
         std::ptr::null()
@@ -203,6 +204,15 @@ pub unsafe extern "C" fn fff_create_instance_with(
         };
         rules.lines().map(str::to_owned).collect()
     };
+    let mut ignore_options = FilePickerIgnoreOptions {
+        extra_ignore,
+        ..Default::default()
+    };
+    if opts.version == FFF_CREATE_OPTIONS_V4_VERSION {
+        let options = unsafe { &*options.cast::<FffCreateOptionsV4>() };
+        ignore_options.disable_git = options.disable_git;
+        ignore_options.disable_ignore_files = options.disable_ignore_files;
+    }
 
     if let Some(log_path) = unsafe { optional_cstr(opts.log_file_path) } {
         let level = unsafe { optional_cstr(opts.log_level) };
@@ -260,7 +270,7 @@ pub unsafe extern "C" fn fff_create_instance_with(
         opts.cache_budget_max_file_size,
     );
 
-    if let Err(e) = FilePicker::new_with_shared_state_and_extra_ignore(
+    if let Err(e) = FilePicker::new_with_shared_state_and_ignore_options(
         shared_picker.clone(),
         shared_frecency.clone(),
         fff::FilePickerOptions {
@@ -275,7 +285,7 @@ pub unsafe extern "C" fn fff_create_instance_with(
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
             git_recency: Default::default(),
         },
-        extra_ignore,
+        ignore_options,
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
     }
@@ -298,8 +308,11 @@ pub unsafe extern "C" fn fff_create_instance_with(
 /// UTF-8 or NULL. The struct itself is consumed by value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance_with_value(opts: FffCreateOptions) -> *mut FffResult {
-    if opts.version == FFF_CREATE_OPTIONS_V3_VERSION {
-        return FffResult::err("FffCreateOptions V3 must be passed by pointer");
+    if (FFF_CREATE_OPTIONS_V3_VERSION..=FFF_CREATE_OPTIONS_V4_VERSION).contains(&opts.version) {
+        return FffResult::err(&format!(
+            "FffCreateOptions V{} must be passed by pointer",
+            opts.version
+        ));
     }
     unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
 }
@@ -1041,14 +1054,14 @@ pub unsafe extern "C" fn fff_restart_index(
         .as_ref()
         .map(|p| p.git_recency_config())
         .unwrap_or_default();
-    let extra_ignore = guard
+    let ignore_options = guard
         .as_ref()
-        .map(FilePicker::extra_ignore)
+        .map(|picker| picker.ignore_options().clone())
         .unwrap_or_default();
 
     drop(guard);
 
-    match FilePicker::new_with_shared_state_and_extra_ignore(
+    match FilePicker::new_with_shared_state_and_ignore_options(
         inst.picker.clone(),
         inst.frecency.clone(),
         fff::FilePickerOptions {
@@ -1063,7 +1076,7 @@ pub unsafe extern "C" fn fff_restart_index(
             enable_home_dir_scanning: home_dir,
             git_recency,
         },
-        extra_ignore,
+        ignore_options,
     ) {
         Ok(()) => FffResult::ok_empty(),
         Err(e) => FffResult::err(&format!("Failed to init file picker: {}", e)),

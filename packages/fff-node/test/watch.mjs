@@ -96,6 +96,56 @@ it("applies extraIgnore during scans, watch updates, and reindex", async () => {
   }
 });
 
+it("keeps Git disabled across watch updates, rescans, and reindex", async () => {
+  const temp = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-ignore-controls-")));
+  const initial = join(temp, "initial");
+  const replacement = join(temp, "replacement");
+  let picker;
+  try {
+    for (const dir of [initial, replacement]) {
+      await promisify(execFile)("git", ["init", "-q", dir]);
+      writeFileSync(join(dir, ".gitignore"), "git-*.txt\n");
+      writeFileSync(join(dir, ".ignore"), "ignored-*.txt\n");
+      writeFileSync(join(dir, "git-initial.txt"), "keep");
+      writeFileSync(join(dir, "ignored-initial.txt"), "drop");
+      writeFileSync(join(dir, "extra-initial.txt"), "drop");
+    }
+    const created = FileFinder.create({
+      basePath: initial,
+      disableGit: true,
+      extraIgnore: ["extra-*.txt"],
+    });
+    assert.ok(created.ok, created.error);
+    picker = created.value;
+    const indexed = () => {
+      const result = picker.glob("**/*.txt");
+      assert.ok(result.ok, result.error);
+      return result.value.items.map((item) => item.relativePath).sort();
+    };
+    assert.deepEqual(await picker.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(indexed(), ["git-initial.txt"]);
+    assert.deepEqual(picker.refreshGitStatus(), { ok: true, value: 0 });
+    assert.ok(await waitFor(() => picker.getScanProgress().value?.isWatcherReady));
+
+    writeFileSync(join(initial, "ignored-added.txt"), "drop");
+    writeFileSync(join(initial, "extra-added.txt"), "drop");
+    writeFileSync(join(initial, "git-added.txt"), "keep");
+    assert.ok(await waitFor(() => indexed().includes("git-added.txt")));
+    assert.deepEqual(indexed(), ["git-added.txt", "git-initial.txt"]);
+
+    assert.ok(picker.scanFiles().ok);
+    assert.deepEqual(await picker.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(indexed(), ["git-added.txt", "git-initial.txt"]);
+
+    assert.ok(picker.reindex(replacement).ok);
+    assert.deepEqual(await picker.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(indexed(), ["git-initial.txt"]);
+  } finally {
+    picker?.destroy();
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 describe("fff-node watch", { concurrency: 1 }, () => {
   before(async () => {
     // realpath.native: Windows tmpdir() may return an 8.3 short path (RUNNER~1) that

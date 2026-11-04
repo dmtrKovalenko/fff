@@ -715,6 +715,8 @@ Pass `extraIgnore` to apply `.gitignore` rules when the SDK builds and updates i
 FileFinder.create({ basePath: process.cwd(), extraIgnore: ["/generated/", "!/keep.log"] });
 ```
 
+Set `disableGit: true` to skip Git discovery, status, ranking, and Git ignore rules. The scan includes hidden files and skips Git metadata under `.git`. Set `disableIgnoreFiles: true` to skip rules from `.ignore` files independently. Both options require zlob and work with `extraIgnore`.
+
 ### Definition modes
 
 Each core grep call uses one `classify_definitions` mode. Rust stores it in `GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript SDKs expose the same setting as `classifyDefinitions`.

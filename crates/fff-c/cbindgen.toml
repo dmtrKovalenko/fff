@@ -8,6 +8,7 @@ sys_includes = ["stdint.h", "stdbool.h", "stddef.h"]
 [export]
 include = [
   "FffCreateOptionsV3", "FFF_CREATE_OPTIONS_V3_VERSION",
+  "FffCreateOptionsV4", "FFF_CREATE_OPTIONS_V4_VERSION",
   "FffResult",
   "FffSearchResult", "FffFileItem", "FffScore", "FffLocation",
   "FffGrepResult", "FffGrepMatch", "FffMatchRange",

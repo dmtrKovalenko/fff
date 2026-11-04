@@ -15,6 +15,8 @@ use fff::{
 pub const FFF_CREATE_OPTIONS_VERSION: u32 = 2;
 /// Version of [`FffCreateOptionsV3`].
 pub const FFF_CREATE_OPTIONS_V3_VERSION: u32 = 3;
+/// Version of [`FffCreateOptionsV4`].
+pub const FFF_CREATE_OPTIONS_V4_VERSION: u32 = 4;
 
 /// V1 and V2 options for the pointer and by-value constructors.
 #[repr(C)]
@@ -89,6 +91,17 @@ pub struct FffCreateOptionsV3 {
     pub base: FffCreateOptions,
     /// Additional newline-separated `.gitignore` rules. NULL for none. Requires zlob.
     pub extra_ignore: *const c_char,
+}
+
+/// V4 options for `fff_create_instance_with`. Pass a pointer cast from the whole struct.
+#[repr(C)]
+pub struct FffCreateOptionsV4 {
+    /// Set `base.base.version` to [`FFF_CREATE_OPTIONS_V4_VERSION`].
+    pub base: FffCreateOptionsV3,
+    /// Skip Git integration and Git ignore rules.
+    pub disable_git: bool,
+    /// Skip rules from `.ignore` files.
+    pub disable_ignore_files: bool,
 }
 
 /// Allocate a heap CString from a `&str`, returning a raw pointer.
@@ -785,7 +798,7 @@ impl From<fff::file_picker::ScanProgress> for FffScanProgress {
 
 #[cfg(test)]
 mod options_layout_tests {
-    use super::{FffCreateOptions, FffCreateOptionsV3};
+    use super::{FffCreateOptions, FffCreateOptionsV3, FffCreateOptionsV4};
     use std::mem::{align_of, offset_of, size_of};
 
     // THIS TEST HAVE TO BE NEVER UPDATED ONLY ADDED NEW FIELDS
@@ -821,5 +834,15 @@ mod options_layout_tests {
         assert_eq!(align_of::<FffCreateOptionsV3>(), 8);
         assert_eq!(offset_of!(FffCreateOptionsV3, base), 0);
         assert_eq!(offset_of!(FffCreateOptionsV3, extra_ignore), 88);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn fff_create_options_v4_extends_v3_layout() {
+        assert_eq!(size_of::<FffCreateOptionsV4>(), 104);
+        assert_eq!(align_of::<FffCreateOptionsV4>(), 8);
+        assert_eq!(offset_of!(FffCreateOptionsV4, base), 0);
+        assert_eq!(offset_of!(FffCreateOptionsV4, disable_git), 96);
+        assert_eq!(offset_of!(FffCreateOptionsV4, disable_ignore_files), 97);
     }
 }
