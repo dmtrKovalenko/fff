@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { findBinary } from "../src/download";
 import { FileFinder } from "../src/index";
@@ -65,6 +67,68 @@ describe("FileFinder - Health Check", () => {
       expect(result.value.filePicker.initialized).toBe(false);
     }
   });
+});
+
+test("create passes extraIgnore rules to the native finder", () => {
+  const basePath = fs.mkdtempSync(path.join(os.tmpdir(), "fff-bun-extra-ignore-"));
+  let finder: FileFinder | undefined;
+  try {
+    fs.writeFileSync(path.join(basePath, "keep.txt"), "keep");
+    fs.writeFileSync(path.join(basePath, "drop.txt"), "drop");
+    const created = FileFinder.create({ basePath, extraIgnore: ["/drop.txt"] });
+    if (!created.ok) throw new Error(created.error);
+    finder = created.value;
+    expect(finder.waitForScanBlocking(10_000)).toEqual({ ok: true, value: true });
+    const files = finder.glob("**/*.txt");
+    if (!files.ok) throw new Error(files.error);
+    expect(files.value.items.map((item) => item.relativePath)).toEqual(["keep.txt"]);
+  } finally {
+    finder?.destroy();
+    fs.rmSync(basePath, { recursive: true, force: true });
+  }
+});
+
+test("Git and .ignore rules can be disabled independently", () => {
+  const basePath = fs.mkdtempSync(path.join(os.tmpdir(), "fff-bun-ignore-controls-"));
+  try {
+    execFileSync("git", ["init", "-q", basePath]);
+    fs.writeFileSync(path.join(basePath, ".gitignore"), "git.txt\n");
+    fs.writeFileSync(path.join(basePath, ".ignore"), "ignore.txt\n");
+    for (const name of ["git.txt", "ignore.txt", "extra.txt", "keep.txt"]) {
+      fs.writeFileSync(path.join(basePath, name), "");
+    }
+
+    for (const [disableGit, disableIgnoreFiles, expected] of [
+      [false, false, ["keep.txt"]],
+      [true, false, ["git.txt", "keep.txt"]],
+      [false, true, ["ignore.txt", "keep.txt"]],
+      [true, true, ["git.txt", "ignore.txt", "keep.txt"]],
+    ] as const) {
+      const created = FileFinder.create({
+        basePath,
+        disableGit,
+        disableIgnoreFiles,
+        disableWatch: true,
+        extraIgnore: ["/extra.txt"],
+      });
+      if (!created.ok) throw new Error(created.error);
+      try {
+        expect(created.value.waitForScanBlocking(10_000)).toEqual({
+          ok: true,
+          value: true,
+        });
+        const files = created.value.glob("**/*.txt");
+        if (!files.ok) throw new Error(files.error);
+        expect(files.value.items.map((item) => item.relativePath).sort()).toEqual([
+          ...expected,
+        ]);
+      } finally {
+        created.value.destroy();
+      }
+    }
+  } finally {
+    fs.rmSync(basePath, { recursive: true, force: true });
+  }
 });
 
 describe("FileFinder - Full Lifecycle", () => {

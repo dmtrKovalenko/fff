@@ -242,7 +242,7 @@ int main(int argc, char **argv) {
     const char *base_path = argc > 1 ? argv[1] : ".";
 
     // make sure that FFF C api is designed more for FFI rather than for direct C usage (I'm sorry)
-    struct FffResult *create_result = fff_create_instance_with(&(struct FffCreateOptions){
+    struct FffResult *create_result = fff_create_instance_with_value((struct FffCreateOptions){
         .version = FFF_CREATE_OPTIONS_VERSION,
         .base_path = base_path,
         .enable_mmap_cache = false,

@@ -344,11 +344,21 @@ pub(crate) fn handle_debounced_events(
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
     // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
     // per batch so we don't hold the picker lock during filtering.
-    let walker_rules = shared_picker
+    let (walker_rules, disable_git, disable_ignore_files) = shared_picker
         .read()
         .ok()
-        .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
-    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
+        .and_then(|g| {
+            g.as_ref().map(|picker| {
+                let options = picker.ignore_options();
+                (
+                    picker.ignore_rules(),
+                    options.disable_git,
+                    options.disable_ignore_files,
+                )
+            })
+        })
+        .unwrap_or_default();
+    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref(), disable_git);
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
     let mut paths_to_remove = Vec::new();
@@ -419,10 +429,12 @@ pub(crate) fn handle_debounced_events(
         }
 
         for path in &debounced_event.event.paths {
-            if matches!(
-                path.file_name().and_then(|f| f.to_str()),
-                Some(".ignore") | Some(".gitignore")
-            ) {
+            let ignore_file_changed = match path.file_name().and_then(|f| f.to_str()) {
+                Some(".ignore") => !disable_ignore_files,
+                Some(".gitignore") => !disable_git,
+                _ => false,
+            };
+            if ignore_file_changed {
                 if path
                     .parent()
                     .is_some_and(|parent| filter.is_ignored(parent))
@@ -808,26 +820,35 @@ fn index_new_directory(
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's ignore rules; read base_path + rules from the picker.
-    let (base_path, walker_rules, follow_symlinks) = match shared_picker.read().ok().and_then(|g| {
+    let state = shared_picker.read().ok().and_then(|g| {
         g.as_ref().map(|p| {
             (
                 p.base_path().to_path_buf(),
                 p.ignore_rules(),
                 p.follows_symlinks(),
+                p.ignore_options().clone(),
             )
         })
-    }) {
-        Some(triple) => triple,
-        None => return Vec::new(),
+    });
+    let Some((base_path, walker_rules, follow_symlinks, ignore_options)) = state else {
+        return Vec::new();
+    };
+
+    // Walk from the original root when caller patterns depend on that root.
+    let (walk_base, scope) = if ignore_options.extra_ignore.is_empty() {
+        (dir, None)
+    } else {
+        (base_path.as_path(), Some(dir))
     };
 
     let walk = match crate::walk::walk_collect_files(
-        dir,
+        walk_base,
         repo.is_some(),
         follow_symlinks,
         1,
         &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &ignore_options,
+        scope,
     ) {
         Ok(walk) => walk,
         Err(e) => {
@@ -836,12 +857,16 @@ fn index_new_directory(
         }
     };
 
-    // TODO: figure out a better optimized way for zlob to rerun the directory walk using existing
-    // ignore rules, but currently we have to filter out ignored files on our own
-    let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
+    // Subtree-rooted walks still need to check the original root's ignore rules.
+    let filter = IgnoreFilter::new(
+        &base_path,
+        walker_rules,
+        repo.as_ref(),
+        ignore_options.disable_git,
+    );
     let join_unless_ignored = |relative_path: &str| -> Option<PathBuf> {
-        let path = dir.join(relative_path);
-        (!filter.is_ignored(&path)).then_some(path)
+        let path = walk_base.join(relative_path);
+        (scope.is_some() || !filter.is_ignored(&path)).then_some(path)
     };
 
     let files_to_add: Vec<PathBuf> = walk
@@ -956,6 +981,7 @@ struct IgnoreFilter<'a> {
     /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
     /// caller's repo (also used for git-status queries) to avoid re-opening.
     repo: Option<&'a Repository>,
+    disable_git: bool,
 }
 
 impl<'a> IgnoreFilter<'a> {
@@ -963,11 +989,13 @@ impl<'a> IgnoreFilter<'a> {
         base_path: &'a Path,
         rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
         repo: Option<&'a Repository>,
+        disable_git: bool,
     ) -> Self {
         Self {
             base_path,
             rules,
             repo,
+            disable_git,
         }
     }
 
@@ -984,6 +1012,7 @@ impl<'a> IgnoreFilter<'a> {
         }
         match self.repo {
             Some(repo) => repo.is_path_ignored(path) == Ok(true),
+            None if self.disable_git => false,
             // No repo and no rules: the non-code-dir heuristic, applied to the
             // base-relative path so ancestors of the base (e.g. a temp dir
             // under AppData/Local on Windows) never match.
