@@ -30,7 +30,7 @@ pub(crate) struct ScanSignals {
 }
 
 /// Which optional phases a scan should run.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct ScanConfig {
     pub(crate) warmup: bool,
     pub(crate) content_indexing: bool,
@@ -38,6 +38,7 @@ pub(crate) struct ScanConfig {
     pub(crate) auto_cache_budget: bool,
     pub(crate) install_watcher: bool,
     pub(crate) follow_symlinks: bool,
+    pub(crate) extra_ignore: Arc<[String]>,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
 }
@@ -91,6 +92,7 @@ impl ScanJob {
             auto_cache_budget: !picker.has_explicit_cache_budget(),
             install_watcher: false, // the watcher is independent of rescan, it is not restarting EVER
             follow_symlinks: picker.follows_symlinks(),
+            extra_ignore: picker.extra_ignore(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
         };
@@ -173,6 +175,7 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            &config.extra_ignore,
         ) {
             Ok(sync) => sync,
             Err(e) => {
@@ -447,6 +450,7 @@ mod tests {
             auto_cache_budget: false,
             install_watcher: false,
             follow_symlinks: false,
+            extra_ignore: Arc::default(),
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
         };

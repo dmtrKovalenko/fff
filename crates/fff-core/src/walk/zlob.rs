@@ -20,6 +20,8 @@ pub(crate) fn walk_collect_files(
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
+    extra_ignore: &[String],
+    scope: Option<&Path>,
 ) -> crate::Result<WalkOutput> {
     // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
     // ~/.cache, ~/.config, etc.); optionally follow symlinks.
@@ -39,14 +41,16 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
-    {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
-        tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
+    let defaults = if is_git_repo { &[] } else { IGNORED_DIRS };
+    if !defaults.is_empty() || !extra_ignore.is_empty() {
+        let rules: Vec<_> = defaults
+            .iter()
+            .copied()
+            .chain(extra_ignore.iter().map(String::as_str))
+            .collect();
+        builder
+            .extra_ignore(&rules)
+            .map_err(|e| crate::Error::WalkFailed(format!("invalid extra ignore rules: {e:?}")))?;
     }
 
     // Single lock for both collections: every entry is either a file or a
@@ -54,6 +58,16 @@ pub(crate) fn walk_collect_files(
     let collected = Mutex::new((Vec::new(), Vec::new()));
 
     let outcome = match builder.run(|entry| {
+        if let Some(scope) = scope {
+            let path = entry.path();
+            if scope.starts_with(path) {
+                return WalkState::Continue;
+            }
+            if !path.starts_with(scope) {
+                return WalkState::SkipDir;
+            }
+        }
+
         // Followed links keep the Symlink kind and lstat metadata, so stat
         // the target to index the ones resolving to files (#912).
         let target = if entry.is_file() {

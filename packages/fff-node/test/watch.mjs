@@ -11,7 +11,7 @@
 import { after, before, describe, it, mock } from "node:test";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdtempSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -37,6 +37,64 @@ const deliveredEvents = (fn) => fn.mock.calls.flatMap((call) => call.arguments[0
 let finder = null;
 /** @type {string} */
 let baseDir = "";
+
+it("applies extraIgnore during scans, watch updates, and reindex", async () => {
+  const temp = realpathSync.native(mkdtempSync(join(tmpdir(), "fff-extra-ignore-")));
+  const initial = join(temp, "initial");
+  const replacement = join(temp, "replacement");
+  let picker;
+  try {
+    for (const dir of [initial, replacement]) {
+      mkdirSync(join(dir, "generated"), { recursive: true });
+      await promisify(execFile)("git", ["init", "-q", dir]);
+      writeFileSync(join(dir, ".gitignore"), "*.log\n");
+      writeFileSync(join(dir, "keep-initial.log"), "keep");
+      writeFileSync(join(dir, "drop.log"), "drop");
+      writeFileSync(join(dir, "generated", "keep-excluded.log"), "drop");
+    }
+
+    const created = FileFinder.create({
+      basePath: initial,
+      extraIgnore: ["/generated/", "!keep-*.log"],
+    });
+    assert.ok(created.ok, created.error);
+    picker = created.value;
+    const indexedLogs = () => {
+      const result = picker.glob("**/*.log");
+      assert.ok(result.ok, result.error);
+      return result.value.items.map((item) => item.relativePath).sort();
+    };
+    assert.deepEqual(await picker.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(indexedLogs(), ["keep-initial.log"]);
+    assert.ok(await waitFor(() => picker.getScanProgress().value?.isWatcherReady));
+
+    writeFileSync(join(initial, "generated", "keep-added-excluded.log"), "drop");
+    writeFileSync(join(initial, "keep-added.log"), "keep");
+    assert.ok(await waitFor(() => indexedLogs().includes("keep-added.log")));
+    assert.deepEqual(indexedLogs(), ["keep-added.log", "keep-initial.log"]);
+
+    const moved = join(temp, "moved");
+    mkdirSync(moved);
+    writeFileSync(join(moved, ".gitignore"), "*.log\n");
+    writeFileSync(join(moved, "keep-moved.log"), "keep");
+    writeFileSync(join(moved, "drop-moved.log"), "drop");
+    renameSync(moved, join(initial, "moved"));
+    const expected = ["keep-added.log", "keep-initial.log", "moved/keep-moved.log"];
+    assert.ok(await waitFor(() => indexedLogs().includes("moved/keep-moved.log")));
+    assert.deepEqual(indexedLogs(), expected);
+
+    assert.ok(picker.scanFiles().ok);
+    assert.deepEqual(await picker.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(indexedLogs(), expected);
+
+    assert.ok(picker.reindex(replacement).ok);
+    assert.deepEqual(await picker.waitForScan(10_000), { ok: true, value: true });
+    assert.deepEqual(indexedLogs(), ["keep-initial.log"]);
+  } finally {
+    picker?.destroy();
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
 
 describe("fff-node watch", { concurrency: 1 }, () => {
   before(async () => {

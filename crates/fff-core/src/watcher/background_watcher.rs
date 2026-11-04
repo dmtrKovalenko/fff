@@ -808,26 +808,35 @@ fn index_new_directory(
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's ignore rules; read base_path + rules from the picker.
-    let (base_path, walker_rules, follow_symlinks) = match shared_picker.read().ok().and_then(|g| {
+    let state = shared_picker.read().ok().and_then(|g| {
         g.as_ref().map(|p| {
             (
                 p.base_path().to_path_buf(),
                 p.ignore_rules(),
                 p.follows_symlinks(),
+                p.extra_ignore(),
             )
         })
-    }) {
-        Some(triple) => triple,
-        None => return Vec::new(),
+    });
+    let Some((base_path, walker_rules, follow_symlinks, extra_ignore)) = state else {
+        return Vec::new();
+    };
+
+    // Walk from the original root when caller patterns depend on that root.
+    let (walk_base, scope) = if extra_ignore.is_empty() {
+        (dir, None)
+    } else {
+        (base_path.as_path(), Some(dir))
     };
 
     let walk = match crate::walk::walk_collect_files(
-        dir,
+        walk_base,
         repo.is_some(),
         follow_symlinks,
         1,
         &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &extra_ignore,
+        scope,
     ) {
         Ok(walk) => walk,
         Err(e) => {
@@ -836,12 +845,11 @@ fn index_new_directory(
         }
     };
 
-    // TODO: figure out a better optimized way for zlob to rerun the directory walk using existing
-    // ignore rules, but currently we have to filter out ignored files on our own
+    // Subtree-rooted walks still need to check the original root's ignore rules.
     let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
     let join_unless_ignored = |relative_path: &str| -> Option<PathBuf> {
-        let path = dir.join(relative_path);
-        (!filter.is_ignored(&path)).then_some(path)
+        let path = walk_base.join(relative_path);
+        (scope.is_some() || !filter.is_ignored(&path)).then_some(path)
     };
 
     let files_to_add: Vec<PathBuf> = walk

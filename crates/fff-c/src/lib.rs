@@ -12,6 +12,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fff::shared::SharedQueryTracker;
@@ -181,6 +182,18 @@ pub unsafe extern "C" fn fff_create_instance2(
 ///   or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions) -> *mut FffResult {
+    unsafe { fff_create_instance_with_extra_ignore(opts, std::ptr::null()) }
+}
+
+/// Creates a finder with extra `.gitignore` rules separated by newlines (zlob only).
+///
+/// # Safety
+/// `opts` follows `fff_create_instance_with`. `extra_ignore` must be a NUL-terminated UTF-8 string or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_create_instance_with_extra_ignore(
+    opts: *const FffCreateOptions,
+    extra_ignore: *const c_char,
+) -> *mut FffResult {
     if opts.is_null() {
         return FffResult::err("opts is null");
     }
@@ -195,6 +208,15 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
     let base_path_str = match unsafe { cstr_to_str(opts.base_path) } {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return FffResult::err("opts.base_path is null or empty"),
+    };
+
+    let extra_ignore = if extra_ignore.is_null() {
+        Arc::default()
+    } else {
+        let Some(rules) = (unsafe { cstr_to_str(extra_ignore) }) else {
+            return FffResult::err("extra_ignore is not valid UTF-8");
+        };
+        rules.lines().map(str::to_owned).collect()
     };
 
     if let Some(log_path) = unsafe { optional_cstr(opts.log_file_path) } {
@@ -253,7 +275,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         opts.cache_budget_max_file_size,
     );
 
-    if let Err(e) = FilePicker::new_with_shared_state(
+    if let Err(e) = FilePicker::new_with_shared_state_and_extra_ignore(
         shared_picker.clone(),
         shared_frecency.clone(),
         fff::FilePickerOptions {
@@ -268,6 +290,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
             git_recency: Default::default(),
         },
+        extra_ignore,
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
     }
@@ -1031,10 +1054,14 @@ pub unsafe extern "C" fn fff_restart_index(
         .as_ref()
         .map(|p| p.git_recency_config())
         .unwrap_or_default();
+    let extra_ignore = guard
+        .as_ref()
+        .map(FilePicker::extra_ignore)
+        .unwrap_or_default();
 
     drop(guard);
 
-    match FilePicker::new_with_shared_state(
+    match FilePicker::new_with_shared_state_and_extra_ignore(
         inst.picker.clone(),
         inst.frecency.clone(),
         fff::FilePickerOptions {
@@ -1049,6 +1076,7 @@ pub unsafe extern "C" fn fff_restart_index(
             enable_home_dir_scanning: home_dir,
             git_recency,
         },
+        extra_ignore,
     ) {
         Ok(()) => FffResult::ok_empty(),
         Err(e) => FffResult::err(&format!("Failed to init file picker: {}", e)),

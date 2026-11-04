@@ -336,9 +336,17 @@ const ffiDefinition = {
   },
 } as const;
 
-type FFFLibrary = ReturnType<typeof dlopen<typeof ffiDefinition>>;
+const extraIgnoreDefinition = {
+  fff_create_instance_with_extra_ignore: {
+    args: [FFIType.ptr, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+} as const;
+
+type FFFLibrary = ReturnType<typeof dlopen<typeof ffiDefinition>> & { path: string };
 
 let lib: FFFLibrary | null = null;
+let extraIgnoreLib: ReturnType<typeof dlopen<typeof extraIgnoreDefinition>> | null = null;
 
 /**
  * Load the native library
@@ -352,7 +360,7 @@ function loadLibrary(): FFFLibrary {
     throw new Error(libNotFoundMessage());
   }
 
-  lib = dlopen(binaryPath, ffiDefinition);
+  lib = Object.assign(dlopen(binaryPath, ffiDefinition), { path: binaryPath });
   return lib;
 }
 
@@ -548,7 +556,9 @@ export function ffiCreate(
   cacheBudgetMaxFileSize: bigint,
   enableFsRootScanning: boolean,
   enableHomeDirScanning: boolean,
+  extraIgnore: string,
 ): Result<NativeHandle> {
+  if (extraIgnore.includes("\0")) return err("extraIgnore cannot contain NUL bytes");
   const library = loadLibrary();
 
   // Keep cstring buffers alive across the FFI call. Bun's `ptr()` returns
@@ -576,7 +586,21 @@ export function ffiCreate(
   opts.writeUInt8(enableFsRootScanning ? 1 : 0, FCO_ENABLE_FS_ROOT_SCANNING);
   opts.writeUInt8(enableHomeDirScanning ? 1 : 0, FCO_ENABLE_HOME_DIR_SCANNING);
 
-  const resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
+  let resultPtr: Pointer | null;
+  if (extraIgnore) {
+    try {
+      extraIgnoreLib ??= dlopen(library.path, extraIgnoreDefinition);
+      const rules = encodeString(extraIgnore);
+      resultPtr = extraIgnoreLib.symbols.fff_create_instance_with_extra_ignore(
+        ptr(opts),
+        ptr(rules),
+      );
+    } catch (error) {
+      return err(`Failed to load native extraIgnore support: ${error}`);
+    }
+  } else {
+    resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
+  }
 
   if (resultPtr === null) {
     return err("FFI returned null pointer");

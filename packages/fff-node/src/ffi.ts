@@ -370,7 +370,9 @@ export function ffiCreate(
   enableFsRootScanning: boolean,
   enableHomeDirScanning: boolean,
   followSymlinks: boolean,
+  extraIgnore: string,
 ): Result<NativeHandle> {
+  if (extraIgnore.includes("\0")) return err("extraIgnore cannot contain NUL bytes");
   loadLibrary();
 
   const optsValue = {
@@ -392,14 +394,24 @@ export function ffiCreate(
     follow_symlinks: followSymlinks ? 1 : 0,
   };
 
-  const rawPtr = load({
-    library: LIBRARY_KEY,
-    funcName: "fff_create_instance_with",
-    retType: DataType.External,
-    paramsType: [FFF_CREATE_OPTIONS_STRUCT],
-    paramsValue: [optsValue],
-    freeResultMemory: false,
-  }) as JsExternal;
+  let rawPtr: JsExternal;
+  try {
+    rawPtr = load({
+      library: LIBRARY_KEY,
+      funcName: extraIgnore
+        ? "fff_create_instance_with_extra_ignore"
+        : "fff_create_instance_with",
+      retType: DataType.External,
+      paramsType: extraIgnore
+        ? [FFF_CREATE_OPTIONS_STRUCT, DataType.String]
+        : [FFF_CREATE_OPTIONS_STRUCT],
+      paramsValue: extraIgnore ? [optsValue, extraIgnore] : [optsValue],
+      freeResultMemory: false,
+    }) as JsExternal;
+  } catch (error) {
+    if (!extraIgnore) throw error;
+    return err(`Failed to load native extraIgnore support: ${error}`);
+  }
 
   const [structData] = restorePointer({
     retType: [FFF_RESULT_STRUCT],

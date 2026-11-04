@@ -531,6 +531,15 @@ struct FffResult *fff_create_instance2(const char *base_path,
 struct FffResult *fff_create_instance_with(const struct FffCreateOptions *opts);
 
 /**
+ * Creates a finder with extra `.gitignore` rules separated by newlines (zlob only).
+ *
+ * # Safety
+ * `opts` follows `fff_create_instance_with`. `extra_ignore` must be a NUL-terminated UTF-8 string or NULL.
+ */
+struct FffResult *fff_create_instance_with_extra_ignore(const struct FffCreateOptions *opts,
+                                                       const char *extra_ignore);
+
+/**
  * [`fff_create_instance_with`] adapter taking [`FffCreateOptions`] **by value**,
  * for FFI libraries that pass native structs by value (e.g. Node's `ffi-rs`).
  *
