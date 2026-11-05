@@ -27,7 +27,7 @@ pub(crate) fn walk_collect_files(
     let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
     if ignore_options.disable_git {
-        flags |= WalkFlags::SKIP_GITIGNORE;
+        flags |= WalkFlags::SKIP_GITIGNORE | WalkFlags::NO_GIT_EXCLUDE | WalkFlags::NO_GIT_GLOBAL;
     }
     if ignore_options.disable_ignore_files {
         flags |= WalkFlags::SKIP_DOT_IGNORE;

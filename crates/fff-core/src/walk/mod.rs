@@ -227,7 +227,8 @@ mod tests {
 
         for base in [&root, &worktree] {
             let counter = Arc::new(AtomicUsize::new(0));
-            let out = walk_collect_files(base, true, false, 1, &counter).unwrap();
+            let out = walk_collect_files(base, true, false, 1, &counter, &Default::default(), None)
+                .unwrap();
             let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
 
             assert!(names.iter().any(|n| n == "src/a.txt"), "{names:?}");
@@ -278,7 +279,8 @@ mod tests {
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let out =
+            walk_collect_files(root, true, false, 1, &counter, &Default::default(), None).unwrap();
         let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
 
         assert!(names.iter().any(|n| n == "src/hit.ts"), "{names:?}");
@@ -290,5 +292,66 @@ mod tests {
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
         assert!(rules.is_ignored(std::path::Path::new(".worktrees/wt1/new.ts")));
         assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts")));
+    }
+
+    // disable_git must also turn off the git exclude files, not only .gitignore.
+    #[cfg(feature = "zlob")]
+    #[test]
+    fn disable_git_skips_every_git_ignore_source() {
+        use crate::file_picker::FilePickerIgnoreOptions;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["from-gitignore", "from-exclude", "from-global", "from-dot"] {
+            fs::write(root.join(name), "x").unwrap();
+        }
+        fs::write(root.join(".gitignore"), "from-gitignore\n").unwrap();
+        fs::write(root.join(".ignore"), "from-dot\n").unwrap();
+        let excludes = dir.path().join("excludes");
+        fs::write(&excludes, "from-global\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.excludesFile", excludes.to_str().unwrap()],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        fs::write(root.join(".git/info/exclude"), "from-exclude\n").unwrap();
+
+        let walk = |disable_git| -> Vec<String> {
+            let options = FilePickerIgnoreOptions {
+                disable_git,
+                ..Default::default()
+            };
+            let counter = Arc::new(AtomicUsize::new(0));
+            walk_collect_files(&root, true, false, 1, &counter, &options, None)
+                .unwrap()
+                .pairs
+                .into_iter()
+                .map(|(_, rel)| rel)
+                .collect()
+        };
+
+        let enabled = walk(false);
+        for name in ["from-gitignore", "from-exclude", "from-global", "from-dot"] {
+            assert!(!enabled.iter().any(|n| n == name), "{name}: {enabled:?}");
+        }
+
+        let disabled = walk(true);
+        for name in ["from-gitignore", "from-exclude", "from-global"] {
+            assert!(disabled.iter().any(|n| n == name), "{name}: {disabled:?}");
+        }
+        assert!(!disabled.iter().any(|n| n == "from-dot"), "{disabled:?}");
+        assert!(
+            !disabled.iter().any(|n| n.starts_with(".git/")),
+            "{disabled:?}"
+        );
     }
 }
