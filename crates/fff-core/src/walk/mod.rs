@@ -179,4 +179,111 @@ mod tests {
         assert!(rules.is_ignored(Path::new("debug.log")));
         assert!(!rules.is_ignored(Path::new("Cargo.toml")));
     }
+
+    // Both backends must honor `info/exclude`, which linked worktrees read from
+    // the common git dir (#982).
+    #[test]
+    fn honors_git_info_exclude() {
+        use std::path::Path;
+        use std::process::Command;
+
+        let git = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("excluded")).unwrap();
+        fs::write(root.join("src/a.txt"), "a").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        fs::write(root.join("excluded/b.txt"), "b").unwrap();
+        fs::write(root.join(".git/info/exclude"), "# comment\nexcluded/\n").unwrap();
+
+        let worktree = dir.path().join("wt");
+        git(
+            &root,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        fs::create_dir_all(worktree.join("excluded")).unwrap();
+        fs::write(worktree.join("excluded/c.txt"), "c").unwrap();
+
+        for base in [&root, &worktree] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let out = walk_collect_files(base, true, false, 1, &counter).unwrap();
+            let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+
+            assert!(names.iter().any(|n| n == "src/a.txt"), "{names:?}");
+            assert!(
+                !names.iter().any(|n| n.starts_with("excluded")),
+                "{names:?}"
+            );
+
+            // The watcher filters incremental updates with these rules.
+            #[cfg(feature = "zlob")]
+            {
+                let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+                assert!(rules.is_ignored(Path::new("excluded/later/new.txt")));
+                assert!(rules.is_ignored(Path::new("debug.log")));
+                assert!(!rules.is_ignored(Path::new("src/a.txt")));
+            }
+        }
+    }
+
+    // zlob 1.8 reads core.excludesFile below the root .gitignore, as git does (#874).
+    #[cfg(feature = "zlob")]
+    #[test]
+    fn honors_git_excludes_file_with_git_precedence() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".worktrees/wt1")).unwrap();
+        fs::write(root.join("src/hit.ts"), "x").unwrap();
+        fs::write(root.join(".worktrees/wt1/hit.ts"), "x").unwrap();
+        fs::write(root.join("drop.tmp"), "x").unwrap();
+        fs::write(root.join("keep.tmp"), "x").unwrap();
+        fs::write(root.join(".gitignore"), "!keep.tmp\n").unwrap();
+
+        let excludes = dir.path().join("excludes");
+        fs::write(&excludes, "# comment\n.worktrees/\n*.tmp\nexcludes\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.excludesFile", excludes.to_str().unwrap()],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+
+        assert!(names.iter().any(|n| n == "src/hit.ts"), "{names:?}");
+        assert!(names.iter().any(|n| n == "keep.tmp"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "drop.tmp"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains(".worktrees")), "{names:?}");
+
+        // The watcher filters incremental updates with these rules.
+        let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
+        assert!(rules.is_ignored(std::path::Path::new(".worktrees/wt1/new.ts")));
+        assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts")));
+    }
 }
