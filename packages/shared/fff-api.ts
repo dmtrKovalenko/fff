@@ -39,6 +39,12 @@ export function err<T>(error: string): Result<T> {
 export interface InitOptions {
   /** Base directory to index (required) */
   basePath: string;
+  /** Extra `.gitignore` rules relative to `basePath`. Use `!pattern` to re-include paths. Requires a zlob build. */
+  extraIgnore?: readonly string[];
+  /** Disable Git integration and Git ignore rules for this index. Requires a zlob build. */
+  disableGit?: boolean;
+  /** Skip rules from `.ignore` files. Requires a zlob build. */
+  disableIgnoreFiles?: boolean;
   /** Path to frecency database (optional, omit to skip frecency initialization) */
   frecencyDbPath?: string;
   /** Path to query history database (optional, omit to skip query tracker initialization) */

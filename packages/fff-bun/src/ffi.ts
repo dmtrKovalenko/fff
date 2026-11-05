@@ -417,9 +417,10 @@ const RES_ERROR = 8; // *mut c_char (8)
 const RES_HANDLE = 16; // *mut c_void (8)
 const RES_INT_VALUE = 24; // i64         (8)
 
-// MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
-const FFF_CREATE_OPTIONS_VERSION = 1;
-const FFF_CREATE_OPTIONS_SIZE = 88;
+// MUST match `FffCreateOptions` in ffi_types.rs.
+const FFF_CREATE_OPTIONS_VERSION = 3;
+const LEGACY_CREATE_OPTIONS_VERSION = 1;
+const FFF_CREATE_OPTIONS_SIZE = 104;
 const FCO_VERSION = 0;
 const FCO_BASE_PATH = 8;
 const FCO_FRECENCY_DB_PATH = 16;
@@ -435,6 +436,9 @@ const FCO_CACHE_BUDGET_MAX_BYTES = 64;
 const FCO_CACHE_BUDGET_MAX_FILE_SIZE = 72;
 const FCO_ENABLE_FS_ROOT_SCANNING = 80;
 const FCO_ENABLE_HOME_DIR_SCANNING = 81;
+const FCO_EXTRA_IGNORE = 88;
+const FCO_DISABLE_GIT = 96;
+const FCO_DISABLE_IGNORE_FILES = 97;
 
 function readResultEnvelope(
   resultPtr: Pointer | null,
@@ -521,16 +525,7 @@ export type NativeHandle = Pointer;
 /**
  * Create a new file finder instance.
  *
- * Hand-encodes a [`FffCreateOptions`] struct (88 bytes, locked offsets — see
- * `crates/fff-c/src/ffi_types.rs::options_layout_tests`) into a Buffer and
- * passes its pointer to `fff_create_instance_with`. Inner cstring addresses
- * come from Bun's native `ptr(buffer)` primitive — no round-trip helpers,
- * no struct support gaps.
- *
- * Adding new options later means: (1) appending the field to
- * `FffCreateOptions` in Rust, (2) bumping `FFF_CREATE_OPTIONS_VERSION`,
- * (3) extending `FFF_CREATE_OPTIONS_SIZE` + offsets here. The C entry point
- * never changes.
+ * Encodes the versioned create options and passes them to `fff_create_instance_with`.
  */
 export function ffiCreate(
   basePath: string,
@@ -548,7 +543,11 @@ export function ffiCreate(
   cacheBudgetMaxFileSize: bigint,
   enableFsRootScanning: boolean,
   enableHomeDirScanning: boolean,
+  extraIgnore: string,
+  disableGit = false,
+  disableIgnoreFiles = false,
 ): Result<NativeHandle> {
+  if (extraIgnore.includes("\0")) return err("extraIgnore cannot contain NUL bytes");
   const library = loadLibrary();
 
   // Keep cstring buffers alive across the FFI call. Bun's `ptr()` returns
@@ -558,9 +557,15 @@ export function ffiCreate(
   const historyCStr = encodeCStringBuf(historyDbPath);
   const logFileCStr = encodeCStringBuf(logFilePath);
   const logLevelCStr = encodeCStringBuf(logLevel);
+  const extraIgnoreCStr = encodeCStringBuf(extraIgnore);
+
+  const version =
+    extraIgnoreCStr || disableGit || disableIgnoreFiles
+      ? FFF_CREATE_OPTIONS_VERSION
+      : LEGACY_CREATE_OPTIONS_VERSION;
 
   const opts = Buffer.alloc(FFF_CREATE_OPTIONS_SIZE);
-  opts.writeUInt32LE(FFF_CREATE_OPTIONS_VERSION, FCO_VERSION);
+  opts.writeUInt32LE(version, FCO_VERSION);
   writePtrLE(opts, FCO_BASE_PATH, basePathCStr);
   writePtrLE(opts, FCO_FRECENCY_DB_PATH, frecencyCStr);
   writePtrLE(opts, FCO_HISTORY_DB_PATH, historyCStr);
@@ -575,6 +580,9 @@ export function ffiCreate(
   opts.writeBigUInt64LE(cacheBudgetMaxFileSize, FCO_CACHE_BUDGET_MAX_FILE_SIZE);
   opts.writeUInt8(enableFsRootScanning ? 1 : 0, FCO_ENABLE_FS_ROOT_SCANNING);
   opts.writeUInt8(enableHomeDirScanning ? 1 : 0, FCO_ENABLE_HOME_DIR_SCANNING);
+  writePtrLE(opts, FCO_EXTRA_IGNORE, extraIgnoreCStr);
+  opts.writeUInt8(disableGit ? 1 : 0, FCO_DISABLE_GIT);
+  opts.writeUInt8(disableIgnoreFiles ? 1 : 0, FCO_DISABLE_IGNORE_FILES);
 
   const resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
 

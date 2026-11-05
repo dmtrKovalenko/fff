@@ -6,12 +6,12 @@ use tracing::{error, info};
 
 use crate::FileSync;
 use crate::error::Error;
-use crate::file_picker::FFFMode;
+use crate::file_picker::{FFFMode, FilePickerIgnoreOptions};
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
-use crate::watch::BackgroundWatcher;
+use crate::watch::{BackgroundWatcher, WatcherOptions};
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanSignals {
@@ -30,7 +30,7 @@ pub(crate) struct ScanSignals {
 }
 
 /// Which optional phases a scan should run.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct ScanConfig {
     pub(crate) warmup: bool,
     pub(crate) content_indexing: bool,
@@ -38,6 +38,7 @@ pub(crate) struct ScanConfig {
     pub(crate) auto_cache_budget: bool,
     pub(crate) install_watcher: bool,
     pub(crate) follow_symlinks: bool,
+    pub(crate) ignore_options: FilePickerIgnoreOptions,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
 }
@@ -91,6 +92,7 @@ impl ScanJob {
             auto_cache_budget: !picker.has_explicit_cache_budget(),
             install_watcher: false, // the watcher is independent of rescan, it is not restarting EVER
             follow_symlinks: picker.follows_symlinks(),
+            ignore_options: picker.ignore_options().clone(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
         };
@@ -165,7 +167,7 @@ impl ScanJob {
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
-        let git = FileSync::discover_git(&base_path);
+        let git = FileSync::discover_git(&base_path, config.ignore_options.disable_git);
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git.clone(),
@@ -173,6 +175,7 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            &config.ignore_options,
         ) {
             Ok(sync) => sync,
             Err(e) => {
@@ -250,9 +253,13 @@ impl ScanJob {
                 git,
                 shared_picker.clone(),
                 shared_frecency.clone(),
-                mode,
-                config.enable_fs_root_scanning,
-                config.enable_home_dir_scanning,
+                WatcherOptions {
+                    mode,
+                    follow_symlinks: config.follow_symlinks,
+                    ignore_options: config.ignore_options,
+                    enable_fs_root_scanning: config.enable_fs_root_scanning,
+                    enable_home_dir_scanning: config.enable_home_dir_scanning,
+                },
                 git_status_worker,
                 tracing::Span::current(),
             ) {
@@ -447,6 +454,7 @@ mod tests {
             auto_cache_budget: false,
             install_watcher: false,
             follow_symlinks: false,
+            ignore_options: Default::default(),
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
         };

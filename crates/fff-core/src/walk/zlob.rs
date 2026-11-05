@@ -1,5 +1,6 @@
 use crate::file_picker::{
-    is_ambiguous_binary_name, is_known_binary_extension_basename, starts_with_binary_content,
+    FilePickerIgnoreOptions, is_ambiguous_binary_name, is_known_binary_extension_basename,
+    starts_with_binary_content,
 };
 use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
@@ -20,11 +21,18 @@ pub(crate) fn walk_collect_files(
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
+    ignore_options: &FilePickerIgnoreOptions,
+    scope: Option<&Path>,
 ) -> crate::Result<WalkOutput> {
-    // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
-    // ~/.cache, ~/.config, etc.); optionally follow symlinks.
+    let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
-    if !is_git_repo {
+    if ignore_options.disable_git {
+        flags |= WalkFlags::SKIP_GITIGNORE | WalkFlags::NO_GIT_EXCLUDE | WalkFlags::NO_GIT_GLOBAL;
+    }
+    if ignore_options.disable_ignore_files {
+        flags |= WalkFlags::SKIP_DOT_IGNORE;
+    }
+    if use_non_git_defaults {
         flags |= WalkFlags::SKIP_HIDDEN;
     }
     if follow_symlinks {
@@ -39,14 +47,21 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
-    {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
-        tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
+    let extra_ignore = &ignore_options.extra_ignore;
+    let defaults = if use_non_git_defaults {
+        IGNORED_DIRS
+    } else {
+        &[]
+    };
+    if !defaults.is_empty() || !extra_ignore.is_empty() {
+        let rules: Vec<_> = defaults
+            .iter()
+            .copied()
+            .chain(extra_ignore.iter().map(String::as_str))
+            .collect();
+        builder
+            .extra_ignore(&rules)
+            .map_err(|e| crate::Error::WalkFailed(format!("invalid extra ignore rules: {e:?}")))?;
     }
 
     // Single lock for both collections: every entry is either a file or a
@@ -54,6 +69,20 @@ pub(crate) fn walk_collect_files(
     let collected = Mutex::new((Vec::new(), Vec::new()));
 
     let outcome = match builder.run(|entry| {
+        if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
+        {
+            return WalkState::SkipDir;
+        }
+        if let Some(scope) = scope {
+            let path = entry.path();
+            if scope.starts_with(path) {
+                return WalkState::Continue;
+            }
+            if !path.starts_with(scope) {
+                return WalkState::SkipDir;
+            }
+        }
+
         // Followed links keep the Symlink kind and lstat metadata, so stat
         // the target to index the ones resolving to files (#912).
         let target = if entry.is_file() {
