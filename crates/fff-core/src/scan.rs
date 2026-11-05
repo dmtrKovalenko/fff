@@ -325,7 +325,7 @@ impl ScanJob {
         signals: &ScanSignals,
         config: &ScanConfig,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
-        known_text: &[bool],
+        known_text: &[u64],
     ) {
         let Some(arena) = unsafe_snapshot
             .arena // we are never touching overlays so this arena is always correct
@@ -362,7 +362,8 @@ impl ScanJob {
             if !signals.cancelled.load(Ordering::Acquire) {
                 sniff_binary_for_non_indexable(
                     non_indexable_files,
-                    known_text.get(indexable_count..).unwrap_or_default(),
+                    indexable_count,
+                    known_text,
                     &unsafe_snapshot.base_path,
                     arena,
                     &signals.cancelled,
@@ -372,6 +373,7 @@ impl ScanJob {
             // this potentially a long running as we are not parallelizing it but it's okay
             sniff_binary_for_non_indexable(
                 files,
+                0,
                 known_text,
                 &unsafe_snapshot.base_path,
                 arena,

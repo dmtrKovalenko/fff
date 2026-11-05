@@ -309,11 +309,11 @@ impl FileSync {
 
     // Marks base files that `previous` already read as text with the same path, size and mtime,
     // so a rescan only reads changed files. Binary verdicts are always checked again.
-    fn unchanged_text_files(&self, previous: &FileSync) -> Vec<bool> {
-        let mut known_text = vec![false; self.base_count];
+    fn unchanged_text_files(&self, previous: &FileSync) -> Vec<u64> {
         if previous.base_count == 0 {
-            return known_text;
+            return Vec::new();
         }
+        let mut known_text = vec![0u64; self.base_count.div_ceil(64)];
 
         let arena = self.arena_base_ptr();
         let previous_arena = previous.arena_base_ptr();
@@ -327,7 +327,7 @@ impl FileSync {
             .collect();
 
         let mut name = String::new();
-        for (file, known) in self.files[..self.base_count].iter().zip(&mut known_text) {
+        for (index, file) in self.files[..self.base_count].iter().enumerate() {
             let Some(&Some(previous_dir)) = previous_dirs.get(file.parent_dir_index as usize)
             else {
                 continue;
@@ -342,10 +342,13 @@ impl FileSync {
                 continue;
             };
 
-            *known = !old.is_deleted()
+            if !old.is_deleted()
                 && !old.is_binary()
                 && old.size == file.size
-                && old.modified == file.modified;
+                && old.modified == file.modified
+            {
+                known_text[index / 64] |= 1u64 << (index % 64);
+            }
         }
 
         known_text
@@ -1689,7 +1692,7 @@ impl FilePicker {
         })
     }
 
-    pub(crate) fn unchanged_text_files(&self, previous: &FileSync) -> Vec<bool> {
+    pub(crate) fn unchanged_text_files(&self, previous: &FileSync) -> Vec<u64> {
         self.sync_data.unchanged_text_files(previous)
     }
 
