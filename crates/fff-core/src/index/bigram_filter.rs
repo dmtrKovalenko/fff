@@ -1189,10 +1189,13 @@ pub(crate) fn sniff_binary_for_non_indexable(
             return;
         }
 
+        let file_index = file_offset + i;
         // check only the files that we are able to grep
         if file.size == 0
             || file.size > constants::MAX_FFFILE_SIZE
-            || BigramFilter::is_candidate(known_text, file_offset + i)
+            || known_text
+                .get(file_index / 64)
+                .is_some_and(|&word| word & (1u64 << (file_index % 64)) != 0)
         {
             continue;
         }
