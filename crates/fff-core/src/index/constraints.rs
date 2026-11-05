@@ -159,8 +159,13 @@ pub(crate) type GlobPattern = globset::GlobMatcher;
 /// `PERIOD` on top of `RECOMMENDED`: we filter an index that already contains
 /// dotfiles, so `**/x` must cross `.config`/`.pi` components. Without it zlob
 /// applies fnmatch's leading-dot rule and diverges from the globset backend.
+///
+/// `MATCH_BASENAME`: a pattern without `/` matches the file name at any depth
+/// (`libc.so*` finds `hash-glibc/lib/libc.so.6`), as in `rg -g` and gitignore.
 #[cfg(feature = "zlob")]
-const GLOB_FLAGS: zlob::ZlobFlags = zlob::ZlobFlags::RECOMMENDED.union(zlob::ZlobFlags::PERIOD);
+const GLOB_FLAGS: zlob::ZlobFlags = zlob::ZlobFlags::RECOMMENDED
+    .union(zlob::ZlobFlags::PERIOD)
+    .union(zlob::ZlobFlags::MATCH_BASENAME);
 
 /// How `Constraint::Glob` is evaluated for each item.
 enum GlobStrategy {
@@ -604,9 +609,18 @@ fn needs_globset(pattern: &str) -> bool {
         .any(|class| matches!(class, b"[{]" | b"[}]" | b"[,]" | b"[\\]"))
 }
 
+// globset has no basename mode, so a pattern without `/` becomes `**/pattern`.
+// This is the same rule as zlob's `MATCH_BASENAME`.
 fn compile_globset(pattern: &str) -> Option<globset::GlobMatcher> {
-    globset::GlobBuilder::new(pattern)
-        .literal_separator(pattern.contains('/'))
+    let basename_glob;
+    let glob = if pattern.contains('/') {
+        pattern
+    } else {
+        basename_glob = format!("**/{pattern}");
+        &basename_glob
+    };
+    globset::GlobBuilder::new(glob)
+        .literal_separator(true)
         .build()
         .ok()
         .map(|glob| glob.compile_matcher())
@@ -1126,5 +1140,72 @@ mod tests {
             .map(|i| i.relative_path)
             .collect();
         assert_eq!(paths, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn test_slash_less_glob_matches_basename() {
+        let arena_ptr = ArenaPtr::null();
+        let items = vec![
+            TestItem {
+                relative_path: "hash-glibc/lib/libc.so.6",
+                file_name: "libc.so.6",
+            },
+            TestItem {
+                relative_path: "libc.so.1",
+                file_name: "libc.so.1",
+            },
+            TestItem {
+                relative_path: "src/main.rs",
+                file_name: "main.rs",
+            },
+        ];
+        let run = |constraints: Vec<Constraint<'_>>| -> Vec<&str> {
+            apply_constraints(&items, &constraints, arena_ptr, arena_ptr)
+                .unwrap_or_default()
+                .iter()
+                .map(|i| i.relative_path)
+                .collect()
+        };
+
+        let expected = vec!["hash-glibc/lib/libc.so.6", "libc.so.1"];
+        // Prepass (pure glob) and inline (with pre-filter) paths.
+        assert_eq!(run(vec![Constraint::Glob("libc.so*")]), expected);
+        assert_eq!(
+            run(vec![
+                Constraint::Glob("libc.so*"),
+                Constraint::Not(Box::new(Constraint::Extension("rs"))),
+            ]),
+            expected
+        );
+        assert_eq!(run(vec![Constraint::Glob("src/*")]), vec!["src/main.rs"]);
+        assert_eq!(
+            run(vec![Constraint::Not(Box::new(Constraint::Glob(
+                "libc.so*"
+            )))]),
+            vec!["src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn test_slash_less_glob_does_not_match_directory_names() {
+        let arena_ptr = ArenaPtr::null();
+        let items = vec![
+            TestItem {
+                relative_path: "lib/x.rs",
+                file_name: "x.rs",
+            },
+            TestItem {
+                relative_path: "src/libx.rs",
+                file_name: "libx.rs",
+            },
+        ];
+        let got: Vec<&str> =
+            apply_constraints(&items, &[Constraint::Glob("*lib*")], arena_ptr, arena_ptr)
+                .unwrap_or_default()
+                .iter()
+                .map(|i| i.relative_path)
+                .collect();
+        // Like `rg -g`, a pattern without `/` sees only the file name.
+        assert_eq!(got, vec!["src/libx.rs"]);
     }
 }
