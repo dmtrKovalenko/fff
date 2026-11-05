@@ -612,12 +612,14 @@ fn needs_globset(pattern: &str) -> bool {
 // globset has no basename mode, so a pattern without `/` becomes `**/pattern`.
 // This is the same rule as zlob's `MATCH_BASENAME`.
 fn compile_globset(pattern: &str) -> Option<globset::GlobMatcher> {
-    let builder = if pattern.contains('/') {
-        globset::GlobBuilder::new(pattern)
+    let basename_glob;
+    let glob = if pattern.contains('/') {
+        pattern
     } else {
-        globset::GlobBuilder::new(&format!("**/{pattern}"))
+        basename_glob = format!("**/{pattern}");
+        &basename_glob
     };
-    builder
+    globset::GlobBuilder::new(glob)
         .literal_separator(true)
         .build()
         .ok()
