@@ -107,7 +107,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       - name: Install cargo-zigbuild
         if: contains(matrix.os, 'ubuntu')
@@ -253,7 +253,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       - name: Install cargo-c
         uses: taiki-e/install-action@v2
@@ -465,7 +465,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       - name: Install cargo-zigbuild
         if: contains(matrix.os, 'ubuntu')
@@ -536,7 +536,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       - name: Install cargo-zigbuild
         if: contains(matrix.os, 'ubuntu')

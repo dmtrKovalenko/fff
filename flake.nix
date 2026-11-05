@@ -39,7 +39,7 @@
 
         # zlob requires Zig >= 0.16, but nixpkgs tops out at 0.15. Pull from
         # mitchellh/zig-overlay which ships every released version.
-        zig = zig-overlay.packages.${system}."0.16.0";
+        zig = zig-overlay.packages.${system}."0.17.1";
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 

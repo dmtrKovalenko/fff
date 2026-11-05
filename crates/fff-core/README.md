@@ -3,7 +3,7 @@
 fff is a file search toolkit. It is faster than ripgrep and fzf and designed for a long running applications like file editors, ai agents, or file exploerers.
 
 > [!Important performance information]  
-> For the most optimized fff build use `zlob` feature. It requires zig v0.16.0 to be installed on the machine.
+> For the most optimized fff build use `zlob` feature. It requires zig v0.17.1 or newer to be installed on the machine.
 
 ## Features
 
