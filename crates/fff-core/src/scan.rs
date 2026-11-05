@@ -307,11 +307,7 @@ impl ScanJob {
         }
     }
 
-    /// THIS IS VERY VERY IMPORTANT THAT ANYTHING INSIDE THIS FUNCTION TO NOT READ ANYTHING CLEARABLE OUTSIDE
-    /// this is a very silly off lock implementation that actually matters, and that's why it is crafted
-    /// to never read anything from the picker, it can only WRITE information using single instructions
-    ///
-    /// Things that are safe and immutable - file list, indexes of files, paths, and signals.
+    // The snapshot pins files and paths while the index builds off-lock.
     #[tracing::instrument(skip_all, fields(warmup = ?config.warmup, indexing = ?config.content_indexing))]
     fn run_post_scan(
         shared_picker: &SharedFilePicker,
@@ -329,7 +325,7 @@ impl ScanJob {
         };
 
         let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
-        if signals.cancelled.load(Ordering::Acquire) {
+        if !config.content_indexing || signals.cancelled.load(Ordering::Acquire) {
             return;
         }
 
@@ -407,17 +403,34 @@ mod tests {
     use super::*;
     use crate::file_picker::{FilePicker, FilePickerOptions};
 
-    fn collected(root: &std::path::Path) -> FilePicker {
+    fn collected(root: &std::path::Path, content_indexing: bool) -> FilePicker {
         let mut picker = FilePicker::new(FilePickerOptions {
             base_path: root.to_string_lossy().into_owned(),
             enable_mmap_cache: false,
-            enable_content_indexing: true,
+            enable_content_indexing: content_indexing,
             watch: false,
             ..Default::default()
         })
         .unwrap();
         picker.collect_files().unwrap();
         picker
+    }
+
+    #[test]
+    fn disabled_content_indexing_skips_bigram_build() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("text.txt"), "some words").unwrap();
+
+        let shared = SharedFilePicker::default();
+        let picker = collected(root.path(), false);
+        let signals = picker.scan_signals();
+        let snapshot = unsafe { picker.post_scan_snapshot() }.unwrap();
+        *shared.write().unwrap() = Some(picker);
+
+        ScanJob::run_post_scan(&shared, &signals, &ScanConfig::default(), &snapshot);
+
+        let guard = shared.read().unwrap();
+        assert!(guard.as_ref().unwrap().bigram_index().is_none());
     }
 
     #[test]
@@ -430,7 +443,7 @@ mod tests {
         std::fs::write(new_root.path().join("new.txt"), "isolated_marker").unwrap();
 
         let shared = SharedFilePicker::default();
-        let old = collected(old_root.path());
+        let old = collected(old_root.path(), true);
         let signals = old.scan_signals();
         *shared.write().unwrap() = Some(old);
         let snapshot = shared
@@ -440,7 +453,10 @@ mod tests {
             .and_then(|picker| unsafe { picker.post_scan_snapshot() })
             .unwrap();
         // The root changes while the old post-scan is still building its index.
-        let old = shared.write().unwrap().replace(collected(new_root.path()));
+        let old = shared
+            .write()
+            .unwrap()
+            .replace(collected(new_root.path(), true));
         let config = ScanConfig {
             warmup: false,
             content_indexing: true,
