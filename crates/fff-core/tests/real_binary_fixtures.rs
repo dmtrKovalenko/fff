@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, SharedFilePicker, SharedFrecency};
+use fff_search::{
+    FilePickerOptions, FuzzySearchOptions, QueryParser, SharedFilePicker, SharedFrecency,
+};
 
 const MARKER: &str = "__jai_runtime_init";
 
@@ -43,6 +45,74 @@ fn plain_opts() -> GrepSearchOptions {
         trim_whitespace: false,
         abort_signal: None,
     }
+}
+
+#[test]
+fn file_search_reports_binary_without_content_indexing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let blob = tmp.path().join("sample-blob.txt");
+    let note = tmp.path().join("sample-note.txt");
+    let text = vec![b'a'; 64 * 1024];
+    let mut binary = text.clone();
+    *binary.last_mut().unwrap() = 0;
+    fs::write(&blob, &binary).unwrap();
+    fs::write(&note, &text).unwrap();
+
+    let shared = SharedFilePicker::default();
+    let frecency = SharedFrecency::noop();
+    FilePicker::new_with_shared_state(
+        shared.clone(),
+        frecency.clone(),
+        FilePickerOptions {
+            base_path: tmp.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            watch: false,
+            mode: FFFMode::Ai,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let file_flags = || {
+        assert!(shared.wait_for_scan(Duration::from_secs(10)));
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let query = QueryParser::default().parse("sample");
+        let result = picker.fuzzy_search(&query, None, FuzzySearchOptions::default());
+        let mut flags: Vec<_> = result
+            .items
+            .iter()
+            .map(|file| (file.relative_path(picker), file.is_binary()))
+            .collect();
+        flags.sort_unstable();
+        flags
+    };
+    assert_eq!(
+        file_flags(),
+        [
+            ("sample-blob.txt".to_owned(), true),
+            ("sample-note.txt".to_owned(), false),
+        ]
+    );
+
+    for (path, replacement) in [(&blob, &text), (&note, &binary)] {
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        fs::write(path, replacement).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+    shared.trigger_full_rescan_async(&frecency).unwrap();
+    assert_eq!(
+        file_flags(),
+        [
+            ("sample-blob.txt".to_owned(), false),
+            ("sample-note.txt".to_owned(), true),
+        ]
+    );
 }
 
 #[test]

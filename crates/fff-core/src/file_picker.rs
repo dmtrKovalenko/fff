@@ -2198,6 +2198,24 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
+    pub(crate) fn classify_binary_files(&self, base_path: &Path, cancelled: &AtomicBool) {
+        let arena = self.arena_base_ptr();
+        let files = self.files();
+        // Leave room in the background pool for watcher work and other scans.
+        let chunk_size = files.len().div_ceil(2).max(256);
+        BACKGROUND_THREAD_POOL.install(|| {
+            files.par_chunks(chunk_size).for_each(|files| {
+                crate::index::sniff_binary_for_non_indexable(
+                    files,
+                    base_path,
+                    arena,
+                    cancelled,
+                    |file| file.size,
+                );
+            });
+        });
+    }
+
     pub(crate) fn discover_git(base_path: &Path, disabled: bool) -> Option<GitDiscovery> {
         if disabled {
             return None;

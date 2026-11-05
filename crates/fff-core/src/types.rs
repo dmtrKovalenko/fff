@@ -609,6 +609,10 @@ impl FileItem {
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
+        self.detect_binary_with_limit(path, chunk, MAX_FFFILE_SIZE);
+    }
+
+    pub(crate) fn detect_binary_with_limit(&self, path: &Path, chunk: &mut [u8], read_limit: u64) {
         if self.size == 0 {
             return;
         }
@@ -621,8 +625,7 @@ impl FileItem {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
             return;
         };
-        // only classify the first MAX_FFFILE_SIZE bytes, never read large files to EOF
-        let mut file = file.take(MAX_FFFILE_SIZE);
+        let mut file = file.take(read_limit.min(MAX_FFFILE_SIZE));
 
         loop {
             match file.read(chunk) {

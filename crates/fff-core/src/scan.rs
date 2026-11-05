@@ -163,7 +163,7 @@ impl ScanJob {
             trace_span: _,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals);
+        let mut scanning = Some(ScanningGuard::new(&signals));
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
@@ -183,6 +183,10 @@ impl ScanJob {
                 return;
             }
         };
+
+        if !config.content_indexing {
+            sync.classify_binary_files(&base_path, &signals.cancelled);
+        }
 
         // 2. Populate the file list
         let git_status_worker;
@@ -213,9 +217,8 @@ impl ScanJob {
             git_status_worker.request_full_rescan(); // this runs anyway
         }
 
-        // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
-        // race window when there scanned is set to true, but `post_scan_indexing_active` flag is `false`
-        let snapshot = if !signals.cancelled.load(Ordering::Acquire) {
+        // Pin the index before clearing the scan signal so a rescan cannot replace it.
+        let snapshot = if config.content_indexing && !signals.cancelled.load(Ordering::Acquire) {
             shared_picker.read().ok().and_then(|guard| {
                 guard
                     .as_ref()
@@ -225,7 +228,9 @@ impl ScanJob {
             None
         };
 
-        signals.scanning.store(false, Ordering::Relaxed); // file are searchable
+        if config.content_indexing {
+            drop(scanning.take());
+        }
 
         // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
         // all the already watched directories are not going to be resubscribed (this is internally deduped)
@@ -233,7 +238,9 @@ impl ScanJob {
             rescubscribe_watcher_post_scan(&shared_picker);
         }
 
-        // 3. Runs post scna in parallel with git status collection
+        drop(scanning);
+
+        // 3. Build the content index in parallel with git status collection.
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
@@ -326,39 +333,26 @@ impl ScanJob {
             return;
         }
 
-        if config.content_indexing {
-            let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
-            let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
-            let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
+        let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
+        let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
+        let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
 
-            // A root change may have replaced the picker while this index was building.
-            if let Ok(mut guard) = shared_picker.write()
-                && let Some(picker) = guard.as_mut()
-                && !signals.cancelled.load(Ordering::Acquire)
-                && picker.base_path() == unsafe_snapshot.base_path
-            {
-                picker.set_bigram_index(index);
-            }
-            crate::index::release_thread_buffers();
+        if let Ok(mut guard) = shared_picker.write()
+            && let Some(picker) = guard.as_mut()
+            && !signals.cancelled.load(Ordering::Acquire)
+            && picker.base_path() == unsafe_snapshot.base_path
+        {
+            picker.set_bigram_index(index);
+        }
+        crate::index::release_thread_buffers();
 
-            // Bigram only sniffs files <= MAX_INDEXABLE_FILE_SIZE; large
-            // unknown-extension binaries slip past it and would otherwise be
-            // grep-able as text. Cheap header sniff catches those.
-            if !signals.cancelled.load(Ordering::Acquire) {
-                sniff_binary_for_non_indexable(
-                    non_indexable_files,
-                    &unsafe_snapshot.base_path,
-                    arena,
-                    &signals.cancelled,
-                );
-            }
-        } else {
-            // this potentially a long running as we are not parallelizing it but it's okay
+        if !signals.cancelled.load(Ordering::Acquire) {
             sniff_binary_for_non_indexable(
-                files,
+                non_indexable_files,
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
+                |_| crate::constants::MAX_FFFILE_SIZE,
             );
         }
 

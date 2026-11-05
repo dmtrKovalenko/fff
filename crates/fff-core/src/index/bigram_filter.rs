@@ -1174,6 +1174,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
     cancelled: &std::sync::atomic::AtomicBool,
+    read_limit: impl Fn(&FileItem) -> u64,
 ) {
     // Non-indexable files are few in a typical repo, so a serial pass with a
     // single reused chunk buffer beats spinning up the thread pool.
@@ -1188,12 +1189,12 @@ pub(crate) fn sniff_binary_for_non_indexable(
         }
 
         // check only the files that we are able to grep
-        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
+        if file.is_binary() || file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
             continue;
         }
 
         let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
-        file.detect_binary_per_byte(abs, &mut chunk);
+        file.detect_binary_with_limit(abs, &mut chunk, read_limit(file));
     }
 }
 
