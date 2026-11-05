@@ -261,27 +261,10 @@ impl FileSync {
         let dir_rel = &rel_path[..parent_end];
         let filename = &rel_path[parent_end..];
 
-        if let Some(dir_idx) = find_dir(dir_rel) {
-            let dir_idx = dir_idx as u32;
-            let cmp_key = |f: &FileItem| {
-                f.parent_dir_index.cmp(&dir_idx).then_with(|| {
-                    let fname = f.file_name(arena);
-                    fname.as_str().cmp(filename)
-                })
-            };
-
-            if self.indexable_count > 0
-                && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(cmp_key)
-            {
-                return Some(pos);
-            }
-
-            if self.indexable_count < self.base_count
-                && let Ok(rel_pos) =
-                    self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
-            {
-                return Some(self.indexable_count + rel_pos);
-            }
+        if let Some(dir_idx) = find_dir(dir_rel)
+            && let Some(pos) = self.find_base_file_index(dir_idx as u32, filename, arena)
+        {
+            return Some(pos);
         }
 
         // Overflow region: linear scan by full relative path.
@@ -296,6 +279,76 @@ impl FileSync {
         }
 
         None
+    }
+
+    fn find_base_file_index(&self, dir_idx: u32, filename: &str, arena: ArenaPtr) -> Option<usize> {
+        let mut fname = String::new();
+        let mut cmp_key = |f: &FileItem| {
+            f.parent_dir_index.cmp(&dir_idx).then_with(|| {
+                fname.clear();
+                f.write_file_name_from_arena(arena, &mut fname);
+                fname.as_str().cmp(filename)
+            })
+        };
+
+        if self.indexable_count > 0
+            && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(&mut cmp_key)
+        {
+            return Some(pos);
+        }
+
+        if self.indexable_count < self.base_count
+            && let Ok(rel_pos) =
+                self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
+        {
+            return Some(self.indexable_count + rel_pos);
+        }
+
+        None
+    }
+
+    // Marks base files that `previous` already read as text with the same path, size and mtime,
+    // so a rescan only reads changed files. Binary verdicts are always checked again.
+    fn unchanged_text_files(&self, previous: &FileSync) -> Vec<bool> {
+        let mut known_text = vec![false; self.base_count];
+        if previous.base_count == 0 {
+            return known_text;
+        }
+
+        let arena = self.arena_base_ptr();
+        let previous_arena = previous.arena_base_ptr();
+        let mut buf = [0u8; PATH_BUF_SIZE];
+        let previous_dirs: Vec<Option<u32>> = self.dirs[..self.base_dirs_count]
+            .iter()
+            .map(|dir| {
+                let dir = dir.read_relative_path(arena, &mut buf);
+                previous.find_base_dir_index(dir).map(|i| i as u32)
+            })
+            .collect();
+
+        let mut name = String::new();
+        for (file, known) in self.files[..self.base_count].iter().zip(&mut known_text) {
+            let Some(&Some(previous_dir)) = previous_dirs.get(file.parent_dir_index as usize)
+            else {
+                continue;
+            };
+
+            name.clear();
+            file.write_file_name_from_arena(arena, &mut name);
+            let Some(old) = previous
+                .find_base_file_index(previous_dir, &name, previous_arena)
+                .map(|i| &previous.files[i])
+            else {
+                continue;
+            };
+
+            *known = !old.is_deleted()
+                && !old.is_binary()
+                && old.size == file.size
+                && old.modified == file.modified;
+        }
+
+        known_text
     }
 
     // TODO remove this function and make a better way to remove all files
@@ -1636,9 +1689,14 @@ impl FilePicker {
         })
     }
 
-    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        self.sync_data = sync;
+    pub(crate) fn unchanged_text_files(&self, previous: &FileSync) -> Vec<bool> {
+        self.sync_data.unchanged_text_files(previous)
+    }
+
+    // Returns the replaced index so the caller can compare against it and drop it off the lock
+    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) -> FileSync {
         self.cache_budget.reset();
+        std::mem::replace(&mut self.sync_data, sync)
     }
 
     #[inline]

@@ -186,6 +186,7 @@ impl ScanJob {
 
         // 2. Populate the file list
         let git_status_worker;
+        let previous;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
@@ -195,7 +196,7 @@ impl ScanJob {
             }
 
             let live_count = sync.live_count;
-            picker.commit_new_sync(sync);
+            previous = picker.commit_new_sync(sync);
             git_status_worker = Arc::clone(&picker.git_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
@@ -233,11 +234,24 @@ impl ScanJob {
             rescubscribe_watcher_post_scan(&shared_picker);
         }
 
+        // The post scan skips files the previous index already read as text and that did not change
+        let known_text = shared_picker
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|picker| picker.base_path() == base_path)
+                    .map(|picker| picker.unchanged_text_files(&previous))
+            })
+            .unwrap_or_default();
+        drop(previous);
+
         // 3. Runs post scna in parallel with git status collection
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
-            Self::run_post_scan(&shared_picker, &signals, &config, snap);
+            Self::run_post_scan(&shared_picker, &signals, &config, snap, &known_text);
         }
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
@@ -311,6 +325,7 @@ impl ScanJob {
         signals: &ScanSignals,
         config: &ScanConfig,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
+        known_text: &[bool],
     ) {
         let Some(arena) = unsafe_snapshot
             .arena // we are never touching overlays so this arena is always correct
@@ -347,6 +362,7 @@ impl ScanJob {
             if !signals.cancelled.load(Ordering::Acquire) {
                 sniff_binary_for_non_indexable(
                     non_indexable_files,
+                    known_text.get(indexable_count..).unwrap_or_default(),
                     &unsafe_snapshot.base_path,
                     arena,
                     &signals.cancelled,
@@ -356,6 +372,7 @@ impl ScanJob {
             // this potentially a long running as we are not parallelizing it but it's okay
             sniff_binary_for_non_indexable(
                 files,
+                known_text,
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
@@ -458,7 +475,7 @@ mod tests {
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
         };
-        ScanJob::run_post_scan(&shared, &signals, &config, &snapshot);
+        ScanJob::run_post_scan(&shared, &signals, &config, &snapshot, &[]);
         drop(snapshot);
         drop(old);
 
