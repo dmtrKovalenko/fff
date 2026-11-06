@@ -2,6 +2,7 @@ local M = {}
 
 local file_picker = require('fff.file_picker')
 local grep = require('fff.picker_ui.grep_renderer')
+local grep_refine = require('fff.picker_ui.grep_refine')
 local picker_ui_state = require('fff.picker_ui.picker_ui_state')
 
 -- Parent module reference (set by picker_ui.lua during initialization).
@@ -13,6 +14,21 @@ function M.init(parent_module) P = parent_module end
 
 -- Convenience alias
 local S = picker_ui_state.state
+
+local function grep_page(file_offset, page_size)
+  if S.refine then return grep_refine.page(file_offset, page_size) end
+  return grep.search(S.query, file_offset, page_size, S.grep_config, S.grep_mode)
+end
+
+local function set_prompt_query(query)
+  vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, { S.config.prompt .. query })
+
+  vim.schedule(function()
+    if P.state.active and S.input_win and vim.api.nvim_win_is_valid(S.input_win) then
+      vim.api.nvim_win_set_cursor(S.input_win, { 1, #S.config.prompt + #query })
+    end
+  end)
+end
 
 function M.update_results() M.update_results_sync() end
 
@@ -45,13 +61,14 @@ function M.update_results_sync()
   local results
   if S.mode == 'grep' then
     S.grep_regex_fallback_error = nil
-    if S.query == '' then
+    if S.refine then grep_refine.filter(S.query) end
+    if S.query == '' and not S.refine then
       results = {}
       S.pagination.total_matched = 0
       S.pagination.grep_file_offsets = {}
       S.pagination.grep_next_file_offset = 0
     else
-      local grep_result = grep.search(S.query, 0, page_size, S.grep_config, S.grep_mode)
+      local grep_result = grep_page(0, page_size)
       results = grep_result.items or {}
       S.pagination.total_matched = grep_result.total_matched or 0
       S.pagination.grep_file_offsets = { 0 }
@@ -85,7 +102,8 @@ function M.update_results_sync()
   if
     S.mode == 'grep'
     and (
-      S.grep_mode == 'definition_only'
+      S.refine
+      or S.grep_mode == 'definition_only'
       or (S.grep_config and S.grep_config.classify_definitions == 'definition_only')
     )
   then
@@ -169,7 +187,7 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
     local file_offset = S.pagination.grep_file_offsets[new_page_index + 1]
     if file_offset == nil then return false end
 
-    ok, results = pcall(grep.search, S.query, file_offset, page_size, S.grep_config, S.grep_mode)
+    ok, results = pcall(grep_page, file_offset, page_size)
     if ok and results then
       local grep_result = results
       results = grep_result.items or {}
@@ -302,7 +320,7 @@ function M.on_input_change()
 end
 
 function M.cycle_grep_modes()
-  if not P.state.active or S.mode ~= 'grep' then return end
+  if not P.state.active or S.mode ~= 'grep' or S.refine then return end
 
   ---@diagnostic disable-next-line: undefined-field
   local modes = (S.grep_config and S.grep_config.modes)
@@ -326,6 +344,24 @@ function M.cycle_grep_modes()
   P.update_status()
 
   if S.query ~= '' then M.update_results_sync() end
+end
+
+--- Switch between live grep and filtering the collected matches of the current query.
+function M.toggle_grep_refine()
+  if not P.state.active or S.mode ~= 'grep' then return end
+
+  local query
+  if S.refine then
+    query = grep_refine.stop()
+  elseif grep_refine.start() then
+    query = ''
+  else
+    return
+  end
+
+  S.history_offset = nil
+  S.last_status_info = nil
+  set_prompt_query(query)
 end
 
 function M.recall_query_from_history()

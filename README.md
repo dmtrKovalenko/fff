@@ -455,6 +455,8 @@ require('fff').setup({
     preview_scroll_down = '<C-d>',
     toggle_debug = '<F2>',
     cycle_grep_modes = '<S-Tab>',
+    -- grep mode only: fuzzy filter the current matches instead of searching again
+    toggle_grep_refine = '<C-g>',
     insert_newline_escape = '<C-CR>',
     -- grep mode only: jump cursor to first match of next/prev file group
     grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
@@ -566,6 +568,12 @@ require('fff').live_grep({ query = 'search term' }) -- pre-fill
 require('fff').live_grep({ query = 'user_file', grep = { modes = { 'definition_only' } } })
 local page = require('fff').content_search('user_file', { mode = 'definition_only' })
 ```
+
+### Refine grep results
+
+`<C-g>` (`keymaps.toggle_grep_refine`) collects every match of the current grep query and clears the prompt. What you type next fuzzy filters those matches by line content and file path instead of searching again. Matching is smart case, and words separated by spaces must all match. Filtered matches keep their grep order. The status shows the filtered and total counts and the collected query, highlighted with `hl.grep_refine_active` (default: `DiagnosticWarn`). Press `<C-g>` again to return to live grep with the original query.
+
+Collection ignores `grep.max_matches_per_file` and stops at 10,000 matches, shown as a `+` after the total. With nothing selected, `<C-q>` sends the filtered matches to the quickfix list.
 
 ### Constraints
 
