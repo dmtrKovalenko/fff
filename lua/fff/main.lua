@@ -193,6 +193,9 @@ local function ensure_indexed(cwd, wait_for_index_ms)
   -- ensure_initialized is idempotent; first call kicks off the initial scan
   -- at config.base_path.
   require('fff.core').ensure_initialized()
+  -- setup() is otherwise only called by the picker UI, which API-only callers never open (#938)
+  local file_picker = require('fff.file_picker')
+  if not file_picker.is_initialized() then file_picker.setup() end
   local config = require('fff.conf').get()
 
   local is_windows = vim.fn.has('win32') == 1
@@ -256,7 +259,7 @@ local function ensure_indexed(cwd, wait_for_index_ms)
     wait_ms = remaining
   end
 
-  local scan_ok = require('fff.file_picker').wait_for_initial_scan(wait_ms)
+  local scan_ok = file_picker.wait_for_initial_scan(wait_ms)
   if not scan_ok then return false, 'timeout waiting for index scan' end
   return true
 end
