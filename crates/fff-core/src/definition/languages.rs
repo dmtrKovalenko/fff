@@ -80,7 +80,7 @@ languages! {
         extensions: [b"rs"],
         attributes: Hash,
         fallback: None,
-        modifiers: [b"async", b"unsafe", b"default"],
+        modifiers: [b"async", b"unsafe", b"default", b"auto"],
         rules: {
             b"pub" => Visibility, b"extern" => Abi,
             b"const" => RustConst, b"static" => RustStatic,
