@@ -30,7 +30,7 @@ import { Type, type TSchema } from "@sinclair/typebox";
 import { AuxFinderPool, routePathConstraint } from "./aux-finders";
 import { type FffMode, loadConfig, VALID_MODES } from "./config";
 import { FilePickerFactory } from "./file-picker";
-import { isFsRoot, isHomeDir, resolveDbPaths } from "./paths";
+import { isFsRoot, isGitRepo, isHomeDir, resolveDbPaths } from "./paths";
 import { buildQuery } from "./query";
 
 export { SCAN_TIMEOUT_MS } from "./sdk";
@@ -319,6 +319,9 @@ function createFffMentionProvider(
 // Extension
 // ---------------------------------------------------------------------------
 
+/**
+ * Registers the FFF file search tools, commands, and autocomplete provider on `pi`.
+ */
 export default function fffExtension(pi: ExtensionAPI) {
   let mainFinder: FileFinderApi | null = null;
   let finderCwd: string | null = null;
@@ -374,12 +377,16 @@ export default function fffExtension(pi: ExtensionAPI) {
   let enableHomeDirScanning = true;
   let warnOnHomeDirScan = true;
   let followSymlinks = true;
+  let gitRepoOnly = false;
 
   function setMode(mode: FffMode): void {
     currentMode = mode;
     toolNames = resolveToolNames(mode);
   }
 
+  /**
+   * Resolves effective startup settings from CLI flags, environment variables, and `pi-fff.json`.
+   */
   function resolveStartupConfig(): void {
     setMode(
       getConfigValue("fff-mode", "PI_FFF_MODE", config.mode, "tools-and-ui", parseMode),
@@ -430,6 +437,13 @@ export default function fffExtension(pi: ExtensionAPI) {
       "FFF_FOLLOW_SYMLINKS",
       config.followSymlinks,
       true,
+      parseBoolean,
+    );
+    gitRepoOnly = getConfigValue(
+      "fff-git-repo-only",
+      "FFF_GIT_REPO_ONLY",
+      config.gitRepoOnly,
+      false,
       parseBoolean,
     );
   }
@@ -484,14 +498,18 @@ export default function fffExtension(pi: ExtensionAPI) {
     });
   }
 
-  // The native layer refuses a picker rooted at $HOME / the fs root unless the
-  // matching opt-in is set (crates/fff-core/src/file_picker.rs). Detect that here
-  // so the opt-out reads as "search off" instead of an init failure (issue #857).
+  /**
+   * The native layer refuses a picker rooted at $HOME / the fs root unless the
+   * matching opt-in is set (crates/fff-core/src/file_picker.rs). Detect that here
+   * so the opt-out reads as "search off" instead of an init failure (issue #857).
+   */
   function scanOptOutReason(cwd: string): string | null {
     if (!enableHomeDirScanning && isHomeDir(cwd))
       return `(fff): cwd is $HOME and "enableHomeDirScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableHomeDirScanning": true / --fff-enable-home-scan=true to index $HOME.`;
     if (!enableFsRootScanning && isFsRoot(cwd))
       return `(fff): cwd is the filesystem root and "enableFsRootScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableFsRootScanning": true / --fff-enable-root-scan=true to index it.`;
+    if (gitRepoOnly && !isGitRepo(cwd))
+      return `(fff): cwd (${cwd}) is not inside a git repository and "gitRepoOnly" is true, so FFF search is disabled for this session. Start pi from a git repository, or set "gitRepoOnly": false / --fff-git-repo-only=false to index non-git directories.`;
     return null;
   }
 
@@ -774,6 +792,12 @@ export default function fffExtension(pi: ExtensionAPI) {
   pi.registerFlag("fff-warn-home-scan", {
     description:
       "Warn when indexing $HOME (default true; silence with --fff-warn-home-scan=false or FFF_WARN_HOME_SCAN=0)",
+    type: "boolean",
+  });
+
+  pi.registerFlag("fff-git-repo-only", {
+    description:
+      "Only index when launched inside a git repository (default false; enable with --fff-git-repo-only or FFF_GIT_REPO_ONLY=1)",
     type: "boolean",
   });
 

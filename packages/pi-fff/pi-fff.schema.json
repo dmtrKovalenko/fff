@@ -46,6 +46,11 @@
       "type": "boolean",
       "default": true,
       "description": "Indexes through directory symlinks, e.g. a git worktree or stow layout whose files live behind links. Set to false to keep the walk inside the real tree."
+    },
+    "gitRepoOnly": {
+      "type": "boolean",
+      "default": false,
+      "description": "Only indexes the workspace when pi is launched from inside a git repository."
     }
   }
 }

@@ -16,6 +16,7 @@ export interface FffConfig {
   enableHomeDirScanning?: boolean;
   warnOnHomeDirScan?: boolean;
   followSymlinks?: boolean;
+  gitRepoOnly?: boolean;
 }
 
 const CONFIG_KEYS = new Set<keyof FffConfig>([
@@ -27,8 +28,12 @@ const CONFIG_KEYS = new Set<keyof FffConfig>([
   "enableHomeDirScanning",
   "warnOnHomeDirScan",
   "followSymlinks",
+  "gitRepoOnly",
 ]);
 
+/**
+ * Loads and validates the global `pi-fff.json` configuration from `agentDir`.
+ */
 export function loadConfig(agentDir = piDataDir()): FffConfig {
   const configPath = join(agentDir, CONFIG_FILE_NAME);
   let contents: string;
@@ -70,6 +75,7 @@ export function loadConfig(agentDir = piDataDir()): FffConfig {
   validateBoolean(configPath, parsed, "enableHomeDirScanning");
   validateBoolean(configPath, parsed, "warnOnHomeDirScan");
   validateBoolean(configPath, parsed, "followSymlinks");
+  validateBoolean(configPath, parsed, "gitRepoOnly");
 
   return parsed as FffConfig;
 }
@@ -97,6 +103,9 @@ function validateString(
   }
 }
 
+/**
+ * Ensures the optional boolean config field at `key` is a boolean when present.
+ */
 function validateBoolean(
   configPath: string,
   config: Record<string, unknown>,
@@ -104,7 +113,8 @@ function validateBoolean(
     | "enableFsRootScanning"
     | "enableHomeDirScanning"
     | "warnOnHomeDirScan"
-    | "followSymlinks",
+    | "followSymlinks"
+    | "gitRepoOnly",
 ): void {
   const value = config[key];
   if (value !== undefined && typeof value !== "boolean") {
