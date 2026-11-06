@@ -117,8 +117,10 @@ function M.resolve(repo_root)
     }
   end
 
-  local short_sha = git(repo_root, 'rev-parse', '--short', 'HEAD')
-  if not short_sha then return nil, 'Failed to determine git SHA' end
+  -- `--short` grows with the object count, so a full clone and CI's shallow one disagree
+  local sha = git(repo_root, 'rev-parse', 'HEAD')
+  if not sha then return nil, 'Failed to determine git SHA' end
+  local short_sha = sha:sub(1, 7)
 
   local base_version = M.read_base_version(repo_root)
   if not base_version then return nil, 'Could not read base version from crates/fff-core/Cargo.toml' end
@@ -129,10 +131,7 @@ function M.resolve(repo_root)
   local branch = git(repo_root, 'symbolic-ref', '--short', 'HEAD')
 
   local prerelease_label, npm_tag
-  if not branch then
-    prerelease_label = 'nightly'
-    npm_tag = 'nightly'
-  elseif branch == 'main' or branch == 'fix/download-version' then
+  if not branch or branch == 'main' then
     prerelease_label = 'nightly'
     npm_tag = 'nightly'
   else
