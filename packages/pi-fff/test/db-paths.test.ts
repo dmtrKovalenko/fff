@@ -106,19 +106,18 @@ describe("isGitRepo", () => {
   });
 
   test("returns true for git worktrees and submodules where .git is a file", () => {
+    const gitDir = path.join(tmpRoot, "main-git", "worktrees", "wt");
     const worktree = path.join(tmpRoot, "worktree");
     const nested = path.join(worktree, "src");
+    fs.mkdirSync(gitDir, { recursive: true });
     fs.mkdirSync(nested, { recursive: true });
-    fs.writeFileSync(
-      path.join(worktree, ".git"),
-      "gitdir: /tmp/main/.git/worktrees/wt\n",
-    );
+    fs.writeFileSync(path.join(worktree, ".git"), "gitdir: ../main-git/worktrees/wt\n");
 
     expect(isGitRepo(worktree)).toBe(true);
     expect(isGitRepo(nested)).toBe(true);
   });
 
-  test("rejects an empty .git directory or a non-gitdir .git file", () => {
+  test("rejects an empty .git directory or an invalid/dangling .git file", () => {
     const emptyGitDir = path.join(tmpRoot, "empty-git-dir");
     fs.mkdirSync(path.join(emptyGitDir, ".git"), { recursive: true });
 
@@ -126,8 +125,13 @@ describe("isGitRepo", () => {
     fs.mkdirSync(invalidGitFile, { recursive: true });
     fs.writeFileSync(path.join(invalidGitFile, ".git"), "not a gitfile\n");
 
+    const danglingGitFile = path.join(tmpRoot, "dangling-git-file");
+    fs.mkdirSync(danglingGitFile, { recursive: true });
+    fs.writeFileSync(path.join(danglingGitFile, ".git"), "gitdir: ./missing-worktree\n");
+
     expect(isGitRepo(emptyGitDir)).toBe(false);
     expect(isGitRepo(invalidGitFile)).toBe(false);
+    expect(isGitRepo(danglingGitFile)).toBe(false);
   });
 
   test("returns false when no ancestor up to the root has .git", () => {

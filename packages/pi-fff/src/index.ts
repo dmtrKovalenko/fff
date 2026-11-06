@@ -384,9 +384,6 @@ export default function fffExtension(pi: ExtensionAPI) {
     toolNames = resolveToolNames(mode);
   }
 
-  /**
-   * Resolves effective startup settings from CLI flags, environment variables, and `pi-fff.json`.
-   */
   function resolveStartupConfig(): void {
     setMode(
       getConfigValue("fff-mode", "PI_FFF_MODE", config.mode, "tools-and-ui", parseMode),
@@ -498,11 +495,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     });
   }
 
-  /**
-   * The native layer refuses a picker rooted at $HOME / the fs root unless the
-   * matching opt-in is set (crates/fff-core/src/file_picker.rs). Detect that here
-   * so the opt-out reads as "search off" instead of an init failure (issue #857).
-   */
+  // The native layer refuses a picker rooted at $HOME / the fs root unless the
+  // matching opt-in is set (crates/fff-core/src/file_picker.rs). Detect that here
+  // so the opt-out reads as "search off" instead of an init failure (issue #857).
   function scanOptOutReason(cwd: string): string | null {
     if (!enableHomeDirScanning && isHomeDir(cwd))
       return `(fff): cwd is $HOME and "enableHomeDirScanning" is false, so FFF search is disabled for this session. Start pi from a project directory, or set "enableHomeDirScanning": true / --fff-enable-home-scan=true to index $HOME.`;

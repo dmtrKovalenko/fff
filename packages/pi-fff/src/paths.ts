@@ -86,9 +86,6 @@ export function isGitRepo(dir: string): boolean {
   }
 }
 
-/**
- * Checks whether `dir` directly contains a valid `.git` directory or gitfile.
- */
 function hasGitMetadata(dir: string): boolean {
   const dotGit = path.join(dir, ".git");
   try {
@@ -97,7 +94,10 @@ function hasGitMetadata(dir: string): boolean {
       return fs.existsSync(path.join(dotGit, "HEAD"));
     }
     if (stat.isFile()) {
-      return fs.readFileSync(dotGit, "utf8").trimStart().startsWith("gitdir:");
+      const content = fs.readFileSync(dotGit, "utf8").trim();
+      if (!content.startsWith("gitdir:")) return false;
+      const target = content.slice("gitdir:".length).trim();
+      return target.length > 0 && fs.existsSync(path.resolve(dir, target));
     }
     return false;
   } catch {

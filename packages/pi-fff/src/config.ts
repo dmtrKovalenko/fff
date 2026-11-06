@@ -103,9 +103,6 @@ function validateString(
   }
 }
 
-/**
- * Ensures the optional boolean config field at `key` is a boolean when present.
- */
 function validateBoolean(
   configPath: string,
   config: Record<string, unknown>,
