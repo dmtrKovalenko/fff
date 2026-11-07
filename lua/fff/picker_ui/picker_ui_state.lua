@@ -19,6 +19,11 @@ M.state = {
   preview_buf = nil,
   preview_visible = false,
 
+  -- Runtime preview override: nil = use config default, true/false = override
+  preview_enabled = nil,
+  -- Runtime maximize override
+  maximized = false,
+
   -- Data state
   items = {},
   filtered_items = {},
@@ -112,6 +117,8 @@ function M.reset_state()
   M.state.preview_win = nil
   M.state.preview_buf = nil
   M.state.preview_visible = false
+  M.state.preview_enabled = nil
+  M.state.maximized = false
 
   M.state.items = {}
   M.state.filtered_items = {}

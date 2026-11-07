@@ -294,6 +294,8 @@ require('fff').live_grep()                         -- live content grep
 require('fff').live_grep_under_cursor()            -- grep <cword> in normal, selection in visual
 require('fff').scan_files()                        -- force rescan
 require('fff').refresh_git_status()                -- refresh git status
+require('fff').toggle_preview()                    -- toggle preview panel
+require('fff').toggle_maximize()                   -- toggle maximize layout
 require('fff').find_files_in_dir(path)             -- find in a specific dir
 require('fff').change_indexing_directory(new_path) -- change root
 
@@ -376,6 +378,8 @@ vim.api.nvim_create_autocmd('User', {
 - `:FFFClearCache [all|frecency|files]`. Clear caches.
 - `:FFFHealth`. Health check.
 - `:FFFDebug [on|off|toggle]`. Toggle the scoring display.
+- `:FFFTogglePreview`. Toggle the preview panel on/off.
+- `:FFFToggleMaximize`. Toggle maximize layout (fills the entire editor).
 - `:FFFOpenLog`. Open `~/.local/state/nvim/log/fff.log`.
 
 ### Configuration
@@ -454,6 +458,8 @@ require('fff').setup({
     preview_scroll_up = '<C-u>',
     preview_scroll_down = '<C-d>',
     toggle_debug = '<F2>',
+    toggle_preview = '<A-p>',
+    toggle_maximize = '<A-m>',
     cycle_grep_modes = '<S-Tab>',
     insert_newline_escape = '<C-CR>',
     -- grep mode only: jump cursor to first match of next/prev file group
