@@ -1,4 +1,5 @@
 local M = {}
+local declares_exact_name
 
 M.state = { initialized = false }
 
@@ -670,6 +671,90 @@ function M.open_file_under_cursor(open_cb)
     open_resolved_file(abs_path, item.relative_path, fuzzy_location, open_cb)
     return true
   end)
+end
+
+--- Jump to a unique declaration; otherwise open the definition picker.
+--- @param opts? {query?: string, cwd?: string, title?: string, layout?: table, grep?: table}
+--- @return boolean jumped Whether a declaration was opened without the picker.
+function M.go_to_definition(opts)
+  vim.validate({ opts = { opts, 'table', true } })
+  opts = vim.deepcopy(opts or {})
+  vim.validate({
+    query = { opts.query, 'string', true },
+    cwd = { opts.cwd, 'string', true },
+    title = { opts.title, 'string', true },
+    layout = { opts.layout, 'table', true },
+    grep = { opts.grep, 'table', true },
+  })
+
+  opts.query = opts.query or vim.fn.expand('<cword>')
+  opts.title = opts.title or 'Definitions'
+  opts.grep = opts.grep or {}
+  opts.grep.modes = { 'definition_only' }
+  opts.grep.classify_definitions = 'definition_only'
+  local config = require('fff.conf').get()
+  local root, same_root
+  if opts.cwd and opts.cwd ~= '' then
+    root = vim.uv.fs_realpath(vim.fn.expand(opts.cwd))
+    if not root or vim.fn.isdirectory(root) ~= 1 then
+      vim.notify('FFF go_to_definition: cwd does not exist', vim.log.levels.ERROR)
+      return false
+    end
+    same_root = vim.uv.fs_realpath(config.base_path) == root
+  end
+
+  local fuzzy = require('fff.core').ensure_initialized()
+  local ready, progress = pcall(fuzzy.get_scan_progress)
+  if opts.query ~= '' and ready and progress.is_index_ready and same_root ~= false then
+    local grep_config = vim.tbl_deep_extend('force', config.grep, opts.grep, {
+      max_matches_per_file = 2,
+      trim_whitespace = false,
+      time_budget_ms = 150,
+      enforce_time_budget = true,
+    })
+    local ok, result =
+      pcall(require('fff.picker_ui.grep_renderer').search, opts.query, 0, 2, grep_config, 'definition_only')
+    -- A partial page or index cannot prove that a declaration is unique.
+    if
+      ok
+      and result.is_index_ready
+      and #result.items == 1
+      and #(result.items[1].match_ranges or {}) == 1
+      and result.next_file_offset == 0
+      and (not root or vim.uv.fs_realpath(result.base_path) == root)
+      and declares_exact_name(result.items[1], opts.query)
+    then
+      local item = result.items[1]
+      local path = vim.fs.joinpath(result.base_path, item.relative_path)
+      vim.cmd("normal! m'")
+      if vim.fn.bufadd(path) ~= vim.api.nvim_get_current_buf() then open_resolved_file(path, item.relative_path) end
+      require('fff.location_utils').jump_to_location({ line = item.line_number, col = item.col + 1 })
+      vim.cmd('normal! zv')
+      return true
+    end
+  end
+
+  M.live_grep({
+    query = opts.query,
+    cwd = root or config.base_path,
+    title = opts.title,
+    layout = opts.layout,
+    grep = opts.grep,
+  })
+  return false
+end
+
+local function is_identifier_byte(byte) return byte ~= nil and (byte >= 128 or string.char(byte):match('[%w_]') ~= nil) end
+
+-- The matcher is a substring search, so `len` also finds `fn length()`.
+-- A direct jump requires the declared identifier to equal the query.
+function declares_exact_name(item, query)
+  local line, range = item.line_content, item.match_ranges[1]
+  if type(line) ~= 'string' or type(range) ~= 'table' then return false end
+  local start, stop = range[1], range[2]
+  if type(start) ~= 'number' or type(stop) ~= 'number' then return false end
+  if line:sub(start + 1, stop) ~= query then return false end
+  return not is_identifier_byte(line:byte(start)) and not is_identifier_byte(line:byte(stop + 1))
 end
 
 return M
