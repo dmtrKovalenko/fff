@@ -366,6 +366,7 @@ pub(crate) fn handle_debounced_events(
         ignore_options.disable_git,
     );
     let mut need_full_git_rescan = false;
+    let mut head_log_changed = false;
     let mut batch_overflow_attempted = false;
     let mut paths_to_remove = Vec::new();
     let mut dirs_to_remove: Vec<PathBuf> = Vec::new();
@@ -463,6 +464,8 @@ pub(crate) fn handle_debounced_events(
 
             if is_dotgit_change_affecting_status(path, &repo) {
                 need_full_git_rescan = true;
+            } else if is_head_log(path, &repo) {
+                head_log_changed = true;
             }
 
             // bare repos keep worktree git dirs outside of any `.git` component
@@ -552,6 +555,13 @@ pub(crate) fn handle_debounced_events(
         paths_to_add_or_modify.len(),
         new_dirs_to_watch.len()
     );
+
+    if head_log_changed
+        && let Some(repo) = repo.as_ref()
+        && git_status_worker.head_log_appended(&repo.path().join("logs/HEAD"))
+    {
+        need_full_git_rescan = true;
+    }
 
     if paths_to_remove.is_empty()
         && dirs_to_remove.is_empty()
@@ -1055,13 +1065,6 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
             return true;
         }
 
-        // some of the git ops are not involving nethier index nor HEAD change, or sometimes
-        // index updates can arrive too late after the change - that's why we track the log
-        // the actual user action, once user
-        if path_in_git_dir == Path::new("logs/HEAD") {
-            return true;
-        }
-
         if let Some(fname) = path_in_git_dir.file_name().and_then(|f| f.to_str())
             && matches!(fname, "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD")
         {
@@ -1070,6 +1073,16 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     }
 
     false
+}
+
+// some git ops touch neither index nor HEAD, or the index update lands late,
+// so a `logs/HEAD` append is the signal that HEAD moved (see `head_log_appended`)
+fn is_head_log(changed: &Path, repo: &Option<Repository>) -> bool {
+    repo.as_ref().is_some_and(|repo| {
+        changed
+            .strip_prefix(repo.path())
+            .is_ok_and(|p| p == Path::new("logs/HEAD"))
+    })
 }
 
 // `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
@@ -1513,7 +1526,7 @@ mod tests {
         let git_dir = repo.path().to_path_buf();
         let repo = Some(repo);
 
-        let affecting = ["index", "index.lock", "HEAD", "logs/HEAD", "MERGE_HEAD"];
+        let affecting = ["index", "index.lock", "HEAD", "MERGE_HEAD"];
         for p in affecting {
             assert!(
                 is_dotgit_change_affecting_status(&git_dir.join(p), &repo),
@@ -1535,6 +1548,15 @@ mod tests {
                 "{p} must NOT trigger a git status rescan"
             );
         }
+
+        // `logs/HEAD` is gated on its size by the worker
+        assert!(!is_dotgit_change_affecting_status(
+            &git_dir.join("logs/HEAD"),
+            &repo
+        ));
+        assert!(is_head_log(&git_dir.join("logs/HEAD"), &repo));
+        assert!(!is_head_log(&git_dir.join("logs/refs/heads/main"), &repo));
+        assert!(!is_head_log(&git_dir.join("logs/HEAD"), &None));
 
         // Worktree paths outside .git never match.
         assert!(!is_dotgit_change_affecting_status(
