@@ -1171,6 +1171,8 @@ pub(crate) fn build_bigram_index(
 #[tracing::instrument(skip_all, name = "Sniffing Large Files Binary", level = tracing::Level::DEBUG)]
 pub(crate) fn sniff_binary_for_non_indexable(
     files: &[FileItem],
+    file_offset: usize,
+    known_text: &[u64],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
     cancelled: &std::sync::atomic::AtomicBool,
@@ -1187,8 +1189,14 @@ pub(crate) fn sniff_binary_for_non_indexable(
             return;
         }
 
+        let file_index = file_offset + i;
         // check only the files that we are able to grep
-        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
+        if file.size == 0
+            || file.size > constants::MAX_FFFILE_SIZE
+            || known_text
+                .get(file_index / 64)
+                .is_some_and(|&word| word & (1u64 << (file_index % 64)) != 0)
+        {
             continue;
         }
 

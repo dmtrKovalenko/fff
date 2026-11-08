@@ -136,6 +136,9 @@ export class FileFinder implements FileFinderApi {
       options.enableFsRootScanning ?? false,
       options.enableHomeDirScanning ?? false,
       options.followSymlinks ?? false,
+      options.extraIgnore?.join("\n") ?? "",
+      options.disableGit ?? false,
+      options.disableIgnoreFiles ?? false,
     );
 
     if (!result.ok) {

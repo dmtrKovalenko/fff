@@ -711,6 +711,14 @@ finder.value.destroy();
 
 Every method returns a `Result<T>` (`{ ok: true, value } | { ok: false, error }`). Full type reference: [`packages/fff-node/src/fff-api.ts`](./packages/fff-node/src/fff-api.ts).
 
+Pass `extraIgnore` to apply `.gitignore` rules when the SDK builds and updates its index. The SDK interprets paths relative to `basePath` and applies these rules before on-disk ignore rules. A `!` prefix re-includes a path. Re-include any ignored parent directories too. The published native packages support this option through zlob.
+
+```ts
+FileFinder.create({ basePath: process.cwd(), extraIgnore: ["/generated/", "!/keep.log"] });
+```
+
+Set `disableGit: true` to skip Git discovery, status, ranking, and Git ignore rules. The scan includes hidden files and skips Git metadata under `.git`. Set `disableIgnoreFiles: true` to skip rules from `.ignore` files independently. Both options require zlob and work with `extraIgnore`.
+
 ### Definition modes
 
 Each core grep call uses one `classify_definitions` mode. Rust stores it in `GrepSearchOptions` as `DefinitionMode`, defaulting to `Off`. The JavaScript SDKs expose the same setting as `classifyDefinitions`.

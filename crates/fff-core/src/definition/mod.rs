@@ -101,6 +101,22 @@ mod tests {
     }
 
     #[test]
+    fn rust_trait_declarations_classify_the_declared_name() {
+        assert_definitions(
+            "x.rs",
+            &[
+                ("pub(crate) trait Needle<T>: Base<T> {", "Needle", true),
+                ("#[doc(hidden)] pub unsafe trait Needle {}", "Needle", true),
+                ("pub unsafe auto trait Needle {}", "Needle", true),
+                ("pub const trait Needle {}", "Needle", true),
+                ("pub trait Needle = Base;", "Needle", true),
+                ("pub trait Other: Needle {", "Needle", false),
+                ("impl<T> Needle<T> for Wrapper<T> {}", "Needle", false),
+            ],
+        );
+    }
+
+    #[test]
     fn matches_must_overlap_the_declared_name() {
         assert!(!is_definition_match(
             Language::Rust as u8,

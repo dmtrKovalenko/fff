@@ -262,4 +262,71 @@ describe('programmatic search APIs', function()
       assert.is_true(#result.items > 0, 'cwd switch did not surface match from the new root')
     end)
   end)
+
+  describe('cwd switching without the picker UI', function()
+    -- API-only callers never open the picker, so file_picker.setup() never runs (#938)
+    local sandbox_root, saved_initialized
+
+    local function capture_errors(fn)
+      local errors, original = {}, vim.notify
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.notify = function(msg, level)
+        if level == vim.log.levels.ERROR then errors[#errors + 1] = msg end
+      end
+      local call_ok, result = pcall(fn)
+      vim.notify = original
+      assert(call_ok, result)
+      return result, errors
+    end
+
+    before_each(function()
+      pcall(vim.api.nvim_del_augroup_by_name, 'fff_file_tracking')
+      vim.g.fff = {}
+      saved_initialized = file_picker.state.initialized
+      file_picker.state.initialized = false
+      init_picker_at_plugin_dir()
+      sandbox_root = vim.fn.tempname() .. '_no_picker_ui'
+      vim.fn.mkdir(sandbox_root, 'p')
+    end)
+
+    after_each(function()
+      pcall(fff_rust.stop_background_monitor)
+      pcall(fff_rust.cleanup_file_picker)
+      if sandbox_root then vim.fn.delete(sandbox_root, 'rf') end
+      sandbox_root = nil
+      file_picker.state.initialized = saved_initialized
+      vim.g.fff = nil
+    end)
+
+    it('file_search switches the indexed root', function()
+      local fd = assert(io.open(sandbox_root .. '/no_picker_ui_target.lua', 'w'))
+      fd:write('-- only lives in the sandbox\n')
+      fd:close()
+
+      local result, errors = capture_errors(
+        function() return fff.file_search('no_picker_ui_target', { cwd = sandbox_root }) end
+      )
+      assert.are.same({}, errors)
+      assert.is_not_nil(find_result_by_name(result.items, 'no_picker_ui_target.lua'))
+    end)
+
+    it('content_search switches the indexed root', function()
+      local marker = 'no_picker_ui' .. '_marker_plugh'
+      local fd = assert(io.open(sandbox_root .. '/grep_target.lua', 'w'))
+      fd:write('-- ' .. marker .. '\n')
+      fd:close()
+
+      -- same lazy windows metadata cache race as the cwd switching grep test
+      if vim.fn.has('win32') == 1 then vim.wait(250, function() return false end) end
+
+      local result, errors = capture_errors(function() return fff.content_search(marker, { cwd = sandbox_root }) end)
+      assert.are.same({}, errors)
+      -- same index lag after mkdir as the cwd switching grep test
+      vim.wait(10000, function()
+        if #result.items == 0 then result = fff.content_search(marker, { cwd = sandbox_root }) end
+        return #result.items > 0
+      end, 50)
+      assert.is_true(#result.items > 0, 'cwd switch did not surface match from the new root')
+    end)
+  end)
 end)

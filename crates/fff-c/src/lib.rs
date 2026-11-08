@@ -12,6 +12,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fff::shared::SharedQueryTracker;
@@ -20,7 +21,7 @@ mod accessors;
 mod ffi_types;
 mod watch;
 
-use fff::file_picker::FilePicker;
+use fff::file_picker::{FilePicker, FilePickerIgnoreOptions};
 use fff::frecency::FrecencyTracker;
 use fff::query_tracker::QueryTracker;
 use fff::{DbHealthChecker, FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser};
@@ -91,14 +92,13 @@ fn default_i32(val: i32, default: i32) -> i32 {
 
 /// Create a new file finder instance (legacy 8-arg positional signature).
 ///
-/// @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
-/// for FFI bindings). The `use_unsafe_no_lock` parameter is ignored.
+/// @deprecated Use [`fff_create_instance_with`]. The `use_unsafe_no_lock` parameter is ignored.
 ///
 /// ## Safety
 /// See `fff_create_instance_with`.
 #[deprecated(
     since = "0.8.5",
-    note = "Use fff_create_instance_with (by pointer) or fff_create_instance_with_value (by value) with FffCreateOptions instead. The struct evolves without ABI breaks."
+    note = "Use fff_create_instance_with with a pointer to FffCreateOptions instead."
 )]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance(
@@ -124,14 +124,13 @@ pub unsafe extern "C" fn fff_create_instance(
 
 /// Create a new file finder instance (legacy 13-arg positional signature).
 ///
-/// @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
-/// for FFI bindings). The `use_unsafe_no_lock` parameter is ignored.
+/// @deprecated Use [`fff_create_instance_with`]. The `use_unsafe_no_lock` parameter is ignored.
 ///
 /// ## Safety
 /// See `fff_create_instance_with`.
 #[deprecated(
     since = "0.8.5",
-    note = "Use fff_create_instance_with (by pointer) or fff_create_instance_with_value (by value) with FffCreateOptions instead. The struct evolves without ABI breaks."
+    note = "Use fff_create_instance_with with a pointer to FffCreateOptions instead."
 )]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance2(
@@ -165,36 +164,42 @@ pub unsafe extern "C" fn fff_create_instance2(
     unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
 }
 
-/// Create a new file finder instance from a versioned [`FffCreateOptions`] struct.
+/// Create a file finder from versioned options. `base_path` is required.
 ///
-/// Populate the struct, set `version` to [`FFF_CREATE_OPTIONS_VERSION`], pass by
-/// pointer. New fields are only appended; older `version` values keep working.
-/// FFI bindings needing struct-by-value should use [`fff_create_instance_with_value`].
-///
-/// `opts.base_path` is required (non-NULL, non-empty). Zero `cache_budget_*`
-/// values are auto-computed from repo size after the initial scan.
-///
-/// ## Safety
-/// * `opts` must be a valid pointer to an `FffCreateOptions` whose `version`
-///   is in the range `1..=FFF_CREATE_OPTIONS_VERSION`.
-/// * All string pointers inside `opts` must be valid null-terminated UTF-8
-///   or NULL.
+/// # Safety
+/// Pass a pointer to initialized fields through the version specified in `opts.version`.
+/// String pointers must be NUL-terminated UTF-8 or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions) -> *mut FffResult {
     if opts.is_null() {
         return FffResult::err("opts is null");
     }
-    let opts = unsafe { &*opts };
-    if opts.version == 0 || opts.version > FFF_CREATE_OPTIONS_VERSION {
+    let version = unsafe { (*opts).version };
+    if version == 0 || version > FFF_CREATE_OPTIONS_VERSION {
         return FffResult::err(&format!(
             "Unsupported FffCreateOptions version {} (library understands up to {})",
-            opts.version, FFF_CREATE_OPTIONS_VERSION
+            version, FFF_CREATE_OPTIONS_VERSION
         ));
     }
+    let opts = unsafe { FffCreateOptions::read_versioned(opts, version) };
 
     let base_path_str = match unsafe { cstr_to_str(opts.base_path) } {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return FffResult::err("opts.base_path is null or empty"),
+    };
+
+    let extra_ignore = if opts.extra_ignore.is_null() {
+        Arc::default()
+    } else {
+        let Some(rules) = (unsafe { cstr_to_str(opts.extra_ignore) }) else {
+            return FffResult::err("extra_ignore is not valid UTF-8");
+        };
+        rules.lines().map(str::to_owned).collect()
+    };
+    let ignore_options = FilePickerIgnoreOptions {
+        extra_ignore,
+        disable_git: opts.disable_git,
+        disable_ignore_files: opts.disable_ignore_files,
     };
 
     if let Some(log_path) = unsafe { optional_cstr(opts.log_file_path) } {
@@ -253,7 +258,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         opts.cache_budget_max_file_size,
     );
 
-    if let Err(e) = FilePicker::new_with_shared_state(
+    if let Err(e) = FilePicker::new_with_shared_state_and_ignore_options(
         shared_picker.clone(),
         shared_frecency.clone(),
         fff::FilePickerOptions {
@@ -263,11 +268,12 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             watch: opts.watch,
             mode,
             cache_budget,
-            follow_symlinks: opts.version >= 2 && opts.follow_symlinks,
+            follow_symlinks: opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
             git_recency: Default::default(),
         },
+        ignore_options,
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
     }
@@ -283,15 +289,33 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
     FffResult::ok_handle(fff_handle)
 }
 
-/// [`fff_create_instance_with`] adapter taking [`FffCreateOptions`] **by value**,
-/// for FFI libraries that pass native structs by value (e.g. Node's `ffi-rs`).
-///
-/// ## Safety
-/// All `*const c_char` fields inside `opts` must be valid null-terminated
-/// UTF-8 or NULL. The struct itself is consumed by value.
+// The exported by-value symbol keeps its original ABI.
+#[repr(C)]
+struct LegacyCreateOptions {
+    version: u32,
+    base_path: *const c_char,
+    frecency_db_path: *const c_char,
+    history_db_path: *const c_char,
+    enable_mmap_cache: bool,
+    enable_content_indexing: bool,
+    watch: bool,
+    ai_mode: bool,
+    log_file_path: *const c_char,
+    log_level: *const c_char,
+    cache_budget_max_files: u64,
+    cache_budget_max_bytes: u64,
+    cache_budget_max_file_size: u64,
+    enable_fs_root_scanning: bool,
+    enable_home_dir_scanning: bool,
+    follow_symlinks: std::mem::MaybeUninit<bool>,
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fff_create_instance_with_value(opts: FffCreateOptions) -> *mut FffResult {
-    unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
+unsafe extern "C" fn fff_create_instance_with_value(opts: LegacyCreateOptions) -> *mut FffResult {
+    if opts.version > 2 {
+        return FffResult::err("The by-value symbol accepts FffCreateOptions versions 1 and 2");
+    }
+    unsafe { fff_create_instance_with((&raw const opts).cast()) }
 }
 
 /// Destroy a file finder instance and free all its resources.
@@ -1031,10 +1055,14 @@ pub unsafe extern "C" fn fff_restart_index(
         .as_ref()
         .map(|p| p.git_recency_config())
         .unwrap_or_default();
+    let ignore_options = guard
+        .as_ref()
+        .map(|picker| picker.ignore_options().clone())
+        .unwrap_or_default();
 
     drop(guard);
 
-    match FilePicker::new_with_shared_state(
+    match FilePicker::new_with_shared_state_and_ignore_options(
         inst.picker.clone(),
         inst.frecency.clone(),
         fff::FilePickerOptions {
@@ -1049,6 +1077,7 @@ pub unsafe extern "C" fn fff_restart_index(
             enable_home_dir_scanning: home_dir,
             git_recency,
         },
+        ignore_options,
     ) {
         Ok(()) => FffResult::ok_empty(),
         Err(e) => FffResult::err(&format!("Failed to init file picker: {}", e)),

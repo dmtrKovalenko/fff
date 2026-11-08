@@ -19,6 +19,22 @@ local function restore_paste(should_restore)
   if should_restore then vim.o.paste = true end
 end
 
+-- Deferred stopinsert ends Insert mode in the window we return to, moving its cursor left.
+local function keep_cursor_on_insert_leave()
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  vim.api.nvim_create_autocmd('ModeChanged', {
+    pattern = 'i:*',
+    once = true,
+    callback = function()
+      if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+        pcall(vim.api.nvim_win_set_cursor, win, cursor)
+      end
+    end,
+  })
+end
+
 function M.relayout()
   if not P.state.active then return end
 
@@ -95,6 +111,8 @@ function M.close()
   for _, win in ipairs(windows) do
     if win and vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
   end
+
+  if vim.api.nvim_get_mode().mode:sub(1, 1) == 'i' then keep_cursor_on_insert_leave() end
 
   local buffers = { S.input_buf, S.list_buf, S.file_info_buf }
   if S.preview_buf then buffers[#buffers + 1] = S.preview_buf end

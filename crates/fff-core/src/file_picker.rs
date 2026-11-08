@@ -262,27 +262,10 @@ impl FileSync {
         let dir_rel = &rel_path[..parent_end];
         let filename = &rel_path[parent_end..];
 
-        if let Some(dir_idx) = find_dir(dir_rel) {
-            let dir_idx = dir_idx as u32;
-            let cmp_key = |f: &FileItem| {
-                f.parent_dir_index.cmp(&dir_idx).then_with(|| {
-                    let fname = f.file_name(arena);
-                    fname.as_str().cmp(filename)
-                })
-            };
-
-            if self.indexable_count > 0
-                && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(cmp_key)
-            {
-                return Some(pos);
-            }
-
-            if self.indexable_count < self.base_count
-                && let Ok(rel_pos) =
-                    self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
-            {
-                return Some(self.indexable_count + rel_pos);
-            }
+        if let Some(dir_idx) = find_dir(dir_rel)
+            && let Some(pos) = self.find_base_file_index(dir_idx as u32, filename, arena)
+        {
+            return Some(pos);
         }
 
         // Overflow region: linear scan by full relative path.
@@ -297,6 +280,79 @@ impl FileSync {
         }
 
         None
+    }
+
+    fn find_base_file_index(&self, dir_idx: u32, filename: &str, arena: ArenaPtr) -> Option<usize> {
+        let mut fname = String::new();
+        let mut cmp_key = |f: &FileItem| {
+            f.parent_dir_index.cmp(&dir_idx).then_with(|| {
+                fname.clear();
+                f.write_file_name_from_arena(arena, &mut fname);
+                fname.as_str().cmp(filename)
+            })
+        };
+
+        if self.indexable_count > 0
+            && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(&mut cmp_key)
+        {
+            return Some(pos);
+        }
+
+        if self.indexable_count < self.base_count
+            && let Ok(rel_pos) =
+                self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
+        {
+            return Some(self.indexable_count + rel_pos);
+        }
+
+        None
+    }
+
+    // Marks base files that `previous` already read as text with the same path, size and mtime,
+    // so a rescan only reads changed files. Binary verdicts are always checked again.
+    fn unchanged_text_files(&self, previous: &FileSync) -> Vec<u64> {
+        if previous.base_count == 0 {
+            return Vec::new();
+        }
+        let mut known_text = vec![0u64; self.base_count.div_ceil(64)];
+
+        let arena = self.arena_base_ptr();
+        let previous_arena = previous.arena_base_ptr();
+        let mut buf = [0u8; PATH_BUF_SIZE];
+        let previous_dirs: Vec<Option<u32>> = self.dirs[..self.base_dirs_count]
+            .iter()
+            .map(|dir| {
+                let dir = dir.read_relative_path(arena, &mut buf);
+                previous.find_base_dir_index(dir).map(|i| i as u32)
+            })
+            .collect();
+
+        let mut name = String::new();
+        for (index, file) in self.files[..self.base_count].iter().enumerate() {
+            let Some(&Some(previous_dir)) = previous_dirs.get(file.parent_dir_index as usize)
+            else {
+                continue;
+            };
+
+            name.clear();
+            file.write_file_name_from_arena(arena, &mut name);
+            let Some(old) = previous
+                .find_base_file_index(previous_dir, &name, previous_arena)
+                .map(|i| &previous.files[i])
+            else {
+                continue;
+            };
+
+            if !old.is_deleted()
+                && !old.is_binary()
+                && old.size == file.size
+                && old.modified == file.modified
+            {
+                known_text[index / 64] |= 1u64 << (index % 64);
+            }
+        }
+
+        known_text
     }
 
     // TODO remove this function and make a better way to remove all files
@@ -619,6 +675,17 @@ impl Default for FilePickerOptions {
     }
 }
 
+/// Controls which ignore rules a picker applies while indexing.
+#[derive(Clone, Debug, Default)]
+pub struct FilePickerIgnoreOptions {
+    /// Extra root-relative rules. Requires the zlob walker.
+    pub extra_ignore: Arc<[String]>,
+    /// Skip Git integration and Git ignore rules.
+    pub disable_git: bool,
+    /// Skip rules from `.ignore` files.
+    pub disable_ignore_files: bool,
+}
+
 pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
@@ -637,6 +704,7 @@ pub struct FilePicker {
     enable_content_indexing: bool,
     watch: bool,
     follow_symlinks: bool,
+    ignore_options: FilePickerIgnoreOptions,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     git_recency_config: GitRecencyConfig,
@@ -713,6 +781,11 @@ impl FilePicker {
 
     pub fn follows_symlinks(&self) -> bool {
         self.follow_symlinks
+    }
+
+    /// Returns the ignore options for this picker.
+    pub fn ignore_options(&self) -> &FilePickerIgnoreOptions {
+        &self.ignore_options
     }
 
     pub fn fs_root_scanning_enabled(&self) -> bool {
@@ -929,10 +1002,14 @@ impl FilePicker {
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
-        Self::with_scm_pause(options, Arc::default())
+        Self::with_scm_pause(options, FilePickerIgnoreOptions::default(), Arc::default())
     }
 
-    fn with_scm_pause(options: FilePickerOptions, paused: Arc<AtomicBool>) -> Result<Self, Error> {
+    fn with_scm_pause(
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+        paused: Arc<AtomicBool>,
+    ) -> Result<Self, Error> {
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
             error!("Base path does not exist: {}", options.base_path);
@@ -987,6 +1064,7 @@ impl FilePicker {
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
             follow_symlinks: options.follow_symlinks,
+            ignore_options,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             git_recency_config: options.git_recency,
@@ -995,14 +1073,51 @@ impl FilePicker {
         })
     }
 
-    /// Create a picker, place it into the shared handle, and spawn background
-    /// indexing + file-system watcgenerate_trace_id the default entry point.
+    /// Create a shared picker and start background indexing and watching.
     pub fn new_with_shared_state(
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let picker = Self::with_scm_pause(options, shared_picker.git_status_pause_flag())?;
+        Self::new_with_shared_state_and_ignore_options(
+            shared_picker,
+            shared_frecency,
+            options,
+            FilePickerIgnoreOptions::default(),
+        )
+    }
+
+    /// Starts background indexing with the supplied ignore options.
+    pub fn new_with_shared_state_and_ignore_options(
+        shared_picker: SharedFilePicker,
+        shared_frecency: SharedFrecency,
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+    ) -> Result<(), Error> {
+        let extra_ignore = &ignore_options.extra_ignore;
+        if !cfg!(feature = "zlob") && !extra_ignore.is_empty() {
+            return Err(Error::WalkFailed(
+                "extra ignore rules require the zlob walker".into(),
+            ));
+        }
+        if !cfg!(feature = "zlob")
+            && (ignore_options.disable_git || ignore_options.disable_ignore_files)
+        {
+            return Err(Error::WalkFailed(
+                "disabling Git or .ignore files requires the zlob walker".into(),
+            ));
+        }
+        if extra_ignore.iter().any(|rule| rule.contains('\0')) {
+            return Err(Error::WalkFailed(
+                "extra ignore rules cannot contain NUL bytes".into(),
+            ));
+        }
+
+        let picker = Self::with_scm_pause(
+            options,
+            ignore_options.clone(),
+            shared_picker.git_status_pause_flag(),
+        )?;
         let backend = picker.scm_backend;
 
         info!(
@@ -1061,6 +1176,7 @@ impl FilePicker {
                 auto_cache_budget: true,
                 install_watcher: true,
                 follow_symlinks,
+                ignore_options,
                 enable_fs_root_scanning,
                 enable_home_dir_scanning,
             },
@@ -1082,7 +1198,11 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git = FileSync::discover_scm(self.scm_backend, &self.base_path);
+        let git = FileSync::discover_scm(
+            self.scm_backend,
+            &self.base_path,
+            self.ignore_options.disable_git,
+        );
         let git_handle = git
             .as_ref()
             .map(|git| git.backend.spawn_initial_status(git.clone()));
@@ -1095,6 +1215,7 @@ impl FilePicker {
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
+            &self.ignore_options,
         )?;
 
         self.sync_data = sync;
@@ -1581,9 +1702,14 @@ impl FilePicker {
         })
     }
 
-    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        self.sync_data = sync;
+    pub(crate) fn unchanged_text_files(&self, previous: &FileSync) -> Vec<u64> {
+        self.sync_data.unchanged_text_files(previous)
+    }
+
+    // Returns the replaced index so the caller can compare against it and drop it off the lock
+    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) -> FileSync {
         self.cache_budget.reset();
+        std::mem::replace(&mut self.sync_data, sync)
     }
 
     #[inline]
@@ -2146,7 +2272,11 @@ impl FileSync {
     pub(crate) fn discover_scm(
         backend: &'static dyn ScmBackend,
         base_path: &Path,
+        disabled: bool,
     ) -> Option<ScmWorkspace> {
+        if disabled {
+            return None;
+        }
         let git = backend.discover(base_path);
         match &git {
             Some(git) => {
@@ -2169,6 +2299,7 @@ impl FileSync {
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
+        ignore_options: &FilePickerIgnoreOptions,
     ) -> Result<FileSync, Error> {
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
@@ -2193,6 +2324,8 @@ impl FileSync {
             follow_symlinks,
             bg_threads,
             synced_files_count,
+            ignore_options,
+            None,
         )?;
         let ignore_rules = ignore_rules.map(Arc::new);
 

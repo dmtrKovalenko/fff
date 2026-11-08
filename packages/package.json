@@ -5,8 +5,9 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
-    "check": "oxfmt . && oxlint --fix .",
-    "check:ci": "oxfmt --check . && oxlint ."
+    "typecheck": "bun run --filter '*' typecheck",
+    "check": "oxfmt . && oxlint --fix . && bun run typecheck",
+    "check:ci": "oxfmt --check . && oxlint . && bun run typecheck"
   },
   "devDependencies": {
     "oxfmt": "0.63.0",
