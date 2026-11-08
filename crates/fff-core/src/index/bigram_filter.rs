@@ -382,6 +382,14 @@ impl BigramIndexBuilder {
     /// Ubiquitous columns (≥90%) are omitted because they barely filter.
     #[inline(always)]
     pub fn compress(self, min_density_pct: Option<u32>) -> BigramFilter {
+        self.compress_in_pool(min_density_pct, &crate::parallelism::BACKGROUND_THREAD_POOL)
+    }
+
+    fn compress_in_pool(
+        self,
+        min_density_pct: Option<u32>,
+        pool: &rayon::ThreadPool,
+    ) -> BigramFilter {
         let cols = self.columns_used() as usize;
         let words = self.words;
         let file_count = self.file_count;
@@ -454,8 +462,7 @@ impl BigramIndexBuilder {
         let encoded: Vec<Option<Vec<u8>>> = if kept.len() * words < PARALLEL_ENCODE_MIN_WORDS {
             kept.iter().map(encode).collect()
         } else {
-            crate::parallelism::BACKGROUND_THREAD_POOL
-                .install(|| kept.par_iter().map(encode).collect())
+            pool.install(|| kept.par_iter().map(encode).collect())
         };
 
         // Pass 3: compact dense columns to the front of the builder slab (no
@@ -1104,6 +1111,7 @@ pub(crate) fn build_bigram_index(
     files: &[crate::types::FileItem],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
+    pool: &rayon::ThreadPool,
 ) -> BigramFilter {
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
@@ -1118,7 +1126,7 @@ pub(crate) fn build_bigram_index(
     // pass runs detached on the background pool without holding the picker
     // read lock, so a watcher event mutating a `FileItem` would race any
     // borrow we took from a cached `Mmap`.
-    crate::parallelism::BACKGROUND_THREAD_POOL.install(|| {
+    pool.install(|| {
         files
             .par_chunks(BIGRAM_CHUNK_FILES)
             .enumerate()
@@ -1174,8 +1182,8 @@ pub(crate) fn build_bigram_index(
         unsafe { libc::close(base_fd) };
     }
 
-    let mut index = builder.compress(None);
-    let skip_index = skip_builder.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT));
+    let mut index = builder.compress_in_pool(None, pool);
+    let skip_index = skip_builder.compress_in_pool(Some(SKIP_INDEX_MIN_DENSITY_PCT), pool);
     index.set_skip_index(skip_index);
 
     index
@@ -1219,12 +1227,12 @@ pub(crate) fn sniff_binary_for_non_indexable(
 }
 
 // Release worker buffers after publishing the index, before allocator collection.
-pub(crate) fn release_thread_buffers() {
+pub(crate) fn release_thread_buffers(pool: &rayon::ThreadPool) {
     fn release() {
         READ_BUF.with_borrow_mut(|buf| *buf = Vec::new());
         NORM_BUF.with_borrow_mut(|buf| *buf = Vec::new());
     }
-    crate::parallelism::BACKGROUND_THREAD_POOL.broadcast(|_| release());
+    pool.broadcast(|_| release());
     release();
 }
 
@@ -1688,7 +1696,12 @@ mod tests {
             file.set_path(path);
         }
 
-        let index = build_bigram_index(&files, base, store.as_arena_ptr());
+        let index = build_bigram_index(
+            &files,
+            base,
+            store.as_arena_ptr(),
+            &crate::parallelism::BACKGROUND_THREAD_POOL,
+        );
         let reference = BigramIndexBuilder::new(files.len());
         let reference_skip = BigramIndexBuilder::new(files.len());
         for (file_idx, name) in names.iter().enumerate() {
