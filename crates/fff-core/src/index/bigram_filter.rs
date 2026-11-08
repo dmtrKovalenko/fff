@@ -21,10 +21,27 @@ const NO_COLUMN: u16 = u16::MAX;
 /// Bigram keys only ever pair printable bytes (32..=126) which is 95 ^ 2
 pub const BIGRAM_KEY_SLOTS: usize = 95 * 95;
 
-// Slot in the compact lookup for a printable bigram key (`hi << 8 | lo`).
+// A bigram key holds two bytes in one `u16`. The first byte is in the high 8 bits.
+// The second byte is in the low 8 bits. The key is equal to `u16::from_be_bytes([first, second])`.
+// Each byte keeps all its 8 bits. Thus, two different byte pairs cannot have the same key.
+// The scratch bitmap of the builder uses `SEEN_BYTE_BITS`, because it holds only normalized bytes.
+pub(crate) const BIGRAM_KEY_SHIFT: u32 = u8::BITS;
+
+#[inline(always)]
+pub(crate) fn bigram_key(first: u8, second: u8) -> u16 {
+    (first as u16) << BIGRAM_KEY_SHIFT | second as u16
+}
+
+#[inline(always)]
+fn split_bigram_key(key: u16) -> (u8, u8) {
+    ((key >> BIGRAM_KEY_SHIFT) as u8, key as u8)
+}
+
+// Slot in the compact lookup for a printable bigram key.
 #[inline(always)]
 fn key_slot(key: u16) -> usize {
-    pair_slot((key >> 8) as usize, (key & 0xFF) as usize)
+    let (first, second) = split_bigram_key(key);
+    pair_slot(first as usize, second as usize)
 }
 
 #[inline(always)]
@@ -651,7 +668,7 @@ impl BigramFilter {
         let mut prev = pattern[0];
         for &b in &pattern[1..] {
             if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key = bigram_key(prev.to_ascii_lowercase(), b.to_ascii_lowercase());
                 if let Some(col) = self.column_ref(key) {
                     Self::and_column(&mut result, col);
                     has_filter = true;
@@ -687,7 +704,7 @@ impl BigramFilter {
             let a = pattern[i];
             let b = pattern[i + 2];
             if (32..=126).contains(&a) && (32..=126).contains(&b) {
-                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key = bigram_key(a.to_ascii_lowercase(), b.to_ascii_lowercase());
                 if let Some(col) = self.column_ref(key) {
                     Self::and_column(&mut result, col);
                     has_filter = true;
@@ -805,9 +822,8 @@ impl BigramFilter {
     /// Dense column for a printable bigram key, or `u16::MAX` when absent.
     #[inline]
     pub fn column(&self, key: u16) -> u16 {
-        let hi = key >> 8;
-        let lo = key & 0xFF;
-        if !(32..=126).contains(&hi) || !(32..=126).contains(&lo) {
+        let (first, second) = split_bigram_key(key);
+        if !(32..=126).contains(&first) || !(32..=126).contains(&second) {
             return NO_COLUMN;
         }
         self.lookup[key_slot(key)]
@@ -990,14 +1006,14 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
     if content.len() < 2 {
         return Vec::new();
     }
-    // Use a flat bitset (65536 bits = 8 KB) for dedup — faster than HashSet.
-    let mut seen = vec![0u64; 1024]; // 1024 * 64 = 65536 bits
+    // One bit per possible key (2^16 bits = 8 KiB). Dedup with a flat bitset is faster than a HashSet.
+    let mut seen = vec![0u64; (1 << (2 * BIGRAM_KEY_SHIFT)) / u64::BITS as usize];
     let mut bigrams = Vec::new();
 
     let mut prev = content[0];
     for &b in &content[1..] {
         if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-            let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+            let key = bigram_key(prev.to_ascii_lowercase(), b.to_ascii_lowercase());
             let word = key as usize / 64;
             let bit = 1u64 << (key as usize % 64);
             if seen[word] & bit == 0 {
@@ -1424,9 +1440,9 @@ mod tests {
     }
 
     /// Build a key the same way `add_file_content` does: two printable-ASCII
-    /// bytes, lowercased, packed as `(hi << 8) | lo`.
+    /// bytes, lowercased.
     fn key(a: u8, b: u8) -> u16 {
-        ((a.to_ascii_lowercase() as u16) << 8) | b.to_ascii_lowercase() as u16
+        bigram_key(a.to_ascii_lowercase(), b.to_ascii_lowercase())
     }
 
     /// Return the sorted list of (consec, skip) bigram keys that should appear
@@ -1454,7 +1470,8 @@ mod tests {
 
     /// Query: does the builder record file 0 as having this bigram set?
     fn builder_has_key_for_file_0(b: &BigramIndexBuilder, k: u16) -> bool {
-        if (k >> 8) < 32 || (k >> 8) > 126 || (k & 0xFF) < 32 || (k & 0xFF) > 126 {
+        let (first, second) = split_bigram_key(k);
+        if !(32..=126).contains(&first) || !(32..=126).contains(&second) {
             return false;
         }
         let col = b.lookup[key_slot(k)].load(Ordering::Relaxed);
