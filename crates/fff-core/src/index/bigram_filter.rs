@@ -24,14 +24,32 @@ pub const BIGRAM_KEY_SLOTS: usize = 95 * 95;
 // Slot in the compact lookup for a printable bigram key (`hi << 8 | lo`).
 #[inline(always)]
 fn key_slot(key: u16) -> usize {
-    let hi = (key >> 8) as usize;
-    let lo = (key & 0xFF) as usize;
+    pair_slot((key >> 8) as usize, (key & 0xFF) as usize)
+}
+
+#[inline(always)]
+fn pair_slot(hi: usize, lo: usize) -> usize {
     debug_assert!((32..=126).contains(&hi) && (32..=126).contains(&lo));
     (hi - 32) * 95 + (lo - 32)
 }
 
-// Normalized bytes fit in seven bits: 256 × u64 = 2 KiB per scratch bitmap.
-const SEEN_WORDS: usize = 256;
+// Normalized bytes are 0 or 32..=126, so the largest one, `~`, sets the width.
+const SEEN_BYTE_BITS: u32 = u8::BITS - b'~'.leading_zeros();
+const SEEN_BYTE_MASK: usize = (1 << SEEN_BYTE_BITS) - 1;
+// One bit per normalized pair: 2^14 bits = 256 × u64 = 2 KiB per scratch bitmap.
+const SEEN_WORDS: usize = (1 << (2 * SEEN_BYTE_BITS)) / u64::BITS as usize;
+// Bitmap words that share one leading byte.
+const SEEN_WORDS_PER_BYTE: usize = SEEN_WORDS >> SEEN_BYTE_BITS;
+
+#[inline(always)]
+fn seen_key(hi: u8, lo: u8) -> usize {
+    (hi as usize) << SEEN_BYTE_BITS | lo as usize
+}
+
+#[inline(always)]
+fn seen_key_slot(key: usize) -> usize {
+    pair_slot(key >> SEEN_BYTE_BITS, key & SEEN_BYTE_MASK)
+}
 
 /// Below this many bitset words (512 KB) sparse encoding runs inline instead of on the pool.
 const PARALLEL_ENCODE_MIN_WORDS: usize = 1 << 16;
@@ -115,8 +133,7 @@ impl BigramIndexBuilder {
     }
 
     #[inline]
-    fn get_or_alloc_column(&self, key: u16) -> u16 {
-        let slot = key_slot(key);
+    fn get_or_alloc_column(&self, slot: usize) -> u16 {
         let current = self.lookup[slot].load(Ordering::Relaxed);
         if current != NO_COLUMN {
             return current;
@@ -210,20 +227,19 @@ impl BigramIndexBuilder {
         bit_mask: u64,
         bases: SlabPtrs,
     ) {
-        // Pack normalized bytes into fourteen bits to keep both maps in L1.
         let mut seen_consec = [0u64; SEEN_WORDS];
         let mut seen_skip = [0u64; SEEN_WORDS];
 
         let mut n0 = n[0];
         let mut n1 = n[1];
 
-        let key = (n0 as usize) << 7 | n1 as usize;
-        // SAFETY: normalized bytes are below 128, so key >> 6 < SEEN_WORDS.
+        let key = seen_key(n0, n1);
+        // SAFETY: seen_key of two normalized bytes is below SEEN_WORDS * 64.
         unsafe { *seen_consec.get_unchecked_mut(key >> 6) |= 1u64 << (key & 63) };
 
         for &cur in &n[2..] {
-            let ck = (n1 as usize) << 7 | cur as usize;
-            let sk = (n0 as usize) << 7 | cur as usize;
+            let ck = seen_key(n1, cur);
+            let sk = seen_key(n0, cur);
             unsafe {
                 *seen_consec.get_unchecked_mut(ck >> 6) |= 1u64 << (ck & 63);
                 *seen_skip.get_unchecked_mut(sk >> 6) |= 1u64 << (sk & 63);
@@ -260,7 +276,7 @@ impl BigramIndexBuilder {
         let mut n1 = n[1];
 
         if n0 != 0 && n1 != 0 {
-            let key = (n0 as u16) << 7 | n1 as u16;
+            let key = seen_key(n0, n1);
             self.record_bigram(
                 &mut seen_consec,
                 key,
@@ -274,7 +290,7 @@ impl BigramIndexBuilder {
         for &cur in &n[2..] {
             if cur != 0 {
                 if n1 != 0 {
-                    let key = (n1 as u16) << 7 | cur as u16;
+                    let key = seen_key(n1, cur);
                     self.record_bigram(
                         &mut seen_consec,
                         key,
@@ -285,7 +301,7 @@ impl BigramIndexBuilder {
                     );
                 }
                 if n0 != 0 {
-                    let key = (n0 as u16) << 7 | cur as u16;
+                    let key = seen_key(n0, cur);
                     skip_builder.record_bigram(
                         &mut seen_skip,
                         key,
@@ -305,23 +321,21 @@ impl BigramIndexBuilder {
     fn record_bigram(
         &self,
         seen: &mut [u64; SEEN_WORDS],
-        packed_key: u16,
+        key: usize,
         word_idx: usize,
         bit_mask: u64,
         col_base: *mut u64,
         words: usize,
     ) {
-        let k = packed_key as usize;
-        let w = k >> 6;
-        let bit = 1u64 << (k & 63);
-        // SAFETY: callers pack normalized seven-bit bytes, so w < SEEN_WORDS.
+        let w = key >> 6;
+        let bit = 1u64 << (key & 63);
+        // SAFETY: callers pass seen_key of normalized bytes, so w < SEEN_WORDS.
         let prev = unsafe { *seen.get_unchecked(w) };
         if prev & bit == 0 {
             unsafe {
                 *seen.get_unchecked_mut(w) = prev | bit;
             }
-            let key = ((packed_key >> 7) << 8) | (packed_key & 0x7F);
-            let col = self.get_or_alloc_column(key);
+            let col = self.get_or_alloc_column(seen_key_slot(key));
             if col != NO_COLUMN {
                 unsafe {
                     let p = col_base.add(col as usize * words + word_idx);
@@ -347,16 +361,16 @@ impl BigramIndexBuilder {
             }
             for (j, &word_bits) in block.iter().enumerate() {
                 let w = blk * 8 + j;
-                let mut bits = match w & 1 {
-                    _ if w < 2 => 0,
+                // Skip 0-sentinel pairs: (0, x) fills the first words, (x, 0) is bit 0 of each run.
+                let mut bits = match w % SEEN_WORDS_PER_BYTE {
+                    _ if w < SEEN_WORDS_PER_BYTE => 0,
                     0 => word_bits & !1,
                     _ => word_bits,
                 };
                 while bits != 0 {
-                    let packed_key = (w << 6 | bits.trailing_zeros() as usize) as u16;
-                    let key = ((packed_key >> 7) << 8) | (packed_key & 0x7F);
+                    let key = w << 6 | bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let col = self.get_or_alloc_column(key);
+                    let col = self.get_or_alloc_column(seen_key_slot(key));
                     if col != NO_COLUMN {
                         unsafe {
                             let p = col_base.add(col as usize * words + word_idx);
@@ -1382,13 +1396,31 @@ mod tests {
         let builder = BigramIndexBuilder::new(64);
         let mut keys = (32..=126).flat_map(|a| (32..=126).map(move |b| u16::from_be_bytes([a, b])));
         for id in 0..MAX_BIGRAM_COLUMNS as u16 {
-            assert_eq!(builder.get_or_alloc_column(keys.next().unwrap()), id);
+            assert_eq!(
+                builder.get_or_alloc_column(key_slot(keys.next().unwrap())),
+                id
+            );
         }
         let absent = keys.next().unwrap();
         for _ in 0..=u16::MAX {
-            assert_eq!(builder.get_or_alloc_column(absent), NO_COLUMN);
+            assert_eq!(builder.get_or_alloc_column(key_slot(absent)), NO_COLUMN);
         }
         assert_eq!(builder.columns_used() as usize, MAX_BIGRAM_COLUMNS);
+    }
+
+    #[test]
+    fn seen_keys_match_query_slots_and_sentinel_masks() {
+        for hi in 32..=126u8 {
+            for lo in 32..=126u8 {
+                let seen = seen_key(hi, lo);
+                assert!(seen >> 6 < SEEN_WORDS);
+                assert_eq!(seen_key_slot(seen), key_slot(u16::from_be_bytes([hi, lo])));
+            }
+            assert!(seen_key(0, hi) >> 6 < SEEN_WORDS_PER_BYTE);
+            let tail = seen_key(hi, 0);
+            assert_eq!(tail & 63, 0);
+            assert_eq!((tail >> 6) % SEEN_WORDS_PER_BYTE, 0);
+        }
     }
 
     /// Build a key the same way `add_file_content` does: two printable-ASCII
