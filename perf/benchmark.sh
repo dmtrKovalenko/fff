@@ -63,7 +63,7 @@ run_bench() {
   echo "Measuring $side $lane $bench" >&2
   if ! (
     cd "$work" || exit
-    ulimit -f 8192 -v 3145728 || exit
+    ulimit -f 8192 -v 8388608 || exit
     exec timeout --kill-after=10s 10m taskset -c 8-11 \
       env -i PATH=/usr/bin:/bin LC_ALL=C TMPDIR="$work" CARGO_TARGET_DIR="$work/target" \
       RAYON_NUM_THREADS=4 FFF_BENCH_PATH="$fixture_path" "$@" "$bins/${bench}_bench" \
