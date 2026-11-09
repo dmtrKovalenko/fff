@@ -75,7 +75,6 @@ jobs:
             --mount "type=bind,src=$(dirname "$(readlink -f "$(command -v zig)")"),dst=/zig,readonly" \
             --mount "type=bind,src=$HOME/.cargo/bin/cargo-zigbuild,dst=/tools/cargo-zigbuild,readonly" \
             --env HOME=/build --env CARGO_TARGET_DIR=/build/target \
-            --env 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=+crt-static' \
             --env PATH=/zig:/rust/bin:/tools:/usr/local/bin:/usr/bin:/bin \
             --workdir /src \
             buildpack-deps:noble@sha256:8e49144867ad1df5bce2864e890b2d783c7754efc68e2b52b27d10942edc4d0d \
@@ -106,11 +105,11 @@ jobs:
       queue: max
     steps:
       - name: Check out the benchmark harness
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: dmtrKovalenko/fff
-          ref: refs/heads/main
-          persist-credentials: false
+        run: |
+          harness="$RUNNER_TEMP/fff-harness"
+          git init -q "$harness"
+          git -C "$harness" -c core.hooksPath=/dev/null fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git refs/heads/main
+          git -C "$harness" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
       - name: Download binaries
         if: inputs.kind == 'pr'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -121,13 +120,14 @@ jobs:
         env:
           KIND: ${{ inputs.kind }}
         run: |
+          harness="$RUNNER_TEMP/fff-harness/perf/benchmark.py"
           if [[ "$KIND" = pr ]]; then
-            python3 perf/benchmark.py compare \
+            python3 "$harness" compare \
               --base "$RUNNER_TEMP/fff-binaries/fff-binary-base/fff-mcp" \
               --head "$RUNNER_TEMP/fff-binaries/fff-binary-head/fff-mcp" \
               --output "$RUNNER_TEMP/fff-measurements.json"
           else
-            python3 perf/benchmark.py reference --output "$RUNNER_TEMP/fff-measurements.json"
+            python3 "$harness" reference --output "$RUNNER_TEMP/fff-measurements.json"
           fi
       - name: Upload measurements
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
