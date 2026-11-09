@@ -48,3 +48,5 @@ bash perf/benchmark.sh prepare
 
 When the fixtures, runner settings or benchmark script change, archive the
 old `core-reference-native` directory and run calibration again.
+
+The PR comment includes the base and head commit hashes used for the comparison.
