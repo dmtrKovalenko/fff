@@ -18,53 +18,152 @@ permissions:
   pull-requests: write
   statuses: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   benchmark:
-    name: Benchmark on load
+    name: Benchmark FFF core on load
     if: github.repository == 'dmtrKovalenko/fff' && github.ref == 'refs/heads/main' && vars.FFF_PERF_RUNNER_REPO != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 95
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Check out the trusted reporting workflow
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
       - name: Queue and wait for measurements
         id: measure
         env:
-          GH_TOKEN: ${{ github.token }}
-          FFF_PERF_RUNNER_REPO: ${{ vars.FFF_PERF_RUNNER_REPO }}
-          FFF_PERF_RUNNER_TOKEN: ${{ secrets.FFF_PERF_RUNNER_TOKEN }}
-        run: python3 -E perf/github.py dispatch "$RUNNER_TEMP/fff-perf"
-      - name: Validate measurements
-        id: prepare
-        if: steps.measure.outputs.stale != 'true'
-        run: python3 -E perf/github.py prepare "$RUNNER_TEMP/fff-perf"
-      - name: Check for search regressions over 10%
-        id: gate
-        if: github.event_name == 'pull_request_target' && steps.prepare.outcome == 'success'
+          RUNNER_REPO: ${{ vars.FFF_PERF_RUNNER_REPO }}
+          RUNNER_TOKEN: ${{ secrets.FFF_PERF_RUNNER_TOKEN }}
+          PERF_DIR: ${{ runner.temp }}/fff-perf
+        run: |
+          current_head() {
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq 'select(.state == "open") | .head.sha'
+          }
+          kind=reference
+          if [[ -n "$PR_NUMBER" ]]; then
+            actual=$(current_head)
+            if [[ "$actual" != "$HEAD_SHA" ]]; then
+              echo 'stale=true' >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            kind=pr
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" -f context='FFF performance' \
+              -f state=pending -f description='Queued for measurement on load' -f target_url="$RUN_URL" >/dev/null
+          fi
+          : "${RUNNER_TOKEN:?Set the FFF_PERF_RUNNER_TOKEN Actions secret}"
+          endpoint="repos/$RUNNER_REPO/actions"
+          run_id=$(jq -nc --arg kind "$kind" --arg harness "$GITHUB_SHA" --arg base "$BASE_SHA" --arg head "$HEAD_SHA" \
+            '{ref:"main", inputs:{kind:$kind,harness_sha:$harness,base_sha:$base,head_sha:$head}}' |
+            GH_TOKEN="$RUNNER_TOKEN" gh api "$endpoint/workflows/benchmark.yml/dispatches" \
+              -H 'X-GitHub-Api-Version: 2026-03-10' --input - --jq .workflow_run_id)
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          echo "Queued measurement run $run_id"
+          for ((attempt=0; attempt<320; attempt++)); do
+            run=$(GH_TOKEN="$RUNNER_TOKEN" gh api "$endpoint/runs/$run_id")
+            if [[ $(jq -r .status <<<"$run") == completed ]]; then
+              jq -e '.conclusion == "success"' <<<"$run" >/dev/null
+              GH_TOKEN="$RUNNER_TOKEN" gh run download "$run_id" -R "$RUNNER_REPO" \
+                --name fff-measurements --dir "$PERF_DIR"
+              if [[ -n "$PR_NUMBER" ]]; then
+                actual=$(current_head)
+                if [[ "$actual" != "$HEAD_SHA" ]]; then
+                  echo 'stale=true' >>"$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo '{"lastUpdate":0,"repoUrl":"","entries":{}}' >"$PERF_DIR/baseline.json"
+              fi
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Measurement run $run_id timed out" >&2
+          exit 1
+      - name: Load the PR base measurements
+        if: github.event_name == 'pull_request_target' && steps.measure.outputs.stale != 'true'
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
-          name: FFF search latency
-          tool: customSmallerIsBetter
-          output-file-path: ${{ runner.temp }}/fff-perf/head.json
+          name: FFF core
+          tool: cargo
+          github-token: ${{ github.token }}
+          output-file-path: ${{ runner.temp }}/fff-perf/base.bench
+          external-data-json-path: ${{ runner.temp }}/fff-perf/baseline.json
+      - name: Associate the baseline with the PR base SHA
+        if: github.event_name == 'pull_request_target' && steps.measure.outputs.stale != 'true'
+        run: |
+          baseline="$RUNNER_TEMP/fff-perf/baseline.json"
+          jq --arg id "$BASE_SHA" --arg url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$BASE_SHA" \
+            '.entries["FFF core"][0].commit = {id:$id, url:$url}' "$baseline" >"$baseline.tmp"
+          mv "$baseline.tmp" "$baseline"
+      - name: Compare and comment on the PR
+        id: gate
+        if: github.event_name == 'pull_request_target' && steps.measure.outputs.stale != 'true'
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: FFF core
+          tool: cargo
+          github-token: ${{ github.token }}
+          output-file-path: ${{ runner.temp }}/fff-perf/head.bench
           external-data-json-path: ${{ runner.temp }}/fff-perf/baseline.json
           save-data-file: false
           alert-threshold: '110%'
           fail-on-alert: true
+          comment-always: true
           summary-always: true
-      - name: Publish the check, PR comment or daily alert
-        if: always() && steps.measure.outputs.stale != 'true'
+      - name: Set the PR head status
+        if: always() && github.event_name == 'pull_request_target' && steps.measure.outputs.stale != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-          FFF_PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
-          FFF_GATE_OUTCOME: ${{ steps.gate.outcome }}
-        run: python3 -E perf/github.py publish "$RUNNER_TEMP/fff-perf"
+          GATE: ${{ steps.gate.outcome }}
+        run: |
+          case "$GATE" in
+            success) state=success; message='FFF core performance passed' ;;
+            failure) state=failure; message='FFF core performance comparison failed' ;;
+            *) state=error; message='FFF core measurement could not complete' ;;
+          esac
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" -f context='FFF performance' \
+            -f state="$state" -f description="$message" -f target_url="$RUN_URL" >/dev/null
+      - name: Alert on reference drift
+        if: always() && github.event_name != 'pull_request_target'
+        env:
+          MEASURE: ${{ steps.measure.outcome }}
+          PERF_DIR: ${{ runner.temp }}/fff-perf
+        run: |
+          title='FFF benchmark reference drift'
+          report="$RUNNER_TEMP/reference.md"
+          if [[ "$MEASURE" == success ]]; then
+            awk '
+              NR == FNR { base[$2] = $5; next }
+              $5 > base[$2] * 1.10 || $5 < base[$2] * 0.90 {
+                if (!found++) print "| Benchmark | Reference (ns) | Measured (ns) | Change |\n| --- | ---: | ---: | ---: |"
+                printf "| `%s` | %d | %d | %+.1f%% |\n", $2, base[$2], $5, 100 * ($5 / base[$2] - 1)
+              }
+            ' "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >"$report"
+            if [[ ! -s "$report" ]]; then
+              echo 'FFF core reference is within 10%' >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          else
+            echo 'Daily FFF core reference measurement could not complete.' >"$report"
+          fi
+          printf '\n[Workflow run](%s)\n' "$RUN_URL" >>"$report"
+          cat "$report" >>"$GITHUB_STEP_SUMMARY"
+          issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --author 'github-actions[bot]' \
+            --search "$title in:title" --json number,title --jq '[.[] | select(.title == "FFF benchmark reference drift")][0].number // empty')
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" -R "$GITHUB_REPOSITORY" --body-file "$report"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file "$report" --assignee "${GITHUB_REPOSITORY_OWNER}"
+          fi
+          exit 1
       - name: Archive timings
-        if: always() && steps.prepare.outcome == 'success'
+        if: always() && steps.measure.outcome == 'success' && steps.measure.outputs.stale != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fff-performance
-          path: ${{ runner.temp }}/fff-perf/fff-measurements.json
+          path: ${{ runner.temp }}/fff-perf/*.bench
           retention-days: 30

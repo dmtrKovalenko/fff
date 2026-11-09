@@ -1,70 +1,57 @@
-# FFF performance CI
+# FFF core performance CI
 
-GitHub Actions builds the PR head and its base as static Linux MCP binaries on
-hosted runners. The private `dmtrKovalenko/fff-perf` repository sends the binaries
-to `load`, which measures one job at a time. PR binaries run in an offline
-gVisor sandbox with read-only fixture mounts.
+Each PR runs FFF's existing Criterion benchmarks against its base revision on
+`load`. Fuzzy file search and grep use pinned FFF and VS Code checkouts on ext4
+and Btrfs. Each revision also runs selected query parsing, definition matching,
+globbing, bigram indexing and SIMD substring search cases.
 
-Each run covers the pinned FFF and VS Code revisions on ext4 and Btrfs. It
-alternates the two binaries across seven pairs and reports median latencies.
-`find_files` and `grep` are measured after warmup and fail the check when any lane
-slows down by more than 10%. First-file latency is informational. The workflow
-updates one comment per PR and archives the measurements.
+GitHub-hosted jobs compile both revisions with the base revision's benchmark
+sources and the release `zlob` feature. One job at a time runs the resulting
+executables on `load` in offline gVisor containers with read-only fixtures.
+GitHub Actions updates the PR with Criterion's median timings and fails the
+head status when a benchmark slows down by more than 10%.
 
-At 04:07 UTC the same worker runs a pinned FFF release against a fixed local
-reference. Drift over 10% in either direction on a gated metric triggers a
-GitHub issue alert. Subsequent drift updates go into the same open issue.
+At 04:07 UTC the worker reruns the same pinned binaries against its saved
+reference. A change of more than 10% in either direction opens or updates
+the reference drift issue.
 
 ## Prepare the worker
 
-Use the same Linux user for fixture setup and the runner service. The worker
-needs Python 3.11 or newer, Git, Docker and gVisor. Register gVisor with Docker
-as `fff-perf-gvisor`. The sandbox uses an empty image.
+Use the runner service account for setup. Register gVisor as the Docker runtime
+`fff-perf-gvisor`, create the empty sandbox image, and mount Btrfs at
+`$HOME/.local/share/fff-perf/btrfs`. On `load` that mount uses a persistent
+8 GiB loop image.
 
 ```sh
 sudo runsc install --runtime=fff-perf-gvisor
 sudo systemctl reload docker
 tar -cf - --files-from=/dev/null | docker import - fff-perf-sandbox:1
+bash perf/benchmark.sh prepare
 ```
-
-Use an ext4 state directory at `$HOME/.local/share/fff-perf` and mount Btrfs at
-its `btrfs` subdirectory. On `load`, Btrfs uses a persistent 8 GiB loop image.
-The harness checks the mounted filesystem types and the fixture revisions.
-Run these commands from the FFF checkout.
-
-```sh
-state="$HOME/.local/share/fff-perf"
-mkdir -p "$state/reference"
-gh release download v0.11.0 --repo dmtrKovalenko/fff \
-  --pattern fff-mcp-x86_64-unknown-linux-musl --dir "$state/reference"
-python3 perf/benchmark.py prepare
-python3 perf/benchmark.py calibrate --output "$state/calibration.json"
-python3 perf/benchmark.py reference --output "$state/reference-check.json"
-```
-
-`calibrate` runs the same checksum-verified binary on both sides. The daily
-run uses the resulting `reference/baseline.json`. Recalibrate explicitly with
-`--replace-reference` when changing the worker settings or pinned workloads.
 
 ## Connect GitHub
 
-1. Create the private `dmtrKovalenko/fff-perf` repository with default branch
-   `main`. Copy [runner.yml](runner.yml) to `.github/workflows/benchmark.yml`
-   and commit it there.
-2. On `load`, install the Linux x64 GitHub Actions runner in
-   `$HOME/.local/share/fff-perf/runner`. Register it in the private repository
-   with the label `fff-perf-load`, then install and start it as a service.
+1. Create the private `dmtrKovalenko/fff-perf` repository. Copy
+   [runner.yml](runner.yml) to `.github/workflows/benchmark.yml` on its
+   default branch `main`.
+2. Register the Linux x64 GitHub Actions runner in
+   `$HOME/.local/share/fff-perf/runner` against that private repository.
+   Set its label to `fff-perf-load` and start its service.
    [GitHub runner setup](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
-3. Add an Actions secret called `FFF_PERF_RUNNER_TOKEN` to
-   `dmtrKovalenko/fff`. Use a fine-grained PAT with access to
-   `dmtrKovalenko/fff-perf` and its **Actions: Read and write** permission.
-   The public workflow uses its built-in token for statuses, PR comments and
-   issue alerts. [Workflow dispatch permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
-4. Merge the FFF workflow and harness into `main`. Run `Measure FFF` manually in
-   the private repository with `kind=reference`. After it succeeds, set
-   `FFF_PERF_RUNNER_REPO` in the public repository's Actions variables to
-   `dmtrKovalenko/fff-perf` and run `FFF performance` manually to verify
-   dispatch and reporting.
-5. Verify the `FFF performance` status and comment on a PR. Make that status
-   required on `main` once the hosted build and same-binary measurements pass
-   on `load`.
+3. Add `FFF_PERF_RUNNER_TOKEN` as an Actions secret in `dmtrKovalenko/fff`.
+   Use a fine-grained PAT scoped to `dmtrKovalenko/fff-perf` with
+   **Actions: Read and write**. The public workflow uses its built-in token
+   to publish PR statuses, timings and issue alerts.
+   [Workflow dispatch permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
+4. Merge the performance workflow. On a new worker, run **Measure FFF core**
+   with `kind=calibrate`, the merged workflow commit as `harness_sha`, and
+   `5d21e4bbdf33a09f58975636208e30747bc8d918` as `base_sha`. Calibration
+   runs the same executables twice and stores the reference in
+   `$HOME/.local/share/fff-perf/core-reference`.
+5. Set the public repository's `FFF_PERF_RUNNER_REPO` Actions variable to
+   `dmtrKovalenko/fff-perf`. Run **FFF performance** manually and verify the
+   daily reference. Verify the status and comment on a PR before making
+   `FFF performance` a required status.
+
+When the fixtures, runner settings or benchmark script change, archive the
+old `core-reference` directory and run calibration again.

@@ -1,138 +1,119 @@
-name: Measure FFF
+name: Measure FFF core
 
 on:
   workflow_dispatch:
     inputs:
       kind:
         type: choice
-        options: [pr, reference]
+        options: [pr, reference, calibrate]
+        required: true
+      harness_sha:
+        type: string
         required: true
       base_sha:
         type: string
-        required: false
       head_sha:
         type: string
-        required: false
 
 permissions: {}
 
-jobs:
-  validate:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Validate request
-        env:
-          KIND: ${{ inputs.kind }}
-          BASE: ${{ inputs.base_sha }}
-          HEAD: ${{ inputs.head_sha }}
-        run: |
-          case "$KIND" in
-            pr) [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$HEAD" =~ ^[0-9a-f]{40}$ ]] ;;
-            reference) [[ -z "$BASE" && -z "$HEAD" ]] ;;
-            *) exit 1 ;;
-          esac
+defaults:
+  run:
+    shell: bash
 
+jobs:
   build:
-    needs: validate
-    if: inputs.kind == 'pr'
+    if: inputs.kind == 'pr' || inputs.kind == 'calibrate'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      RUST_TOOLCHAIN: 1.99.1
+    timeout-minutes: 35
     strategy:
       matrix:
-        variant: [base, head]
+        variant: ${{ fromJSON(inputs.kind == 'pr' && '["base","head"]' || '["base"]') }}
     steps:
-      - name: Fetch source
+      - name: Fetch source and trusted build script
         env:
+          HARNESS: ${{ inputs.harness_sha }}
+          BASE: ${{ inputs.base_sha }}
           REVISION: ${{ matrix.variant == 'base' && inputs.base_sha || inputs.head_sha }}
         run: |
+          [[ "$HARNESS" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ && "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+          repo=https://github.com/dmtrKovalenko/fff.git
           git init -q source
-          git -C source -c core.hooksPath=/dev/null fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$REVISION"
-          git -C source -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
-          test "$(git -C source rev-parse HEAD)" = "$REVISION"
+          git -C source fetch -q --depth=1 "$repo" "$HARNESS" "$BASE" "$REVISION"
+          git -C source show "$HARNESS:perf/build.sh" > "$RUNNER_TEMP/build.sh"
+          git -C source -c core.hooksPath=/dev/null checkout -q --detach "$REVISION"
+          git -C source -c core.hooksPath=/dev/null checkout "$BASE" -- crates/fff-core/benches
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
           use-cache: false
-      - name: Install build tools
+      - name: Install Rust build tools
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
-          cargo "+$RUST_TOOLCHAIN" install cargo-zigbuild --version 0.24.1 --locked
-      - name: Build the FFF MCP binary
+          rustup toolchain install 1.99.1 --profile minimal --target x86_64-unknown-linux-musl
+          cargo +1.99.1 install cargo-zigbuild --version 0.24.1 --locked
+      - name: Build the FFF core benchmarks
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.1
         run: |
-          output="$RUNNER_TEMP/fff-build"
-          mkdir -p "$output"
-          command_token=$(cat /proc/sys/kernel/random/uuid)
-          printf '::stop-commands::%s\n' "$command_token"
-          trap 'printf "::%s::\n" "$command_token"' EXIT
-          docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
-            --security-opt no-new-privileges \
-            --mount "type=bind,src=$GITHUB_WORKSPACE/source,dst=/src,readonly" \
-            --mount "type=bind,src=$output,dst=/build" \
-            --mount "type=bind,src=$(rustc "+$RUST_TOOLCHAIN" --print sysroot),dst=/rust,readonly" \
-            --mount "type=bind,src=$(dirname "$(readlink -f "$(command -v zig)")"),dst=/zig,readonly" \
-            --mount "type=bind,src=$HOME/.cargo/bin/cargo-zigbuild,dst=/tools/cargo-zigbuild,readonly" \
-            --env HOME=/build --env CARGO_TARGET_DIR=/build/target \
-            --env PATH=/zig:/rust/bin:/tools:/usr/local/bin:/usr/bin:/bin \
-            --workdir /src \
-            buildpack-deps:noble@sha256:8e49144867ad1df5bce2864e890b2d783c7754efc68e2b52b27d10942edc4d0d \
-            bash -euc 'cargo zigbuild --locked --profile ci --target x86_64-unknown-linux-musl -p fff-mcp --no-default-features --features zlob
-              install -m 0555 /build/target/x86_64-unknown-linux-musl/ci/fff-mcp /build/fff-mcp'
-          test -f "$output/fff-mcp"
-          test ! -L "$output/fff-mcp"
-          headers=$(readelf -l "$output/fff-mcp")
-          if [[ "$headers" == *INTERP* ]]; then
-            echo "Expected a static FFF MCP binary"
-            exit 1
-          fi
-      - name: Upload binary
+          token=$(cat /proc/sys/kernel/random/uuid)
+          printf '::stop-commands::%s\n' "$token"
+          trap 'printf "::%s::\n" "$token"' EXIT
+          bash "$RUNNER_TEMP/build.sh" source "$RUNNER_TEMP/fff-build"
+      - name: Upload benchmark binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: fff-binary-${{ matrix.variant }}
-          path: ${{ runner.temp }}/fff-build/fff-mcp
+          name: fff-bench-${{ matrix.variant }}
+          path: ${{ runner.temp }}/fff-build/bins
           if-no-files-found: error
           retention-days: 2
 
   measure:
-    needs: [validate, build]
-    if: ${{ !cancelled() && needs.validate.result == 'success' && (inputs.kind == 'reference' || needs.build.result == 'success') }}
+    needs: build
+    if: ${{ !cancelled() && (inputs.kind == 'reference' || needs.build.result == 'success') }}
     runs-on: [self-hosted, linux, x64, fff-perf-load]
-    timeout-minutes: 30
+    timeout-minutes: 35
     concurrency:
       group: fff-perf-load
       queue: max
     steps:
-      - name: Check out the benchmark harness
+      - name: Fetch trusted measurement script
+        env:
+          HARNESS: ${{ inputs.harness_sha }}
         run: |
-          harness="$RUNNER_TEMP/fff-harness"
-          git init -q "$harness"
-          git -C "$harness" -c core.hooksPath=/dev/null fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git refs/heads/main
-          git -C "$harness" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
-      - name: Download binaries
-        if: inputs.kind == 'pr'
+          [[ "$HARNESS" =~ ^[0-9a-f]{40}$ ]]
+          repo=$(mktemp -d)
+          trap 'rm -rf -- "$repo"' EXIT
+          git init -q "$repo"
+          git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$HARNESS"
+          git -C "$repo" show "$HARNESS:perf/benchmark.sh" > "$RUNNER_TEMP/benchmark.sh"
+      - name: Download benchmark binaries
+        if: inputs.kind != 'reference'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: fff-binary-*
+          pattern: fff-bench-*
           path: ${{ runner.temp }}/fff-binaries
-      - name: Measure
+      - name: Measure on load
         env:
           KIND: ${{ inputs.kind }}
+          BASE: ${{ inputs.base_sha }}
         run: |
-          harness="$RUNNER_TEMP/fff-harness/perf/benchmark.py"
-          if [[ "$KIND" = pr ]]; then
-            python3 "$harness" compare \
-              --base "$RUNNER_TEMP/fff-binaries/fff-binary-base/fff-mcp" \
-              --head "$RUNNER_TEMP/fff-binaries/fff-binary-head/fff-mcp" \
-              --output "$RUNNER_TEMP/fff-measurements.json"
-          else
-            python3 "$harness" reference --output "$RUNNER_TEMP/fff-measurements.json"
-          fi
+          token=$(cat /proc/sys/kernel/random/uuid)
+          printf '::stop-commands::%s\n' "$token"
+          trap 'printf "::%s::\n" "$token"' EXIT
+          script="$RUNNER_TEMP/benchmark.sh"
+          binaries="$RUNNER_TEMP/fff-binaries"
+          output="$RUNNER_TEMP/fff-results"
+          case "$KIND" in
+            pr) bash "$script" compare "$output" "$binaries/fff-bench-base" "$binaries/fff-bench-head" ;;
+            calibrate) bash "$script" calibrate "$output" "$binaries/fff-bench-base" "$BASE" ;;
+            reference) bash "$script" reference "$output" ;;
+            *) exit 1 ;;
+          esac
       - name: Upload measurements
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fff-measurements
-          path: ${{ runner.temp }}/fff-measurements.json
+          path: ${{ runner.temp }}/fff-results/*.bench
           if-no-files-found: error
           retention-days: 14
