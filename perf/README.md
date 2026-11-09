@@ -14,9 +14,9 @@ of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
 benchmark slows down by more than 10%.
 
-At 04:07 UTC the worker reruns the same pinned binaries against its saved
-reference. A change of more than 10% in either direction opens or updates
-the reference drift issue.
+At 04:07 UTC **FFF performance reference** runs directly on `load` with
+the saved binaries. A change of more than 10% in either direction opens
+or updates the reference drift issue.
 
 ## Prepare the worker
 
@@ -39,14 +39,12 @@ bash perf/benchmark.sh prepare
    `$HOME/.local/share/fff-perf/runner` against `dmtrKovalenko/fff`.
    Set its label to `fff-perf-load` and start its service.
    [GitHub runner setup](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
-3. Merge the performance workflow. On a new worker, run **FFF performance**
-   with `kind=calibrate`. Calibration runs the pinned revision twice and
+3. Merge the performance workflows. On a new worker, run **FFF performance**
+   manually to calibrate. Calibration runs the pinned revision twice and
    stores the reference in `$HOME/.local/share/fff-perf/core-reference-native`.
-4. Run **FFF performance** with `kind=reference` to verify the saved
+4. Run **FFF performance reference** manually to verify the saved
    reference. Verify the status and comment on a PR before making
    `FFF performance` a required status.
 
 When the fixtures, runner settings or benchmark script change, archive the
 old `core-reference-native` directory and run calibration again.
-
-The PR comment includes the base and head commit hashes used for the comparison.
