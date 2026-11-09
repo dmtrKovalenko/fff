@@ -2,11 +2,11 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use fff_search::simd_string_utils::memmem;
 use std::path::Path;
 
-/// Load real source files from the repository as benchmark haystacks.
-/// Falls back to concatenating all .rs files under crates/ if specific files are missing.
 fn load_real_files() -> Vec<(&'static str, Vec<u8>)> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR"); // crates/fff-core
-    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let default_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let fixture_root = std::env::var_os("FFF_BENCH_PATH");
+    let repo_root = fixture_root.as_deref().map_or(default_root, Path::new);
 
     let files: &[(&str, &str)] = &[
         ("grep.rs/80KB", "crates/fff-core/src/grep.rs"),
