@@ -27,7 +27,7 @@ jobs:
     name: Benchmark FFF core on load
     if: github.repository == 'dmtrKovalenko/fff' && github.ref == 'refs/heads/main' && vars.FFF_PERF_RUNNER_REPO != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 95
+    timeout-minutes: 105
     env:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -61,10 +61,10 @@ jobs:
           run_id=$(jq -nc --arg kind "$kind" --arg harness "$GITHUB_SHA" --arg base "$BASE_SHA" --arg head "$HEAD_SHA" \
             '{ref:"main", inputs:{kind:$kind,harness_sha:$harness,base_sha:$base,head_sha:$head}}' |
             GH_TOKEN="$RUNNER_TOKEN" gh api "$endpoint/workflows/benchmark.yml/dispatches" \
-              -H 'X-GitHub-Api-Version: 2026-03-10' --input - --jq .workflow_run_id)
+              --method POST -H 'X-GitHub-Api-Version: 2026-03-10' --input - --jq .workflow_run_id)
           [[ "$run_id" =~ ^[0-9]+$ ]]
           echo "Queued measurement run $run_id"
-          for ((attempt=0; attempt<320; attempt++)); do
+          for ((attempt=0; attempt<360; attempt++)); do
             run=$(GH_TOKEN="$RUNNER_TOKEN" gh api "$endpoint/runs/$run_id")
             if [[ $(jq -r .status <<<"$run") == completed ]]; then
               jq -e '.conclusion == "success"' <<<"$run" >/dev/null
@@ -138,7 +138,7 @@ jobs:
           if [[ "$MEASURE" == success ]]; then
             awk '
               NR == FNR { base[$2] = $5; next }
-              $5 > base[$2] * 1.10 || $5 < base[$2] * 0.90 {
+              10 * $5 > 11 * base[$2] || 10 * $5 < 9 * base[$2] {
                 if (!found++) print "| Benchmark | Reference (ns) | Measured (ns) | Change |\n| --- | ---: | ---: | ---: |"
                 printf "| `%s` | %d | %d | %+.1f%% |\n", $2, base[$2], $5, 100 * ($5 / base[$2] - 1)
               }

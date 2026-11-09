@@ -74,7 +74,7 @@ run_bench() {
   local fixture_path=$1
   shift
   container="fff-criterion-$(basename "$work")"
-  echo "Measuring $side $lane $bench"
+  echo "Measuring $side $lane $bench" >&2
   if ! (ulimit -f 8192
     timeout --kill-after=10s 10m "${docker[@]}" run --rm --name "$container" \
       --label io.fff.perf=criterion --runtime fff-perf-gvisor --pull never \
@@ -105,24 +105,60 @@ run_bench() {
       print "test", lane "/" name, "... bench:", value, "ns/iter (+/-", $NF
     }
     END { if (!count) exit 1 }
-  ' "$work/stdout" >>"$output/$side.bench"
+  ' "$work/stdout"
 }
 
 base=
 head=
 first=base
-pair() {
+sample_pair() {
+  local attempt=$1
+  shift
   if [[ -z "$base" ]]; then
-    run_bench head "$head" "$@"
+    run_bench head "$head" "$@" >"$work/head.$attempt"
   elif [[ "$first" == base ]]; then
-    run_bench base "$base" "$@"
-    run_bench head "$head" "$@"
+    run_bench base "$base" "$@" >"$work/base.$attempt"
+    run_bench head "$head" "$@" >"$work/head.$attempt"
     first=head
   else
-    run_bench head "$head" "$@"
-    run_bench base "$base" "$@"
+    run_bench head "$head" "$@" >"$work/head.$attempt"
+    run_bench base "$base" "$@" >"$work/base.$attempt"
     first=base
   fi
+}
+
+drifted() {
+  awk '
+    NR == FNR { base[$2] = $5; next }
+    $2 in base && (10 * $5 > 11 * base[$2] || 10 * $5 < 9 * base[$2]) { found = 1 }
+    END { exit !found }
+  ' "$1" "$2"
+}
+
+pair() {
+  local side samples=1
+  local sides=(head)
+  sample_pair 1 "$@"
+  if [[ -n "$base" ]]; then
+    sides+=(base)
+  else
+    grep -F "test $1/$2/" "$output/base.bench" >"$work/base.1"
+  fi
+  if drifted "$work/base.1" "$work/head.1"; then
+    echo "Rechecking $1 $2 after a change over 10%" >&2
+    sample_pair 2 "$@"
+    sample_pair 3 "$@"
+    samples=3
+  fi
+  for side in "${sides[@]}"; do
+    if (( samples == 1 )); then
+      cat "$work/$side.1" >>"$output/$side.bench"
+    else
+      sort -s -k2,2 -k5,5n "$work/$side.1" "$work/$side.2" "$work/$side.3" |
+        awk 'NR % 3 == 1 { name = $2 } $2 != name { exit 1 }
+          NR % 3 == 2 { print } END { if (NR % 3) exit 1 }' >>"$output/$side.bench"
+    fi
+  done
 }
 
 case "$mode" in

@@ -8,8 +8,10 @@ globbing, bigram indexing and SIMD substring search cases.
 GitHub-hosted jobs compile both revisions with the base revision's benchmark
 sources and the release `zlob` feature. One job at a time runs the resulting
 executables on `load` in offline gVisor containers with read-only fixtures.
-GitHub Actions updates the PR with Criterion's median timings and fails the
-head status when a benchmark slows down by more than 10%.
+When a timing moves by more than 10%, the worker takes two more measurements
+of that benchmark group and uses the median across the three runs. GitHub
+Actions updates the PR with the timings and fails the head status when a
+benchmark slows down by more than 10%.
 
 At 04:07 UTC the worker reruns the same pinned binaries against its saved
 reference. A change of more than 10% in either direction opens or updates

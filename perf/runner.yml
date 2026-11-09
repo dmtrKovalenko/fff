@@ -72,7 +72,7 @@ jobs:
     needs: build
     if: ${{ !cancelled() && (inputs.kind == 'reference' || needs.build.result == 'success') }}
     runs-on: [self-hosted, linux, x64, fff-perf-load]
-    timeout-minutes: 35
+    timeout-minutes: 45
     concurrency:
       group: fff-perf-load
       queue: max
