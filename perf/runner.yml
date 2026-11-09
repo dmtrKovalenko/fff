@@ -1,0 +1,138 @@
+name: Measure FFF
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        type: choice
+        options: [pr, reference]
+        required: true
+      base_sha:
+        type: string
+        required: false
+      head_sha:
+        type: string
+        required: false
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate request
+        env:
+          KIND: ${{ inputs.kind }}
+          BASE: ${{ inputs.base_sha }}
+          HEAD: ${{ inputs.head_sha }}
+        run: |
+          case "$KIND" in
+            pr) [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$HEAD" =~ ^[0-9a-f]{40}$ ]] ;;
+            reference) [[ -z "$BASE" && -z "$HEAD" ]] ;;
+            *) exit 1 ;;
+          esac
+
+  build:
+    needs: validate
+    if: inputs.kind == 'pr'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUST_TOOLCHAIN: 1.99.1
+    strategy:
+      matrix:
+        variant: [base, head]
+    steps:
+      - name: Fetch source
+        env:
+          REVISION: ${{ matrix.variant == 'base' && inputs.base_sha || inputs.head_sha }}
+        run: |
+          git init -q source
+          git -C source -c core.hooksPath=/dev/null fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$REVISION"
+          git -C source -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$REVISION"
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+          use-cache: false
+      - name: Install build tools
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          cargo "+$RUST_TOOLCHAIN" install cargo-zigbuild --version 0.24.1 --locked
+      - name: Build the FFF MCP binary
+        run: |
+          output="$RUNNER_TEMP/fff-build"
+          mkdir -p "$output"
+          command_token=$(cat /proc/sys/kernel/random/uuid)
+          printf '::stop-commands::%s\n' "$command_token"
+          trap 'printf "::%s::\n" "$command_token"' EXIT
+          docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/source,dst=/src,readonly" \
+            --mount "type=bind,src=$output,dst=/build" \
+            --mount "type=bind,src=$(rustc "+$RUST_TOOLCHAIN" --print sysroot),dst=/rust,readonly" \
+            --mount "type=bind,src=$(dirname "$(readlink -f "$(command -v zig)")"),dst=/zig,readonly" \
+            --mount "type=bind,src=$HOME/.cargo/bin/cargo-zigbuild,dst=/tools/cargo-zigbuild,readonly" \
+            --env HOME=/build --env CARGO_TARGET_DIR=/build/target \
+            --env 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=+crt-static' \
+            --env PATH=/zig:/rust/bin:/tools:/usr/local/bin:/usr/bin:/bin \
+            --workdir /src \
+            buildpack-deps:noble@sha256:8e49144867ad1df5bce2864e890b2d783c7754efc68e2b52b27d10942edc4d0d \
+            bash -euc 'cargo zigbuild --locked --profile ci --target x86_64-unknown-linux-musl -p fff-mcp --no-default-features --features zlob
+              install -m 0555 /build/target/x86_64-unknown-linux-musl/ci/fff-mcp /build/fff-mcp'
+          test -f "$output/fff-mcp"
+          test ! -L "$output/fff-mcp"
+          headers=$(readelf -l "$output/fff-mcp")
+          if [[ "$headers" == *INTERP* ]]; then
+            echo "Expected a static FFF MCP binary"
+            exit 1
+          fi
+      - name: Upload binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fff-binary-${{ matrix.variant }}
+          path: ${{ runner.temp }}/fff-build/fff-mcp
+          if-no-files-found: error
+          retention-days: 2
+
+  measure:
+    needs: [validate, build]
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (inputs.kind == 'reference' || needs.build.result == 'success') }}
+    runs-on: [self-hosted, linux, x64, fff-perf-load]
+    timeout-minutes: 30
+    concurrency:
+      group: fff-perf-load
+      queue: max
+    steps:
+      - name: Check out the benchmark harness
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: dmtrKovalenko/fff
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Download binaries
+        if: inputs.kind == 'pr'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: fff-binary-*
+          path: ${{ runner.temp }}/fff-binaries
+      - name: Measure
+        env:
+          KIND: ${{ inputs.kind }}
+        run: |
+          if [[ "$KIND" = pr ]]; then
+            python3 perf/benchmark.py compare \
+              --base "$RUNNER_TEMP/fff-binaries/fff-binary-base/fff-mcp" \
+              --head "$RUNNER_TEMP/fff-binaries/fff-binary-head/fff-mcp" \
+              --output "$RUNNER_TEMP/fff-measurements.json"
+          else
+            python3 perf/benchmark.py reference --output "$RUNNER_TEMP/fff-measurements.json"
+          fi
+      - name: Upload measurements
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fff-measurements
+          path: ${{ runner.temp }}/fff-measurements.json
+          if-no-files-found: error
+          retention-days: 14

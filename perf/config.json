@@ -1,0 +1,30 @@
+{
+  "fixtures": {
+    "fff": {
+      "url": "https://github.com/dmtrKovalenko/fff.git",
+      "revision": "5d21e4bbdf33a09f58975636208e30747bc8d918",
+      "file_query": "crates/fff-mcp/src/server.rs",
+      "expected_path": "crates/fff-mcp/src/server.rs",
+      "grep_query": "struct GrepParams"
+    },
+    "vscode": {
+      "url": "https://github.com/microsoft/vscode.git",
+      "revision": "9192ec485939d98bb8b81410e03cee0a34747573",
+      "file_query": "src/vs/editor/editor.api.ts",
+      "expected_path": "src/vs/editor/editor.api.ts",
+      "grep_query": "export interface ITextModel"
+    }
+  },
+  "worker": {
+    "image": "fff-perf-sandbox:1",
+    "cpus": "8-11",
+    "threads": 4,
+    "pairs": 7,
+    "repeats": 13
+  },
+  "reference": {
+    "release": "v0.11.0",
+    "binary": "fff-mcp-x86_64-unknown-linux-musl",
+    "sha256": "d1e8671f40c89c445aaa1728a21ec04b74be2e5f99091485caeabcc97f99aceb"
+  }
+}

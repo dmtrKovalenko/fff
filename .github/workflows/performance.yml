@@ -1,0 +1,70 @@
+name: FFF performance
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+  schedule:
+    - cron: '7 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: fff-performance
+  queue: max
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  benchmark:
+    name: Benchmark on load
+    if: github.repository == 'dmtrKovalenko/fff' && github.ref == 'refs/heads/main' && vars.FFF_PERF_RUNNER_REPO != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the trusted reporting workflow
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Queue and wait for measurements
+        id: measure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFF_PERF_RUNNER_REPO: ${{ vars.FFF_PERF_RUNNER_REPO }}
+          FFF_PERF_RUNNER_TOKEN: ${{ secrets.FFF_PERF_RUNNER_TOKEN }}
+        run: python3 -E perf/github.py dispatch "$RUNNER_TEMP/fff-perf"
+      - name: Validate measurements
+        id: prepare
+        if: steps.measure.outputs.stale != 'true'
+        run: python3 -E perf/github.py prepare "$RUNNER_TEMP/fff-perf"
+      - name: Check for search regressions over 10%
+        id: gate
+        if: github.event_name == 'pull_request_target' && steps.prepare.outcome == 'success'
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: FFF search latency
+          tool: customSmallerIsBetter
+          output-file-path: ${{ runner.temp }}/fff-perf/head.json
+          external-data-json-path: ${{ runner.temp }}/fff-perf/baseline.json
+          save-data-file: false
+          alert-threshold: '110%'
+          fail-on-alert: true
+          summary-always: true
+      - name: Publish the check, PR comment or daily alert
+        if: always() && steps.measure.outputs.stale != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFF_PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          FFF_GATE_OUTCOME: ${{ steps.gate.outcome }}
+        run: python3 -E perf/github.py publish "$RUNNER_TEMP/fff-perf"
+      - name: Archive timings
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fff-performance
+          path: ${{ runner.temp }}/fff-perf/fff-measurements.json
+          retention-days: 30
