@@ -454,6 +454,18 @@ export function ffiDestroy(handle: NativeHandle): void {
   });
 }
 
+export async function ffiDestroyAsync(handle: NativeHandle): Promise<void> {
+  loadLibrary();
+  await load({
+    library: LIBRARY_KEY,
+    funcName: "fff_destroy",
+    retType: DataType.Void,
+    paramsType: [DataType.External],
+    paramsValue: [handle],
+    runInNewThread: true,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Struct type definitions for restorePointer (must match #[repr(C)] layout)
 // ---------------------------------------------------------------------------
@@ -1860,9 +1872,7 @@ export function ffiWatchCleanupAfterDestroy(
   handle: NativeHandle,
   watchIds: Iterable<number>,
 ): void {
-  for (const id of watchIds) {
-    watchHandlers.delete(id);
-  }
+  ffiWatchDropHandlers(watchIds);
   watchInstances.delete(handle as unknown);
   releaseWatchTrampolineIfIdle();
 }
@@ -1925,4 +1935,8 @@ export function closeLibrary(): void {
     close(LIBRARY_KEY);
     isLoaded = false;
   }
+}
+
+export function ffiWatchDropHandlers(watchIds: Iterable<number>): void {
+  for (const id of watchIds) watchHandlers.delete(id);
 }

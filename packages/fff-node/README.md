@@ -84,9 +84,13 @@ if (grep.ok) {
 const dirs = finder.directorySearch("components");
 if (dirs.ok) console.log(dirs.value.items.map((d) => d.relativePath));
 
-// Free the resources when you don't need a file picker anymore
-finder.destroy();
+// Free resources without blocking the Node event loop
+await finder.destroyAsync();
 ```
+
+`destroyAsync()` makes the finder unavailable immediately and resolves after native
+resources and watch callbacks are released. The synchronous `finder.destroy()`
+remains available for callers that need synchronous cleanup.
 
 ## Watching files
 
