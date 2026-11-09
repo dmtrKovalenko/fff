@@ -73,6 +73,7 @@ export class FilePickerFactory {
   }
 }
 
+/** Complete every picker cleanup before reporting any disposal failures. */
 export async function destroyPickers(
   pickers: readonly { destroy(): void; destroyAsync?(): Promise<void> }[],
 ): Promise<void> {

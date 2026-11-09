@@ -454,6 +454,7 @@ export function ffiDestroy(handle: NativeHandle): void {
   });
 }
 
+/** Run native teardown on a worker and wait for resource disposal. */
 export async function ffiDestroyAsync(handle: NativeHandle): Promise<void> {
   loadLibrary();
   await load({
@@ -1937,6 +1938,7 @@ export function closeLibrary(): void {
   }
 }
 
+/** Remove JS handlers without releasing the native callback trampoline. */
 export function ffiWatchDropHandlers(watchIds: Iterable<number>): void {
   for (const id of watchIds) watchHandlers.delete(id);
 }

@@ -33,7 +33,7 @@ describe("picker cleanup", () => {
       settled = true;
     });
     const rejected = closing.catch((error) => error);
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(settled).toBe(false);
     pending.resolve();
     expect(await rejected).toMatchObject({ errors: [failure] });

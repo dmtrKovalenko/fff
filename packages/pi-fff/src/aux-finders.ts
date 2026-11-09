@@ -40,6 +40,7 @@ export class AuxFinderPool {
     this.pending.clear();
   }
 
+  /** Close the pool after pending creations and all native disposals finish. */
   destroyAsync(): Promise<void> {
     if (this.destroyPromise) return this.destroyPromise;
     const ready = this.entries;
