@@ -5,9 +5,10 @@ Each PR runs FFF's existing Criterion benchmarks against its base revision on
 and Btrfs. Each revision also runs selected query parsing, definition matching,
 globbing, bigram indexing and SIMD substring search cases.
 
-GitHub-hosted jobs compile both revisions with the base revision's benchmark
-sources and the release `zlob` feature. One job at a time runs the resulting
-executables on `load` in offline gVisor containers with read-only fixtures.
+GitHub-hosted jobs compile both revisions with the default branch's benchmark
+sources and the release `zlob` feature. After the hosted **Spelling** workflow
+runs for the current PR commit, one job at a time runs the resulting
+executables directly on `load` as the runner service user.
 When a timing moves by more than 10%, the worker takes two more measurements
 of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
@@ -19,41 +20,31 @@ the reference drift issue.
 
 ## Prepare the worker
 
-Use the runner service account for setup. Register gVisor as the Docker runtime
-`fff-perf-gvisor`, create the empty sandbox image, and mount Btrfs at
+Use the runner service account for setup. Mount Btrfs at
 `$HOME/.local/share/fff-perf/btrfs`. On `load` that mount uses a persistent
-8 GiB loop image.
+8 GiB loop image, and the benchmark processes use CPUs 8–11.
 
 ```sh
-sudo runsc install --runtime=fff-perf-gvisor
-sudo systemctl reload docker
-tar -cf - --files-from=/dev/null | docker import - fff-perf-sandbox:1
 bash perf/benchmark.sh prepare
 ```
 
 ## Connect GitHub
 
-1. Create the private `dmtrKovalenko/fff-perf` repository. Copy
-   [runner.yml](runner.yml) to `.github/workflows/benchmark.yml` on its
-   default branch `main`.
+1. In `dmtrKovalenko/fff`, set **Settings → Actions → General → Approval
+   for running fork pull request workflows from contributors** to
+   **Require approval for all external contributors**. Use the PR's
+   **Approve workflows to run** button for fork commits you want to benchmark.
+   [GitHub fork approvals](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks)
 2. Register the Linux x64 GitHub Actions runner in
-   `$HOME/.local/share/fff-perf/runner` against that private repository.
+   `$HOME/.local/share/fff-perf/runner` against `dmtrKovalenko/fff`.
    Set its label to `fff-perf-load` and start its service.
    [GitHub runner setup](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
-3. Add `FFF_PERF_RUNNER_TOKEN` as an Actions secret in `dmtrKovalenko/fff`.
-   Use a fine-grained PAT scoped to `dmtrKovalenko/fff-perf` with
-   **Actions: Read and write**. The public workflow uses its built-in token
-   to publish PR statuses, timings and issue alerts.
-   [Workflow dispatch permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
-4. Merge the performance workflow. On a new worker, run **Measure FFF core**
-   with `kind=calibrate`, the merged workflow commit as `harness_sha`, and
-   `5d21e4bbdf33a09f58975636208e30747bc8d918` as `base_sha`. Calibration
-   runs the same executables twice and stores the reference in
-   `$HOME/.local/share/fff-perf/core-reference`.
-5. Set the public repository's `FFF_PERF_RUNNER_REPO` Actions variable to
-   `dmtrKovalenko/fff-perf`. Run **FFF performance** manually and verify the
-   daily reference. Verify the status and comment on a PR before making
+3. Merge the performance workflow. On a new worker, run **FFF performance**
+   with `kind=calibrate`. Calibration runs the pinned revision twice and
+   stores the reference in `$HOME/.local/share/fff-perf/core-reference-native`.
+4. Run **FFF performance** with `kind=reference` to verify the saved
+   reference. Verify the status and comment on a PR before making
    `FFF performance` a required status.
 
 When the fixtures, runner settings or benchmark script change, archive the
-old `core-reference` directory and run calibration again.
+old `core-reference-native` directory and run calibration again.

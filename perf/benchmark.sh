@@ -4,10 +4,9 @@ export LC_ALL=C
 
 mode=$1
 state="$HOME/.local/share/fff-perf"
-reference="$state/core-reference"
+reference="$state/core-reference-native"
 fff=5d21e4bbdf33a09f58975636208e30747bc8d918
 vscode=9192ec485939d98bb8b81410e03cee0a34747573
-docker=(docker --host=unix:///var/run/docker.sock)
 
 mkdir -p "$state/ext4"
 exec 9>"$state/benchmark.lock"
@@ -43,19 +42,9 @@ done
 output=$2
 mkdir -p "$output"
 work=$(mktemp -d "$state/core-run.XXXXXX")
-container=
-cleanup() {
-  if [[ -n "$container" ]]; then "${docker[@]}" rm -f "$container" >/dev/null 2>&1 || true; fi
-  rm -rf -- "$work"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-stale=$("${docker[@]}" ps -aq --filter label=io.fff.perf=criterion)
-if [[ -n "$stale" ]]; then
-  xargs -r "${docker[@]}" rm -f <<<"$stale" >/dev/null
-fi
 
 stage() {
   local source=$1 dest=$2
@@ -69,30 +58,21 @@ stage() {
 }
 
 run_bench() {
-  local side=$1 bins=$2 lane=$3 bench=$4 filter=$5
-  shift 5
-  local fixture_path=$1
-  shift
-  container="fff-criterion-$(basename "$work")"
+  local side=$1 bins=$2 lane=$3 bench=$4 filter=$5 fixture_path=$6
+  shift 6
   echo "Measuring $side $lane $bench" >&2
-  if ! (ulimit -f 8192
-    timeout --kill-after=10s 10m "${docker[@]}" run --rm --name "$container" \
-      --label io.fff.perf=criterion --runtime fff-perf-gvisor --pull never \
-      --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-      --user "$(id -u):$(id -g)" --pids-limit 256 --memory 3g --memory-swap 3g \
-      --cpuset-cpus 8-11 --log-driver none \
-      --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777 \
-      --env HOME=/tmp --env CARGO_TARGET_DIR=/tmp/target --env RAYON_NUM_THREADS=4 \
-      --mount "type=bind,src=$bins/${bench}_bench,dst=/bench,readonly" \
-      --mount "type=bind,src=$fixture_path,dst=/src,readonly,bind-recursive=disabled" \
-      --workdir /tmp --entrypoint /bench "$@" fff-perf-sandbox:1 \
+  if ! (
+    cd "$work" || exit
+    ulimit -f 8192 -v 3145728 || exit
+    exec timeout --kill-after=10s 10m taskset -c 8-11 \
+      env -i PATH=/usr/bin:/bin LC_ALL=C TMPDIR="$work" CARGO_TARGET_DIR="$work/target" \
+      RAYON_NUM_THREADS=4 FFF_BENCH_PATH="$fixture_path" "$@" "$bins/${bench}_bench" \
       --bench --color never --noplot --output-format bencher --nresamples 10000 \
       --warm-up-time 1 --measurement-time 2 --sample-size 30 "$filter"
   ) >"$work/stdout" 2>"$work/stderr"; then
     tail -n 20 "$work/stderr" >&2
     exit 1
   fi
-  container=
   awk -v lane="$lane/$bench" '
     NF >= 8 && $1 == "test" && $(NF-5) == "..." && $(NF-4) == "bench:" &&
     $(NF-3) ~ /^[0-9,]+$/ && $(NF-2) == "ns/iter" && $(NF-1) == "(+/-" && $NF ~ /^[0-9,]+\)$/ {
@@ -203,9 +183,9 @@ for fs in ext4 btrfs; do
     path="$state/$fs/$name-${revision:0:12}"
     pair "$fs/$name" fuzzy_search \
       '^fuzzy_search_repo/(empty/no_current_file|short/current_file|path/no_current_file|multipart/current_file|extension/no_current_file)$' \
-      "$path" --env FFF_BENCH_PATH=/src --env "FFF_BENCH_CURRENT_FILE=$file" \
-      --env "FFF_BENCH_PATH_QUERY=$path_query" --env "FFF_BENCH_MULTIPART_QUERY=$multipart"
-    pair "$fs/$name" grep '^grep_repo/' "$path" --env FFF_BENCH_PATH=/src
+      "$path" "FFF_BENCH_CURRENT_FILE=$file" \
+      "FFF_BENCH_PATH_QUERY=$path_query" "FFF_BENCH_MULTIPART_QUERY=$multipart"
+    pair "$fs/$name" grep '^grep_repo/' "$path"
   done
 done
 
