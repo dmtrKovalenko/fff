@@ -18,8 +18,18 @@ When a timing moves by more than 10%, the worker takes two more measurements
 of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
 benchmark slows down by more than 10%. `perf/report.sh` writes that comment:
-a 🔴/🟢/⚪ mark per benchmark, a Mermaid chart of PR time against base, and
-the full table.
+a 🔴/🟢/⚪ mark per benchmark, a chart of PR time against base, and the
+full table.
+
+The chart is drawn with [fframes](https://github.com/dmtrKovalenko/fframes)
+by `perf/chart`, a package outside the main workspace. The image is uploaded
+as `pr-<number>.png` to the `perf-charts` prerelease, so it stays out of the
+git history. To draw one locally:
+
+```sh
+cargo run --release --manifest-path perf/chart/Cargo.toml --example chart -- \
+  base.bench head.bench chart.png
+```
 
 At 04:07 UTC **FFF performance reference** runs directly on `load` with
 the saved binaries. A change of more than 10% in either direction opens

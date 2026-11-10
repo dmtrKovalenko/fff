@@ -179,6 +179,7 @@ jobs:
     if: ${{ !cancelled() && needs.plan.outputs.kind == 'pr' }}
     runs-on: ubuntu-24.04
     permissions:
+      contents: write
       issues: write
       pull-requests: write
       statuses: write
@@ -203,9 +204,41 @@ jobs:
         with:
           name: fff-measurements
           path: ${{ runner.temp }}/fff-perf
+      - name: Restore the chart renderer build
+        if: steps.timings.outcome == 'success'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ runner.temp }}/harness/perf/chart/target
+          key: fff-perf-chart-${{ github.sha }}
+          restore-keys: fff-perf-chart-
+      - name: Render the timing chart
+        id: chart
+        if: steps.timings.outcome == 'success'
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ needs.plan.outputs.number }}
+          PERF_DIR: ${{ runner.temp }}/fff-perf
+        run: |
+          repo="$RUNNER_TEMP/harness" chart="$RUNNER_TEMP/pr-$PR_NUMBER.png"
+          git init -q "$repo"
+          git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$GITHUB_SHA"
+          git -C "$repo" -c core.hooksPath=/dev/null checkout -q FETCH_HEAD -- perf/chart
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo +1.99.1 run --release --locked --manifest-path "$repo/perf/chart/Cargo.toml" --example chart -- \
+            "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" "$chart"
+          # Release assets keep the images out of the git history.
+          gh release view perf-charts -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create perf-charts -R "$GITHUB_REPOSITORY" --prerelease --latest=false --target "$GITHUB_SHA" \
+              --title 'Performance charts' --notes 'Charts shown in the FFF performance PR comments.'
+          gh release upload perf-charts "$chart" -R "$GITHUB_REPOSITORY" --clobber
+          printf 'url=https://github.com/%s/releases/download/perf-charts/pr-%s.png?run=%s-%s\n' \
+            "$GITHUB_REPOSITORY" "$PR_NUMBER" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >>"$GITHUB_OUTPUT"
       - name: Publish timings
         if: always() && steps.current.outputs.match == 'true'
         env:
+          CHART: ${{ steps.chart.outputs.url }}
           PR_NUMBER: ${{ needs.plan.outputs.number }}
           BASE_SHA: ${{ needs.plan.outputs.base_sha }}
           HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
@@ -217,7 +250,7 @@ jobs:
           if [[ "$MEASURE" == success ]]; then
             script="$RUNNER_TEMP/report.sh" code=0
             curl -fsSL "https://raw.githubusercontent.com/dmtrKovalenko/fff/$GITHUB_SHA/perf/report.sh" -o "$script" &&
-              bash "$script" "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >"$report" || code=$?
+              bash "$script" "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" "$CHART" >"$report" || code=$?
             case "$code" in
               0) state=success ;;
               1) state=failure ;;

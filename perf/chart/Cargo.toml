@@ -1,0 +1,13 @@
+[package]
+name = "fff-perf-chart"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+fframes = { version = "=1.4.2-rc.1", features = ["compile-time-svgtree"] }
+
+[workspace]
