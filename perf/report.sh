@@ -10,9 +10,15 @@ awk -v chart="${3:-}" '
     if (ns >= 1e3) return sprintf("%.2f µs", ns / 1e3)
     return sprintf("%d ns", ns)
   }
-  function row(i) {
-    return sprintf("| %s | `%s` | %s | %s | %+.2f%% |\n", mark[i], name[i], human(before[i]), human(after[i]), ratio[i] - 100)
+  function row(i, bench, fence) {
+    bench = name[i]
+    gsub(/\|/, "\\\\|", bench)
+    fence = "`"
+    while (index(bench, fence)) fence = fence "`"
+    if (length(fence) > 1) bench = " " bench " "
+    return sprintf("| %s | %s%s%s | %s | %s | %+.2f%% |\n", mark[i], fence, bench, fence, human(before[i]), human(after[i]), ratio[i] - 100)
   }
+  $1 != "test" || $3 != "..." || $4 != "bench:" || $5 !~ /^[0-9]+$/ || $5 <= 0 || $6 != "ns/iter" { next }
   NR == FNR { base[$2] = $5; next }
   $2 in base {
     n++
