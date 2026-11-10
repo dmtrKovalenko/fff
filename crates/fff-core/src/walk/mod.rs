@@ -123,7 +123,16 @@ mod tests {
         let mut results = Vec::new();
         for threads in [1, 4] {
             let counter = Arc::new(AtomicUsize::new(0));
-            let out = walk_collect_files(root, true, false, threads, &counter).unwrap();
+            let out = walk_collect_files(
+                root,
+                true,
+                false,
+                threads,
+                &counter,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
             let mut files: Vec<_> = out
                 .pairs
                 .into_iter()
@@ -152,7 +161,8 @@ mod tests {
         fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join("module/lib.rs"), "pub fn lib() {}\n").unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 4, &counter).unwrap();
+        let out =
+            walk_collect_files(root, true, false, 4, &counter, &Default::default(), None).unwrap();
         let mut paths: Vec<_> = out.pairs.into_iter().map(|(_, path)| path).collect();
         paths.sort();
         assert_eq!(
