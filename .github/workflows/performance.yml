@@ -58,12 +58,23 @@ jobs:
           started=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/attempts/$CI_ATTEMPT/jobs" \
             --jq '.jobs[] | select(.runner_id > 0 and .started_at != null) | .id')
           [[ -n "$started" ]] || exit 0
-          gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+          pr=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
             -f state=open -f base=main -f head="$SOURCE_OWNER:$SOURCE_BRANCH" |
             jq -r --argjson repo "$SOURCE_REPO_ID" --arg sha "$SOURCE_SHA" '
               .[] | select(.head.repo.id == $repo and .head.sha == $sha) |
               "kind=pr\nnumber=\(.number)\nbase_sha=\(.base.sha)\nhead_sha=\(.head.sha)"
-            ' >>"$GITHUB_OUTPUT"
+            ')
+          [[ "$pr" =~ number=([0-9]+) ]] || exit 0
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}/files" \
+            --jq '.[] | .filename, .previous_filename // empty')
+          # Only core Rust sources and Rust dependency changes are measured.
+          if grep -E '^(Cargo\.(toml|lock)|\.cargo/config\.toml|crates/fff-(core|grep|query-parser)/(Cargo\.toml|.*\.rs))$' \
+            <<<"$files" >/dev/null; then
+            printf '%s\n' "$pr" >>"$GITHUB_OUTPUT"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_SHA" -f context='FFF performance' -f state=success \
+              -f description='Skipped, no core Rust or dependency changes' -f target_url="$RUN_URL" >/dev/null
+          fi
       - name: Mark the PR check pending
         if: steps.resolve.outputs.kind == 'pr'
         env:
@@ -204,25 +215,21 @@ jobs:
           report="$RUNNER_TEMP/fff-timings.md"
           state=error
           if [[ "$MEASURE" == success ]]; then
-            state=success
-            if ! awk '
-              NR == FNR { base[$2] = $5; next }
-              {
-                if (10 * $5 > 11 * base[$2]) failed = 1
-                if (!rows++) print "| Benchmark | Baseline (ns) | Measured (ns) | Change |\n| --- | ---: | ---: | ---: |"
-                printf "| `%s` | %d | %d | %+.2f%% |\n", $2, base[$2], $5, 100 * ($5 / base[$2] - 1)
-              }
-              END { exit failed }
-            ' "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >"$report"; then
-              state=failure
-            fi
+            script="$RUNNER_TEMP/report.sh" code=0
+            curl -fsSL "https://raw.githubusercontent.com/dmtrKovalenko/fff/$GITHUB_SHA/perf/report.sh" -o "$script" &&
+              bash "$script" "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >"$report" || code=$?
+            case "$code" in
+              0) state=success ;;
+              1) state=failure ;;
+              *) echo 'FFF core measurement could not complete.' >"$report" ;;
+            esac
           else
             echo 'FFF core measurement could not complete.' >"$report"
           fi
           case "$state" in
-            success) message='FFF core performance passed' ;;
-            failure) message='FFF core performance comparison failed' ;;
-            error) message='FFF core measurement could not complete' ;;
+            success) icon=✅ message='FFF core performance passed' ;;
+            failure) icon=🔴 message='FFF core performance comparison failed' ;;
+            error) icon=⚠️ message='FFF core measurement could not complete' ;;
           esac
           gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" -f context='FFF performance' \
             -f state="$state" -f description="$message" -f target_url="$RUN_URL" >/dev/null
@@ -230,10 +237,10 @@ jobs:
             marker='<!-- fff-core-performance -->'
             comment="$RUNNER_TEMP/fff-pr-comment.md"
             {
-              printf '%s\n## FFF core performance\n\n%s\n\n' "$marker" "$message"
-              printf 'Base %s · PR %s\n\n<details><summary>Criterion timings</summary>\n\n' "$BASE_SHA" "$HEAD_SHA"
+              printf '%s\n## 🥼 FFF core performance\n\n%s **%s**\n\n' "$marker" "$icon" "$message"
+              printf 'Base %s · PR %s\n\n' "$BASE_SHA" "$HEAD_SHA"
               cat "$report"
-              printf '\n</details>\n\n[Workflow run](%s)\n' "$RUN_URL"
+              printf '\n🔗 [Workflow run](%s)\n' "$RUN_URL"
             } >"$comment"
             comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
               --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- fff-core-performance -->"))) | .id' |
