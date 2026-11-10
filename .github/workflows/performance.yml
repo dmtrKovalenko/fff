@@ -271,7 +271,7 @@ jobs:
             comment="$RUNNER_TEMP/fff-pr-comment.md"
             {
               printf '%s\n## 🥼 FFF core performance\n\n%s **%s**\n\n' "$marker" "$icon" "$message"
-              printf 'Base %s · PR %s\n\n' "$BASE_SHA" "$HEAD_SHA"
+              printf 'Base %s, PR %s\n\n' "$BASE_SHA" "$HEAD_SHA"
               cat "$report"
               printf '\n🔗 [Workflow run](%s)\n' "$RUN_URL"
             } >"$comment"

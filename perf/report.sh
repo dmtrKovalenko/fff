@@ -27,7 +27,7 @@ awk -v chart="${3:-}" '
   END {
     if (!n) exit 2
     header = "| | Benchmark | Base | PR | Change |\n| --- | --- | ---: | ---: | ---: |\n"
-    printf "🔴 %d slower · 🟢 %d faster · ⚪ %d within ±10%%\n\n", slower, faster, n - slower - faster
+    printf "🔴 %d slower, 🟢 %d faster, ⚪ %d within ±10%%\n\n", slower, faster, n - slower - faster
     if (slower + faster) {
       printf "%s", header
       for (i = 1; i <= n; i++) if (mark[i] != "⚪") printf "%s", row(i)

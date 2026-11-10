@@ -139,7 +139,7 @@ impl Chart {
         let slower = group.count(|verdict| matches!(verdict, Verdict::Slower));
         let tail = match slower {
             0 => format!("{} benchmarks", group.timings.len()),
-            _ => format!("{} benchmarks · {slower} slower", group.timings.len()),
+            _ => format!("{} benchmarks, {slower} slower", group.timings.len()),
         };
         let tail_x = MARGIN + (group.name.chars().count() + 1) as f32 * ADVANCE * 22.0;
         let rows: Vec<_> = group
