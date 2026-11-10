@@ -1,4 +1,4 @@
-use crate::index::bigram_filter::BigramFilter;
+use crate::index::bigram_filter::{BigramFilter, bigram_key};
 use regex_syntax::hir::{Class, Hir, HirKind};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -48,7 +48,7 @@ fn consec_key(a: u8, b: u8) -> Option<u16> {
     let al = a.to_ascii_lowercase();
     let bl = b.to_ascii_lowercase();
     if (32..=126).contains(&al) && (32..=126).contains(&bl) {
-        Some((al as u16) << 8 | bl as u16)
+        Some(bigram_key(al, bl))
     } else {
         None
     }

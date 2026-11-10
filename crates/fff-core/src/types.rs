@@ -609,7 +609,7 @@ impl FileItem {
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
-        if self.size == 0 {
+        if self.is_binary() || self.size == 0 {
             return;
         }
 
