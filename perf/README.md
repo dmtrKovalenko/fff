@@ -5,18 +5,40 @@ Each PR runs FFF's existing Criterion benchmarks against its base revision on
 and Btrfs. Each revision also runs selected query parsing, definition matching,
 globbing, bigram indexing and SIMD substring search cases.
 
-GitHub-hosted jobs compile both revisions with the default branch's benchmark
-sources and the release `zlob` feature. After the hosted **Spelling** workflow
-runs for the current PR commit, one job at a time runs the resulting
-executables directly on `load` as the runner service user.
+Automatic measurements cover Rust sources or `Cargo.toml` changes in
+`fff-core`, `fff-grep` or `fff-query-parser`, the root `Cargo.toml`,
+`Cargo.lock` or `.cargo/config.toml`. Other PRs get a passing
+`FFF performance` status marked as skipped.
+
+Add `perf-check` to measure the current revision regardless of its changed
+files. Remove and re-add the label to rerun a measurement. While the label is
+present, new revisions are measured. External contributors' workflows require
+GitHub's approval before their jobs can start.
+
+The PR workflow compiles both revisions on GitHub-hosted runners using the
+same benchmark sources and the release `zlob` feature. One job at a time runs
+the resulting executables directly on `load` as the runner service user.
 When a timing moves by more than 10%, the worker takes two more measurements
 of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
-benchmark slows down by more than 10%.
+benchmark slows down by more than 10%. The PR workflow draws the chart and
+passes it with the timings to **Publish FFF performance**. Same-repository PRs
+call the publisher directly. GitHub runs it from `main` after fork benchmarks
+finish because fork workflow tokens are read-only.
 
-At 04:07 UTC the worker reruns the same pinned binaries against its saved
-reference. A change of more than 10% in either direction opens or updates
-the reference drift issue.
+The chart is drawn with [fframes](https://github.com/dmtrKovalenko/fframes)
+by `perf/chart`, a package outside the main workspace. The image is uploaded
+as `pr-<number>.png` to the `perf-charts` prerelease, so it stays out of the
+git history. To draw one locally:
+
+```sh
+cargo run --release --manifest-path perf/chart/Cargo.toml --example chart -- \
+  base.bench head.bench chart.png
+```
+
+At 04:07 UTC **FFF performance reference** runs directly on `load` with
+the saved binaries. A change of more than 10% in either direction opens
+or updates the reference drift issue.
 
 ## Prepare the worker
 
@@ -26,6 +48,28 @@ Use the runner service account for setup. Mount Btrfs at
 
 ```sh
 bash perf/benchmark.sh prepare
+```
+
+Then reserve the benchmark CPUs as root while the runner is idle, passing
+the runner's systemd unit:
+
+```sh
+sudo bash perf/tune.sh actions.runner.dmtrKovalenko-fff.load.service
+```
+
+It keeps every other service off CPUs 8–11, takes their hyperthread siblings
+offline, sets the `performance` governor and turns turbo off. The settings
+persist across reboots. `benchmark.sh` refuses to measure until they hold.
+
+To see how noisy the worker is, compare one set of binaries with itself a
+few times. Every run should report all benchmarks within ±10%:
+
+```sh
+bins=$HOME/.local/share/fff-perf/core-reference-native/bins
+for i in 1 2 3 4 5; do
+  bash perf/benchmark.sh compare "/tmp/fff-noise/$i" "$bins" "$bins"
+  bash perf/report.sh /tmp/fff-noise/$i/{base,head}.bench | head -n 1
+done
 ```
 
 ## Connect GitHub
@@ -39,12 +83,12 @@ bash perf/benchmark.sh prepare
    `$HOME/.local/share/fff-perf/runner` against `dmtrKovalenko/fff`.
    Set its label to `fff-perf-load` and start its service.
    [GitHub runner setup](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
-3. Merge the performance workflow. On a new worker, run **FFF performance**
-   with `kind=calibrate`. Calibration runs the pinned revision twice and
+3. Merge the performance workflows. On a new worker, run **FFF performance**
+   manually to calibrate. Calibration runs the pinned revision twice and
    stores the reference in `$HOME/.local/share/fff-perf/core-reference-native`.
-4. Run **FFF performance** with `kind=reference` to verify the saved
+4. Run **FFF performance reference** manually to verify the saved
    reference. Verify the status and comment on a PR before making
    `FFF performance` a required status.
 
-When the fixtures, runner settings or benchmark script change, archive the
+When the fixtures, runner settings, CPU tuning or benchmark script change, archive the
 old `core-reference-native` directory and run calibration again.

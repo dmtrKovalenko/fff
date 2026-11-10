@@ -1,18 +1,10 @@
 name: FFF performance
 
 on:
-  workflow_run:
-    workflows: [Spelling]
-    types: [completed]
-  schedule:
-    - cron: '7 4 * * *'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
-    inputs:
-      kind:
-        type: choice
-        options: [reference, calibrate]
-        default: reference
-        required: true
 
 concurrency:
   group: fff-performance
@@ -30,14 +22,12 @@ env:
 jobs:
   plan:
     if: >-
-      github.repository == 'dmtrKovalenko/fff' && github.ref == 'refs/heads/main' &&
-      (github.event_name != 'workflow_run' ||
-       (github.event.workflow_run.event == 'pull_request' &&
-        github.event.workflow_run.path == '.github/workflows/spelling.yaml' &&
-        (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')))
+      github.repository == 'dmtrKovalenko/fff' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action != 'labeled' || github.event.label.name == 'perf-check')))
     runs-on: ubuntu-24.04
     permissions:
-      actions: read
       pull-requests: read
       statuses: write
     outputs:
@@ -48,33 +38,37 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Resolve the PR revision that ran CI
+      - name: Resolve the benchmark revision
         id: resolve
         env:
-          REQUESTED_KIND: ${{ inputs.kind }}
-          CI_RUN_ID: ${{ github.event.workflow_run.id }}
-          CI_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          SOURCE_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
-          SOURCE_REPO_ID: ${{ github.event.workflow_run.head_repository.id }}
-          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FORCE: ${{ contains(github.event.pull_request.labels.*.name, 'perf-check') }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" != workflow_run ]]; then
-            printf 'kind=%s\nbase_sha=5d21e4bbdf33a09f58975636208e30747bc8d918\n' "${REQUESTED_KIND:-reference}" >>"$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            printf 'kind=calibrate\nbase_sha=5d21e4bbdf33a09f58975636208e30747bc8d918\n' >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          [[ -n "$SOURCE_OWNER" && "$SOURCE_REPO_ID" =~ ^[0-9]+$ && "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 0
-          started=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/attempts/$CI_ATTEMPT/jobs" \
-            --jq '.jobs[] | select(.runner_id > 0 and .started_at != null) | .id')
-          [[ -n "$started" ]] || exit 0
-          gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
-            -f state=open -f base=main -f head="$SOURCE_OWNER:$SOURCE_BRANCH" |
-            jq -r --argjson repo "$SOURCE_REPO_ID" --arg sha "$SOURCE_SHA" '
-              .[] | select(.head.repo.id == $repo and .head.sha == $sha) |
-              "kind=pr\nnumber=\(.number)\nbase_sha=\(.base.sha)\nhead_sha=\(.head.sha)"
-            ' >>"$GITHUB_OUTPUT"
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq 'select(.state == "open" and .base.ref == "main") | .head.sha')
+          [[ "$actual" == "$HEAD_SHA" ]] || exit 0
+          kind=pr
+          if [[ "$FORCE" != true ]]; then
+            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+              --jq '.[] | .filename, .previous_filename // empty')
+            if ! grep -E '^(Cargo\.(toml|lock)|\.cargo/config\.toml|crates/fff-(core|grep|query-parser)/(Cargo\.toml|.*\.rs))$' \
+              <<<"$files" >/dev/null; then
+              kind=skip
+            fi
+          fi
+          printf 'kind=%s\nnumber=%s\nbase_sha=%s\nhead_sha=%s\n' \
+            "$kind" "$PR_NUMBER" "$BASE_SHA" "$HEAD_SHA" >>"$GITHUB_OUTPUT"
       - name: Mark the PR check pending
-        if: steps.resolve.outputs.kind == 'pr'
+        if: >-
+          steps.resolve.outputs.kind == 'pr' &&
+          github.event.pull_request.head.repo.id == github.event.repository.id &&
+          github.actor != 'dependabot[bot]'
         env:
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
@@ -90,7 +84,7 @@ jobs:
       matrix:
         variant: ${{ fromJSON(needs.plan.outputs.kind == 'pr' && '["base","head"]' || '["base"]') }}
     steps:
-      - name: Fetch source and trusted build script
+      - name: Fetch source and benchmark harness
         env:
           HARNESS: ${{ github.sha }}
           BASE: ${{ needs.plan.outputs.base_sha }}
@@ -127,14 +121,14 @@ jobs:
           path: ${{ runner.temp }}/fff-build/bins
           if-no-files-found: error
           retention-days: 2
+          overwrite: true
 
   measure:
     needs: [plan, build]
-    if: ${{ !cancelled() && (needs.plan.outputs.kind == 'reference' || (needs.plan.outputs.kind != '' && needs.build.result == 'success')) }}
     runs-on: [self-hosted, linux, x64, fff-perf-load]
     timeout-minutes: 45
     steps:
-      - name: Fetch trusted measurement script
+      - name: Fetch measurement script
         env:
           HARNESS: ${{ github.sha }}
         run: |
@@ -145,7 +139,6 @@ jobs:
           git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$HARNESS"
           git -C "$repo" show "$HARNESS:perf/benchmark.sh" > "$RUNNER_TEMP/benchmark.sh"
       - name: Download benchmark binaries
-        if: needs.plan.outputs.kind != 'reference'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: fff-bench-*
@@ -164,7 +157,6 @@ jobs:
           case "$KIND" in
             pr) bash "$script" compare "$output" "$binaries/fff-bench-base" "$binaries/fff-bench-head" ;;
             calibrate) bash "$script" calibrate "$output" "$binaries/fff-bench-base" "$BASE" ;;
-            reference) bash "$script" reference "$output" ;;
             *) exit 1 ;;
           esac
       - name: Upload measurements
@@ -174,22 +166,21 @@ jobs:
           path: ${{ runner.temp }}/fff-results/*.bench
           if-no-files-found: error
           retention-days: 30
+          overwrite: true
 
   report:
     needs: [plan, measure]
-    if: "!cancelled() && (needs.plan.outputs.kind == 'pr' || needs.plan.outputs.kind == 'reference')"
+    if: "!cancelled() && (needs.plan.outputs.kind == 'pr' || needs.plan.outputs.kind == 'skip')"
     runs-on: ubuntu-24.04
     permissions:
-      issues: write
-      pull-requests: write
-      statuses: write
-    env:
-      GH_TOKEN: ${{ github.token }}
+      pull-requests: read
+    outputs:
+      ready: ${{ steps.upload.outcome == 'success' }}
     steps:
       - name: Verify the PR revision is current
         id: current
-        if: needs.plan.outputs.kind == 'pr'
         env:
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.plan.outputs.number }}
           HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
         run: |
@@ -200,84 +191,71 @@ jobs:
           fi
       - name: Download measured timings
         id: timings
-        if: needs.measure.result == 'success' && (needs.plan.outputs.kind == 'reference' || steps.current.outputs.match == 'true')
+        if: needs.measure.result == 'success' && steps.current.outputs.match == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fff-measurements
           path: ${{ runner.temp }}/fff-perf
-      - name: Publish timings
-        if: always() && (needs.plan.outputs.kind == 'reference' || steps.current.outputs.match == 'true')
-        env:
-          PR_NUMBER: ${{ needs.plan.outputs.number }}
-          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
-          HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
-          MEASURE: ${{ steps.timings.outcome }}
-          PERF_DIR: ${{ runner.temp }}/fff-perf
+      - name: Restore the chart renderer build
+        if: steps.timings.outcome == 'success'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ runner.temp }}/harness/perf/chart/target
+          key: fff-perf-chart-${{ github.sha }}
+          restore-keys: fff-perf-chart-
+      - name: Render the timing chart
+        if: steps.timings.outcome == 'success'
+        continue-on-error: true
         run: |
-          report="$RUNNER_TEMP/fff-timings.md"
-          state=error
-          if [[ "$MEASURE" == success ]]; then
-            state=success
-            if ! awk -v pr="$PR_NUMBER" '
-              NR == FNR { base[$2] = $5; next }
-              {
-                drift = 10 * $5 > 11 * base[$2] || (!pr && 10 * $5 < 9 * base[$2])
-                if (drift) failed = 1
-                if (pr || drift) {
-                  if (!rows++) print "| Benchmark | Baseline (ns) | Measured (ns) | Change |\n| --- | ---: | ---: | ---: |"
-                  printf "| `%s` | %d | %d | %+.2f%% |\n", $2, base[$2], $5, 100 * ($5 / base[$2] - 1)
-                }
-              }
-              END { exit failed }
-            ' "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >"$report"; then
-              state=failure
-            fi
-          else
-            echo 'FFF core measurement could not complete.' >"$report"
-          fi
-          if [[ -n "$PR_NUMBER" ]]; then
-            case "$state" in
-              success) message='FFF core performance passed' ;;
-              failure) message='FFF core performance comparison failed' ;;
-              error) message='FFF core measurement could not complete' ;;
-            esac
-            gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" -f context='FFF performance' \
-              -f state="$state" -f description="$message" -f target_url="$RUN_URL" >/dev/null
-            if [[ "$MEASURE" == success ]]; then
-              marker='<!-- fff-core-performance -->'
-              comment="$RUNNER_TEMP/fff-pr-comment.md"
-              {
-                printf '%s\n## FFF core performance\n\n%s\n\n' "$marker" "$message"
-                printf 'Base %s · PR %s\n\n<details><summary>Criterion timings</summary>\n\n' "$BASE_SHA" "$HEAD_SHA"
-                cat "$report"
-                printf '\n</details>\n\n[Workflow run](%s)\n' "$RUN_URL"
-              } >"$comment"
-              comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-                --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- fff-core-performance -->"))) | .id' |
-                tail -n 1)
-              if [[ -n "$comment_id" ]]; then
-                gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" \
-                  --field "body=@$comment" >/dev/null
-              else
-                gh pr comment "$PR_NUMBER" -R "$GITHUB_REPOSITORY" --body-file "$comment"
-              fi
-            fi
-            cat "$report" >>"$GITHUB_STEP_SUMMARY"
-            [[ "$state" == success ]]
-            exit
-          fi
-          if [[ "$state" == success ]]; then
-            echo 'FFF core reference is within 10%' >>"$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          title='FFF benchmark reference drift'
-          printf '\n[Workflow run](%s)\n' "$RUN_URL" >>"$report"
-          cat "$report" >>"$GITHUB_STEP_SUMMARY"
-          issue=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --author 'github-actions[bot]' \
-            --search "$title in:title" --json number,title --jq '[.[] | select(.title == "FFF benchmark reference drift")][0].number // empty')
-          if [[ -n "$issue" ]]; then
-            gh issue comment "$issue" -R "$GITHUB_REPOSITORY" --body-file "$report"
-          else
-            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file "$report" --assignee "${GITHUB_REPOSITORY_OWNER}"
-          fi
-          exit 1
+          PERF_DIR="$RUNNER_TEMP/fff-perf"
+          repo="$RUNNER_TEMP/harness" chart="$RUNNER_TEMP/fff-chart.png"
+          git init -q "$repo"
+          git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$GITHUB_SHA"
+          git -C "$repo" -c core.hooksPath=/dev/null checkout -q FETCH_HEAD -- perf/chart
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo +1.99.1 run --release --locked --manifest-path "$repo/perf/chart/Cargo.toml" --example chart -- \
+            "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" "$chart"
+          mv "$chart" "$PERF_DIR/chart.png"
+      - name: Record the compared revision
+        if: "!cancelled() && steps.current.outputs.match == 'true'"
+        env:
+          KIND: ${{ needs.plan.outputs.kind }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+        run: |
+          PERF_DIR="$RUNNER_TEMP/fff-perf"
+          mkdir -p "$PERF_DIR"
+          printf '%s\n' "$KIND" >"$PERF_DIR/kind"
+          printf '%s\n' "$BASE_SHA" >"$PERF_DIR/base-sha"
+      - name: Upload the PR report
+        id: upload
+        if: "!cancelled() && steps.current.outputs.match == 'true'"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fff-performance-report-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fff-perf
+          if-no-files-found: error
+          retention-days: 30
+      - name: Check fork timings
+        if: >-
+          steps.timings.outcome == 'success' &&
+          (github.event.pull_request.head.repo.id != github.event.repository.id || github.actor == 'dependabot[bot]')
+        run: |
+          PERF_DIR="$RUNNER_TEMP/fff-perf"
+          script="$RUNNER_TEMP/report.sh"
+          curl -fsSL "https://raw.githubusercontent.com/dmtrKovalenko/fff/$GITHUB_SHA/perf/report.sh" -o "$script"
+          bash "$script" "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: report
+    if: >-
+      !cancelled() && needs.report.outputs.ready == 'true' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.actor != 'dependabot[bot]'
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/performance-publish.yml

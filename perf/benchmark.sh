@@ -7,6 +7,7 @@ state="$HOME/.local/share/fff-perf"
 reference="$state/core-reference-native"
 fff=5d21e4bbdf33a09f58975636208e30747bc8d918
 vscode=9192ec485939d98bb8b81410e03cee0a34747573
+cpus=8-11
 
 mkdir -p "$state/ext4"
 exec 9>"$state/benchmark.lock"
@@ -39,6 +40,31 @@ for fs in ext4 btrfs; do
 done
 [[ "$mode" != prepare ]] || exit 0
 
+expand() {
+  local part
+  for part in ${1//,/ }; do seq "${part%-*}" "${part#*-}"; done
+}
+
+# perf/tune.sh sets all of this up.
+tuned() {
+  local cpu unit sys=/sys/devices/system/cpu
+  for cpu in $(expand "$cpus"); do
+    [[ $(cat "$sys/cpu$cpu/topology/thread_siblings_list") == "$cpu" ]] || return 1
+    [[ ! -e "$sys/cpu$cpu/cpufreq/scaling_governor" ||
+      $(cat "$sys/cpu$cpu/cpufreq/scaling_governor") == performance ]] || return 1
+  done
+  [[ ! -e "$sys/intel_pstate/no_turbo" || $(cat "$sys/intel_pstate/no_turbo") == 1 ]] || return 1
+  [[ ! -e "$sys/cpufreq/boost" || $(cat "$sys/cpufreq/boost") == 0 ]] || return 1
+  for unit in init.scope system.slice user.slice; do
+    unit=$(cat "/sys/fs/cgroup/$unit/cpuset.cpus.effective") || return 1
+    ! expand "$unit" | grep -qxFf <(expand "$cpus") || return 1
+  done
+}
+if ! tuned; then
+  echo "CPUs $cpus are not reserved and tuned, run perf/tune.sh as root" >&2
+  exit 1
+fi
+
 output=$2
 mkdir -p "$output"
 work=$(mktemp -d "$state/core-run.XXXXXX")
@@ -64,7 +90,7 @@ run_bench() {
   if ! (
     cd "$work" || exit
     ulimit -f 8192 -v 8388608 || exit
-    exec timeout --kill-after=10s 10m taskset -c 8-11 \
+    exec timeout --kill-after=10s 10m taskset -c "$cpus" \
       env -i PATH=/usr/bin:/bin LC_ALL=C TMPDIR="$work" CARGO_TARGET_DIR="$work/target" \
       RAYON_NUM_THREADS=4 FFF_BENCH_PATH="$fixture_path" "$@" "$bins/${bench}_bench" \
       --bench --color never --noplot --output-format bencher --nresamples 10000 \
