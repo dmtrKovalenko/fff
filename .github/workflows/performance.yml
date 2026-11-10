@@ -17,6 +17,16 @@ defaults:
 
 env:
   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  PERF_PATHS: |-
+    Cargo.toml
+    Cargo.lock
+    .cargo/config.toml
+    crates/fff-core/Cargo.toml
+    crates/fff-core/**/*.rs
+    crates/fff-grep/Cargo.toml
+    crates/fff-grep/**/*.rs
+    crates/fff-query-parser/Cargo.toml
+    crates/fff-query-parser/**/*.rs
 
 jobs:
   plan:
@@ -60,9 +70,10 @@ jobs:
             trap 'rm -rf -- "$repo"' EXIT
             git init -q --bare "$repo"
             git -C "$repo" fetch -q --no-tags --filter=blob:none "$url" "$BASE_SHA" "$HEAD_SHA"
-            git -C "$repo" diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" >"$repo/changed"
-            if ! grep -zE '^(Cargo\.(toml|lock)|\.cargo/config\.toml|crates/fff-(core|grep|query-parser)/(Cargo\.toml|.*\.rs))$' \
-              "$repo/changed" >/dev/null; then
+            mapfile -t paths <<<"$PERF_PATHS"
+            git --glob-pathspecs -C "$repo" diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" \
+              -- "${paths[@]}" >"$repo/changed"
+            if [[ ! -s "$repo/changed" ]]; then
               kind=skip
             fi
           fi

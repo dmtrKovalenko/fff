@@ -8,10 +8,9 @@ revision also runs selected query parsing, definition matching, globbing,
 bigram indexing and SIMD substring search cases.
 
 Automatic measurements use the diff from the merge base with `main` to the
-PR head. This includes changes from earlier PRs in the stack. The file filter
-covers Rust sources or `Cargo.toml` changes in
-`fff-core`, `fff-grep` or `fff-query-parser`, the root `Cargo.toml`,
-`Cargo.lock` or `.cargo/config.toml`. Other PRs get a passing
+PR head. This includes changes from earlier PRs in the stack. The
+`PERF_PATHS` list in `.github/workflows/performance.yml` defines which source
+and dependency files trigger measurement. Other PRs get a passing
 `FFF performance` status marked as skipped.
 
 Add `perf-check` to measure the current revision regardless of its changed
