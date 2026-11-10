@@ -1,11 +1,15 @@
 # FFF core performance CI
 
-Each PR runs FFF's existing Criterion benchmarks against its base revision on
-`load`. Fuzzy file search and grep use pinned FFF and VS Code checkouts on ext4
-and Btrfs. Each revision also runs selected query parsing, definition matching,
-globbing, bigram indexing and SIMD substring search cases.
+Each measured PR compares its head against a commit pinned from `main` when
+the workflow starts, including when the PR targets another branch in a stack.
+The workflow runs FFF's existing Criterion benchmarks on `load`. Fuzzy file
+search and grep use pinned FFF and VS Code checkouts on ext4 and Btrfs. Each
+revision also runs selected query parsing, definition matching, globbing,
+bigram indexing and SIMD substring search cases.
 
-Automatic measurements cover Rust sources or `Cargo.toml` changes in
+Automatic measurements use the diff from the merge base with `main` to the
+PR head. This includes changes from earlier PRs in the stack. The file filter
+covers Rust sources or `Cargo.toml` changes in
 `fff-core`, `fff-grep` or `fff-query-parser`, the root `Cargo.toml`,
 `Cargo.lock` or `.cargo/config.toml`. Other PRs get a passing
 `FFF performance` status marked as skipped.
@@ -38,7 +42,12 @@ cargo run --release --manifest-path perf/chart/Cargo.toml --example chart -- \
 
 At 04:07 UTC **FFF performance reference** runs directly on `load` with
 the saved binaries. A change of more than 10% in either direction opens
-or updates the reference drift issue.
+or updates the reference drift issue. A measurement failure opens or
+updates a reference failure issue with a link to the run.
+
+GitHub Actions keeps the build and measurement job logs on each run. The
+`fff-measurements` artifact keeps `benchmark.log` and any collected timings
+for 30 days, including when a benchmark fails.
 
 ## Prepare the worker
 

@@ -9,7 +9,18 @@ mkdir "$output/work" "$output/bins"
 
 docker build --tag fff-perf-build - <<'DOCKERFILE'
 FROM buildpack-deps:noble@sha256:8e49144867ad1df5bce2864e890b2d783c7754efc68e2b52b27d10942edc4d0d
-RUN apt-get update && apt-get install -y --no-install-recommends libclang-dev && rm -rf /var/lib/apt/lists/*
+RUN for delay in 0 15 60 120; do \
+      if [ "$delay" -gt 0 ]; then \
+        echo "Retrying Ubuntu packages in $delay seconds"; \
+        sleep "$delay"; \
+      fi; \
+      if apt-get -o Acquire::Retries=2 --error-on=any update && \
+         apt-get -o Acquire::Retries=2 install -y --no-install-recommends libclang-dev; then \
+        rm -rf /var/lib/apt/lists/*; \
+        exit 0; \
+      fi; \
+    done; \
+    exit 1
 DOCKERFILE
 
 docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
