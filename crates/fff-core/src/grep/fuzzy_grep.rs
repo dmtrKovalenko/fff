@@ -36,7 +36,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     // Cap at 2: higher values (3+) let the SIMD prefilter pass lines
     // missing key characters entirely (e.g. query "flvencodeX" matching
     // lines without 'l' or 'v'). Quality comes from the post-match filters.
-    let max_typos = (grep_text.len() / 3).min(2);
+    let max_typos = usize::from(fuzzy_grep_max_typos(grep_text));
     let scoring = neo_frizbee::Scoring {
         // Use default gap penalties. Higher values (e.g. 20) cause
         // smith-waterman to prefer *dropping needle chars* over paying
@@ -369,4 +369,35 @@ pub(super) fn fuzzy_grep_search<'a>(
         filtered_file_count,
         abort_resume,
     )
+}
+
+pub(crate) fn fuzzy_grep_max_typos(pattern: &str) -> u16 {
+    (pattern.len() / 3).min(2) as u16
+}
+
+/// Fuzzy-filter caller-supplied `(path, line)` hits in input order.
+/// The indices in `rows` refer to that same input.
+pub fn refine_grep_into<'a>(
+    hits: impl IntoIterator<Item = (&'a str, &'a str)>,
+    query: &str,
+    rows: &mut Vec<usize>,
+) {
+    rows.clear();
+    let hits = hits.into_iter();
+    if query.is_empty() {
+        rows.extend(hits.enumerate().map(|(index, _)| index));
+        return;
+    }
+
+    let mut matcher = neo_frizbee::Matcher::new(query, &neo_frizbee::Config::default());
+    let mut text = String::new();
+    for (index, (path, line)) in hits.enumerate() {
+        text.clear();
+        text.push_str(line);
+        text.push(' ');
+        text.push_str(path);
+        if matcher.match_one(&text, 0).is_some() {
+            rows.push(index);
+        }
+    }
 }

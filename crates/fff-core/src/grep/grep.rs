@@ -205,8 +205,8 @@ pub(crate) fn grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
-) -> GrepResult<'a> {
-    let result = grep_search_parsed(
+) -> (GrepResult<'a>, String) {
+    let (result, pattern) = grep_search_parsed(
         files,
         total_files,
         query,
@@ -231,7 +231,7 @@ pub(crate) fn grep_search<'a>(
         || options.classify_definitions == super::DefinitionMode::DefinitionOnly
         || abort_signal.load(Ordering::Relaxed)
     {
-        return result;
+        return (result, pattern);
     }
 
     // An empty section must not trigger a literal retry when the query matched the other section.
@@ -242,7 +242,7 @@ pub(crate) fn grep_search<'a>(
             classify_definitions: Default::default(),
             ..options.clone()
         };
-        let unfiltered = grep_search_parsed(
+        let (unfiltered, _) = grep_search_parsed(
             files,
             total_files,
             query,
@@ -256,13 +256,13 @@ pub(crate) fn grep_search<'a>(
             overflow_arena,
         );
         if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
-            return result;
+            return (result, pattern);
         }
     }
 
     let raw = query.raw_query.trim();
     if raw.is_empty() {
-        return result;
+        return (result, pattern);
     }
 
     // Keep any explicit FilePath scope (AI mode `path/to/file.ext` prefix) so the
@@ -282,7 +282,7 @@ pub(crate) fn grep_search<'a>(
         location: None,
     };
 
-    let mut fallback = grep_search_parsed(
+    let (mut fallback, fallback_pattern) = grep_search_parsed(
         files,
         total_files,
         &literal_query,
@@ -297,10 +297,10 @@ pub(crate) fn grep_search<'a>(
     );
 
     if fallback.matches.is_empty() {
-        result
+        (result, pattern)
     } else {
         fallback.literal_fallback = true;
-        fallback
+        (fallback, fallback_pattern)
     }
 }
 
@@ -317,12 +317,12 @@ fn grep_search_parsed<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
-) -> GrepResult<'a> {
+) -> (GrepResult<'a>, String) {
     let constraints_from_query = &query.constraints[..];
 
     let grep_text = extract_grep_text(query);
     if grep_text.is_empty() {
-        return GrepResult::empty(total_files, total_files);
+        return (GrepResult::empty(total_files, total_files), grep_text);
     }
 
     let casing = options.effective_casing();
@@ -347,10 +347,13 @@ fn grep_search_parsed<'a>(
             );
 
             if files_to_search.is_empty() {
-                return GrepResult::empty(total_files, filtered_file_count);
+                return (
+                    GrepResult::empty(total_files, filtered_file_count),
+                    grep_text,
+                );
             }
 
-            return super::fuzzy_grep::fuzzy_grep_search(
+            let result = super::fuzzy_grep::fuzzy_grep_search(
                 &grep_text,
                 &mut files_to_search,
                 options,
@@ -363,6 +366,7 @@ fn grep_search_parsed<'a>(
                 arena,
                 overflow_arena,
             );
+            return (result, grep_text);
         }
         GrepMode::Regex => build_regex(&grep_text, casing)
             .inspect_err(|err| {
@@ -373,9 +377,10 @@ fn grep_search_parsed<'a>(
             .ok(),
     };
 
-    let (multiline_segment_len, effective_pattern) = match replace_newline_escapes(&grep_text) {
-        Some((replaced, first_newline_pos)) => (Some(first_newline_pos), replaced),
-        None => (None, grep_text),
+    let multiline_pattern = replace_newline_escapes(&grep_text);
+    let (multiline_segment_len, effective_pattern) = match &multiline_pattern {
+        Some((replaced, first_newline_pos)) => (Some(*first_newline_pos), replaced.as_str()),
+        None => (None, grep_text.as_str()),
     };
 
     let is_multiline = multiline_segment_len.is_some();
@@ -398,9 +403,9 @@ fn grep_search_parsed<'a>(
     // PlainText (or regex-fallback-to-plain): literal bigram query.
     // Regex: decompose the pattern HIR into an AND/OR bigram query tree.
     let bigram_candidates = if regex.is_none() {
-        literal_candidates(bigram_index, bigram_overlay, &[&effective_pattern])
+        literal_candidates(bigram_index, bigram_overlay, &[effective_pattern])
     } else {
-        regex_candidates(bigram_index, bigram_overlay, &effective_pattern)
+        regex_candidates(bigram_index, bigram_overlay, effective_pattern)
     };
 
     let (mut files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
@@ -414,10 +419,13 @@ fn grep_search_parsed<'a>(
     );
 
     if files_to_search.is_empty() {
-        return GrepResult {
-            regex_fallback_error,
-            ..GrepResult::empty(total_files, filtered_file_count)
-        };
+        return (
+            GrepResult {
+                regex_fallback_error,
+                ..GrepResult::empty(total_files, filtered_file_count)
+            },
+            grep_text,
+        );
     }
 
     // `PlainTextMatcher` is used by the grep-searcher engine for line detection.
@@ -486,7 +494,7 @@ fn grep_search_parsed<'a>(
         },
     );
     result.regex_fallback_error = regex_fallback_error;
-    result
+    (result, grep_text)
 }
 
 /// Replace unescaped `\n` escapes with real newlines in a single pass.
