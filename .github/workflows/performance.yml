@@ -2,7 +2,6 @@ name: FFF performance
 
 on:
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
@@ -18,6 +17,16 @@ defaults:
 
 env:
   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  PERF_PATHS: |-
+    Cargo.toml
+    Cargo.lock
+    .cargo/config.toml
+    crates/fff-core/Cargo.toml
+    crates/fff-core/**/*.rs
+    crates/fff-grep/Cargo.toml
+    crates/fff-grep/**/*.rs
+    crates/fff-query-parser/Cargo.toml
+    crates/fff-query-parser/**/*.rs
 
 jobs:
   plan:
@@ -42,7 +51,6 @@ jobs:
         id: resolve
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           FORCE: ${{ contains(github.event.pull_request.labels.*.name, 'perf-check') }}
         run: |
@@ -51,14 +59,21 @@ jobs:
             exit 0
           fi
           actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq 'select(.state == "open" and .base.ref == "main") | .head.sha')
+            --jq 'select(.state == "open") | .head.sha')
           [[ "$actual" == "$HEAD_SHA" ]] || exit 0
+          url="https://github.com/$GITHUB_REPOSITORY.git"
+          BASE_SHA=$(git ls-remote --exit-code "$url" refs/heads/main | cut -f1)
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
           kind=pr
           if [[ "$FORCE" != true ]]; then
-            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
-              --jq '.[] | .filename, .previous_filename // empty')
-            if ! grep -E '^(Cargo\.(toml|lock)|\.cargo/config\.toml|crates/fff-(core|grep|query-parser)/(Cargo\.toml|.*\.rs))$' \
-              <<<"$files" >/dev/null; then
+            repo=$(mktemp -d)
+            trap 'rm -rf -- "$repo"' EXIT
+            git init -q --bare "$repo"
+            git -C "$repo" fetch -q --no-tags --filter=blob:none "$url" "$BASE_SHA" "$HEAD_SHA"
+            mapfile -t paths <<<"$PERF_PATHS"
+            git --glob-pathspecs -C "$repo" diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" \
+              -- "${paths[@]}" >"$repo/changed"
+            if [[ ! -s "$repo/changed" ]]; then
               kind=skip
             fi
           fi
@@ -144,6 +159,7 @@ jobs:
           pattern: fff-bench-*
           path: ${{ runner.temp }}/fff-binaries
       - name: Measure on load
+        id: measure
         env:
           KIND: ${{ needs.plan.outputs.kind }}
           BASE: ${{ needs.plan.outputs.base_sha }}
@@ -154,28 +170,32 @@ jobs:
           script="$RUNNER_TEMP/benchmark.sh"
           binaries="$RUNNER_TEMP/fff-binaries"
           output="$RUNNER_TEMP/fff-results"
+          mkdir -p "$output"
           case "$KIND" in
             pr) bash "$script" compare "$output" "$binaries/fff-bench-base" "$binaries/fff-bench-head" ;;
             calibrate) bash "$script" calibrate "$output" "$binaries/fff-bench-base" "$BASE" ;;
             *) exit 1 ;;
-          esac
-      - name: Upload measurements
+          esac 2>&1 | tee "$output/benchmark.log"
+      - name: Upload measurement logs and timings
+        if: ${{ !cancelled() && (steps.measure.outcome == 'success' || steps.measure.outcome == 'failure') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fff-measurements
-          path: ${{ runner.temp }}/fff-results/*.bench
+          path: |
+            ${{ runner.temp }}/fff-results/*.bench
+            ${{ runner.temp }}/fff-results/benchmark.log
           if-no-files-found: error
           retention-days: 30
           overwrite: true
 
   report:
-    needs: [plan, measure]
+    needs: [plan, build, measure]
     if: "!cancelled() && (needs.plan.outputs.kind == 'pr' || needs.plan.outputs.kind == 'skip')"
     runs-on: ubuntu-24.04
     permissions:
       pull-requests: read
     outputs:
-      ready: ${{ steps.upload.outcome == 'success' }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Verify the PR revision is current
         id: current
@@ -185,7 +205,7 @@ jobs:
           HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
         run: |
           actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq 'select(.state == "open" and .base.ref == "main") | .head.sha')
+            --jq 'select(.state == "open") | .head.sha')
           if [[ "$actual" == "$HEAD_SHA" ]]; then
             echo 'match=true' >>"$GITHUB_OUTPUT"
           fi
@@ -222,12 +242,20 @@ jobs:
         if: "!cancelled() && steps.current.outputs.match == 'true'"
         env:
           KIND: ${{ needs.plan.outputs.kind }}
+          PR_NUMBER: ${{ needs.plan.outputs.number }}
           BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          MEASURE_RESULT: ${{ needs.measure.result }}
         run: |
           PERF_DIR="$RUNNER_TEMP/fff-perf"
           mkdir -p "$PERF_DIR"
           printf '%s\n' "$KIND" >"$PERF_DIR/kind"
+          printf '%s\n' "$PR_NUMBER" >"$PERF_DIR/pr-number"
           printf '%s\n' "$BASE_SHA" >"$PERF_DIR/base-sha"
+          case "$BUILD_RESULT/$MEASURE_RESULT" in
+            failure/*) printf 'build\n' >"$PERF_DIR/failure-stage" ;;
+            */failure) printf 'measure\n' >"$PERF_DIR/failure-stage" ;;
+          esac
       - name: Upload the PR report
         id: upload
         if: "!cancelled() && steps.current.outputs.match == 'true'"
@@ -250,7 +278,7 @@ jobs:
   publish:
     needs: report
     if: >-
-      !cancelled() && needs.report.outputs.ready == 'true' &&
+      !cancelled() && needs.report.outputs.artifact_id != '' &&
       github.event.pull_request.head.repo.id == github.event.repository.id &&
       github.actor != 'dependabot[bot]'
     permissions:
@@ -259,3 +287,5 @@ jobs:
       pull-requests: write
       statuses: write
     uses: ./.github/workflows/performance-publish.yml
+    with:
+      report_artifact_id: ${{ needs.report.outputs.artifact_id }}

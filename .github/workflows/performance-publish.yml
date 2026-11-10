@@ -2,6 +2,10 @@ name: Publish FFF performance
 
 on:
   workflow_call:
+    inputs:
+      report_artifact_id:
+        required: true
+        type: string
   workflow_run:
     workflows: [FFF performance]
     types: [completed]
@@ -34,40 +38,56 @@ jobs:
       BENCH_RUN: ${{ github.event.workflow_run.id || github.run_id }}
       BENCH_ATTEMPT: ${{ github.event.workflow_run.run_attempt || github.run_attempt }}
     steps:
-      - name: Find the current PR and its report
-        id: pr
+      - name: Find the PR report
+        id: report
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
-          SOURCE_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
-          SOURCE_REPO: ${{ github.event.workflow_run.head_repository.id }}
-          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ARTIFACT_ID: ${{ inputs.report_artifact_id }}
         run: |
-          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 0
           if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-            [[ -n "$SOURCE_OWNER" && "$SOURCE_REPO" =~ ^[0-9]+$ ]] || exit 0
-            PR_NUMBER=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
-              -f state=open -f base=main -f head="$SOURCE_OWNER:$SOURCE_BRANCH" |
-              jq -r --argjson repo "$SOURCE_REPO" --arg sha "$HEAD_SHA" '
-                first(.[] | select(.head.repo.id == $repo and .head.sha == $sha) | .number) // empty
-              ')
+            ARTIFACT_ID=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/runs/$BENCH_RUN/artifacts" \
+              -f name="fff-performance-report-$BENCH_ATTEMPT" --jq '.artifacts[] | select(.expired == false) | .id')
           fi
-          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || exit 0
-          actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq 'select(.state == "open" and .base.ref == "main") | .head.sha')
-          [[ "$actual" == "$HEAD_SHA" ]] || exit 0
-          artifact=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/runs/$BENCH_RUN/artifacts" \
-            -f name="fff-performance-report-$BENCH_ATTEMPT" --jq '.artifacts[] | select(.expired == false) | .id')
-          [[ -n "$artifact" ]] || exit 0
-          printf 'number=%s\nhead_sha=%s\n' "$PR_NUMBER" "$HEAD_SHA" >>"$GITHUB_OUTPUT"
+          if [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            printf 'id=%s\n' "$ARTIFACT_ID" >>"$GITHUB_OUTPUT"
+          fi
       - name: Download the PR report
-        if: steps.pr.outputs.number != ''
+        if: steps.report.outputs.id != ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           github-token: ${{ github.token }}
           run-id: ${{ env.BENCH_RUN }}
-          name: fff-performance-report-${{ env.BENCH_ATTEMPT }}
+          artifact-ids: ${{ steps.report.outputs.id }}
           path: ${{ runner.temp }}/fff-perf
+      - name: Verify the PR revision is current
+        id: pr
+        if: steps.report.outputs.id != ''
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
+          SOURCE_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          SOURCE_REPO: ${{ github.event.workflow_run.head_repository.id || github.event.pull_request.head.repo.id }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch || github.event.pull_request.head.ref }}
+        run: |
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_REPO" =~ ^[0-9]+$ ]] || exit 0
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            if [[ -r "$RUNNER_TEMP/fff-perf/pr-number" ]]; then
+              PR_NUMBER=$(<"$RUNNER_TEMP/fff-perf/pr-number")
+            else
+              PR_NUMBER=$(gh api --paginate --slurp --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+                -f state=open -f head="$SOURCE_OWNER:$SOURCE_BRANCH" |
+                jq -r --argjson repo "$SOURCE_REPO" --arg sha "$HEAD_SHA" '
+                  [.[][] | select(.head.repo.id == $repo and .head.sha == $sha) | .number]
+                  | select(length == 1) | .[0]
+                ')
+            fi
+          fi
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || exit 0
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" |
+            jq -r --argjson repo "$SOURCE_REPO" --arg branch "$SOURCE_BRANCH" '
+              select(.state == "open" and .head.repo.id == $repo and .head.ref == $branch) | .head.sha
+            ')
+          [[ "$actual" == "$HEAD_SHA" ]] || exit 0
+          printf 'number=%s\nhead_sha=%s\n' "$PR_NUMBER" "$HEAD_SHA" >>"$GITHUB_OUTPUT"
       - name: Publish timings
         if: steps.pr.outputs.number != ''
         env:
@@ -112,6 +132,12 @@ jobs:
               1) state=failure icon=🔴 message='FFF core performance comparison failed' ;;
               *)
                 state=error message='FFF core measurement could not complete'
+                if [[ -r "$PERF_DIR/failure-stage" ]]; then
+                  case $(<"$PERF_DIR/failure-stage") in
+                    build) message='FFF core benchmark build failed' ;;
+                    measure) message='FFF core benchmark measurement failed' ;;
+                  esac
+                fi
                 echo "$message" >"$report"
                 ;;
             esac
