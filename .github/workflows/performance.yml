@@ -4,6 +4,9 @@ on:
   workflow_run:
     workflows: [Spelling]
     types: [completed]
+  pull_request_target:
+    branches: [main]
+    types: [labeled]
   workflow_dispatch:
 
 concurrency:
@@ -23,8 +26,9 @@ jobs:
   plan:
     if: >-
       github.repository == 'dmtrKovalenko/fff' && github.ref == 'refs/heads/main' &&
-      (github.event_name != 'workflow_run' ||
-       (github.event.workflow_run.event == 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request_target' && github.event.label.name == 'perf-check') ||
+       (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
         github.event.workflow_run.path == '.github/workflows/spelling.yaml' &&
         (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')))
     runs-on: ubuntu-24.04
@@ -40,41 +44,53 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Resolve the PR revision that ran CI
+      - name: Resolve the benchmark revision
         id: resolve
         env:
           CI_RUN_ID: ${{ github.event.workflow_run.id }}
           CI_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          SOURCE_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
-          SOURCE_REPO_ID: ${{ github.event.workflow_run.head_repository.id }}
-          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_OWNER: ${{ github.event.workflow_run.head_repository.owner.login || github.event.pull_request.head.repo.owner.login }}
+          SOURCE_REPO_ID: ${{ github.event.workflow_run.head_repository.id || github.event.pull_request.head.repo.id }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch || github.event.pull_request.head.ref }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             printf 'kind=calibrate\nbase_sha=5d21e4bbdf33a09f58975636208e30747bc8d918\n' >>"$GITHUB_OUTPUT"
             exit 0
           fi
           [[ -n "$SOURCE_OWNER" && "$SOURCE_REPO_ID" =~ ^[0-9]+$ && "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 0
+          if [[ "$GITHUB_EVENT_NAME" == pull_request_target ]]; then
+            spelling=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/spelling.yaml/runs" \
+              -f event=pull_request -f status=completed -f head_sha="$SOURCE_SHA" |
+              jq -r --argjson repo "$SOURCE_REPO_ID" --arg branch "$SOURCE_BRANCH" --arg sha "$SOURCE_SHA" '
+                first(.workflow_runs[] | select(.head_repository.id == $repo and .head_branch == $branch and .head_sha == $sha and
+                  (.conclusion == "success" or .conclusion == "failure")) | [.id, .run_attempt] | @tsv) // empty
+              ')
+            [[ -n "$spelling" ]] || exit 0
+            read -r CI_RUN_ID CI_ATTEMPT <<<"$spelling"
+          fi
           started=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/attempts/$CI_ATTEMPT/jobs" \
             --jq '.jobs[] | select(.runner_id > 0 and .started_at != null) | .id')
           [[ -n "$started" ]] || exit 0
           pr=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
             -f state=open -f base=main -f head="$SOURCE_OWNER:$SOURCE_BRANCH" |
-            jq -r --argjson repo "$SOURCE_REPO_ID" --arg sha "$SOURCE_SHA" '
-              .[] | select(.head.repo.id == $repo and .head.sha == $sha) |
-              "kind=pr\nnumber=\(.number)\nbase_sha=\(.base.sha)\nhead_sha=\(.head.sha)"
+            jq -c --argjson repo "$SOURCE_REPO_ID" --arg sha "$SOURCE_SHA" '
+              first(.[] | select(.head.repo.id == $repo and .head.sha == $sha)) // empty
             ')
-          [[ "$pr" =~ number=([0-9]+) ]] || exit 0
-          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}/files" \
-            --jq '.[] | .filename, .previous_filename // empty')
-          # Only core Rust sources and Rust dependency changes are measured.
-          if grep -E '^(Cargo\.(toml|lock)|\.cargo/config\.toml|crates/fff-(core|grep|query-parser)/(Cargo\.toml|.*\.rs))$' \
-            <<<"$files" >/dev/null; then
-            printf '%s\n' "$pr" >>"$GITHUB_OUTPUT"
-          else
-            gh api "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_SHA" -f context='FFF performance' -f state=success \
-              -f description='Skipped, no core Rust or dependency changes' -f target_url="$RUN_URL" >/dev/null
+          [[ -n "$pr" ]] || exit 0
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]] &&
+            ! jq -e 'any(.labels[]; .name == "perf-check")' <<<"$pr" >/dev/null; then
+            number=$(jq -r '.number' <<<"$pr")
+            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$number/files" \
+              --jq '.[] | .filename, .previous_filename // empty')
+            if ! grep -E '^(Cargo\.(toml|lock)|\.cargo/config\.toml|crates/fff-(core|grep|query-parser)/(Cargo\.toml|.*\.rs))$' \
+              <<<"$files" >/dev/null; then
+              gh api "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_SHA" -f context='FFF performance' -f state=success \
+                -f description='Skipped, no core Rust or dependency changes' -f target_url="$RUN_URL" >/dev/null
+              exit 0
+            fi
           fi
+          jq -r '"kind=pr\nnumber=\(.number)\nbase_sha=\(.base.sha)\nhead_sha=\(.head.sha)"' <<<"$pr" >>"$GITHUB_OUTPUT"
       - name: Mark the PR check pending
         if: steps.resolve.outputs.kind == 'pr'
         env:

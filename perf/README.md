@@ -5,10 +5,15 @@ Each PR runs FFF's existing Criterion benchmarks against its base revision on
 and Btrfs. Each revision also runs selected query parsing, definition matching,
 globbing, bigram indexing and SIMD substring search cases.
 
-A PR is measured only when it changes Rust sources or `Cargo.toml` in
+Automatic measurements cover Rust sources or `Cargo.toml` changes in
 `fff-core`, `fff-grep` or `fff-query-parser`, the root `Cargo.toml`,
 `Cargo.lock` or `.cargo/config.toml`. Other PRs get a passing
 `FFF performance` status marked as skipped.
+
+Add `perf-check` to measure the current revision regardless of its changed
+files. Remove and re-add the label to rerun a measurement. While the label is
+present, new revisions are measured after Spelling runs. Fork commits still
+require GitHub's workflow approval.
 
 GitHub-hosted jobs compile both revisions with the default branch's benchmark
 sources and the release `zlob` feature. After the hosted **Spelling** workflow
