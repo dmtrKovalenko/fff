@@ -1456,7 +1456,7 @@ mod tests {
         // A sibling mapping can fail after scratch chunks discover their keys.
         let partial = BigramIndexBuilder::new(64);
         assert!(partial.col_data_ptr().is_some());
-        partial.get_or_alloc_column(key(b'h', b'e'));
+        partial.get_or_alloc_column(key_slot(key(b'h', b'e')));
         let index = partial.compress(None);
         assert_eq!(index.query(b"hello"), None);
         assert_eq!(index.columns_used(), 0);
