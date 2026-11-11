@@ -119,7 +119,7 @@ pub(crate) fn multi_grep_search<'a>(
     let total_files = files.live_count();
 
     if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
-        return GrepResult::empty(total_files, total_files);
+        return GrepResult::default().empty(total_files, total_files);
     }
 
     let bigram_candidates = literal_candidates(bigram_index, bigram_overlay, patterns);
@@ -137,7 +137,7 @@ pub(crate) fn multi_grep_search<'a>(
     );
 
     if files_to_search.is_empty() {
-        return GrepResult::empty(total_files, filtered_file_count);
+        return GrepResult::default().empty(total_files, filtered_file_count);
     }
 
     let casing = options.effective_casing();
@@ -157,6 +157,7 @@ pub(crate) fn multi_grep_search<'a>(
 
     let ac_matcher = AhoCorasickMatcher { ac: &ac };
     perform_grep(
+        Default::default(),
         &mut files_to_search,
         options,
         &GrepContext {

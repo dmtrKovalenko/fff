@@ -199,6 +199,7 @@ pub(crate) fn grep_search<'a>(
     total_files: usize,
     query: &FFFQuery<'_>,
     grep_text: String,
+    mut page: GrepResult<'a>,
     options: &GrepSearchOptions,
     reuse: Option<&GrepReuse<'_>>,
     budget: &ContentCacheBudget,
@@ -209,11 +210,14 @@ pub(crate) fn grep_search<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> (GrepResult<'a>, String) {
-    let (result, pattern) = grep_search_parsed(
+    page.matches.clear();
+    page.files.clear();
+    let (mut result, pattern) = grep_search_parsed(
         files,
         total_files,
         query,
         grep_text,
+        page,
         options,
         reuse,
         budget,
@@ -231,13 +235,18 @@ pub(crate) fn grep_search<'a>(
     // for later pages: an empty full scan at offset 0 stays empty at any offset,
     // so paging offsets consistently index the literal search's file list.
     let full_scan_empty = result.matches.is_empty() && result.next_file_offset == 0;
+    let raw = query.raw_query.trim();
     if !full_scan_empty
+        || raw.is_empty()
         || query.constraints.is_empty()
         || options.classify_definitions == super::DefinitionMode::DefinitionOnly
         || abort_signal.load(Ordering::Relaxed)
     {
         return (result, pattern);
     }
+
+    let mut page = GrepResult::default();
+    result.swap_rows(&mut page);
 
     // An empty section must not trigger a literal retry when the query matched the other section.
     if options.classify_definitions.is_filtered() {
@@ -247,11 +256,12 @@ pub(crate) fn grep_search<'a>(
             classify_definitions: Default::default(),
             ..options.clone()
         };
-        let (unfiltered, _) = grep_search_parsed(
+        (page, _) = grep_search_parsed(
             files,
             total_files,
             query,
             pattern.clone(),
+            page,
             &probe,
             None,
             budget,
@@ -262,14 +272,13 @@ pub(crate) fn grep_search<'a>(
             arena,
             overflow_arena,
         );
-        if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
+        let matched = !page.matches.is_empty() || page.next_file_offset != 0;
+        page.files.clear();
+        page.matches.clear();
+        if matched {
+            result.swap_rows(&mut page);
             return (result, pattern);
         }
-    }
-
-    let raw = query.raw_query.trim();
-    if raw.is_empty() {
-        return (result, pattern);
     }
 
     // Keep any explicit FilePath scope (AI mode `path/to/file.ext` prefix) so the
@@ -294,6 +303,7 @@ pub(crate) fn grep_search<'a>(
         total_files,
         &literal_query,
         extract_grep_text(&literal_query),
+        page,
         options,
         None,
         budget,
@@ -306,6 +316,7 @@ pub(crate) fn grep_search<'a>(
     );
 
     if fallback.matches.is_empty() {
+        result.swap_rows(&mut fallback);
         (result, pattern)
     } else {
         fallback.literal_fallback = true;
@@ -319,6 +330,7 @@ fn grep_search_parsed<'a>(
     total_files: usize,
     query: &FFFQuery<'_>,
     grep_text: String,
+    page: GrepResult<'a>,
     options: &GrepSearchOptions,
     reuse: Option<&GrepReuse<'_>>,
     budget: &ContentCacheBudget,
@@ -332,7 +344,7 @@ fn grep_search_parsed<'a>(
     let constraints_from_query = &query.constraints[..];
 
     if grep_text.is_empty() {
-        return (GrepResult::empty(total_files, total_files), grep_text);
+        return (page.empty(total_files, total_files), grep_text);
     }
 
     let casing = options.effective_casing();
@@ -357,15 +369,13 @@ fn grep_search_parsed<'a>(
             );
 
             if files_to_search.is_empty() {
-                return (
-                    GrepResult::empty(total_files, filtered_file_count),
-                    grep_text,
-                );
+                return (page.empty(total_files, filtered_file_count), grep_text);
             }
 
             let result = super::fuzzy_grep::fuzzy_grep_search(
                 &grep_text,
                 &mut files_to_search,
+                page,
                 options,
                 reuse,
                 total_files,
@@ -433,7 +443,7 @@ fn grep_search_parsed<'a>(
         return (
             GrepResult {
                 regex_fallback_error,
-                ..GrepResult::empty(total_files, filtered_file_count)
+                ..page.empty(total_files, filtered_file_count)
             },
             grep_text,
         );
@@ -452,6 +462,7 @@ fn grep_search_parsed<'a>(
 
     let should_prefilter = regex.is_none();
     let mut result = perform_grep(
+        page,
         &mut files_to_search,
         options,
         &GrepContext {
@@ -612,6 +623,7 @@ impl GrepContext<'_, '_> {
     fields(prefiltered_count = files_to_search.len())
 )]
 pub(super) fn perform_grep<'a, F>(
+    page: GrepResult<'a>,
     files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
     ctx: &GrepContext<'_, '_>,
@@ -636,8 +648,8 @@ where
     // the resume point for the next page. usize::MAX means no abort happened.
     let first_skipped = AtomicUsize::new(usize::MAX);
 
-    let mut result_files: Vec<&'a FileItem> = Vec::new();
-    let mut all_matches: Vec<GrepMatch> = Vec::new();
+    let mut result_files = page.files;
+    let mut all_matches = page.matches;
     let mut files_consumed: usize = 0;
     let mut page_filled = false;
     let mut aborted = false;

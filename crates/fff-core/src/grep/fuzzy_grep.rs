@@ -13,6 +13,7 @@ use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 pub(super) fn fuzzy_grep_search<'a>(
     grep_text: &str,
     files_to_search: &mut super::prefilter::RankedFiles<'a>,
+    page: GrepResult<'a>,
     options: &GrepSearchOptions,
     reuse: Option<&super::GrepReuse<'_>>,
     total_files: usize,
@@ -374,7 +375,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     }
 
     let abort_resume = Some(first_skipped.load(Ordering::Relaxed)).filter(|&i| i != usize::MAX);
-    GrepResult::collect(
+    page.collect(
         per_file_results,
         files_to_search.len(),
         options,

@@ -197,9 +197,15 @@ pub struct GrepResult<'a> {
 }
 
 impl<'a> GrepResult<'a> {
-    /// Empty result carrying only the file counts (empty query / prefilter miss)
-    pub(crate) fn empty(total_files: usize, filtered_file_count: usize) -> Self {
+    pub(super) fn swap_rows(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.files, &mut other.files);
+        std::mem::swap(&mut self.matches, &mut other.matches);
+    }
+
+    pub(super) fn empty(self, total_files: usize, filtered_file_count: usize) -> Self {
         Self {
+            files: self.files,
+            matches: self.matches,
             total_files,
             filtered_file_count,
             ..Default::default()
@@ -207,6 +213,7 @@ impl<'a> GrepResult<'a> {
     }
 
     pub(crate) fn collect(
+        self,
         per_file_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)>,
         files_to_search_len: usize,
         options: &GrepSearchOptions,
@@ -220,8 +227,8 @@ impl<'a> GrepResult<'a> {
         // Each match stores a `file_index` pointing into `result_files` so that
         // consumers (FFI JSON, Lua) can look up file metadata without duplicating
         // it across every match from the same file
-        let mut result_files: Vec<&'a FileItem> = Vec::new();
-        let mut all_matches: Vec<GrepMatch> = Vec::new();
+        let mut result_files = self.files;
+        let mut all_matches = self.matches;
         // files_consumed tracks how far into files_to_search we have advanced,
         // counting every file whose results were emitted (with or without matches).
         // We use the batch_idx of the last consumed file + 1, which is correct

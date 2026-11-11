@@ -330,7 +330,7 @@ fn search_files(
         page_index,
         page_size,
     ): FileSearchArgs,
-    buffers: Option<&mut [SearchBuffer; 2]>,
+    buffers: Option<&mut [SearchBuffer<SearchResult<'static>>; 2]>,
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
     let Some(ref picker) = *file_picker_guard else {
@@ -368,13 +368,24 @@ fn search_files(
         },
     };
     let tracker = query_tracker_guard.as_ref();
-    let results = match buffers {
-        Some([previous, next]) => {
-            picker.fuzzy_search_swap(&parsed_query, tracker, options, previous, next)
-        }
-        None => picker.fuzzy_search(&parsed_query, tracker, options),
+    let Some(storage) = buffers else {
+        let mut page = picker.fuzzy_search(&parsed_query, tracker, options);
+        return render_files(lua, picker, &parsed_query, &query, &mut page);
     };
+    let [mut previous, mut next] = std::mem::take(storage);
+    let page = picker.fuzzy_search_swap(&parsed_query, tracker, options, &mut previous, &mut next);
+    let rendered = render_files(lua, picker, &parsed_query, &query, page);
+    *storage = [previous.release_picker(), next.release_picker()];
+    rendered
+}
 
+fn render_files<'p>(
+    lua: &Lua,
+    picker: &'p FilePicker,
+    parsed_query: &FFFQuery<'_>,
+    query: &str,
+    results: &mut SearchResult<'p>,
+) -> LuaResult<LuaValue> {
     if results.items.is_empty() && query.contains(std::path::MAIN_SEPARATOR) {
         let pure_query = match &parsed_query.fuzzy_query {
             fff_query_parser::FuzzyQuery::Text(t) => t.trim(),
@@ -383,24 +394,17 @@ fn search_files(
 
         let path = expand_tilde(pure_query);
         if path.is_absolute() && path.is_file() {
-            if let Some(found_file) = picker.get_file_by_path(&path) {
-                let found = SearchResult {
-                    items: vec![found_file],
-                    scores: vec![Score {
-                        exact_match: true,
-                        match_type: "path",
-                        ..Default::default()
-                    }],
-                    match_byte_offsets: vec![Default::default()],
-                    total_matched: 1,
-                    total_files: results.total_files,
-                    location: parsed_query.location,
-                };
-
-                return lua_types::SearchResultLua::new(found, picker).into_lua(lua);
-            }
-
-            return build_file_path_fallback(lua, &path, results.total_files);
+            let Some(found_file) = picker.get_file_by_path(&path) else {
+                return build_file_path_fallback(lua, &path, results.total_files);
+            };
+            results.items.push(found_file);
+            results.scores.push(Score {
+                exact_match: true,
+                match_type: "path",
+                ..Default::default()
+            });
+            results.match_byte_offsets.push(Default::default());
+            results.total_matched = 1;
         }
     }
 
@@ -1169,29 +1173,32 @@ fn parse_grep_args(
 }
 
 fn new_picker_search(lua: &Lua, (grep, ttl_ms): (bool, Option<u64>)) -> LuaResult<LuaFunction> {
-    let mut buffers = std::array::from_fn(|_| match ttl_ms {
-        Some(ms) => SearchBuffer::with_ttl(Duration::from_millis(ms)),
-        None => SearchBuffer::default(),
-    });
-    lua.create_function_mut(move |lua, args: LuaMultiValue| {
-        let page = if grep {
-            grep_from_lua(lua, args, Some(&mut buffers))
-        } else {
+    if grep {
+        let mut buffers = new_buffers(ttl_ms);
+        lua.create_function_mut(move |lua, args| grep_from_lua(lua, args, Some(&mut buffers)))
+    } else {
+        let mut buffers = new_buffers(ttl_ms);
+        lua.create_function_mut(move |lua, args| {
             search_files(
                 lua,
                 FileSearchArgs::from_lua_multi(args, lua)?,
                 Some(&mut buffers),
             )
-        }?;
-        buffers.swap(0, 1);
-        Ok(page)
+        })
+    }
+}
+
+fn new_buffers<P: Default>(ttl_ms: Option<u64>) -> [SearchBuffer<P>; 2] {
+    std::array::from_fn(|_| match ttl_ms {
+        Some(ms) => SearchBuffer::with_ttl(Duration::from_millis(ms)),
+        None => SearchBuffer::default(),
     })
 }
 
 fn grep_from_lua(
     lua: &Lua,
     args: LuaMultiValue,
-    buffers: Option<&mut [SearchBuffer; 2]>,
+    buffers: Option<&mut [SearchBuffer<fff::GrepResult<'static>>; 2]>,
 ) -> LuaResult<LuaValue> {
     let classify_definitions = match args.get(11) {
         None | Some(LuaValue::Nil) => fff::DefinitionMode::Off,
@@ -1213,17 +1220,30 @@ fn live_grep_with_options(
     lua: &Lua,
     query: &str,
     options: &fff::GrepSearchOptions,
-    buffers: Option<&mut [SearchBuffer; 2]>,
+    buffers: Option<&mut [SearchBuffer<fff::GrepResult<'static>>; 2]>,
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
     let Some(ref picker) = *file_picker_guard else {
         return Err(error::to_lua_error(Error::FilePickerMissing));
     };
     let parsed_query = FFFQuery::parse(query, NvimGrepConfig);
-    let mut result = match buffers {
-        Some([previous, next]) => picker.grep_swap(&parsed_query, options, previous, next),
-        None => picker.grep(&parsed_query, options),
+    let Some(storage) = buffers else {
+        let mut page = picker.grep(&parsed_query, options);
+        return render_grep(lua, picker, options, &mut page);
     };
+    let [mut previous, mut next] = std::mem::take(storage);
+    let page = picker.grep_swap(&parsed_query, options, &mut previous, &mut next);
+    let rendered = render_grep(lua, picker, options, page);
+    *storage = [previous.release_picker(), next.release_picker()];
+    rendered
+}
+
+fn render_grep(
+    lua: &Lua,
+    picker: &FilePicker,
+    options: &fff::GrepSearchOptions,
+    result: &mut fff::GrepResult<'_>,
+) -> LuaResult<LuaValue> {
     if options.classify_definitions == fff::DefinitionMode::Classify {
         result.matches.sort_by_key(|m| !m.is_definition);
     }

@@ -32,9 +32,79 @@ pub struct SearchMetadata {
     pub grep_files_reused: usize,
 }
 
-/// Caller-owned storage for a search. Swap two buffers to reuse their allocations.
+/// Caller-owned result page and refinement state. The swap APIs leave the new page in previous.
 #[derive(Debug)]
-pub struct SearchBuffer {
+pub struct SearchBuffer<P> {
+    pub page: P,
+    pub(crate) state: SearchState,
+}
+
+impl<P: Default> Default for SearchBuffer<P> {
+    fn default() -> Self {
+        Self::with_ttl(Duration::from_secs(15))
+    }
+}
+
+impl<P: Default> SearchBuffer<P> {
+    /// Limit reuse from the original scan. The default is 15 seconds. Zero disables candidate reuse.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            page: P::default(),
+            state: SearchState {
+                ttl,
+                metadata: None,
+                index_revision: None,
+                files: Default::default(),
+                dirs: Vec::new(),
+                grep_misses: Vec::new(),
+                grep_insensitive: false,
+            },
+        }
+    }
+}
+
+impl<P> SearchBuffer<P> {
+    pub fn metadata(&self) -> Option<&SearchMetadata> {
+        self.state.metadata.as_ref()
+    }
+}
+
+impl SearchBuffer<crate::SearchResult<'_>> {
+    /// Release file references before unlocking the picker, retaining page capacity and refinement state.
+    pub fn release_picker(self) -> SearchBuffer<crate::SearchResult<'static>> {
+        let mut page = self.page;
+        page.scores.clear();
+        page.match_byte_offsets.clear();
+        SearchBuffer {
+            state: self.state,
+            page: crate::SearchResult {
+                items: empty_file_refs(page.items),
+                scores: page.scores,
+                match_byte_offsets: page.match_byte_offsets,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl SearchBuffer<crate::GrepResult<'_>> {
+    /// Release file references before unlocking the picker, retaining page capacity and refinement state.
+    pub fn release_picker(self) -> SearchBuffer<crate::GrepResult<'static>> {
+        let mut page = self.page;
+        page.matches.clear();
+        SearchBuffer {
+            state: self.state,
+            page: crate::GrepResult {
+                files: empty_file_refs(page.files),
+                matches: page.matches,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SearchState {
     metadata: Option<SearchMetadata>,
     ttl: Duration,
     pub(crate) index_revision: Option<u64>,
@@ -50,35 +120,11 @@ pub(crate) struct Candidates<'a, T> {
 }
 
 pub(crate) struct FuzzyBuffers<'a> {
-    previous: Option<&'a SearchBuffer>,
-    next: &'a mut SearchBuffer,
+    previous: Option<&'a SearchState>,
+    next: &'a mut SearchState,
 }
 
-impl Default for SearchBuffer {
-    fn default() -> Self {
-        Self::with_ttl(Duration::from_secs(15))
-    }
-}
-
-impl SearchBuffer {
-    /// Set the maximum age from the original scan. The default is 15 seconds. Zero disables reuse.
-    pub fn with_ttl(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            metadata: None,
-            index_revision: None,
-            files: Default::default(),
-            dirs: Vec::new(),
-            grep_misses: Vec::new(),
-            grep_insensitive: false,
-        }
-    }
-
-    /// The query last written to this buffer, if it has been used.
-    pub fn metadata(&self) -> Option<&SearchMetadata> {
-        self.metadata.as_ref()
-    }
-
+impl SearchState {
     pub(crate) fn record_grep(
         &mut self,
         pattern: &str,
@@ -193,7 +239,7 @@ impl SearchBuffer {
         mode: SearchMode,
     ) -> (&mut SearchMetadata, Option<&'a SearchMetadata>) {
         let now = Instant::now();
-        let old = previous.metadata().filter(|old| {
+        let old = previous.metadata.as_ref().filter(|old| {
             previous.index_revision == Some(revision)
                 && old.mode == mode
                 && now.duration_since(old.scanned_at) < self.ttl.min(previous.ttl)
@@ -274,4 +320,11 @@ fn grep_refines(old: &str, new: &str, mode: GrepMode) -> bool {
         }
         GrepMode::Fuzzy => new.is_ascii() && fuzzy_grep_max_typos(new) == fuzzy_grep_max_typos(old),
     }
+}
+
+fn empty_file_refs(mut files: Vec<&FileItem>) -> Vec<&'static FileItem> {
+    files.clear();
+    let (ptr, _, capacity) = files.into_raw_parts();
+    // SAFETY: there are no references left, and changing their lifetime preserves the allocation layout.
+    unsafe { Vec::from_raw_parts(ptr.cast(), 0, capacity) }
 }
