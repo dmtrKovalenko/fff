@@ -811,14 +811,14 @@ impl FileItem {
         base_path: &Path,
         budget: &ContentCacheBudget,
         base_dir: Option<&std::fs::File>,
-    ) -> Option<&'a [u8]> {
+    ) -> Option<(&'a [u8], Option<std::fs::File>)> {
         #[cfg(not(target_os = "windows"))]
         {
             // Fast path: persistent cache hit (zero-copy). Safe here because
             // grep callers hold the picker read lock for the lifetime of the
             // returned slice — see [`Self::get_cached_content`] safety note.
             if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
-                return Some(cached);
+                return Some((cached, None));
             }
         }
 
@@ -833,7 +833,7 @@ impl FileItem {
         if self.size >= FRESH_MMAP_THRESHOLD {
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
-            return Some(&stored[..]);
+            return Some((&stored[..], None));
         } else {
             let _ = (mmap_slot, arena);
         }
@@ -842,7 +842,7 @@ impl FileItem {
         buf.resize(len, 0);
 
         file.read_exact(buf).ok()?;
-        Some(buf.as_slice())
+        Some((buf.as_slice(), Some(file)))
     }
 
     fn open_for_search(
@@ -1151,7 +1151,7 @@ mod content_cache_budget_tests {
             for base_dir in [Some(&directory), None] {
                 let mut buf = Vec::new();
                 let mut mmap = MmapSlot::default();
-                let actual = file
+                let (actual, _) = file
                     .get_content_for_search(
                         &mut buf,
                         &mut mmap,

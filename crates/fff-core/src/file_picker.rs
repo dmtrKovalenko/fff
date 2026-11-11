@@ -35,7 +35,8 @@ use crate::frecency::{FrecencyReader, FrecencyTracker};
 use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{
-    GrepMode, GrepResult, GrepSearchOptions, fuzzy_grep_max_typos, grep_search, multi_grep_search,
+    GrepMode, GrepResult, GrepReuse, GrepSearchOptions, extract_grep_text, fuzzy_grep_max_typos,
+    grep_search, multi_grep_search,
 };
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
@@ -1663,19 +1664,33 @@ impl FilePicker {
     /// If `options.abort_signal` is set it overrides the picker's internal
     /// cancellation flag, giving the caller full control over when to stop.
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
-        self.grep_with_pattern(query, options).0
+        self.grep_with_pattern(query, options, extract_grep_text(query), None)
+            .0
     }
 
-    /// Search indexed file contents and write query metadata into `next`.
-    /// Each call searches current files, including rows beyond a previous page.
+    /// Reuse files ruled out by a compatible grep and record the next page’s search metadata.
+    /// Partial pages leave unsearched files eligible for the next call.
     pub fn grep_swap(
         &self,
         query: &FFFQuery<'_>,
         options: &GrepSearchOptions,
-        _previous: &SearchBuffer,
+        previous: &SearchBuffer,
         next: &mut SearchBuffer,
     ) -> GrepResult<'_> {
-        let (result, pattern) = self.grep_with_pattern(query, options);
+        let pattern = extract_grep_text(query);
+        let reuse = next.begin_grep(
+            previous,
+            self.index_revision,
+            self.get_files(),
+            &pattern,
+            options,
+        );
+        let (result, pattern) = self.grep_with_pattern(query, options, pattern, Some(&reuse));
+        let skipped = if result.literal_fallback {
+            0
+        } else {
+            reuse.files_skipped()
+        };
         let mode = if result.regex_fallback_error.is_some() {
             GrepMode::PlainText
         } else {
@@ -1683,7 +1698,10 @@ impl FilePicker {
         };
         let max_typos = (mode == GrepMode::Fuzzy && !pattern.is_empty())
             .then(|| fuzzy_grep_max_typos(&pattern));
-        next.record_grep(query.raw_query, &pattern, mode, max_typos);
+        next.record_grep(query.raw_query, &pattern, mode, max_typos, skipped);
+        if !result.literal_fallback && mode == options.mode {
+            next.index_revision = Some(self.index_revision);
+        }
         result
     }
 
@@ -1691,6 +1709,8 @@ impl FilePicker {
         &self,
         query: &FFFQuery<'_>,
         options: &GrepSearchOptions,
+        pattern: String,
+        reuse: Option<&GrepReuse<'_>>,
     ) -> (GrepResult<'_>, String) {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
@@ -1705,7 +1725,9 @@ impl FilePicker {
                 self.get_files(),
                 self.live_file_count(),
                 query,
+                pattern,
                 options,
+                reuse,
                 self.cache_budget(),
                 self.sync_data.bigram_index.as_deref(),
                 overlay_guard.as_deref(),

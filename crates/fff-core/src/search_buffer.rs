@@ -1,5 +1,8 @@
-use crate::GrepMode;
+use crate::grep::{GrepReuse, fuzzy_grep_max_typos};
+use crate::types::FileItem;
+use crate::{GrepMode, GrepSearchOptions};
 use fff_query_parser::{FFFQuery, FuzzyQuery};
+use std::sync::atomic::AtomicU64;
 
 /// The search engine that produced a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +25,8 @@ pub struct SearchMetadata {
     pub mode: SearchMode,
     /// Typo budget for fuzzy matching. Match positions are on the result page.
     pub max_typos: Option<u16>,
+    /// Files skipped because the previous grep ruled out their current contents.
+    pub grep_files_reused: usize,
 }
 
 /// Caller-owned storage for a search. Swap two buffers to reuse their allocations.
@@ -31,6 +36,8 @@ pub struct SearchBuffer {
     pub(crate) index_revision: Option<u64>,
     files: [Vec<u32>; 2],
     dirs: Vec<u32>,
+    grep_misses: Vec<AtomicU64>,
+    grep_insensitive: bool,
 }
 
 pub(crate) struct Candidates<'a, T> {
@@ -55,10 +62,41 @@ impl SearchBuffer {
         pattern: &str,
         mode: GrepMode,
         max_typos: Option<u16>,
+        reused: usize,
     ) {
         let metadata = self.reset(raw_query, SearchMode::Grep(mode));
         metadata.effective_pattern.push_str(pattern);
         metadata.max_typos = max_typos;
+        metadata.grep_files_reused = reused;
+    }
+
+    pub(crate) fn begin_grep<'a>(
+        &'a mut self,
+        previous: &'a Self,
+        revision: u64,
+        files: &'a [FileItem],
+        pattern: &str,
+        options: &GrepSearchOptions,
+    ) -> GrepReuse<'a> {
+        let insensitive = options.effective_casing().is_insensitive_for(pattern);
+        let reuse = previous.index_revision == Some(revision)
+            && previous.grep_insensitive == insensitive
+            && previous.metadata().is_some_and(|old| {
+                old.mode == SearchMode::Grep(options.mode)
+                    && !old.effective_pattern.is_empty()
+                    && grep_refines(&old.effective_pattern, pattern, options.mode)
+            });
+        self.grep_misses.clear();
+        if !pattern.is_empty() {
+            self.grep_misses
+                .resize_with(files.len(), AtomicU64::default);
+        }
+        self.grep_insensitive = insensitive;
+        GrepReuse::new(
+            files,
+            if reuse { &previous.grep_misses } else { &[] },
+            &self.grep_misses,
+        )
     }
 
     pub(crate) fn begin_fuzzy<'a>(
@@ -117,12 +155,14 @@ impl SearchBuffer {
             effective_pattern: String::new(),
             mode,
             max_typos: None,
+            grep_files_reused: 0,
         });
         metadata.raw_query.clear();
         metadata.raw_query.push_str(raw_query);
         metadata.effective_pattern.clear();
         metadata.mode = mode;
         metadata.max_typos = None;
+        metadata.grep_files_reused = 0;
         metadata
     }
 }
@@ -158,4 +198,27 @@ pub(crate) fn dirs_only(query: &FFFQuery<'_>) -> bool {
 
 fn has_uppercase(text: &str) -> bool {
     text.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+fn grep_refines(old: &str, new: &str, mode: GrepMode) -> bool {
+    if new == old {
+        return true;
+    }
+    let Some(suffix) = new.strip_prefix(old) else {
+        return false;
+    };
+    match mode {
+        GrepMode::PlainText => !old.ends_with('\\'),
+        GrepMode::Regex => {
+            // A word appended to a line-local expression can only narrow its matches.
+            !old.contains("(?")
+                && old
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.+*?|()[]-".contains(&b))
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+        GrepMode::Fuzzy => new.is_ascii() && fuzzy_grep_max_typos(new) == fuzzy_grep_max_typos(old),
+    }
 }

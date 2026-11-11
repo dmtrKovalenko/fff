@@ -160,6 +160,7 @@ pub(crate) fn multi_grep_search<'a>(
         &mut files_to_search,
         options,
         &GrepContext {
+            reuse: None,
             total_files,
             filtered_file_count,
             budget,
@@ -169,7 +170,7 @@ pub(crate) fn multi_grep_search<'a>(
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
         },
-        |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
+        |file: &FileItem, file_bytes: &[u8], max_matches: usize, _| {
             let state = SinkState {
                 file,
                 definition_mode: options.classify_definitions,

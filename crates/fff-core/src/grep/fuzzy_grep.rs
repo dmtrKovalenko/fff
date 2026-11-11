@@ -14,6 +14,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     grep_text: &str,
     files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
+    reuse: Option<&super::GrepReuse<'_>>,
     total_files: usize,
     filtered_file_count: usize,
     case_insensitive: bool,
@@ -173,7 +174,9 @@ pub(super) fn fuzzy_grep_search<'a>(
                         arena
                     };
 
-                    let file_bytes = file.get_content_for_search(
+                    let (file_bytes, miss) = super::reuse::read_candidate(
+                        reuse,
+                        file,
                         buf,
                         mmap_slot,
                         file_arena,
@@ -193,6 +196,9 @@ pub(super) fn fuzzy_grep_search<'a>(
                             }
                         }
                         if chars_found < min_chars_required {
+                            if let Some(miss) = miss {
+                                miss.record();
+                            }
                             return None;
                         }
                     }
@@ -235,6 +241,12 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                     // Single-pass: score + indices in one Smith-Waterman run per line (not parallel)
                     let matches_with_indices = matcher.match_list_indices(&file_lines);
+                    // Only the raw subsequence test stays monotone as the query grows.
+                    if matches_with_indices.is_empty()
+                        && let Some(miss) = miss
+                    {
+                        miss.record();
+                    }
                     let mut file_matches: Vec<GrepMatch> = Vec::new();
 
                     for mut match_indices in matches_with_indices {

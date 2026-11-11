@@ -12,6 +12,8 @@ mod fuzzy_grep;
 mod multi_pattern;
 mod prefilter;
 mod regex;
+mod reuse;
+pub(crate) use reuse::GrepReuse;
 mod sink;
 mod types;
 

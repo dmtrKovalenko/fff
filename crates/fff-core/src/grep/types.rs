@@ -41,7 +41,7 @@ pub enum GrepMode {
 }
 
 /// A single content match within a file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepMatch {
     /// Index into the deduplicated `files` vec of the GrepResult.
     pub file_index: usize,

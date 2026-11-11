@@ -1,3 +1,4 @@
+use super::GrepReuse;
 use super::prefilter::prefilter_with_filepath_retry;
 use super::regex::{RegexMatcher, RegexSink, build_regex};
 use super::sink::{SinkState, debug_assert_newline_terminator, strip_line_terminators};
@@ -197,7 +198,9 @@ pub(crate) fn grep_search<'a>(
     files: &'a [FileItem],
     total_files: usize,
     query: &FFFQuery<'_>,
+    grep_text: String,
     options: &GrepSearchOptions,
+    reuse: Option<&GrepReuse<'_>>,
     budget: &ContentCacheBudget,
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
@@ -210,7 +213,9 @@ pub(crate) fn grep_search<'a>(
         files,
         total_files,
         query,
+        grep_text,
         options,
+        reuse,
         budget,
         bigram_index,
         bigram_overlay,
@@ -246,7 +251,9 @@ pub(crate) fn grep_search<'a>(
             files,
             total_files,
             query,
+            pattern.clone(),
             &probe,
+            None,
             budget,
             bigram_index,
             bigram_overlay,
@@ -286,7 +293,9 @@ pub(crate) fn grep_search<'a>(
         files,
         total_files,
         &literal_query,
+        extract_grep_text(&literal_query),
         options,
+        None,
         budget,
         bigram_index,
         bigram_overlay,
@@ -309,7 +318,9 @@ fn grep_search_parsed<'a>(
     files: &'a [FileItem],
     total_files: usize,
     query: &FFFQuery<'_>,
+    grep_text: String,
     options: &GrepSearchOptions,
+    reuse: Option<&GrepReuse<'_>>,
     budget: &ContentCacheBudget,
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
@@ -320,7 +331,6 @@ fn grep_search_parsed<'a>(
 ) -> (GrepResult<'a>, String) {
     let constraints_from_query = &query.constraints[..];
 
-    let grep_text = extract_grep_text(query);
     if grep_text.is_empty() {
         return (GrepResult::empty(total_files, total_files), grep_text);
     }
@@ -357,6 +367,7 @@ fn grep_search_parsed<'a>(
                 &grep_text,
                 &mut files_to_search,
                 options,
+                reuse,
                 total_files,
                 filtered_file_count,
                 case_insensitive,
@@ -444,6 +455,7 @@ fn grep_search_parsed<'a>(
         &mut files_to_search,
         options,
         &GrepContext {
+            reuse,
             total_files,
             filtered_file_count,
             budget,
@@ -455,7 +467,7 @@ fn grep_search_parsed<'a>(
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
-        |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
+        |file: &FileItem, file_bytes: &[u8], max_matches: usize, miss| {
             let state = SinkState {
                 file,
                 definition_mode: options.classify_definitions,
@@ -472,9 +484,17 @@ fn grep_search_parsed<'a>(
                         regex: re,
                         is_multiline,
                     };
-                    let mut sink = RegexSink { state, re };
+                    let mut sink = RegexSink {
+                        state,
+                        re,
+                        saw_match: false,
+                    };
                     if let Err(e) = searcher.search_slice(&regex_matcher, file_bytes, &mut sink) {
                         tracing::error!(error = %e, "Grep (regex) search failed");
+                    } else if !sink.saw_match
+                        && let Some(miss) = miss
+                    {
+                        miss.record();
                     }
                     sink.state.matches
                 }
@@ -545,7 +565,7 @@ pub fn parse_grep_query(query: &str) -> FFFQuery<'_> {
 /// Extract the grep pattern text from the parsed query: all non-constraint
 /// tokens joined with spaces, e.g. `"name = *.rs someth"` -> `"name = someth"`
 /// with constraint `Extension("rs")`.
-fn extract_grep_text(query: &FFFQuery<'_>) -> String {
+pub(crate) fn extract_grep_text(query: &FFFQuery<'_>) -> String {
     if !matches!(query.fuzzy_query, fff_query_parser::FuzzyQuery::Empty) {
         return query.grep_text();
     }
@@ -564,6 +584,7 @@ fn extract_grep_text(query: &FFFQuery<'_>) -> String {
 
 #[derive(Clone, Copy)]
 pub(super) struct GrepContext<'a, 'b> {
+    pub(super) reuse: Option<&'a GrepReuse<'a>>,
     pub(super) total_files: usize,
     pub(super) filtered_file_count: usize,
     pub(super) budget: &'a ContentCacheBudget,
@@ -597,7 +618,7 @@ pub(super) fn perform_grep<'a, F>(
     search_file: F,
 ) -> GrepResult<'a>
 where
-    F: Fn(&FileItem, &[u8], usize) -> Vec<GrepMatch> + Sync,
+    F: Fn(&FileItem, &[u8], usize, Option<&super::reuse::GrepMiss<'_>>) -> Vec<GrepMatch> + Sync,
 {
     let time_budget = if options.time_budget_ms > 0 {
         Some(std::time::Duration::from_millis(options.time_budget_ms))
@@ -664,7 +685,9 @@ where
                         return None;
                     }
 
-                    let content = file.get_content_for_search(
+                    let (content, miss) = super::reuse::read_candidate(
+                        ctx.reuse,
+                        file,
                         buf,
                         mmap_slot,
                         ctx.arena_for_file(file),
@@ -679,10 +702,14 @@ where
                     if let Some(pf) = ctx.prefilter
                         && pf.find(content).is_none()
                     {
+                        if let Some(miss) = miss {
+                            miss.record();
+                        }
                         return None;
                     }
 
-                    let file_matches = search_file(file, content, options.max_matches_per_file);
+                    let file_matches =
+                        search_file(file, content, options.max_matches_per_file, miss.as_ref());
 
                     if file_matches.is_empty() {
                         return None;
