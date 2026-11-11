@@ -39,7 +39,7 @@
 
         # zlob requires Zig >= 0.16, but nixpkgs tops out at 0.15. Pull from
         # mitchellh/zig-overlay which ships every released version.
-        zig = zig-overlay.packages.${system}."0.16.0";
+        zig = zig-overlay.packages.${system}."0.17.1";
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
@@ -53,7 +53,15 @@
         commonArgs = {
           pname = cargoToml.package.name;
           version = cargoToml.package.version;
-          src = craneLib.cleanCargoSource ./.;
+          # Cargo sources plus the MCP instructions that fff-mcp embeds with include_str!.
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            name = "source";
+            filter =
+              path: type:
+              pkgs.lib.hasSuffix "/crates/fff-mcp/src/instructions.md" path
+              || craneLib.filterCargoSources path type;
+          };
           strictDeps = true;
 
           nativeBuildInputs = [ pkgs.pkg-config pkgs.perl zig pkgs.llvmPackages.libclang.lib ];

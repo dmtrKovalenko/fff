@@ -151,6 +151,9 @@ local function restore_from_state(state, source_label)
 
   M.state.active = true
   M.state.current_file_cache = state.current_file_cache
+  file_picker.resume_git_status()
+  -- checked before searching: a refresh finishing after the search must trigger a rerun
+  local git_status_refreshing = file_picker.is_git_status_refreshing()
 
   -- Restore the full picker state
   M.state.query = state.query
@@ -196,6 +199,7 @@ local function restore_from_state(state, source_label)
     end
   end)
 
+  if git_status_refreshing then M.monitor_git_status_refresh() end
   return true
 end
 
@@ -647,6 +651,7 @@ local function open_ui_with_state(query, results, location, merged_config, curre
 
   M.state.active = true
   M.state.current_file_cache = current_file_cache
+  file_picker.resume_git_status()
 
   -- Set up initial state
   if query then
@@ -786,8 +791,32 @@ function M.monitor_scan_progress(iteration)
 
     vim.defer_fn(function() M.monitor_scan_progress(iteration + 1) end, timeout)
   else
+    local git_status_refreshing = file_picker.is_git_status_refreshing()
     M.update_results()
+    if git_status_refreshing then M.monitor_git_status_refresh() end
   end
+end
+
+local git_refresh_monitor_id = 0
+
+--- Rerun the query once the pending git status refresh (queued on open) has been applied
+function M.monitor_git_status_refresh()
+  git_refresh_monitor_id = git_refresh_monitor_id + 1
+  local monitor_id = git_refresh_monitor_id
+
+  local function poll(iteration)
+    if not M.state.active or monitor_id ~= git_refresh_monitor_id then return end
+
+    if file_picker.is_git_status_refreshing() then
+      vim.defer_fn(function() poll(iteration + 1) end, iteration < 20 and 50 or 250)
+    else
+      M.state.pending_restore_cursor = M.state.cursor
+      M.update_results()
+    end
+  end
+
+  -- scheduled so a search the caller queued (e.g. via on_lines) runs first
+  vim.schedule(function() poll(0) end)
 end
 
 return M

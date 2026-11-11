@@ -1,0 +1,167 @@
+name: Publish FFF performance
+
+on:
+  workflow_call:
+    inputs:
+      report_artifact_id:
+        required: true
+        type: string
+  workflow_run:
+    workflows: [FFF performance]
+    types: [completed]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'dmtrKovalenko/fff' &&
+      (github.event_name == 'pull_request' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.path == '.github/workflows/performance.yml' &&
+        github.event.workflow_run.conclusion != 'cancelled' &&
+        (github.event.workflow_run.head_repository.id != github.event.repository.id ||
+         github.event.workflow_run.actor.login == 'dependabot[bot]')))
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BENCH_RUN: ${{ github.event.workflow_run.id || github.run_id }}
+      BENCH_ATTEMPT: ${{ github.event.workflow_run.run_attempt || github.run_attempt }}
+    steps:
+      - name: Find the PR report
+        id: report
+        env:
+          ARTIFACT_ID: ${{ inputs.report_artifact_id }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            ARTIFACT_ID=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/runs/$BENCH_RUN/artifacts" \
+              -f name="fff-performance-report-$BENCH_ATTEMPT" --jq '.artifacts[] | select(.expired == false) | .id')
+          fi
+          if [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            printf 'id=%s\n' "$ARTIFACT_ID" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Download the PR report
+        if: steps.report.outputs.id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BENCH_RUN }}
+          artifact-ids: ${{ steps.report.outputs.id }}
+          path: ${{ runner.temp }}/fff-perf
+      - name: Verify the PR revision is current
+        id: pr
+        if: steps.report.outputs.id != ''
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
+          SOURCE_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          SOURCE_REPO: ${{ github.event.workflow_run.head_repository.id || github.event.pull_request.head.repo.id }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch || github.event.pull_request.head.ref }}
+        run: |
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_REPO" =~ ^[0-9]+$ ]] || exit 0
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            if [[ -r "$RUNNER_TEMP/fff-perf/pr-number" ]]; then
+              PR_NUMBER=$(<"$RUNNER_TEMP/fff-perf/pr-number")
+            else
+              PR_NUMBER=$(gh api --paginate --slurp --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+                -f state=open -f head="$SOURCE_OWNER:$SOURCE_BRANCH" |
+                jq -r --argjson repo "$SOURCE_REPO" --arg sha "$HEAD_SHA" '
+                  [.[][] | select(.head.repo.id == $repo and .head.sha == $sha) | .number]
+                  | select(length == 1) | .[0]
+                ')
+            fi
+          fi
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || exit 0
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" |
+            jq -r --argjson repo "$SOURCE_REPO" --arg branch "$SOURCE_BRANCH" '
+              select(.state == "open" and .head.repo.id == $repo and .head.ref == $branch) | .head.sha
+            ')
+          [[ "$actual" == "$HEAD_SHA" ]] || exit 0
+          printf 'number=%s\nhead_sha=%s\n' "$PR_NUMBER" "$HEAD_SHA" >>"$GITHUB_OUTPUT"
+      - name: Publish timings
+        if: steps.pr.outputs.number != ''
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ env.BENCH_RUN }}
+        run: |
+          PERF_DIR="$RUNNER_TEMP/fff-perf"
+          kind=$(<"$PERF_DIR/kind")
+          base=$(<"$PERF_DIR/base-sha")
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+
+          state=success
+          report="$RUNNER_TEMP/fff-timings.md"
+          if [[ "$kind" == skip ]]; then
+            message='Skipped, no core Rust or dependency changes'
+            echo "$message" >"$report"
+          else
+            [[ "$kind" == pr ]]
+            chart_url=''
+            code=2
+            if [[ -s "$PERF_DIR/base.bench" && -s "$PERF_DIR/head.bench" ]]; then
+              if [[ -f "$PERF_DIR/chart.png" && "$(file -b --mime-type "$PERF_DIR/chart.png")" == image/png ]]; then
+                chart="$RUNNER_TEMP/pr-$PR_NUMBER.png"
+                mv "$PERF_DIR/chart.png" "$chart"
+                if { gh release view perf-charts -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+                     gh release create perf-charts -R "$GITHUB_REPOSITORY" --prerelease --latest=false --target main \
+                       --title 'Performance charts' --notes 'Charts shown in the FFF performance PR comments.' ||
+                     gh release view perf-charts -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; } &&
+                   gh release upload perf-charts "$chart" -R "$GITHUB_REPOSITORY" --clobber; then
+                  chart_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/perf-charts/pr-$PR_NUMBER.png?run=$BENCH_RUN-$BENCH_ATTEMPT"
+                else
+                  echo '::warning::Could not upload the performance chart'
+                fi
+              fi
+              script="$RUNNER_TEMP/report.sh" code=0
+              curl -fsSL "https://raw.githubusercontent.com/dmtrKovalenko/fff/$GITHUB_SHA/perf/report.sh" -o "$script" &&
+                bash "$script" "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" "$chart_url" >"$report" || code=$?
+            fi
+            case "$code" in
+              0) icon=✅ message='FFF core performance passed' ;;
+              1) state=failure icon=🔴 message='FFF core performance comparison failed' ;;
+              *)
+                state=error message='FFF core measurement could not complete'
+                if [[ -r "$PERF_DIR/failure-stage" ]]; then
+                  case $(<"$PERF_DIR/failure-stage") in
+                    build) message='FFF core benchmark build failed' ;;
+                    measure) message='FFF core benchmark measurement failed' ;;
+                  esac
+                fi
+                echo "$message" >"$report"
+                ;;
+            esac
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" -f context='FFF performance' \
+            -f state="$state" -f description="$message" -f target_url="$RUN_URL" >/dev/null
+          if [[ "$kind" == pr && "$state" != error ]]; then
+            marker='<!-- fff-core-performance -->'
+            comment="$RUNNER_TEMP/fff-pr-comment.md"
+            {
+              printf '%s\n## 🥼 FFF core performance\n\n%s **%s**\n\n' "$marker" "$icon" "$message"
+              printf 'Base %s, PR %s\n\n' "$base" "$HEAD_SHA"
+              cat "$report"
+              printf '\n🔗 [Workflow run](%s)\n' "$RUN_URL"
+            } >"$comment"
+            comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- fff-core-performance -->"))) | .id' |
+              tail -n 1)
+            if [[ -n "$comment_id" ]]; then
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" \
+                --field "body=@$comment" >/dev/null
+            else
+              gh pr comment "$PR_NUMBER" -R "$GITHUB_REPOSITORY" --body-file "$comment"
+            fi
+          fi
+          cat "$report" >>"$GITHUB_STEP_SUMMARY"
+          [[ "$state" == success ]]

@@ -61,7 +61,7 @@ ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]
 mimalloc-collect = ["dep:libmimalloc-sys"]
 # Use zlob (Zig-compiled C globbing library) for glob matching.
 # Requires Zig to be installed. When disabled, falls back to globset (pure Rust).
-zlob = ["dep:zlob", "fff-query-parser/zlob"]
+zlob = ["dep:zlob", "dep:globset", "fff-query-parser/zlob"]
 
 [dependencies]
 ahash = { workspace = true }

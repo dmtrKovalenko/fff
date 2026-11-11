@@ -165,6 +165,7 @@ mod sort_buffer;
 
 pub(crate) mod index;
 pub(crate) mod parallelism;
+pub use parallelism::set_full_parallel_indexing;
 pub(crate) mod simd_path;
 pub(crate) mod stable_vec;
 pub(crate) mod walk;

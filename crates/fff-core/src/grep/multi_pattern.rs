@@ -126,7 +126,7 @@ pub(crate) fn multi_grep_search<'a>(
     let base_file_count = bigram_boundary(bigram_overlay, files.len());
 
     // Constraints are separate from patterns, so a miss must not broaden the search.
-    let (files_to_search, filtered_file_count) = prefilter_files(
+    let (mut files_to_search, filtered_file_count) = prefilter_files(
         files,
         constraints,
         bigram_candidates.as_deref(),
@@ -157,7 +157,7 @@ pub(crate) fn multi_grep_search<'a>(
 
     let ac_matcher = AhoCorasickMatcher { ac: &ac };
     perform_grep(
-        &files_to_search,
+        &mut files_to_search,
         options,
         &GrepContext {
             total_files,

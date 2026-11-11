@@ -241,6 +241,12 @@ function M.run(opts)
             rust_health.file_picker.base_path or 'unknown'
           ),
         })
+        if rust_health.file_picker.shared_base_path then
+          table.insert(health.messages, {
+            level = 'ok',
+            msg = 'Linked git worktree, sharing history with ' .. rust_health.file_picker.shared_base_path,
+          })
+        end
       else
         table.insert(health.messages, {
           level = 'info',

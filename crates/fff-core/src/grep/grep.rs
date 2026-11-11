@@ -336,7 +336,7 @@ fn grep_search_parsed<'a>(
         GrepMode::Fuzzy => {
             let bigram_candidates = fuzzy_candidates(bigram_index, bigram_overlay, &grep_text);
 
-            let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+            let (mut files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
                 files,
                 constraints_from_query,
                 bigram_candidates.as_deref(),
@@ -352,7 +352,7 @@ fn grep_search_parsed<'a>(
 
             return super::fuzzy_grep::fuzzy_grep_search(
                 &grep_text,
-                &files_to_search,
+                &mut files_to_search,
                 options,
                 total_files,
                 filtered_file_count,
@@ -403,7 +403,7 @@ fn grep_search_parsed<'a>(
         regex_candidates(bigram_index, bigram_overlay, &effective_pattern)
     };
 
-    let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+    let (mut files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
         files,
         constraints_from_query,
         bigram_candidates.as_deref(),
@@ -433,7 +433,7 @@ fn grep_search_parsed<'a>(
 
     let should_prefilter = regex.is_none();
     let mut result = perform_grep(
-        &files_to_search,
+        &mut files_to_search,
         options,
         &GrepContext {
             total_files,
@@ -583,7 +583,7 @@ impl GrepContext<'_, '_> {
     fields(prefiltered_count = files_to_search.len())
 )]
 pub(super) fn perform_grep<'a, F>(
-    files_to_search: &[&'a FileItem],
+    files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
     ctx: &GrepContext<'_, '_>,
     search_file: F,
@@ -627,7 +627,7 @@ where
 
     while chunk_start < files_to_search.len() {
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
-        let chunk = &files_to_search[chunk_start..chunk_end];
+        let chunk = files_to_search.batch(chunk_start..chunk_end);
         chunk_start = chunk_end;
         let chunk_offset = files_consumed;
 

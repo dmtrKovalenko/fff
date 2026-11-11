@@ -9,7 +9,7 @@ local child, fixture
 
 local function setup(geometry, opts)
   opts = opts or {}
-  fixture = fixture_lib.create()
+  fixture = fixture_lib.create(opts.extra_files)
   child = MiniTest.new_child_neovim()
   child.start({
     '--clean',
@@ -298,6 +298,47 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
       vim.loop.sleep(20)
     end
     vim.loop.sleep(400)
+    assert_snapshot_match()
+  end
+end
+
+T['grep_classify'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      setup({ cols = 140, rows = 32 }, {
+        extra_files = { ['src/app.rs'] = 'fn start() {\n    helper();\n    helper();\n}\n' },
+      })
+    end,
+    post_case = teardown,
+  },
+})
+
+local function open_grep(prompt_position, query)
+  child.lua(
+    string.format(
+      'require("fff").live_grep({ query = %q, layout = { prompt_position = %q }, grep = { classify_definitions = true } })',
+      query,
+      prompt_position
+    )
+  )
+  vim.loop.sleep(600)
+end
+
+-- Definitions and usages share one page, so the divider and per-section headers must
+-- render in both orders and the cursor must cross the divider like any other row.
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['grep_classify']['mixed_page_' .. prompt] = function()
+    open_grep(prompt, 'helper')
+    assert_snapshot_match()
+  end
+
+  T['grep_classify']['cursor_crosses_divider_' .. prompt] = function()
+    open_grep(prompt, 'helper')
+    for _ = 1, 2 do
+      child.type_keys(SCROLL_KEY[prompt])
+      vim.loop.sleep(50)
+    end
+    vim.loop.sleep(300)
     assert_snapshot_match()
   end
 end

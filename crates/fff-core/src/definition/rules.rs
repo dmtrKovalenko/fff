@@ -30,7 +30,9 @@ macro_rules! declaration {
                         start < end && start as usize >= name.start && end as usize <= name.end
                     });
                 }
-                ranges.iter().any(|&(start, end)| (start as usize) < name.end && (end as usize) > name.start)
+                ranges.iter().any(|&(start, end)| {
+                    start < end && (start as usize) < name.end && (end as usize) > name.start
+                })
             }
 
             fn declaration(&mut self) -> Option<std::ops::Range<usize>> {
@@ -101,7 +103,7 @@ macro_rules! action {
         let $name = $p.identifier()?;
         if matches!(
             &$p.line[$name.clone()],
-            b"fn" | b"unsafe" | b"async" | b"extern"
+            b"fn" | b"unsafe" | b"async" | b"extern" | b"trait"
         ) {
             $p.pos = $name.start;
         } else {
@@ -176,6 +178,20 @@ macro_rules! action {
         return Some($name);
     }};
     (Typedef, $p:ident, $name:ident, $modifiers:ident) => {{ return $p.typedef_name() }};
+    (Alias, $p:ident, $name:ident, $modifiers:ident) => {{
+        // `export * as Name from "module"` binds Name; anything else is an ordinary `as`.
+        let start = $p.pos;
+        if $modifiers
+            && let Some(alias) = $p.identifier()
+            && $p
+                .identifier()
+                .is_some_and(|from| &$p.line[from] == b"from")
+        {
+            return Some(alias);
+        }
+        $p.pos = start;
+        return $p.fallback($name, $modifiers);
+    }};
 }
 
 macro_rules! declaration_prefix {

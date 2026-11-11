@@ -135,7 +135,8 @@ test-c-api: test-c-smoke
 # so check the stdout in case the sigsegv coming out of fff was printed (actual regression).
 # Output is streamed live via `tee`; pipefail (set above) propagates nvim's exit.
 test-lua: test-setup build-e2e
-	@logfile=$$(mktemp); \
+	@set -e -o pipefail; \
+	logfile=$$(mktemp); \
 	trap 'rm -f "$$logfile"' EXIT; \
 	nvim --headless -u tests/minimal_init.lua \
 		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1 \
@@ -147,7 +148,8 @@ test-lua: test-setup build-e2e
 	fi
 
 test-lua-snap: test-setup build-e2e
-	@logfile=$$(mktemp); \
+	@set -e -o pipefail; \
+	logfile=$$(mktemp); \
 	trap 'rm -f "$$logfile"' EXIT; \
 	nvim --headless -u tests/minimal_init.lua \
 		-c "lua local ok,err=pcall(require('mini.test').run_file,'tests/picker_ui_snap.lua'); if not ok then io.stderr:write('mini.test failed to load: '..tostring(err)..'\\n'); vim.cmd('cquit 2') end" 2>&1 \

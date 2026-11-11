@@ -11,7 +11,7 @@ use notify::event::{
 use notify_debouncer_full::DebouncedEvent;
 use tempfile::TempDir;
 
-use super::handle_debounced_events;
+use super::{WatcherOptions, handle_debounced_events};
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
 use crate::frecency::FrecencyTracker;
@@ -777,7 +777,7 @@ impl Fixture {
     fn feed(&self, events: impl IntoIterator<Item = DebouncedEvent>) -> RescanStats {
         let before = self.picker.rescan_stats();
         handle_debounced_events(
-            FFFMode::Neovim,
+            &WatcherOptions::default(),
             events.into_iter().collect(),
             &self.base,
             &self.git_workdir,

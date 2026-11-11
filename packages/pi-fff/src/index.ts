@@ -5,7 +5,6 @@
  * @-mention autocomplete suggestions to the interactive editor.
  */
 
-import nodePath from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -53,6 +52,7 @@ const MENTION_MAX_RESULTS = 20;
 
 // If we exceed 10 seconds for indexed grep - something is definitely off
 const GREP_TIME_BUDGET_MS = 10_000;
+const FUZZY_STAGE_BUDGET_MS = 2_000;
 
 const HOME_SCAN_STATUS_KEY = "fff";
 const HOME_SCAN_POLL_MS = 1_000;
@@ -89,13 +89,21 @@ function toolNameList(names: ToolNames): string[] {
 // Cursor store — simple bounded Map for pagination cursors
 // ---------------------------------------------------------------------------
 
+type GrepStage =
+  | "normal"
+  | "definitions"
+  | "references"
+  | "fuzzy_definitions"
+  | "fuzzy_matches";
+
 interface ToolGrepCursor {
   cursor: GrepCursor;
   finder: FileFinderApi;
-  definitionsOnly: boolean;
-  foundDefinitions: boolean;
+  stage: GrepStage;
+  foundMatches: boolean;
   mode?: GrepMode;
   query?: string;
+  suggestion?: { query: string; pattern: string; mode: GrepMode };
 }
 
 const cursorCache = new Map<string, ToolGrepCursor>();
@@ -555,7 +563,6 @@ export default function fffExtension(pi: ExtensionAPI) {
   }
 
   function destroyFinder() {
-    stopHomeScanStatus();
     if (mainFinder && !mainFinder.isDestroyed) {
       mainFinder.destroy();
       mainFinder = null;
@@ -565,6 +572,8 @@ export default function fffExtension(pi: ExtensionAPI) {
     auxPool?.destroy();
     auxPool = null;
     pickers = null;
+    // UI teardown last: a throwing ctx must not leak the native finders (#948).
+    stopHomeScanStatus();
   }
 
   async function resolveFinderForPath(
@@ -575,12 +584,9 @@ export default function fffExtension(pi: ExtensionAPI) {
     const route = routePathConstraint(pathParam, activeCwd);
     if (!route) return null;
     if (!auxPool) throw new Error("FFF auxiliary finder pool is not initialized");
-    const aux = await auxPool.acquire(route.root);
-    // A broader covering picker may have been reused; rebase the suffix so the
-    // constraint stays relative to the picker's actual root.
-    const rebase = nodePath.relative(aux.root, route.root).replaceAll(nodePath.sep, "/");
-    const suffix = [rebase, route.suffix].filter(Boolean).join("/");
-    const query = buildQuery(suffix || undefined, pattern, exclude, aux.root);
+    // Exact root: a broader cached finder may have excluded the target subtree (#711).
+    const aux = await auxPool.acquire(route.root, { exact: true });
+    const query = buildQuery(route.suffix || undefined, pattern, exclude, aux.root);
     return { finder: aux.finder, query, root: aux.root };
   }
 
@@ -863,8 +869,11 @@ export default function fffExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", async () => {
+  // A ctx captured from a replaced session is stale and throws on access (#948).
+  pi.on("session_shutdown", async (_event, ctx) => {
+    uiCtx = ctx;
     destroyFinder();
+    uiCtx = null;
   });
 
   // --- Shared render helpers ---
@@ -1013,10 +1022,11 @@ export default function fffExtension(pi: ExtensionAPI) {
     promptSnippet: "Grep contents",
     promptGuidelines: (names) => [
       `${names.grep}: prefer bare identifiers as patterns. Literal queries are most efficient.`,
-      `${names.grep}: use definitions_only: true to find declarations; if none are found, the tool returns other matches with a notice.`,
-      `${names.grep}: use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').`,
+      `${names.grep}: use definitions_only: true to try declarations, exact matches, fuzzy declarations, then fuzzy matches. Exact stages finish before fallback; fuzzy stages have a two-second budget. Empty stages advance with a notice.`,
+      `${names.grep}: if all stages find nothing, the tool suggests files from a broader search while preserving exclusions. Suggestions are not declaration results.`,
+      `${names.grep}: keep module words in path, e.g. '**/*billing*client*/**'. Use exclude for noise ('test/,*.min.js').`,
       `${names.grep}: caseSensitive: true when you need exact case (smart-case otherwise).`,
-      `${names.grep}: after 1-2 greps, read the top match instead of more greps.`,
+      `${names.grep}: returned source lines verify declaration locations. Do not re-read identical lines; read more only for additional context. Ranking includes recency, not semantic relevance.`,
     ],
     parameters: grepSchema,
 
@@ -1082,43 +1092,52 @@ export default function fffExtension(pi: ExtensionAPI) {
       // caseSensitive override flips smartCase off; omitting it keeps smart-case
       // (case-insensitive when pattern is all lowercase).
       const smartCase = params.caseSensitive !== true;
-
-      let definitionsOnly = resumed?.definitionsOnly ?? params.definitions_only ?? false;
-      const preferDefinitions = definitionsOnly;
-      const foundDefinitions = resumed?.foundDefinitions ?? false;
+      let stage = resumed?.stage ?? (params.definitions_only ? "definitions" : "normal");
+      const preferDefinitions = stage !== "normal";
+      const suggestion = preferDefinitions
+        ? (resumed?.suggestion ?? {
+            query: buildQuery(undefined, pattern, params.exclude, aux?.root ?? activeCwd),
+            pattern,
+            mode,
+          })
+        : undefined;
+      const foundMatches = resumed?.foundMatches ?? false;
       const options = {
-        mode,
         smartCase,
         maxMatchesPerFile: GREP_MAX_MATCHES_PER_FILE,
         pageSize,
-        cursor: resumed?.cursor ?? null,
         beforeContext: context,
         afterContext: context,
         timeBudgetMs: GREP_TIME_BUDGET_MS,
       };
-      const grepResult = picker.grep(query, {
-        ...options,
-        classifyDefinitions: definitionsOnly ? "definition_only" : "classify",
-      });
-
-      if (!grepResult.ok) throw new Error(grepResult.error);
-
-      let result = grepResult.value;
-      const definitionsFallback =
-        definitionsOnly &&
-        !foundDefinitions &&
-        result.items.length === 0 &&
-        !result.nextCursor;
-      if (definitionsFallback) {
-        const fallback = picker.grep(query, {
+      let result: GrepResult;
+      let nativeCursor = resumed?.cursor ?? null;
+      for (;;) {
+        if (signal?.aborted) throw new Error("Operation aborted");
+        if (isFuzzyGrepStage(stage)) mode = "fuzzy";
+        const page = picker.grep(query, {
           ...options,
-          cursor: null,
-          classifyDefinitions: "classify",
+          mode,
+          cursor: nativeCursor,
+          classifyDefinitions:
+            stage === "definitions" || stage === "fuzzy_definitions"
+              ? "definition_only"
+              : "classify",
+          // Fuzzy stages read every candidate file, so bound each one on large indexes.
+          ...(isFuzzyGrepStage(stage)
+            ? { timeBudgetMs: FUZZY_STAGE_BUDGET_MS, enforceTimeBudget: true }
+            : {}),
         });
-        if (!fallback.ok) throw new Error(fallback.error);
-        result = fallback.value;
-        definitionsOnly = false;
+        if (!page.ok) throw new Error(page.error);
+        result = page.value;
+        if (isFuzzyGrepStage(stage) && !foundMatches && result.items.length === 0)
+          result.nextCursor = null;
+        const next = nextGrepStage(stage);
+        if (result.items.length > 0 || result.nextCursor || foundMatches || !next) break;
+        stage = next;
+        nativeCursor = null;
       }
+      if (stage === "definitions") result.items = exactDefinitionsFirst(result.items);
       let fuzzyNotice: string | null = null;
 
       // if we hit the timeout do not run the fuzzy fallback
@@ -1126,7 +1145,8 @@ export default function fffExtension(pi: ExtensionAPI) {
       if (
         result.items.length === 0 &&
         !result.nextCursor &&
-        (!params.cursor || definitionsFallback) &&
+        !params.cursor &&
+        !preferDefinitions &&
         mode !== "regex"
       ) {
         // When the caller pinned a specific file (path has an extension), the
@@ -1136,7 +1156,7 @@ export default function fffExtension(pi: ExtensionAPI) {
         // excluded / out-of-scope directories.
         const lastSeg = params.path?.split(/[\\/]/).pop() ?? "";
         const pathTargetsFile = /\.[a-zA-Z][a-zA-Z0-9]{0,9}$/.test(lastSeg);
-        const fuzzyQuery = pathTargetsFile && !preferDefinitions ? pattern : query;
+        const fuzzyQuery = pathTargetsFile ? pattern : query;
         const fuzzy = picker.grep(fuzzyQuery, {
           mode: "fuzzy",
           smartCase,
@@ -1145,7 +1165,7 @@ export default function fffExtension(pi: ExtensionAPI) {
           cursor: null,
           beforeContext: 0,
           afterContext: 0,
-          classifyDefinitions: definitionsOnly ? "definition_only" : "classify",
+          classifyDefinitions: "classify",
           timeBudgetMs: GREP_TIME_BUDGET_MS,
         });
 
@@ -1158,6 +1178,20 @@ export default function fffExtension(pi: ExtensionAPI) {
       }
 
       let output = formatGrepOutput(result);
+      if (
+        suggestion &&
+        !foundMatches &&
+        result.items.length === 0 &&
+        !result.nextCursor
+      ) {
+        const suggested = suggestOtherFiles(picker, suggestion, query, smartCase, signal);
+        if (suggested) {
+          return {
+            content: [{ type: "text", text: suggested }],
+            details: { totalMatched: 0, totalFiles: result.totalFiles },
+          };
+        }
+      }
       const notices: string[] = [];
       if (result.regexFallbackError) {
         notices.push(`Invalid regex: ${result.regexFallbackError}, used literal match`);
@@ -1166,23 +1200,23 @@ export default function fffExtension(pi: ExtensionAPI) {
         const cursor = storeCursor({
           cursor: result.nextCursor,
           finder: picker,
-          definitionsOnly,
-          foundDefinitions:
-            foundDefinitions || (definitionsOnly && result.items.length > 0),
+          stage,
+          foundMatches: foundMatches || result.items.length > 0,
           mode,
           query,
+          suggestion,
         });
         notices.push(`Continue with cursor="${cursor}"`);
       }
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
       if (fuzzyNotice) output = `[${fuzzyNotice}]\n${output}`;
-      if (definitionsFallback) {
+      if (preferDefinitions && (!foundMatches || isFuzzyGrepStage(stage))) {
         const notice =
-          result.items.length > 0 || result.nextCursor
-            ? "No matching definitions found. Showing other matches:"
-            : "No matching definitions or other matches found.";
-        output = `[${notice}]\n${output}`;
+          result.items.length === 0 && !result.nextCursor && !foundMatches
+            ? "No matching definitions or other matches found."
+            : grepStageNotice(stage);
+        if (notice) output = `[${notice}]\n${output}`;
       }
 
       return {
@@ -1411,9 +1445,9 @@ export default function fffExtension(pi: ExtensionAPI) {
         const pageSize = Math.min(effectiveLimit, GREP_PAGE_SIZE_MAX);
         const context = clampContext(params.context);
 
-        let definitionsOnly =
-          resumed?.definitionsOnly ?? params.definitions_only ?? false;
-        const foundDefinitions = resumed?.foundDefinitions ?? false;
+        let stage =
+          resumed?.stage ?? (params.definitions_only ? "definitions" : "normal");
+        const foundMatches = resumed?.foundMatches ?? false;
         const options = {
           patterns: params.patterns,
           constraints: params.constraints,
@@ -1426,15 +1460,15 @@ export default function fffExtension(pi: ExtensionAPI) {
         };
         const grepResult = f.multiGrep({
           ...options,
-          classifyDefinitions: definitionsOnly ? "definition_only" : "off",
+          classifyDefinitions: stage === "definitions" ? "definition_only" : "off",
         });
 
         if (!grepResult.ok) throw new Error(grepResult.error);
 
         let result = grepResult.value;
         const definitionsFallback =
-          definitionsOnly &&
-          !foundDefinitions &&
+          stage === "definitions" &&
+          !foundMatches &&
           result.items.length === 0 &&
           !result.nextCursor;
         if (definitionsFallback) {
@@ -1445,8 +1479,9 @@ export default function fffExtension(pi: ExtensionAPI) {
           });
           if (!fallback.ok) throw new Error(fallback.error);
           result = fallback.value;
-          definitionsOnly = false;
+          stage = "references";
         }
+        if (stage === "definitions") result.items = exactDefinitionsFirst(result.items);
         let output = formatGrepOutput(result);
 
         const notices: string[] = [];
@@ -1456,9 +1491,8 @@ export default function fffExtension(pi: ExtensionAPI) {
           const cursor = storeCursor({
             cursor: result.nextCursor,
             finder: f,
-            definitionsOnly,
-            foundDefinitions:
-              foundDefinitions || (definitionsOnly && result.items.length > 0),
+            stage,
+            foundMatches: foundMatches || result.items.length > 0,
           });
           notices.push(`More available. cursor="${cursor}" to continue`);
         }
@@ -1622,4 +1656,125 @@ function sessionModes(entries: unknown): FffMode[] {
     }
   }
   return modes;
+}
+
+function suggestOtherFiles(
+  picker: FileFinderApi,
+  suggestion: { query: string; pattern: string; mode: GrepMode },
+  scopedQuery: string,
+  smartCase: boolean,
+  signal?: AbortSignal,
+): string | undefined {
+  if (signal?.aborted) throw new Error("Operation aborted");
+  if (suggestion.query !== scopedQuery) {
+    const result = picker.grep(suggestion.query, {
+      mode: suggestion.mode,
+      smartCase,
+      classifyDefinitions: "off",
+      pageSize: 3,
+      maxMatchesPerFile: 1,
+      timeBudgetMs: 100,
+      enforceTimeBudget: true,
+      beforeContext: 0,
+      afterContext: 0,
+    });
+    if (!result.ok) throw new Error(result.error);
+    const files = [...new Set(result.value.items.map((item) => item.relativePath))].slice(
+      0,
+      3,
+    );
+    if (files.length) {
+      return `No matches in the requested scope. These files elsewhere in the indexed project contain the pattern:\n${files.join("\n")}`;
+    }
+  }
+  if (signal?.aborted) throw new Error("Operation aborted");
+  if (!suggestion.pattern.trim()) return;
+  const result = picker.fileSearch(suggestion.query, { pageSize: 3 });
+  if (!result.ok) throw new Error(result.error);
+  const files = result.value.items
+    .filter(
+      (_, index) =>
+        (result.value.scores[index]?.baseScore ?? 0) > suggestion.pattern.length * 10,
+    )
+    .map((item) => item.relativePath);
+  if (files.length) {
+    return `No matching definitions or other matches found in the requested scope. These filenames may be relevant; their contents are unverified:\n${files.join("\n")}`;
+  }
+}
+
+function nextGrepStage(stage: GrepStage): GrepStage | undefined {
+  switch (stage) {
+    case "definitions":
+      return "references";
+    case "references":
+      return "fuzzy_definitions";
+    case "fuzzy_definitions":
+      return "fuzzy_matches";
+    default:
+      return undefined;
+  }
+}
+
+// Exact declarations lead each file, and files containing them lead the page.
+function exactDefinitionsFirst(items: GrepResult["items"]): GrepResult["items"] {
+  const encoder = new TextEncoder();
+  const exact = new Set<GrepResult["items"][number]>();
+  const files = new Map<string, { order: number; exact: boolean }>();
+  for (const item of items) {
+    let file = files.get(item.relativePath);
+    if (!file) {
+      file = { order: files.size, exact: false };
+      files.set(item.relativePath, file);
+    }
+    const line = encoder.encode(item.lineContent);
+    if (item.matchRanges.some(([start, end]) => declaresWord(line, start, end))) {
+      exact.add(item);
+      file.exact = true;
+    }
+  }
+  return [...items].sort((a, b) => {
+    const aFile = files.get(a.relativePath)!;
+    const bFile = files.get(b.relativePath)!;
+    return (
+      Number(!aFile.exact) - Number(!bFile.exact) ||
+      aFile.order - bFile.order ||
+      Number(!exact.has(a)) - Number(!exact.has(b))
+    );
+  });
+}
+
+function isFuzzyGrepStage(stage: GrepStage): boolean {
+  return stage === "fuzzy_definitions" || stage === "fuzzy_matches";
+}
+
+function grepStageNotice(stage: GrepStage): string | undefined {
+  switch (stage) {
+    case "references":
+      return "No matching definitions found. Showing other matches:";
+    case "fuzzy_definitions":
+      return "No exact matches found. Maybe you meant these definitions:";
+    case "fuzzy_matches":
+      return "No exact matches or approximate definitions found. Maybe you meant these other matches:";
+    default:
+      return undefined;
+  }
+}
+
+// A whole word before any parameter, type or value list approximates the declared name.
+function declaresWord(line: Uint8Array, start: number, end: number): boolean {
+  if (start >= end || isWordByte(line[start - 1]) || isWordByte(line[end])) return false;
+  for (let i = 0; i < start; i++) {
+    const byte = line[i];
+    if (byte === 0x28 || byte === 0x3c || byte === 0x3d) return false;
+    if (byte === 0x3a && line[i - 1] !== 0x3a && line[i + 1] !== 0x3a) return false;
+  }
+  return true;
+}
+
+function isWordByte(byte: number | undefined): boolean {
+  if (byte === undefined) return false;
+  const lower = byte | 0x20;
+  return (
+    byte === 0x5f || (byte >= 0x30 && byte <= 0x39) || (lower >= 0x61 && lower <= 0x7a)
+  );
 }

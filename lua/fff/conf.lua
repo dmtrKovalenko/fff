@@ -55,6 +55,8 @@ local M = {}
 --- @field enabled boolean
 --- @field db_path string
 
+--- @alias FffGitStatusUpdates 'while_open'|'always'|'manual'
+
 --- @class FffHistoryConfig
 --- @field enabled boolean
 --- @field db_path string
@@ -445,6 +447,9 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      -- 'while_open': pause git status while the picker is closed, refresh it on open
+      -- 'always': track every change in the background, 'manual': only on :FFFRefreshGit
+      status_updates = 'while_open',
       -- Boost files that participated in recent commits of the current branch:
       -- +1 score point per commit the file appeared in (max = max_commits)
       recency = {
@@ -498,7 +503,7 @@ local function init()
       enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
       modes = { 'plain', 'regex', 'fuzzy', 'definition_only' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
-      classify_definitions = false, -- Classify matching definitions and show them before other matches
+      classify_definitions = true, -- Show matching definitions first within each page
       -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
       -- file-path filter, scoping the content search to matching files. When off, such
       -- tokens are searched as literal text. A token is a filename if it has a valid-looking

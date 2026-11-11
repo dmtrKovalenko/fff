@@ -12,7 +12,7 @@
 /**
  * Current used version of [`FffCreateOptions`].
  */
-#define FFF_CREATE_OPTIONS_VERSION 2
+#define FFF_CREATE_OPTIONS_VERSION 3
 
 /**
  * Current version of [`FffWatchOptions`].
@@ -65,10 +65,7 @@ typedef struct FffResult {
 } FffResult;
 
 /**
- * Options for `fff_create_instance_with`.
- *
- * Versioned struct: the layout is stable across releases, new fields are
- * only appended.
+ * Append-only options for `fff_create_instance_with`.
  */
 typedef struct FffCreateOptions {
   /**
@@ -139,6 +136,18 @@ typedef struct FffCreateOptions {
    * external loop protection cyclic symlinks can wedge the watcher.
    */
   bool follow_symlinks;
+  /**
+   * Additional newline-separated `.gitignore` rules. NULL for none. Requires zlob.
+   */
+  const char *extra_ignore;
+  /**
+   * Skip Git integration and Git ignore rules. Requires zlob.
+   */
+  bool disable_git;
+  /**
+   * Skip rules from `.ignore` files. Requires zlob.
+   */
+  bool disable_ignore_files;
 } FffCreateOptions;
 
 /**
@@ -472,13 +481,12 @@ typedef struct FffWatchOptions {
 /**
  * Create a new file finder instance (legacy 8-arg positional signature).
  *
- * @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
- * for FFI bindings). The `use_unsafe_no_lock` parameter is ignored.
+ * @deprecated Use [`fff_create_instance_with`]. The `use_unsafe_no_lock` parameter is ignored.
  *
  * ## Safety
  * See `fff_create_instance_with`.
  */
-__attribute__((deprecated("Use fff_create_instance_with (by pointer) or fff_create_instance_with_value (by value) with FffCreateOptions instead. The struct evolves without ABI breaks.")))
+__attribute__((deprecated("Use fff_create_instance_with with a pointer to FffCreateOptions instead.")))
 struct FffResult *fff_create_instance(const char *base_path,
                                       const char *frecency_db_path,
                                       const char *history_db_path,
@@ -491,13 +499,12 @@ struct FffResult *fff_create_instance(const char *base_path,
 /**
  * Create a new file finder instance (legacy 13-arg positional signature).
  *
- * @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
- * for FFI bindings). The `use_unsafe_no_lock` parameter is ignored.
+ * @deprecated Use [`fff_create_instance_with`]. The `use_unsafe_no_lock` parameter is ignored.
  *
  * ## Safety
  * See `fff_create_instance_with`.
  */
-__attribute__((deprecated("Use fff_create_instance_with (by pointer) or fff_create_instance_with_value (by value) with FffCreateOptions instead. The struct evolves without ABI breaks.")))
+__attribute__((deprecated("Use fff_create_instance_with with a pointer to FffCreateOptions instead.")))
 struct FffResult *fff_create_instance2(const char *base_path,
                                        const char *frecency_db_path,
                                        const char *history_db_path,
@@ -513,32 +520,13 @@ struct FffResult *fff_create_instance2(const char *base_path,
                                        uint64_t cache_budget_max_file_size);
 
 /**
- * Create a new file finder instance from a versioned [`FffCreateOptions`] struct.
+ * Create a file finder from versioned options. `base_path` is required.
  *
- * Populate the struct, set `version` to [`FFF_CREATE_OPTIONS_VERSION`], pass by
- * pointer. New fields are only appended; older `version` values keep working.
- * FFI bindings needing struct-by-value should use [`fff_create_instance_with_value`].
- *
- * `opts.base_path` is required (non-NULL, non-empty). Zero `cache_budget_*`
- * values are auto-computed from repo size after the initial scan.
- *
- * ## Safety
- * * `opts` must be a valid pointer to an `FffCreateOptions` whose `version`
- *   is in the range `1..=FFF_CREATE_OPTIONS_VERSION`.
- * * All string pointers inside `opts` must be valid null-terminated UTF-8
- *   or NULL.
+ * # Safety
+ * Pass a pointer to initialized fields through the version specified in `opts.version`.
+ * String pointers must be NUL-terminated UTF-8 or NULL.
  */
 struct FffResult *fff_create_instance_with(const struct FffCreateOptions *opts);
-
-/**
- * [`fff_create_instance_with`] adapter taking [`FffCreateOptions`] **by value**,
- * for FFI libraries that pass native structs by value (e.g. Node's `ffi-rs`).
- *
- * ## Safety
- * All `*const c_char` fields inside `opts` must be valid null-terminated
- * UTF-8 or NULL. The struct itself is consumed by value.
- */
-struct FffResult *fff_create_instance_with_value(struct FffCreateOptions opts);
 
 /**
  * Destroy a file finder instance and free all its resources.
@@ -1508,5 +1496,10 @@ uint8_t fff_watch_events_get_kind(const struct FffWatchEventBatch *batch, uint32
  * `batch` must be a pointer produced by this library, or null (no-op).
  */
 void fff_free_watch_events(struct FffWatchEventBatch *batch);
+
+/* Source adapter for the current struct. The exported by-value symbol uses the original ABI. */
+static inline struct FffResult *fff_create_instance_with_value(struct FffCreateOptions opts) {
+  return fff_create_instance_with(&opts);
+}
 
 #endif  /* FFF_C_H */
