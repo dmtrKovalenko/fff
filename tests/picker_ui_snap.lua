@@ -343,4 +343,61 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
   end
 end
 
+T['picker_search'] = MiniTest.new_set({
+  parametrize = { { 'bottom' }, { 'top' } },
+  hooks = {
+    pre_case = function() setup(LAYOUTS[2]) end,
+    post_case = teardown,
+  },
+})
+
+T['picker_search']['typing_and_resume'] = function(prompt_position)
+  child.lua(
+    [[
+    local prompt_position = ...
+    local fff, fuzzy = require('fff'), require('fff.fuzzy')
+    local ui = require('fff.picker_ui.picker_ui')
+    local new_search = assert(fuzzy.new_picker_search)
+    local live = setmetatable({}, { __mode = 'k' })
+    local last_query
+    fuzzy.new_picker_search = function(grep)
+      local native = new_search(grep)
+      local fresh = grep and fuzzy.live_grep or fuzzy.fuzzy_search_files
+      local function search(query, ...)
+        local page = native(query, ...)
+        assert(vim.deep_equal(page.items, fresh(query, ...).items), query)
+        last_query = query
+        return page
+      end
+      live[search] = true
+      return search
+    end
+
+    for _, open in ipairs({ fff.find_files, fff.live_grep }) do
+      open({ layout = { prompt_position = prompt_position } })
+      for _, query in ipairs({ 'hel', 'helper' }) do
+        vim.api.nvim_buf_set_lines(ui.state.input_buf, 0, -1, false, { ui.state.config.prompt .. query })
+        assert(vim.wait(2000, function() return last_query == query and #ui.state.items > 0 end))
+      end
+      if open == fff.live_grep then
+        for _, mode in ipairs({ 'regex', 'fuzzy', 'definition_only' }) do
+          last_query = nil
+          ui.cycle_grep_modes()
+          assert(ui.state.grep_mode == mode and last_query == 'helper')
+          assert(#ui.state.items > 0 and ui.state.items[1].line_number)
+        end
+      end
+      ui.close()
+      collectgarbage('collect')
+      assert(next(live) == nil, 'resume snapshot retained the native buffers')
+      last_query = nil
+      assert(ui.resume())
+      assert(vim.wait(2000, function() return last_query == 'helper' and #ui.state.items > 0 end))
+      ui.close()
+    end
+  ]],
+    { prompt_position }
+  )
+end
+
 return T

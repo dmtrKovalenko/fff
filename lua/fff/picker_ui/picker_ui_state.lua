@@ -4,6 +4,10 @@ local utils = require('fff.utils')
 
 local canonicalize_fff_path = utils.canonicalize_fff_path
 
+-- The live search owns native buffers and stays outside resume snapshots.
+---@type function?
+M.search = nil
+
 -- State structure definitions
 M.state = {
   -- UI state
@@ -101,6 +105,7 @@ end
 
 -- Complete state reset (called on close)
 function M.reset_state()
+  M.search = nil
   M.state.active = false
   M.state.layout = nil
   M.state.input_win = nil

@@ -7,7 +7,7 @@ use fff::query_tracker::QueryTracker;
 use fff::{
     DbHealthChecker, DirSearchConfig, Error, FFFMode, FFFQuery, FileSearchConfig,
     FuzzySearchOptions, GitRecencyConfig, MixedSearchConfig, PaginationArgs, QueryParser, Score,
-    SearchResult, SharedFilePicker, SharedFrecency, SharedQueryTracker,
+    SearchBuffer, SearchResult, SharedFilePicker, SharedFrecency, SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
 use mlua::prelude::*;
@@ -305,8 +305,21 @@ pub fn scan_files(_: &Lua, _: ()) -> LuaResult<()> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-pub fn fuzzy_search_files(
+type FileSearchArgs = (
+    String,
+    usize,
+    Option<String>,
+    i32,
+    Option<u32>,
+    Option<usize>,
+    Option<usize>,
+);
+
+pub fn fuzzy_search_files(lua: &Lua, args: FileSearchArgs) -> LuaResult<LuaValue> {
+    search_files(lua, args, None)
+}
+
+fn search_files(
     lua: &Lua,
     (
         query,
@@ -316,15 +329,8 @@ pub fn fuzzy_search_files(
         min_combo_count,
         page_index,
         page_size,
-    ): (
-        String,
-        usize,
-        Option<String>,
-        i32,
-        Option<u32>,
-        Option<usize>,
-        Option<usize>,
-    ),
+    ): FileSearchArgs,
+    buffers: Option<&mut [SearchBuffer; 2]>,
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
     let Some(ref picker) = *file_picker_guard else {
@@ -350,21 +356,24 @@ pub fn fuzzy_search_files(
     );
 
     let parsed_query = FFFQuery::parse(&query, FileSearchConfig);
-    let results = picker.fuzzy_search(
-        &parsed_query,
-        query_tracker_guard.as_ref(),
-        FuzzySearchOptions {
-            max_threads,
-            current_file: current_file.as_deref(),
-            project_path: Some(picker.shared_base_path()),
-            combo_boost_score_multiplier,
-            min_combo_count,
-            pagination: PaginationArgs {
-                offset: page_index.unwrap_or(0),
-                limit: page_size.unwrap_or(0),
-            },
+    let options = FuzzySearchOptions {
+        max_threads,
+        current_file: current_file.as_deref(),
+        project_path: Some(picker.shared_base_path()),
+        combo_boost_score_multiplier,
+        min_combo_count,
+        pagination: PaginationArgs {
+            offset: page_index.unwrap_or(0),
+            limit: page_size.unwrap_or(0),
         },
-    );
+    };
+    let tracker = query_tracker_guard.as_ref();
+    let results = match buffers {
+        Some([previous, next]) => {
+            picker.fuzzy_search_swap(&parsed_query, tracker, options, previous, next)
+        }
+        None => picker.fuzzy_search(&parsed_query, tracker, options),
+    };
 
     if results.items.is_empty() && query.contains(std::path::MAIN_SEPARATOR) {
         let pure_query = match &parsed_query.fuzzy_query {
@@ -500,7 +509,7 @@ type GrepArgs = (
 
 pub fn live_grep(lua: &Lua, args: GrepArgs) -> LuaResult<LuaValue> {
     let (query, options) = parse_grep_args(args);
-    live_grep_with_options(lua, &query, &options)
+    live_grep_with_options(lua, &query, &options, None)
 }
 
 /// Build a file-picker result for an absolute path that exists on disk but
@@ -1044,25 +1053,9 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     )?;
     exports.set(
         "live_grep",
-        lua.create_function(|lua, args: LuaMultiValue| {
-            let classify_definitions = match args.get(11) {
-                None | Some(LuaValue::Nil) => fff::DefinitionMode::Off,
-                Some(LuaValue::Boolean(enabled)) => (*enabled).into(),
-                Some(LuaValue::String(mode)) => fff::DefinitionMode::parse(&mode.to_str()?)
-                    .ok_or_else(|| {
-                        LuaError::RuntimeError("Invalid classify_definitions mode".into())
-                    })?,
-                _ => {
-                    return Err(LuaError::RuntimeError(
-                        "classify_definitions must be a mode string or boolean".into(),
-                    ));
-                }
-            };
-            let (query, mut options) = parse_grep_args(GrepArgs::from_lua_multi(args, lua)?);
-            options.classify_definitions = classify_definitions;
-            live_grep_with_options(lua, &query, &options)
-        })?,
+        lua.create_function(|lua, args| grep_from_lua(lua, args, None))?,
     )?;
+    exports.set("new_picker_search", lua.create_function(new_picker_search)?)?;
     exports.set("track_access", lua.create_function(track_access)?)?;
     exports.set(
         "get_file_access_count",
@@ -1175,17 +1168,59 @@ fn parse_grep_args(
     (query, options)
 }
 
+fn new_picker_search(lua: &Lua, grep: bool) -> LuaResult<LuaFunction> {
+    let mut buffers = [SearchBuffer::default(), SearchBuffer::default()];
+    lua.create_function_mut(move |lua, args: LuaMultiValue| {
+        let page = if grep {
+            grep_from_lua(lua, args, Some(&mut buffers))
+        } else {
+            search_files(
+                lua,
+                FileSearchArgs::from_lua_multi(args, lua)?,
+                Some(&mut buffers),
+            )
+        }?;
+        buffers.swap(0, 1);
+        Ok(page)
+    })
+}
+
+fn grep_from_lua(
+    lua: &Lua,
+    args: LuaMultiValue,
+    buffers: Option<&mut [SearchBuffer; 2]>,
+) -> LuaResult<LuaValue> {
+    let classify_definitions = match args.get(11) {
+        None | Some(LuaValue::Nil) => fff::DefinitionMode::Off,
+        Some(LuaValue::Boolean(enabled)) => (*enabled).into(),
+        Some(LuaValue::String(mode)) => fff::DefinitionMode::parse(&mode.to_str()?)
+            .ok_or_else(|| LuaError::RuntimeError("Invalid classify_definitions mode".into()))?,
+        _ => {
+            return Err(LuaError::RuntimeError(
+                "classify_definitions must be a mode string or boolean".into(),
+            ));
+        }
+    };
+    let (query, mut options) = parse_grep_args(GrepArgs::from_lua_multi(args, lua)?);
+    options.classify_definitions = classify_definitions;
+    live_grep_with_options(lua, &query, &options, buffers)
+}
+
 fn live_grep_with_options(
     lua: &Lua,
     query: &str,
     options: &fff::GrepSearchOptions,
+    buffers: Option<&mut [SearchBuffer; 2]>,
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
     let Some(ref picker) = *file_picker_guard else {
         return Err(error::to_lua_error(Error::FilePickerMissing));
     };
     let parsed_query = FFFQuery::parse(query, NvimGrepConfig);
-    let mut result = picker.grep(&parsed_query, options);
+    let mut result = match buffers {
+        Some([previous, next]) => picker.grep_swap(&parsed_query, options, previous, next),
+        None => picker.grep(&parsed_query, options),
+    };
     if options.classify_definitions == fff::DefinitionMode::Classify {
         result.matches.sort_by_key(|m| !m.is_definition);
     }

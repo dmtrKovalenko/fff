@@ -29,8 +29,9 @@ local last_result = nil
 ---@param page_size? number Max matches to collect (default 50)
 ---@param config? table Grep configuration overrides
 ---@param grep_mode? FffGrepMode Search mode (default: "plain")
+---@param search? function Picker-owned grep function
 ---@return fff.grep.SearchResult
-function M.search(query, file_offset, page_size, config, grep_mode)
+function M.search(query, file_offset, page_size, config, grep_mode, search)
   file_offset = file_offset or 0
   page_size = page_size or 50
   config = config or require('fff.conf').get().grep
@@ -50,7 +51,8 @@ function M.search(query, file_offset, page_size, config, grep_mode)
   then
     error('Invalid classify_definitions mode: ' .. classify_definitions)
   end
-  last_result = fuzzy.live_grep(
+  search = search or fuzzy.live_grep
+  last_result = search(
     query or '',
     file_offset,
     page_size,

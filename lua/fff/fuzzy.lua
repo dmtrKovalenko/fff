@@ -19,6 +19,8 @@ M.init_file_picker = rust_module.init_file_picker
 M.restart_index_in_path = rust_module.restart_index_in_path
 M.scan_files = rust_module.scan_files
 M.get_cached_files = rust_module.get_cached_files
+---@type (fun(grep: boolean): function)?
+M.new_picker_search = rust_module.new_picker_search
 M.fuzzy_search_files = rust_module.fuzzy_search_files
 M.fuzzy_search_directories = rust_module.fuzzy_search_directories
 M.fuzzy_search_mixed = rust_module.fuzzy_search_mixed
