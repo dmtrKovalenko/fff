@@ -41,7 +41,6 @@ jobs:
       statuses: write
     outputs:
       kind: ${{ steps.resolve.outputs.kind }}
-      number: ${{ steps.resolve.outputs.number }}
       base_sha: ${{ steps.resolve.outputs.base_sha }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
     env:
@@ -77,8 +76,17 @@ jobs:
               kind=skip
             fi
           fi
-          printf 'kind=%s\nnumber=%s\nbase_sha=%s\nhead_sha=%s\n' \
-            "$kind" "$PR_NUMBER" "$BASE_SHA" "$HEAD_SHA" >>"$GITHUB_OUTPUT"
+          printf 'kind=%s\nbase_sha=%s\nhead_sha=%s\n' "$kind" "$BASE_SHA" "$HEAD_SHA" >>"$GITHUB_OUTPUT"
+          printf '%s %s %s\n' "$kind" "$PR_NUMBER" "$BASE_SHA" >"$RUNNER_TEMP/comparison"
+      - name: Save the comparison for publication
+        if: steps.resolve.outputs.kind == 'pr' || steps.resolve.outputs.kind == 'skip'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fff-plan
+          path: ${{ runner.temp }}/comparison
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
       - name: Mark the PR check pending
         if: >-
           steps.resolve.outputs.kind == 'pr' &&
@@ -113,24 +121,27 @@ jobs:
           git -C source -c core.hooksPath=/dev/null checkout -q --detach "$REVISION"
           git -C source -c core.hooksPath=/dev/null checkout "$HARNESS" -- crates/fff-core/benches
       - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
           use-cache: false
-      - name: Install Rust build tools
-        run: |
-          rustup toolchain install 1.99.1 --profile minimal --target x86_64-unknown-linux-musl
-          cargo +1.99.1 install cargo-zigbuild --version 0.24.1 --locked
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
+        with:
+          toolchain: 1.99.1
+          target: x86_64-unknown-linux-musl
+          cache: false
+          rustflags: ''
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --version 0.24.1 --locked
       - name: Build the FFF core benchmarks
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.1
         run: |
           token=$(cat /proc/sys/kernel/random/uuid)
           printf '::stop-commands::%s\n' "$token"
           trap 'printf "::%s::\n" "$token"' EXIT
           bash "$RUNNER_TEMP/build.sh" source "$RUNNER_TEMP/fff-build"
       - name: Upload benchmark binaries
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7
         with:
           name: fff-bench-${{ matrix.variant }}
           path: ${{ runner.temp }}/fff-build/bins
@@ -154,7 +165,7 @@ jobs:
           git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$HARNESS"
           git -C "$repo" show "$HARNESS:perf/benchmark.sh" > "$RUNNER_TEMP/benchmark.sh"
       - name: Download benchmark binaries
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@v8
         with:
           pattern: fff-bench-*
           path: ${{ runner.temp }}/fff-binaries
@@ -178,7 +189,7 @@ jobs:
           esac 2>&1 | tee "$output/benchmark.log"
       - name: Upload measurement logs and timings
         if: ${{ !cancelled() && (steps.measure.outcome == 'success' || steps.measure.outcome == 'failure') }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7
         with:
           name: fff-measurements
           path: |
@@ -187,105 +198,3 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           overwrite: true
-
-  report:
-    needs: [plan, build, measure]
-    if: "!cancelled() && (needs.plan.outputs.kind == 'pr' || needs.plan.outputs.kind == 'skip')"
-    runs-on: ubuntu-24.04
-    permissions:
-      pull-requests: read
-    outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - name: Verify the PR revision is current
-        id: current
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ needs.plan.outputs.number }}
-          HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
-        run: |
-          actual=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq 'select(.state == "open") | .head.sha')
-          if [[ "$actual" == "$HEAD_SHA" ]]; then
-            echo 'match=true' >>"$GITHUB_OUTPUT"
-          fi
-      - name: Download measured timings
-        id: timings
-        if: needs.measure.result == 'success' && steps.current.outputs.match == 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: fff-measurements
-          path: ${{ runner.temp }}/fff-perf
-      - name: Restore the chart renderer build
-        if: steps.timings.outcome == 'success'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ${{ runner.temp }}/harness/perf/chart/target
-          key: fff-perf-chart-${{ github.sha }}
-          restore-keys: fff-perf-chart-
-      - name: Render the timing chart
-        if: steps.timings.outcome == 'success'
-        continue-on-error: true
-        run: |
-          PERF_DIR="$RUNNER_TEMP/fff-perf"
-          repo="$RUNNER_TEMP/harness" chart="$RUNNER_TEMP/fff-chart.png"
-          git init -q "$repo"
-          git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$GITHUB_SHA"
-          git -C "$repo" -c core.hooksPath=/dev/null checkout -q FETCH_HEAD -- perf/chart
-          rustup toolchain install 1.99.1 --profile minimal
-          cargo +1.99.1 run --release --locked --manifest-path "$repo/perf/chart/Cargo.toml" --example chart -- \
-            "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" "$chart"
-          mv "$chart" "$PERF_DIR/chart.png"
-      - name: Record the compared revision
-        if: "!cancelled() && steps.current.outputs.match == 'true'"
-        env:
-          KIND: ${{ needs.plan.outputs.kind }}
-          PR_NUMBER: ${{ needs.plan.outputs.number }}
-          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
-          BUILD_RESULT: ${{ needs.build.result }}
-          MEASURE_RESULT: ${{ needs.measure.result }}
-        run: |
-          PERF_DIR="$RUNNER_TEMP/fff-perf"
-          mkdir -p "$PERF_DIR"
-          printf '%s\n' "$KIND" >"$PERF_DIR/kind"
-          printf '%s\n' "$PR_NUMBER" >"$PERF_DIR/pr-number"
-          printf '%s\n' "$BASE_SHA" >"$PERF_DIR/base-sha"
-          case "$BUILD_RESULT/$MEASURE_RESULT" in
-            failure/*) printf 'build\n' >"$PERF_DIR/failure-stage" ;;
-            */failure) printf 'measure\n' >"$PERF_DIR/failure-stage" ;;
-          esac
-      - name: Upload the PR report
-        id: upload
-        if: "!cancelled() && steps.current.outputs.match == 'true'"
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: fff-performance-report-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/fff-perf
-          if-no-files-found: error
-          retention-days: 30
-      - name: Check fork timings
-        if: >-
-          steps.timings.outcome == 'success' &&
-          (github.event.pull_request.head.repo.id != github.event.repository.id || github.actor == 'dependabot[bot]')
-        run: |
-          PERF_DIR="$RUNNER_TEMP/fff-perf"
-          script="$RUNNER_TEMP/report.sh"
-          curl -fsSL "https://raw.githubusercontent.com/dmtrKovalenko/fff/$GITHUB_SHA/perf/report.sh" -o "$script"
-          bash "$script" "$PERF_DIR/base.bench" "$PERF_DIR/head.bench" >>"$GITHUB_STEP_SUMMARY"
-
-  publish:
-    needs: report
-    if: >-
-      !cancelled() && needs.report.outputs.artifact_id != '' &&
-      github.event.pull_request.head.repo.id == github.event.repository.id &&
-      github.actor != 'dependabot[bot]'
-    permissions:
-      actions: read
-      contents: write
-      pull-requests: write
-      statuses: write
-    uses: ./.github/workflows/performance-publish.yml
-    with:
-      report_artifact_id: ${{ needs.report.outputs.artifact_id }}
