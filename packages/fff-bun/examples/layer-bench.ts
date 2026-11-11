@@ -59,7 +59,7 @@ function heap(label: string): void {
 
 // --- fff over FFI --------------------------------------------------------
 
-// A fresh instance per iteration keeps layer compaction out of the timings.
+// A fresh instance per iteration starts every run with free layer ids.
 let fff = openFinder();
 const fresh = () => {
   fff.destroy();
@@ -98,8 +98,15 @@ bench("buildLayerFile (off-instance)", () => {
 });
 console.log(`${"layer file size".padEnd(46)} ${fmtBytes(statSync(layerFile).size)}`);
 bench("loadLayer into empty instance", () => checked(fff.loadLayer(layerFile)), fresh);
-bench(`loadLayer with all ${fileCount} already indexed (dedup)`, () =>
-  checked(fff.loadLayer(layerFile)));
+const indexed = () => {
+  fresh();
+  checked(fff.addPaths(paths));
+};
+bench(
+  `loadLayer with all ${fileCount} already indexed (dedup)`,
+  () => checked(fff.loadLayer(layerFile)),
+  indexed,
+);
 fresh();
 const loaded = checked(fff.loadLayer(layerFile));
 bench(`saveLayer (${fileCount})`, () => {

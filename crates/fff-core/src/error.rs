@@ -15,6 +15,8 @@ pub enum Error {
     FilePickerMissing,
     #[error("Index is busy with post-scan processing, retry later")]
     IndexBusy,
+    #[error("Every index layer id is in use")]
+    LayerLimit,
     #[error("Layer file {path}: {source}")]
     LayerFile {
         path: std::path::PathBuf,

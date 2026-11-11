@@ -702,8 +702,9 @@ export class FileFinder implements FileFinderApi {
   }
 
   /**
-   * Seal the writable index layer and open a new one. Returns its id.
-   * At most three overlays exist. Opening a fourth merges the two newest first.
+   * Seal the open index layer and open a new one for `addPaths`. Returns its id.
+   * Layer ids and labels never change, and the watcher writes only to layer 1.
+   * At most three overlays exist. Creating a fourth fails.
    */
   createLayer(label?: string): Result<number> {
     const guard = this.ensureAlive();
@@ -711,7 +712,7 @@ export class FileFinder implements FileFinderApi {
     return ffiLayerCreate(guard.value, label);
   }
 
-  /** Id of the layer new files are currently written into. */
+  /** Id of the layer `addPaths` writes to. Layer 1, the session layer, until a layer is open. */
   currentLayer(): Result<number> {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
@@ -735,8 +736,9 @@ export class FileFinder implements FileFinderApi {
   }
 
   /**
-   * Append paths to the writable layer without touching the filesystem.
-   * Paths already indexed are skipped. Returns the number added.
+   * Append paths to the open layer without touching the filesystem. Opens an
+   * unlabeled layer when none is open. Paths already indexed are skipped.
+   * Returns the number added.
    */
   addPaths(entries: Array<string | LayerEntry>): Result<number> {
     const guard = this.ensureAlive();
@@ -753,7 +755,7 @@ export class FileFinder implements FileFinderApi {
     return ffiLayerSave(guard.value, id.value, filePath);
   }
 
-  /** Load a layer file as a new sealed overlay. Returns its id. */
+  /** Load a layer file as a new sealed overlay. Returns its id. Fails when three overlays exist. */
   loadLayer(filePath: string): Result<number> {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;

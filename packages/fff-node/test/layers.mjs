@@ -51,7 +51,7 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     const bad = finder.addPaths(["other.ts", "in\0valid.ts"]);
     assert.equal(bad.ok, false);
     assert.equal(finder.addPaths([{ path: "bad.ts", size: -1 }]).ok, false);
-    assert.deepEqual(finder.layerFileCount(1), { ok: true, value: 2 });
+    assert.deepEqual(finder.layerFileCount(2), { ok: true, value: 2 });
   });
 
   it("createLayer / listLayers", () => {

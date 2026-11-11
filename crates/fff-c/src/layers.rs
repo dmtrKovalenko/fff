@@ -7,8 +7,9 @@ use fff::{IndexEntry, LayerBuilder, LayerSnapshot};
 use crate::ffi_types::FffResult;
 use crate::{cstr_to_str, instance_ref, optional_cstr};
 
-/// Seal the writable layer and return the new layer ID in `int_value`.
-/// Fails while a scan or post-scan indexing is running.
+/// Seal the open layer, open a new one for `fff_layer_add_paths`, and return its ID in `int_value`.
+/// Layer IDs and labels never change. Fails when every layer ID is in use or while a scan or
+/// post-scan indexing is running.
 /// # Safety
 /// Provide a live instance and a NULL or NUL-terminated UTF-8 label.
 #[unsafe(no_mangle)]
@@ -25,7 +26,8 @@ pub unsafe extern "C" fn fff_layer_create(
     }
 }
 
-/// Return the writable layer ID in `int_value`.
+/// Return the ID of the layer `fff_layer_add_paths` writes to in `int_value`. This is 1, the
+/// session layer where the watcher writes, until a layer is open.
 /// # Safety
 /// Provide a live instance.
 #[unsafe(no_mangle)]
@@ -84,7 +86,8 @@ pub unsafe extern "C" fn fff_layer_list(fff_handle: *mut c_void) -> *mut FffResu
     }
 }
 
-/// Append a batch of base-relative paths and return the number of files added.
+/// Append a batch of base-relative paths to the open layer and return the number of files added.
+/// Opens an unlabeled layer when none is open.
 /// # Safety
 /// Provide a live instance and `paths_len` readable bytes containing exactly `count` NUL-terminated UTF-8 paths.
 /// For an empty batch `paths` may be NULL. Each metadata array is NULL or holds `count` readable little-endian u64s (unaligned allowed).
@@ -173,7 +176,7 @@ pub unsafe extern "C" fn fff_layer_save(
     }
 }
 
-/// Load a sealed overlay and return its layer ID.
+/// Load a sealed overlay and return its layer ID. Fails when every layer ID is in use.
 /// # Safety
 /// Provide a live instance and a NUL-terminated UTF-8 path.
 #[unsafe(no_mangle)]

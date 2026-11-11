@@ -899,7 +899,8 @@ FffResult *res = fff_glob(handle, "**/*.rs", "", 0, 0, 100);
 
 `fff_layer_create` / `fff_layer_add_paths` append paths the scanner can't see;
 `fff_layer_save` writes any layer (0 = base scan) to a file and
-`fff_layer_load` attaches it back as a sealed overlay; `fff_base_load` installs
+`fff_layer_load` attaches it back as a sealed overlay. Layer IDs never change, and the
+watcher writes only to layer 1. `fff_base_load` installs
 it as the base scan in the background (wait with `fff_wait_for_scan`).
 `fff_layer_build` packs a layer file without an instance. Pass NUL-terminated UTF-8 paths in one buffer, with optional parallel `sizes` / `modified` arrays (NULL to omit).
 

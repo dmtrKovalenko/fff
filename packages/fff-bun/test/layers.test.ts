@@ -28,7 +28,7 @@ describe("FileFinder - index layers", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test("addPaths lands in the session layer and dedups", () => {
+  test("addPaths opens a layer and dedups", () => {
     const added = finder.addPaths([
       "virtual/a.ts",
       { path: "virtual/b.ts", size: 42, modified: 1_700_000_000 },
@@ -36,7 +36,9 @@ describe("FileFinder - index layers", () => {
       "virtual/a.ts",
     ]);
     expect(added).toEqual({ ok: true, value: 2 });
-    expect(finder.layerFileCount(1)).toEqual({ ok: true, value: 2 });
+    expect(finder.currentLayer()).toEqual({ ok: true, value: 2 });
+    expect(finder.layerFileCount(1)).toEqual({ ok: true, value: 0 });
+    expect(finder.layerFileCount(2)).toEqual({ ok: true, value: 2 });
 
     const found = finder.fileSearch("virtual");
     expect(found.ok).toBe(true);
@@ -64,7 +66,7 @@ describe("FileFinder - index layers", () => {
     ]);
     const bad = finder.addPaths(["other.ts", "in\0valid.ts"]);
     expect(bad.ok).toBe(false);
-    expect(finder.layerFileCount(1)).toEqual({ ok: true, value: 2 });
+    expect(finder.layerFileCount(2)).toEqual({ ok: true, value: 2 });
   });
 
   test("createLayer / listLayers / currentLayer", () => {

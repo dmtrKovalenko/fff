@@ -2128,7 +2128,11 @@ mod filename_bonus_tests {
         let (base, base_arena) = make_files(&[base_path]);
         let (mut overflow, _) = make_files(&[overflow_path]);
         let mut layers = crate::index::layers::LayerStack::new(1, 0);
-        overflow[0].set_path(layers.top_builder().add_file_immediate(overflow_path, 6));
+        overflow[0].set_path(
+            layers
+                .session_builder()
+                .add_file_immediate(overflow_path, 6),
+        );
         overflow[0].set_layer(crate::SESSION_LAYER);
         let parser = QueryParser::default();
         let query = parser.parse("controller");

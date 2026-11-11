@@ -109,8 +109,15 @@ fn add_entries_appends_to_the_open_layer_and_skips_duplicates() {
         .expect("add");
     assert_eq!(added, 2);
 
-    let session = layer_paths(&picker, SESSION_LAYER);
-    assert_eq!(session, vec!["virtual/one.rs", "virtual/two.rs"]);
+    // Explicit paths open their own layer instead of joining the session layer.
+    let layer = picker.current_layer();
+    assert_eq!(layer, SESSION_LAYER + 1);
+    assert!(layer_paths(&picker, SESSION_LAYER).is_empty());
+    assert_eq!(
+        layer_paths(&picker, layer),
+        vec!["virtual/one.rs", "virtual/two.rs"]
+    );
+    assert_eq!(picker.layers()[1].label, None);
     assert!(search_paths(&picker, "virtual").contains(&"virtual/two.rs".to_string()));
     assert!(search_dirs(&picker, "virtual").contains(&"virtual/".to_string()));
 
@@ -122,7 +129,22 @@ fn add_entries_appends_to_the_open_layer_and_skips_duplicates() {
         ])
         .expect("add");
     assert_eq!(added, 1);
-    assert_eq!(layer_paths(&picker, SESSION_LAYER).len(), 3);
+    assert_eq!(layer_paths(&picker, layer).len(), 3);
+}
+
+#[test]
+fn add_entries_of_known_paths_opens_no_layer() {
+    let tmp = TempDir::new().expect("tempdir");
+    let base = tmp.path();
+    fs::write(base.join("scanned.rs"), "scanned\n").expect("write");
+
+    let mut picker = picker(base);
+    assert_eq!(
+        picker.add_entries([IndexEntry::new("scanned.rs")]).unwrap(),
+        0
+    );
+    assert_eq!(picker.layers().len(), 1);
+    assert_eq!(picker.current_layer(), SESSION_LAYER);
 }
 
 #[test]
@@ -167,8 +189,8 @@ fn imported_layer_is_searchable_and_sealed_lookups_work() {
     assert_eq!(picker.layers()[1].label.as_deref(), Some("generated"));
     assert_eq!(
         picker.current_layer(),
-        layer,
-        "imported layer becomes the top"
+        SESSION_LAYER,
+        "an import does not open a layer for add_entries"
     );
 
     let found = search_paths(&picker, "mod2999");
@@ -192,19 +214,17 @@ fn imported_layer_is_searchable_and_sealed_lookups_work() {
         Some("changed\n".len() as u64)
     );
 
-    // A brand new file never reopens the sealed import; it lands in a fresh
-    // open layer above it.
+    // A brand new file lands in the session layer and never touches the import.
     let fresh = base.join("out/pkg0/new.ts");
     fs::create_dir_all(fresh.parent().unwrap()).expect("mkdir");
     fs::write(&fresh, "new\n").expect("write");
     picker
         .handle_create_or_modify(&fresh)
         .expect("update indexed file");
-    assert_eq!(picker.current_layer(), layer + 1);
     assert_eq!(layer_paths(&picker, layer).len(), 3000);
-    assert_eq!(layer_paths(&picker, layer + 1), vec!["out/pkg0/new.ts"]);
+    assert_eq!(layer_paths(&picker, SESSION_LAYER), vec!["out/pkg0/new.ts"]);
     let open: Vec<bool> = picker.layers().iter().map(|l| l.is_open).collect();
-    assert_eq!(open, [false, false, true]);
+    assert_eq!(open, [true, false]);
 }
 
 #[test]
@@ -222,8 +242,9 @@ fn add_entries_revives_a_tombstoned_file() {
             .expect("add"),
         1
     );
+    let layer = picker.current_layer();
     assert!(picker.remove_file_by_path(base.join("virtual/gone.rs")));
-    assert!(layer_paths(&picker, SESSION_LAYER).is_empty());
+    assert!(layer_paths(&picker, layer).is_empty());
 
     assert_eq!(
         picker
@@ -240,8 +261,8 @@ fn add_entries_revives_a_tombstoned_file() {
         (revived.size, revived.modified, revived.is_binary()),
         (5, 20, false)
     );
-    assert_eq!(layer_paths(&picker, SESSION_LAYER), vec!["virtual/gone.rs"]);
-    assert_eq!(picker.files_in_layer(SESSION_LAYER).len(), 1, "slot reused");
+    assert_eq!(layer_paths(&picker, layer), vec!["virtual/gone.rs"]);
+    assert_eq!(picker.files_in_layer(layer).len(), 1, "slot reused");
     assert!(search_paths(&picker, "gone").contains(&"virtual/gone.rs".to_string()));
 }
 
@@ -271,7 +292,7 @@ fn imported_entry_refreshes_tombstoned_base_metadata() {
 }
 
 #[test]
-fn grammar_survives_snapshot_import_and_layer_compaction() {
+fn grammar_survives_snapshot_import_and_a_rescan() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("base.ml"), "let base = 1").unwrap();
     let mut source = picker(root.path());
@@ -295,12 +316,12 @@ fn grammar_survives_snapshot_import_and_layer_compaction() {
         .import_layer(LayerSnapshot::from_bytes(&bytes).unwrap())
         .unwrap();
     assert_eq!(id, 3);
-    for expected in [3, 2] {
-        if expected == 2 {
-            target.create_layer(None).expect("create layer");
+    for rescan in [false, true] {
+        if rescan {
+            target.collect_files().expect("rescan");
         }
         let file = target.get_file_by_path(root.path().join(path)).unwrap();
-        assert_eq!(layer_paths(&target, expected), [path]);
+        assert_eq!(layer_paths(&target, id), [path]);
         assert!(file.is_overflow());
         assert_eq!(file.relative_path(&target), path);
         assert!(file.is_definition_match("let needle = 1", &[(4, 10)]));
@@ -462,8 +483,9 @@ fn explicit_layers_survive_a_rescan() {
 
     let mut picker = picker(base);
     picker
-        .add_entries([IndexEntry::new("session_only.rs")])
+        .add_entries([IndexEntry::new("virtual/early.rs")])
         .expect("add");
+    let early = picker.current_layer();
     let kept = picker.create_layer(Some("kept")).expect("create layer");
     picker
         .add_entries([
@@ -471,29 +493,44 @@ fn explicit_layers_survive_a_rescan() {
             IndexEntry::new("scanned.rs"),
         ])
         .expect("add");
-
+    let watched = base.join("watched.rs");
+    fs::write(&watched, "watched\n").expect("write");
+    picker.handle_create_or_modify(&watched).expect("watch");
     fs::write(base.join("added_on_disk.rs"), "new\n").expect("write");
+
+    let shape = |picker: &FilePicker| -> Vec<(u8, Option<String>, bool)> {
+        picker
+            .layers()
+            .iter()
+            .map(|l| (l.id, l.label.clone(), l.is_open))
+            .collect()
+    };
+    let before = shape(&picker);
     picker.collect_files().expect("rescan");
 
-    let labels: Vec<Option<String>> = picker.layers().iter().map(|l| l.label.clone()).collect();
-    assert!(labels.contains(&Some("kept".to_string())), "{labels:?}");
-    let kept = picker
-        .layers()
-        .iter()
-        .find(|l| l.label.as_deref() == Some("kept"))
-        .map(|l| l.id)
-        .unwrap_or(kept);
+    // Ids, labels and the open layer are unchanged.
+    assert_eq!(shape(&picker), before);
+    assert_eq!(layer_paths(&picker, early), vec!["virtual/early.rs"]);
     assert_eq!(layer_paths(&picker, kept), vec!["virtual/kept.rs"]);
+    assert_eq!(picker.current_layer(), kept);
+    picker
+        .add_entries([IndexEntry::new("virtual/after.rs")])
+        .expect("add");
+    assert_eq!(
+        layer_paths(&picker, kept),
+        vec!["virtual/kept.rs", "virtual/after.rs"]
+    );
 
     let paths = live_paths(&picker);
-    assert!(paths.contains(&"added_on_disk.rs".to_string()));
-    assert!(paths.contains(&"virtual/kept.rs".to_string()));
+    for expected in ["added_on_disk.rs", "watched.rs", "virtual/early.rs"] {
+        assert!(paths.contains(&expected.to_string()), "{expected}");
+    }
     assert_eq!(
         paths.iter().filter(|p| p.as_str() == "scanned.rs").count(),
         1
     );
     // The session layer is rebuilt from disk, not carried over.
-    assert!(!paths.contains(&"session_only.rs".to_string()));
+    assert!(layer_paths(&picker, SESSION_LAYER).is_empty());
 }
 
 #[test]

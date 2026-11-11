@@ -143,10 +143,10 @@ Notes:
 
 ## Index layers
 
-The path index is a stack: layer 0 is the base scan, on top of it sit up to
-three append-only overlays. Layer 1 is opened automatically and collects
-everything the watcher indexes during the session. Layers only hold paths;
-file contents are never layered.
+The path index is a stack: layer 0 is the base scan, and up to three overlays
+sit on top of it. Layer 1, the session layer, holds the files the watcher finds
+after the last scan. The other two layers hold only the paths you add or load.
+Layers only hold paths; file contents are never layered.
 
 Add paths that the scanner can't see (generated files, remote checkouts,
 virtual trees) and persist any layer — the base scan included — to a file:
@@ -176,8 +176,10 @@ for (const layer of checked(finder.listLayers())) {
 }
 ```
 
-Batch paths in one `addPaths` call to reduce FFI overhead. Explicit layers survive a rescan.
-Once the overlay stack is full, FFF compacts the two newest overlays.
+Batch paths in one `addPaths` call to reduce FFI overhead. `addPaths` writes to the
+layer that `createLayer` opened last, and opens an unlabeled layer when none is open.
+Layers keep their ids, labels and paths across rescans. When all three overlays exist,
+`createLayer` and `loadLayer` return an error and no layer changes.
 
 ## API Reference
 

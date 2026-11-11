@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::path::Path;
@@ -22,61 +22,84 @@ use crate::stable_vec::StableVec;
 use crate::types::{ContentCacheBudget, DirItem, FileItem};
 
 impl FileSync {
-    // Sealing drops the layer's chunk dedup table, keeping only the packed
-    // arena. At the cap the two newest layers compact into one first.
-    fn create_layer(&mut self, label: Option<&str>) -> LayerId {
-        self.seal_top_sorted();
-        self.make_room();
-        self.layers
-            .open_new(label, self.files.len(), self.dirs.len());
+    // Seals the open layer and opens an empty one under the session layer.
+    // Fails instead of merging when every id is taken, so ids never move.
+    fn create_layer(&mut self, label: Option<&str>) -> Result<LayerId, Error> {
+        let id = self.layers.free_id().ok_or(Error::LayerLimit)?;
+        self.seal_open_layer();
+        self.layers.insert_open(id, label);
 
-        self.layers.top_id()
+        Ok(id)
     }
 
-    // Sealed layers are immutable: a sealed top (imported or adopted) gets a
-    // fresh open layer above it before the first write.
-    pub(super) fn ensure_open_top(&mut self) -> LayerId {
-        if !self.layers.top_is_open() {
-            self.make_room();
-            self.layers
-                .open_new(None, self.files.len(), self.dirs.len());
-        }
-
-        self.layers.top_id()
-    }
-
-    fn make_room(&mut self) {
-        if self.layers.is_full() {
-            self.compact_newest_layers();
+    // Sealing drops the layer's chunk dedup table, keeping only the packed arena.
+    fn seal_open_layer(&mut self) {
+        if let Some(id) = self.layers.open_layer() {
+            self.sort_layer(id);
+            self.layers.seal(id);
         }
     }
 
     // Sorting by `(dir, name)` turns every later lookup into a binary search.
-    fn seal_top_sorted(&mut self) {
-        let top = self.layers.top_id();
-        if !self.layers.is_sorted(top)
-            && let Some((start, end)) = self.layers.file_range(top, self.files.len())
-        {
-            self.sort_file_range(start, end);
-        }
-
-        self.layers.seal_top();
-        self.layers.set_sorted(top, true);
-    }
-
-    fn sort_file_range(&mut self, start: usize, end: usize) {
-        self.open_file_index.reset();
-        if end - start < 2 {
+    fn sort_layer(&mut self, id: LayerId) {
+        if self.layers.is_sorted(id) {
             return;
         }
+        let Some((start, end)) = self.layers.file_range(id, self.files.len()) else {
+            return;
+        };
 
-        let arenas = self.layer_arenas();
-        let (mut buf_a, mut buf_b) = ([0u8; PATH_BUF_SIZE], [0u8; PATH_BUF_SIZE]);
-        self.files.range_mut(start..end).sort_unstable_by(|a, b| {
-            let pa = a.path.read_to_buf(arenas.get(a.layer_id()), &mut buf_a);
-            let pb = b.path.read_to_buf(arenas.get(b.layer_id()), &mut buf_b);
-            dir_name_key(pa, a.path.filename_offset).cmp(&dir_name_key(pb, b.path.filename_offset))
-        });
+        if end - start > 1 {
+            let arenas = self.layer_arenas();
+            let (mut buf_a, mut buf_b) = ([0u8; PATH_BUF_SIZE], [0u8; PATH_BUF_SIZE]);
+            self.files.range_mut(start..end).sort_unstable_by(|a, b| {
+                let pa = a.path.read_to_buf(arenas.get(a.layer_id()), &mut buf_a);
+                let pb = b.path.read_to_buf(arenas.get(b.layer_id()), &mut buf_b);
+                dir_name_key(pa, a.path.filename_offset)
+                    .cmp(&dir_name_key(pb, b.path.filename_offset))
+            });
+        }
+        self.layers.set_sorted(id, true);
+    }
+
+    // Moves the files and dirs pushed past `files_len` / `dirs_len` to the end
+    // of layer `id`, shifting every layer above it. Only those upper layers and
+    // the new slots move, so growing the newest layer moves the session only.
+    fn settle_appended(&mut self, id: LayerId, files_len: usize, dirs_len: usize) {
+        let (Some((_, files_end)), Some((_, dirs_end))) = (
+            self.layers.file_range(id, files_len),
+            self.layers.dir_range(id, dirs_len),
+        ) else {
+            return;
+        };
+        let added_files = self.files.len() - files_len;
+        let added_dirs = self.dirs.len() - dirs_len;
+
+        if added_dirs > 0 && dirs_end < dirs_len {
+            let dirs_total = self.dirs.len();
+            self.dirs
+                .range_mut(dirs_end..dirs_total)
+                .rotate_right(added_dirs);
+            let moved = dirs_len - dirs_end;
+            let remap = |dir: u32| match dir as usize {
+                d if d < dirs_end || d >= dirs_total => dir,
+                d if d < dirs_len => (d + added_dirs) as u32,
+                d => (d - moved) as u32,
+            };
+            let (base_count, files_total) = (self.base_count, self.files.len());
+            for file in self.files.range_mut(base_count..files_total) {
+                file.parent_dir_index = remap(file.parent_dir_index);
+            }
+            self.overlay_dir_index.reset();
+        }
+        if added_files > 0 && files_end < files_len {
+            let files_total = self.files.len();
+            self.files
+                .range_mut(files_end..files_total)
+                .rotate_right(added_files);
+        }
+
+        self.layers.shift_above(id, added_files, added_dirs);
     }
 
     // Brings a tombstoned slot back; `false` when it was already live.
@@ -110,40 +133,6 @@ impl FileSync {
         true
     }
 
-    fn compact_newest_layers(&mut self) {
-        let at = self.layers.merge_candidate();
-        let merged = (at + 1) as LayerId;
-        let files_end = self.files.len();
-        let dirs_end = self.dirs.len();
-        let (files_start, _) = self
-            .layers
-            .file_range(merged, files_end)
-            .expect("layer to compact");
-        let (dirs_start, _) = self
-            .layers
-            .dir_range(merged, dirs_end)
-            .expect("layer to compact");
-        let arenas = self.layer_arenas();
-        let mut builder =
-            ChunkedPathStoreBuilder::new((files_end - files_start) + (dirs_end - dirs_start));
-        let mut buf = [0u8; PATH_BUF_SIZE];
-
-        for file in self.files.range_mut(files_start..files_end) {
-            let path = file.path.read_to_buf(arenas.get(file.layer_id()), &mut buf);
-            file.set_path(builder.add_file_immediate(path, file.path.filename_offset));
-            file.set_layer(merged);
-        }
-        for dir in self.dirs.range_mut(dirs_start..dirs_end) {
-            let path = dir.path.read_to_buf(arenas.get(dir.layer_id()), &mut buf);
-            dir.path = builder.add_dir_immediate(path);
-            dir.set_layer(merged);
-        }
-
-        self.layers.merge_at(at, builder.finish());
-        self.sort_file_range(files_start, files_end);
-        self.layers.set_sorted(merged, true);
-    }
-
     // `true` when the tables were reallocated (mmap caches are dropped).
     fn ensure_capacity(&mut self, files_extra: usize, dirs_extra: usize) -> bool {
         let mut grew = false;
@@ -163,29 +152,47 @@ impl FileSync {
         grew
     }
 
-    fn add_entries(&mut self, entries: &[IndexEntry<'_>]) -> usize {
-        let layer = self.ensure_open_top();
+    // Explicit paths never go to the session layer, which a rescan rebuilds
+    // from disk. A layer is opened for the first new path, so a batch of
+    // duplicates does not take an id.
+    fn add_entries(&mut self, entries: &[IndexEntry<'_>]) -> Result<usize, Error> {
+        let mut layer = self.layers.open_layer();
+        if layer.is_none() && self.layers.free_id().is_none() {
+            return Err(Error::LayerLimit);
+        }
+        let (files_len, dirs_len) = (self.files.len(), self.dirs.len());
+        let mut batch: AHashSet<String> = AHashSet::new();
         let mut added = 0;
 
         for entry in entries {
             let Some(path) = normalize_relative_path(entry.relative_path) else {
                 continue;
             };
-            if let Some(idx) = self.find_relative_path_index(&path) {
+            if let Some(idx) = self.lookup_relative_path(&path, files_len) {
                 added +=
                     self.revive_entry(idx, entry.size, entry.modified, entry.is_binary()) as usize;
                 continue;
             }
+            if batch.contains(path.as_str()) {
+                continue;
+            }
+            let layer = match layer {
+                Some(id) => id,
+                None => *layer.insert(self.create_layer(None)?),
+            };
 
             let offset = filename_offset(&path) as u16;
-            let Some(dir_idx) = self.find_or_add_dir(&path[..offset as usize]) else {
+            let Some(dir_idx) = self.find_or_add_dir_in(layer, &path[..offset as usize]) else {
+                break;
+            };
+            let Some(builder) = self.layers.builder(layer) else {
                 break;
             };
 
             let mut file =
                 FileItem::new_raw(offset, entry.size, entry.modified, None, entry.is_binary());
             file.mark_definition_language(&path);
-            file.set_path(self.layers.top_builder().add_file_immediate(&path, offset));
+            file.set_path(builder.add_file_immediate(&path, offset));
             file.set_layer(layer);
             file.parent_dir_index = dir_idx;
 
@@ -194,18 +201,19 @@ impl FileSync {
             }
             self.live_count += 1;
             self.revive_dir(dir_idx);
+            batch.insert(path);
             added += 1;
         }
 
-        added
+        if let Some(layer) = layer {
+            self.settle_appended(layer, files_len, dirs_len);
+        }
+        Ok(added)
     }
 
-    // Appends the snapshot as a new sealed layer; files already present in
-    // the index are skipped. Returns the new layer id and files added.
-    fn append_snapshot(&mut self, snapshot: LayerSnapshot) -> (LayerId, usize) {
-        self.seal_top_sorted();
-        self.make_room();
-
+    // Attaches `snapshot` as layer `id` under the session layer; files already
+    // present in the index are revived or skipped. Returns the files added.
+    fn attach_snapshot(&mut self, id: LayerId, snapshot: LayerSnapshot, open: bool) -> usize {
         let LayerSnapshot {
             label,
             store,
@@ -213,12 +221,11 @@ impl FileSync {
             dirs,
             layout,
         } = snapshot;
-        let layer = self.layers.top_id() + 1;
         let arena = store.as_arena_ptr();
-        let files_start = self.files.len();
+        let (files_len, dirs_len) = (self.files.len(), self.dirs.len());
         // Registered up front so lookups below can resolve the new dirs' arena.
         self.layers
-            .push_sealed(label, store, files_start, self.dirs.len());
+            .insert_sealed(id, label, store, layout == SnapshotLayout::Sorted);
 
         let mut dir_map: Vec<u32> = Vec::with_capacity(dirs.len());
         let mut dir_buf = [0u8; PATH_BUF_SIZE];
@@ -228,7 +235,7 @@ impl FileSync {
                 Some(idx) => idx as u32,
                 None => {
                     let idx = self.dirs.len() as u32;
-                    dir.set_layer(layer);
+                    dir.set_layer(id);
                     dir.set_deleted(false);
                     if !self.dirs.push(dir) {
                         break;
@@ -247,13 +254,13 @@ impl FileSync {
                 continue;
             };
             let path = file.path.read_to_buf(arena, &mut path_buf);
-            if let Some(idx) = self.lookup_relative_path(path, files_start) {
+            if let Some(idx) = self.lookup_relative_path(path, files_len) {
                 added +=
                     self.revive_entry(idx, file.size, file.modified, file.is_binary()) as usize;
                 continue;
             }
 
-            file.set_layer(layer);
+            file.set_layer(id);
             file.set_deleted(false);
             file.parent_dir_index = dir_idx;
             if !self.files.push(file) {
@@ -264,12 +271,14 @@ impl FileSync {
             added += 1;
         }
 
+        self.settle_appended(id, files_len, dirs_len);
         // Every sealed layer must be binary searchable.
-        if layout != SnapshotLayout::Sorted {
-            self.sort_file_range(files_start, self.files.len());
+        self.sort_layer(id);
+        if open {
+            self.layers.reopen(id);
         }
 
-        (layer, added)
+        added
     }
 
     // Live files of `layer` (0 = base) as a self-contained snapshot; the arena
@@ -377,25 +386,28 @@ impl FileSync {
         })
     }
 
-    // Moves every explicit overlay of `old` onto this sync. The session layer
-    // is left behind: a rescan re-discovers its files.
+    // Moves every explicit layer of `old` onto this sync with its id, label and
+    // open state. The session layer stays behind: a rescan re-discovers its files.
     pub(super) fn adopt_overlays(&mut self, old: &mut FileSync) {
-        let top = old.layers.top_id();
-        let exports: Vec<Option<LayerExport>> = (1..=top)
-            .map(|id| (id > SESSION_LAYER).then(|| old.export_layer_parts(id))?)
+        let exports: Vec<(LayerId, Option<LayerExport>)> = old
+            .layers
+            .ids()
+            .filter(|&id| id != SESSION_LAYER)
+            .map(|id| (id, old.export_layer_parts(id)))
             .collect();
         // Taking the stack leaves each arena uniquely owned, so a layer with
         // foreign dirs reopens it in place instead of copying it.
         let base_only = LayerStack::new(old.base_count, old.base_dirs_count);
-        let stores = std::mem::replace(&mut old.layers, base_only).into_stores();
-        for (export, store) in exports.into_iter().zip(stores) {
-            let Some(export) = export.filter(|export| !export.is_empty()) else {
+        let mut stores = std::mem::replace(&mut old.layers, base_only).into_stores();
+        for (id, export) in exports {
+            let (Some(export), Some(pos)) = (export, stores.iter().position(|s| s.0 == id)) else {
                 continue;
             };
+            let (_, store, open) = stores.swap_remove(pos);
             let snapshot = export.into_snapshot(store, &old.dirs);
             self.ensure_capacity(snapshot.files.len(), snapshot.dirs.len());
-            let (layer, added) = self.append_snapshot(snapshot);
-            debug!(layer, added, "Adopted index layer across rescan");
+            let added = self.attach_snapshot(id, snapshot, open);
+            debug!(layer = id, added, "Adopted index layer across rescan");
         }
     }
 
@@ -475,7 +487,6 @@ impl FileSync {
             base_dirs_count,
             live_dirs_count: base_dirs_count,
             layers: LayerStack::new(base_count, base_dirs_count),
-            open_file_index: PathIndex::default(),
             overlay_dir_index: PathIndex::default(),
             git,
             shared_base,
@@ -499,10 +510,6 @@ struct LayerExport {
 }
 
 impl LayerExport {
-    fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.label.is_none()
-    }
-
     fn into_snapshot(
         self,
         store: Arc<ChunkedPathStore>,
@@ -548,31 +555,34 @@ impl LayerExport {
 }
 
 impl FilePicker {
-    /// Seals the writable overlay and opens a new one, returning its id.
+    /// Seals the open layer and opens a new one for [`add_entries`](Self::add_entries),
+    /// returning its id.
     ///
-    /// Everything the watcher indexes from now on lands in the new layer. The
-    /// stack holds at most [`MAX_OVERLAY_LAYERS`](crate::MAX_OVERLAY_LAYERS)
-    /// overlays; past that the two newest are compacted into one, so
-    /// [`SESSION_LAYER`](crate::SESSION_LAYER) — every file added since the
-    /// picker started — always survives.
+    /// A layer keeps its id and label until the picker is dropped, rescans
+    /// included. The watcher only writes to [`SESSION_LAYER`](crate::SESSION_LAYER),
+    /// so a layer holds exactly the paths added or imported into it.
     ///
-    /// Returns [`Error::IndexBusy`] during a scan or post-scan indexing.
+    /// Returns [`Error::LayerLimit`] when all [`MAX_OVERLAY_LAYERS`](crate::MAX_OVERLAY_LAYERS)
+    /// overlays exist and [`Error::IndexBusy`] during a scan or post-scan indexing.
     pub fn create_layer(&mut self, label: Option<&str>) -> Result<LayerId, Error> {
         self.ensure_index_idle()?;
-        let id = self.sync_data.create_layer(label);
+        let id = self.sync_data.create_layer(label)?;
         debug!(layer = id, ?label, "Opened new index layer");
 
         Ok(id)
     }
 
-    /// Layer new files are currently written into.
+    /// Layer [`add_entries`](Self::add_entries) appends to. Until a layer is
+    /// open this is [`SESSION_LAYER`](crate::SESSION_LAYER), where the watcher
+    /// writes, and `add_entries` opens an unlabeled layer itself.
     #[inline]
     pub fn current_layer(&self) -> LayerId {
-        self.sync_data.layers.top_id()
+        self.sync_data.layers.open_layer().unwrap_or(SESSION_LAYER)
     }
 
-    /// Overlay layers oldest first. The base scan (layer 0) is not included —
-    /// it is the whole of [`get_files`](Self::get_files) below `base_count`.
+    /// Overlay layers by id, so the session layer comes first. The base scan
+    /// (layer 0) is not included — it is the whole of [`get_files`](Self::get_files)
+    /// below `base_count`.
     pub fn layers(&self) -> Vec<LayerInfo> {
         self.sync_data
             .layers
@@ -605,34 +615,43 @@ impl FilePicker {
         }
     }
 
-    /// Appends entries to the writable layer without touching the filesystem.
-    /// Paths already in the index are skipped. Returns the number added.
+    /// Appends entries to the open layer without touching the filesystem,
+    /// opening an unlabeled layer when none is open. Entries survive rescans.
+    /// Paths already in the index are skipped and tombstoned ones are revived.
+    /// Returns the number added.
     ///
-    /// Grows the file table when needed. Returns [`Error::IndexBusy`] during post-scan indexing.
+    /// Grows the file table when needed. Returns [`Error::LayerLimit`] when a
+    /// layer must be opened but all exist, and [`Error::IndexBusy`] during a
+    /// scan or post-scan indexing.
     pub fn add_entries<'a>(
         &mut self,
         entries: impl IntoIterator<Item = IndexEntry<'a>>,
     ) -> Result<usize, Error> {
         let entries: Vec<IndexEntry<'a>> = entries.into_iter().collect();
         self.reserve_index(entries.len(), entries.len())?;
-        let added = self.sync_data.add_entries(&entries);
+        let added = self.sync_data.add_entries(&entries)?;
         debug!(
             added,
-            layer = self.sync_data.layers.top_id(),
+            layer = self.current_layer(),
             "Added entries to index layer"
         );
 
         Ok(added)
     }
 
-    /// Attaches `snapshot` as a new sealed layer on top of the stack and
-    /// returns its id. Files already present in the index are skipped.
+    /// Attaches `snapshot` as a new sealed layer and returns its id. Files
+    /// already present in the index are skipped. The open layer stays open.
+    ///
+    /// Returns [`Error::LayerLimit`] when all [`MAX_OVERLAY_LAYERS`](crate::MAX_OVERLAY_LAYERS)
+    /// overlays exist.
     pub fn import_layer(&mut self, snapshot: LayerSnapshot) -> Result<LayerId, Error> {
+        self.ensure_index_idle()?;
+        let id = self.sync_data.layers.free_id().ok_or(Error::LayerLimit)?;
         self.reserve_index(snapshot.files.len(), snapshot.dirs.len())?;
-        let (layer, added) = self.sync_data.append_snapshot(snapshot);
-        info!(layer, added, "Imported index layer");
+        let added = self.sync_data.attach_snapshot(id, snapshot, false);
+        info!(layer = id, added, "Imported index layer");
 
-        Ok(layer)
+        Ok(id)
     }
 
     /// Replaces the base scan with `snapshot`, keeping explicit overlay layers.
@@ -747,6 +766,59 @@ mod tests {
             .expect("explicit layer survives the rescan");
         assert_eq!(picker.sync_data.layer_arenas().get(kept).as_ptr(), before);
         assert_eq!(picker.files_in_layer(kept).len(), 1);
+    }
+
+    #[test]
+    fn growing_an_older_layer_keeps_parents_and_ranges_consistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("scanned.rs"), "").unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: tmp.path().to_string_lossy().into_owned(),
+            watch: false,
+            enable_home_dir_scanning: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        picker.create_layer(Some("old")).unwrap();
+        picker.add_entries([IndexEntry::new("old/a.rs")]).unwrap();
+        let mut builder = crate::LayerBuilder::new(Some("import"));
+        assert!(builder.push(&IndexEntry::new("imp/b.rs")));
+        picker.import_layer(builder.finish()).unwrap();
+        for path in ["sess/c.rs", "sess/deep/d.rs"] {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "").unwrap();
+            assert!(picker.add_new_file(&full).is_some());
+        }
+        picker
+            .add_entries([
+                IndexEntry::new("old/new/e.rs"),
+                IndexEntry::new("sess/f.rs"),
+                IndexEntry::new("imp/g.rs"),
+            ])
+            .unwrap();
+
+        let sync = &picker.sync_data;
+        let arenas = sync.layer_arenas();
+        let (mut file_buf, mut dir_buf) = ([0u8; PATH_BUF_SIZE], [0u8; PATH_BUF_SIZE]);
+        for file in &sync.files[sync.base_count..] {
+            let path = file
+                .path
+                .read_to_buf(arenas.get(file.layer_id()), &mut file_buf);
+            let dir = &sync.dirs[file.parent_dir_index as usize];
+            let dir_path = dir.read_relative_path(arenas.get(dir.layer_id()), &mut dir_buf);
+            assert_eq!(dir_path, &path[..file.path.filename_offset as usize]);
+        }
+        for id in [SESSION_LAYER, 2, 3] {
+            let (start, end) = sync.layers.file_range(id, sync.files.len()).unwrap();
+            assert!(sync.files[start..end].iter().all(|f| f.layer_id() == id));
+            let (start, end) = sync.layers.dir_range(id, sync.dirs.len()).unwrap();
+            assert!(sync.dirs[start..end].iter().all(|d| d.layer_id() == id));
+        }
+        assert_eq!(picker.files_in_layer(2).len(), 4);
+        assert_eq!(picker.files_in_layer(SESSION_LAYER).len(), 2);
     }
 
     #[test]

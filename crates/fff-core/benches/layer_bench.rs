@@ -166,10 +166,9 @@ fn bench_persist(c: &mut Criterion) {
     });
 
     let mut picker = empty_picker(dir.path());
-    picker
+    let layer = picker
         .import_layer(LayerSnapshot::load(&file).unwrap())
         .unwrap();
-    let layer = picker.current_layer();
     group.bench_function("export_layer_100k", |b| {
         b.iter(|| black_box(picker.export_layer(layer).unwrap()))
     });
