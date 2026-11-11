@@ -52,18 +52,29 @@ impl<P: Default> SearchBuffer<P> {
             page: P::default(),
             state: SearchState {
                 ttl,
-                metadata: None,
-                index_revision: None,
-                files: Default::default(),
-                dirs: Vec::new(),
-                grep_misses: Vec::new(),
-                grep_insensitive: false,
+                ..Default::default()
             },
         }
     }
 }
 
 impl<P> SearchBuffer<P> {
+    pub(crate) fn fuzzy_swap(
+        &mut self,
+        next: &mut Self,
+        query: &FFFQuery<'_>,
+        mode: SearchMode,
+        revision: u64,
+        fill: impl FnOnce(Option<FuzzyBuffers<'_>>, &mut P),
+    ) -> &mut P {
+        let buffers = next.state.begin_fuzzy(&self.state, query, mode, revision);
+        let capture = buffers.is_some();
+        fill(buffers, &mut next.page);
+        next.state.index_revision = capture.then_some(revision);
+        std::mem::swap(self, next);
+        &mut self.page
+    }
+
     pub fn metadata(&self) -> Option<&SearchMetadata> {
         self.state.metadata.as_ref()
     }
@@ -103,7 +114,7 @@ impl SearchBuffer<crate::GrepResult<'_>> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct SearchState {
     metadata: Option<SearchMetadata>,
     ttl: Duration,
@@ -119,10 +130,7 @@ pub(crate) struct Candidates<'a, T> {
     pub next: &'a mut T,
 }
 
-pub(crate) struct FuzzyBuffers<'a> {
-    previous: Option<&'a SearchState>,
-    next: &'a mut SearchState,
-}
+pub(crate) type FuzzyBuffers<'a> = Candidates<'a, SearchState>;
 
 impl SearchState {
     pub(crate) fn record_grep(
@@ -181,7 +189,7 @@ impl SearchState {
         ))
     }
 
-    pub(crate) fn begin_fuzzy<'a>(
+    fn begin_fuzzy<'a>(
         &'a mut self,
         previous: &'a Self,
         query: &FFFQuery<'_>,

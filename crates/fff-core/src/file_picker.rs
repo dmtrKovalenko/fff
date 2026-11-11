@@ -1278,23 +1278,21 @@ impl FilePicker {
         previous: &'b mut SearchBuffer<SearchResult<'p>>,
         next: &mut SearchBuffer<SearchResult<'p>>,
     ) -> &'b mut SearchResult<'p> {
-        let mut buffers = next.state.begin_fuzzy(
-            &previous.state,
+        previous.fuzzy_swap(
+            next,
             query,
             SearchMode::Files,
             self.index_revision,
-        );
-        let capture = buffers.is_some();
-        self.fuzzy_search_impl(
-            query,
-            query_tracker,
-            options,
-            buffers.as_mut().map(FuzzyBuffers::files),
-            &mut next.page,
-        );
-        next.state.index_revision = capture.then_some(self.index_revision);
-        std::mem::swap(previous, next);
-        &mut previous.page
+            |mut buffers, page| {
+                self.fuzzy_search_impl(
+                    query,
+                    query_tracker,
+                    options,
+                    buffers.as_mut().map(FuzzyBuffers::files),
+                    page,
+                );
+            },
+        )
     }
 
     #[tracing::instrument(skip_all, name = "Fuzzy file search", fields(query = query.raw_query))]
@@ -1414,22 +1412,20 @@ impl FilePicker {
         previous: &'b mut SearchBuffer<DirSearchResult<'p>>,
         next: &mut SearchBuffer<DirSearchResult<'p>>,
     ) -> &'b mut DirSearchResult<'p> {
-        let mut buffers = next.state.begin_fuzzy(
-            &previous.state,
+        previous.fuzzy_swap(
+            next,
             query,
             SearchMode::Directories,
             self.index_revision,
-        );
-        let capture = buffers.is_some();
-        self.fuzzy_search_directories_impl(
-            query,
-            options,
-            buffers.as_mut().map(FuzzyBuffers::dirs),
-            &mut next.page,
-        );
-        next.state.index_revision = capture.then_some(self.index_revision);
-        std::mem::swap(previous, next);
-        &mut previous.page
+            |mut buffers, page| {
+                self.fuzzy_search_directories_impl(
+                    query,
+                    options,
+                    buffers.as_mut().map(FuzzyBuffers::dirs),
+                    page,
+                );
+            },
+        )
     }
 
     fn fuzzy_search_directories_impl<'p, 'q>(
@@ -1520,17 +1516,15 @@ impl FilePicker {
         previous: &'b mut SearchBuffer<MixedSearchResult<'p>>,
         next: &mut SearchBuffer<MixedSearchResult<'p>>,
     ) -> &'b mut MixedSearchResult<'p> {
-        let buffers = next.state.begin_fuzzy(
-            &previous.state,
+        previous.fuzzy_swap(
+            next,
             query,
             SearchMode::Mixed,
             self.index_revision,
-        );
-        let capture = buffers.is_some();
-        self.fuzzy_search_mixed_impl(query, query_tracker, options, buffers, &mut next.page);
-        next.state.index_revision = capture.then_some(self.index_revision);
-        std::mem::swap(previous, next);
-        &mut previous.page
+            |buffers, page| {
+                self.fuzzy_search_mixed_impl(query, query_tracker, options, buffers, page);
+            },
+        )
     }
 
     fn fuzzy_search_mixed_impl<'p, 'q>(
@@ -1556,7 +1550,7 @@ impl FilePicker {
         // Run file search and dir search with no pagination (we merge then paginate).
         let internal_limit = page_offset.saturating_add(page_limit).saturating_mul(2);
 
-        let dir_options = FuzzySearchOptions {
+        let ranking_options = FuzzySearchOptions {
             pagination: PaginationArgs {
                 offset: 0,
                 limit: internal_limit,
@@ -1566,7 +1560,7 @@ impl FilePicker {
         let mut dir_results = DirSearchResult::default();
         self.fuzzy_search_directories_impl(
             query,
-            dir_options,
+            ranking_options,
             buffers.as_mut().map(FuzzyBuffers::dirs),
             &mut dir_results,
         );
@@ -1589,18 +1583,11 @@ impl FilePicker {
             return;
         }
 
-        let file_options = FuzzySearchOptions {
-            pagination: PaginationArgs {
-                offset: 0,
-                limit: internal_limit,
-            },
-            ..options
-        };
         let mut file_results = SearchResult::default();
         self.fuzzy_search_impl(
             query,
             query_tracker,
-            file_options,
+            ranking_options,
             buffers.as_mut().map(FuzzyBuffers::files),
             &mut file_results,
         );

@@ -1,20 +1,138 @@
-use std::{fs, path::Path, time::Duration};
-
 use fff_search::{
-    DirSearchConfig, FilePicker, FilePickerOptions, FileSearchConfig, FuzzySearchOptions, GrepMode,
-    GrepResult, GrepSearchOptions, MixedItemRef, MixedSearchConfig, PaginationArgs, QueryParser,
-    SearchBuffer, SearchMode, parse_grep_query, refine_grep_into,
+    DefinitionMode, DirSearchConfig, FilePicker, FilePickerOptions, FileSearchConfig,
+    FuzzySearchOptions, GrepMode, GrepResult, GrepSearchOptions, MixedItemRef, MixedSearchConfig,
+    PaginationArgs, QueryParser, SearchBuffer, SearchMode, SearchResult, parse_grep_query,
 };
+use std::{fs, ptr, time::Duration};
 
 #[test]
-fn fuzzy_swap_reuses_candidates_beyond_the_page() {
+fn refine_a_search_in_two_caller_owned_buffers() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("components")).unwrap();
-    let controller = root.path().join("components/controller.rs");
-    fs::write(&controller, "").unwrap();
-    fs::write(root.path().join("co"), "").unwrap();
-    let mut picker = picker(root.path());
-    let parser = QueryParser::new(FileSearchConfig);
+    for (path, text) in [
+        ("co", ""),
+        (
+            "components/controller.rs",
+            "fn schema() {}\nschemas();\nname(\n*.txt needle\nab....cdefghijkl\n",
+        ),
+        ("components/controller_test.txt", "schemas();\n"),
+    ] {
+        fs::write(root.path().join(path), text).unwrap();
+    }
+    for i in 0..70 {
+        fs::write(root.path().join(format!("{i}.txt")), "unrelated").unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().display().to_string(),
+        enable_mmap_cache: false,
+        enable_content_indexing: false,
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    check_fuzzy_searches(&picker);
+
+    let mut buffers = Default::default();
+    let full = GrepSearchOptions {
+        page_limit: usize::MAX,
+        time_budget_ms: 0,
+        ..Default::default()
+    };
+    for (mode, prefix, refined) in [
+        (GrepMode::PlainText, "schema", "schemas"),
+        (GrepMode::Regex, "sch.ma", "sch.mas"),
+        (GrepMode::Fuzzy, "shcema", "shcemas"),
+    ] {
+        let options = GrepSearchOptions {
+            mode,
+            ..full.clone()
+        };
+        check_grep(&picker, &mut buffers, prefix, &options);
+        check_grep(&picker, &mut buffers, refined, &options);
+        let meta = buffers[0].metadata().unwrap();
+        assert!(meta.grep_files_reused >= 64);
+        assert_eq!(meta.scanned_at, buffers[1].metadata().unwrap().scanned_at);
+        assert_eq!(meta.max_typos.is_some(), mode == GrepMode::Fuzzy);
+
+        let partial = GrepSearchOptions {
+            page_limit: 1,
+            max_matches_per_file: 1,
+            ..options.clone()
+        };
+        check_grep(&picker, &mut buffers, prefix, &partial);
+        let resume = GrepSearchOptions {
+            file_offset: buffers[0].page.next_file_offset,
+            ..options.clone()
+        };
+        assert!(resume.file_offset > 0);
+        check_grep(&picker, &mut buffers, prefix, &resume);
+        check_grep(&picker, &mut buffers, refined, &options);
+        let definitions = GrepSearchOptions {
+            classify_definitions: DefinitionMode::DefinitionOnly,
+            ..options.clone()
+        };
+        check_grep(&picker, &mut buffers, "schema *.rs", &definitions);
+        check_grep(&picker, &mut buffers, "schemas", &options);
+    }
+
+    for (mode, text) in [
+        (GrepMode::Regex, "absent"),
+        (GrepMode::Regex, "absent|schema"),
+        (GrepMode::Regex, "name("),
+        (GrepMode::PlainText, "*.txt needle"),
+        (GrepMode::Fuzzy, "abc"),
+        (GrepMode::Fuzzy, "abcd"),
+        (GrepMode::PlainText, "schema"),
+        (GrepMode::PlainText, "schema\\n"),
+        (GrepMode::PlainText, ""),
+    ] {
+        check_grep(
+            &picker,
+            &mut buffers,
+            text,
+            &GrepSearchOptions {
+                mode,
+                ..full.clone()
+            },
+        );
+    }
+
+    let path = root.path().join("0.txt");
+    check_grep(&picker, &mut buffers, "new", &full);
+    fs::write(&path, "new hit").unwrap();
+    let mut buffers = buffers.map(SearchBuffer::<GrepResult>::release_picker);
+    picker.handle_create_or_modify(&path).unwrap();
+    check_grep(&picker, &mut buffers, "new hit", &full);
+    assert_eq!(buffers[0].page.matches.len(), 1);
+    assert_eq!(buffers[0].metadata().unwrap().grep_files_reused, 0);
+
+    for ttl in [Duration::from_millis(1), Duration::ZERO] {
+        let mut buffers = std::array::from_fn(|_| SearchBuffer::with_ttl(ttl));
+        fs::write(&path, "unrelated").unwrap();
+        check_grep(&picker, &mut buffers, "new", &full);
+        fs::write(&path, "new hit").unwrap();
+        std::thread::sleep(ttl);
+        check_grep(&picker, &mut buffers, "new hit", &full);
+        assert_eq!(buffers[0].page.matches.len(), 1);
+        assert_eq!(buffers[0].metadata().unwrap().grep_files_reused, 0);
+    }
+    // A valid regex prefix can miss a file that its oversized literal fallback matches.
+    let literal = format!("x[yz]{}", "a".repeat(600_000));
+    fs::write(&path, &literal).unwrap();
+    picker.handle_create_or_modify(&path).unwrap();
+    let options = GrepSearchOptions {
+        mode: GrepMode::Regex,
+        ..full
+    };
+    let mut buffers = Default::default();
+    check_grep(&picker, &mut buffers, "x[yz]", &options);
+    check_grep(&picker, &mut buffers, &literal, &options);
+    assert_eq!(buffers[0].page.matches.len(), 1);
+    assert!(buffers[0].page.regex_fallback_error.is_some());
+}
+
+fn check_fuzzy_searches(picker: &FilePicker) {
     let options = FuzzySearchOptions {
         pagination: PaginationArgs {
             offset: 0,
@@ -22,582 +140,114 @@ fn fuzzy_swap_reuses_candidates_beyond_the_page() {
         },
         ..Default::default()
     };
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-
-    let first =
-        picker.fuzzy_search_swap(&parser.parse("co"), None, options, &mut previous, &mut next);
-    assert_eq!(first.items[0].relative_path(&picker), "co");
-    assert!(first.total_matched > first.items.len());
-
-    let query = parser.parse("control");
-    picker.fuzzy_search_swap(&query, None, options, &mut previous, &mut next);
-    let page = &previous.page;
-    assert_eq!(
-        page.items[0].relative_path(&picker),
-        "components/controller.rs"
-    );
-    assert_eq!(previous.metadata().unwrap().max_typos, Some(2));
-    assert_eq!(
-        previous.metadata().unwrap().scanned_at,
-        next.metadata().unwrap().scanned_at
-    );
-    assert!(!page.match_byte_offsets[0].is_empty());
-
-    for input in [
-        "contr",
+    let parser = QueryParser::new(FileSearchConfig);
+    let [mut previous, mut next]: [SearchBuffer<SearchResult>; 2] = Default::default();
+    for text in [
+        "co",
+        "con",
         "control",
         "controller",
-        "controllerxxx",
         "Controller",
         "contról",
+        "absent_xyz",
+        "",
     ] {
-        let query = parser.parse(input);
-        let full = picker.fuzzy_search(&query, None, options);
-        let page = picker.fuzzy_search_swap(&query, None, options, &mut previous, &mut next);
-        assert_eq!(page.total_matched, full.total_matched, "{input}");
-        assert!(
-            page.items
-                .iter()
-                .zip(&full.items)
-                .all(|(a, b)| std::ptr::eq(*a, *b))
+        let query = parser.parse(text);
+        let fresh = picker.fuzzy_search(&query, None, options);
+        let warmed = next.page.items.capacity() > 0;
+        let storage = (
+            next.page.items.as_ptr(),
+            next.page.scores.as_ptr(),
+            next.page.match_byte_offsets.as_ptr(),
         );
-        assert_eq!(page.match_byte_offsets, full.match_byte_offsets, "{input}");
-    }
-
-    let (mut previous, mut next) = (previous.release_picker(), next.release_picker());
-    assert!(picker.remove_file_by_path(&controller));
-    let removed = picker.fuzzy_search_swap(
-        &parser.parse("control"),
-        None,
-        options,
-        &mut previous,
-        &mut next,
-    );
-    assert_eq!(removed.total_matched, 0);
-    let (mut previous, mut next) = (previous.release_picker(), next.release_picker());
-    picker.handle_create_or_modify(&controller).unwrap();
-    let page = picker.fuzzy_search_swap(
-        &parser.parse("controller"),
-        None,
-        options,
-        &mut previous,
-        &mut next,
-    );
-    assert_eq!(
-        page.items[0].relative_path(&picker),
-        "components/controller.rs"
-    );
-
-    fs::remove_file(root.path().join("co")).unwrap();
-    fs::write(root.path().join("controllers"), "").unwrap();
-    let (mut previous, mut next) = (previous.release_picker(), next.release_picker());
-    picker.collect_files().unwrap();
-    let page = picker.fuzzy_search_swap(
-        &parser.parse("controllers"),
-        None,
-        options,
-        &mut previous,
-        &mut next,
-    );
-    assert_eq!(page.items[0].relative_path(&picker), "controllers");
-
-    let prefix = parser.parse("contr");
-    picker.fuzzy_search_swap(&prefix, None, options, &mut previous, &mut next);
-    let added = root.path().join("contr1");
-    fs::write(&added, "").unwrap();
-    let (mut previous, mut next) = (previous.release_picker(), next.release_picker());
-    picker.add_new_file(&added).unwrap();
-    let query = parser.parse("contr1");
-    let page = picker.fuzzy_search_swap(&query, None, options, &mut previous, &mut next);
-    assert_eq!(page.items[0].relative_path(&picker), "contr1");
-}
-
-#[test]
-fn fuzzy_swap_preserves_rank_and_highlights_through_consecutive_edits() {
-    let root = tempfile::tempdir().unwrap();
-    for prefix in ["controller", "comptroller", "container", "connector"] {
-        for suffix in ["service", "services", "server", "servant"] {
-            fs::write(root.path().join(format!("{prefix}_{suffix}.rs")), "").unwrap();
+        let page = picker.fuzzy_search_swap(&query, None, options, &mut previous, &mut next);
+        if warmed {
+            assert_eq!(
+                storage,
+                (
+                    page.items.as_ptr(),
+                    page.scores.as_ptr(),
+                    page.match_byte_offsets.as_ptr()
+                )
+            );
         }
-    }
-    let picker = picker(root.path());
-    let parser = QueryParser::new(FileSearchConfig);
-    let options = FuzzySearchOptions::default();
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-    let input = "controller_service";
-    for end in 2..=input.len() {
-        let query = parser.parse(&input[..end]);
-        let full = picker.fuzzy_search(&query, None, options);
-        let page = picker.fuzzy_search_swap(&query, None, options, &mut previous, &mut next);
-        assert_eq!(page.total_matched, full.total_matched);
-        assert!(
-            page.items
-                .iter()
-                .map(|&f| std::ptr::from_ref(f))
-                .eq(full.items.iter().map(|&f| std::ptr::from_ref(f)))
-        );
+        assert_items(&page.items, &fresh.items);
+        assert_eq!(page.total_matched, fresh.total_matched);
         assert!(
             page.scores
                 .iter()
                 .map(|s| s.total)
-                .eq(full.scores.iter().map(|s| s.total))
+                .eq(fresh.scores.iter().map(|s| s.total))
         );
-        assert_eq!(page.match_byte_offsets, full.match_byte_offsets);
+        assert_eq!(page.match_byte_offsets, fresh.match_byte_offsets);
+        if text == "co" {
+            assert!(page.total_matched > page.items.len());
+            assert_eq!(page.items[0].relative_path(picker), "co");
+        }
+        if text == "control" {
+            assert!(page.items[0].relative_path(picker).contains("controller"));
+            assert_eq!(
+                previous.metadata().unwrap().scanned_at,
+                next.metadata().unwrap().scanned_at
+            );
+        }
     }
-}
+    let mut dirs = [SearchBuffer::default(), SearchBuffer::default()];
+    let mut mixed = [SearchBuffer::default(), SearchBuffer::default()];
+    for text in ["com", "comp", "components/", "components/controller"] {
+        let query = QueryParser::new(DirSearchConfig).parse(text);
+        let [previous, next] = &mut dirs;
+        let page = picker.fuzzy_search_directories_swap(&query, options, previous, next);
+        let fresh = picker.fuzzy_search_directories(&query, options);
+        assert_items(&page.items, &fresh.items);
+        assert_eq!(page.total_matched, fresh.total_matched);
 
-#[test]
-fn directory_and_mixed_swap_match_one_shot_search() {
-    let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("components")).unwrap();
-    fs::write(root.path().join("components/component.rs"), "").unwrap();
-    fs::create_dir(root.path().join("common")).unwrap();
-    let picker = picker(root.path());
-    let options = FuzzySearchOptions::default();
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-
-    let parser = QueryParser::new(DirSearchConfig);
-    for input in ["com", "comp", "components"] {
-        let query = parser.parse(input);
-        let full = picker.fuzzy_search_directories(&query, options);
-        let page = picker.fuzzy_search_directories_swap(&query, options, &mut previous, &mut next);
-        assert_eq!(page.total_matched, full.total_matched);
-        assert!(
-            page.items
-                .iter()
-                .zip(&full.items)
-                .all(|(a, b)| std::ptr::eq(*a, *b))
-        );
-    }
-
-    let (mut previous, mut next) = (SearchBuffer::default(), SearchBuffer::default());
-    let parser = QueryParser::new(MixedSearchConfig);
-    for input in ["com", "components/", "components/component"] {
-        let query = parser.parse(input);
-        let full = picker.fuzzy_search_mixed(&query, None, options);
-        let page = picker.fuzzy_search_mixed_swap(&query, None, options, &mut previous, &mut next);
-        assert_eq!(page.total_matched, full.total_matched);
-        assert!(
-            page.items
-                .iter()
-                .zip(&full.items)
-                .all(|(a, b)| match (a, b) {
-                    (MixedItemRef::File(a), MixedItemRef::File(b)) => std::ptr::eq(*a, *b),
-                    (MixedItemRef::Dir(a), MixedItemRef::Dir(b)) => std::ptr::eq(*a, *b),
-                    _ => false,
-                })
-        );
-    }
-}
-
-#[test]
-fn grep_swap_reports_pattern_mode_and_typo_budget() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(
-        root.path().join("a.rs"),
-        "fn schema() {}\nname(\nfoo !bar_baz qux\n",
-    )
-    .unwrap();
-    let picker = picker(root.path());
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-
-    for (raw, mode, effective_mode, typos) in [
-        (
-            "schema *.rs",
-            GrepMode::PlainText,
-            GrepMode::PlainText,
-            None,
-        ),
-        ("sch.ma", GrepMode::Regex, GrepMode::Regex, None),
-        ("shcema", GrepMode::Fuzzy, GrepMode::Fuzzy, Some(2)),
-        ("name(", GrepMode::Regex, GrepMode::PlainText, None),
-        (
-            "foo !bar_baz qux",
-            GrepMode::PlainText,
-            GrepMode::PlainText,
-            None,
-        ),
-    ] {
-        let query = parse_grep_query(raw);
-        let options = GrepSearchOptions {
-            mode,
-            ..Default::default()
+        let query = QueryParser::new(MixedSearchConfig).parse(text);
+        let [previous, next] = &mut mixed;
+        let page = picker.fuzzy_search_mixed_swap(&query, None, options, previous, next);
+        let fresh = picker.fuzzy_search_mixed(&query, None, options);
+        let path = |item: &MixedItemRef| match item {
+            MixedItemRef::Dir(dir) => dir.relative_path(picker),
+            MixedItemRef::File(file) => file.relative_path(picker),
         };
-        picker.grep_swap(&query, &options, &mut previous, &mut next);
-        let page = &previous.page;
-        assert_eq!(page.matches.len(), 1, "{raw}");
-        assert!(!page.matches[0].match_byte_offsets.is_empty(), "{raw}");
-        let metadata = previous.metadata().unwrap();
-        assert_eq!(metadata.raw_query, raw);
-        assert_eq!(metadata.effective_pattern, raw.trim_end_matches(" *.rs"));
-        assert_eq!(metadata.mode, SearchMode::Grep(effective_mode));
-        assert_eq!(metadata.max_typos, typos);
+        assert!(page.items.iter().map(path).eq(fresh.items.iter().map(path)));
+        assert_eq!(page.total_matched, fresh.total_matched);
     }
+}
 
-    let query = parse_grep_query("schema");
-    let options = GrepSearchOptions {
-        classify_definitions: fff_search::DefinitionMode::DefinitionOnly,
-        ..Default::default()
+fn check_grep<'p>(
+    picker: &'p FilePicker,
+    [previous, next]: &mut [SearchBuffer<GrepResult<'p>>; 2],
+    text: &str,
+    options: &GrepSearchOptions,
+) {
+    let query = parse_grep_query(text);
+    let fresh = picker.grep(&query, options);
+    let storage = (next.page.files.as_ptr(), next.page.matches.as_ptr());
+    let fits = fresh.files.len() <= next.page.files.capacity()
+        && fresh.matches.len() <= next.page.matches.capacity();
+    let page = picker.grep_swap(&query, options, previous, next);
+    assert_eq!(page.matches, fresh.matches, "{text}");
+    assert_items(&page.files, &fresh.files);
+    assert_eq!(page.next_file_offset, fresh.next_file_offset);
+    assert_eq!(page.filtered_file_count, fresh.filtered_file_count);
+    assert_eq!(page.literal_fallback, fresh.literal_fallback);
+    assert_eq!(page.regex_fallback_error, fresh.regex_fallback_error);
+    if fits {
+        assert_eq!(storage, (page.files.as_ptr(), page.matches.as_ptr()));
+    }
+    let mode = if page.regex_fallback_error.is_some() {
+        GrepMode::PlainText
+    } else {
+        options.mode
     };
-    let page = picker.grep_swap(&query, &options, &mut previous, &mut next);
-    assert!(page.matches[0].is_definition);
-
-    let hits = [("a.rs", "fn schema() {}"), ("b.rs", "let other = 1;")];
-    let mut rows = Vec::new();
-    refine_grep_into(hits, "schema", &mut rows);
-    assert_eq!(rows, [0]);
-    refine_grep_into(hits, "", &mut rows);
-    assert_eq!(rows, [0, 1]);
+    let meta = previous.metadata().unwrap();
+    assert_eq!(meta.mode, SearchMode::Grep(mode));
+    assert_eq!(meta.raw_query, text);
 }
 
-#[test]
-fn grep_swap_reuses_misses_but_searches_edited_and_unvisited_files() {
-    let root = tempfile::tempdir().unwrap();
-    for (name, content) in [
-        ("a.rs", "nothing here!\n"),
-        ("b.rs", "fn schema() {}\nfn schemas() {}\n"),
-        ("c.rs", "fn schemas() {}\n"),
-        ("d.rs", "other xyz!!!!\n"),
-    ] {
-        fs::write(root.path().join(name), content).unwrap();
-    }
-    let mut picker = picker(root.path());
-    for index in 0..picker.get_files().len() {
-        let name = picker.get_files()[index].relative_path(&picker);
-        picker.get_file_mut(index).unwrap().1.access_frecency_score =
-            200 - i16::from(name.as_bytes()[0]);
-    }
-
-    for (mode, prefix, refined) in [
-        (GrepMode::PlainText, "schema", "schemas"),
-        (GrepMode::Regex, "sch.ma", "sch.mas"),
-        (GrepMode::Fuzzy, "shcema", "shcemas"),
-    ] {
-        let mut previous = SearchBuffer::default();
-        let mut next = SearchBuffer::default();
-        let mut options = GrepSearchOptions {
-            mode,
-            page_limit: 1,
-            max_matches_per_file: 1,
-            classify_definitions: fff_search::DefinitionMode::DefinitionOnly,
-            ..Default::default()
-        };
-        let prefix = parse_grep_query(prefix);
-        let refined = parse_grep_query(refined);
-        let page = picker.grep_swap(&prefix, &options, &mut previous, &mut next);
-        assert_ne!(page.next_file_offset, 0, "{mode:?}");
-        options.page_limit = usize::MAX;
-        let all = picker.grep(&refined, &options);
-        picker.grep_swap(&refined, &options, &mut previous, &mut next);
-        let page = &previous.page;
-        assert_eq!(all.files_with_matches, 2, "{mode:?}");
-        assert_same_page(page, &all);
-        assert!(
-            previous.metadata().unwrap().grep_files_reused > 0,
-            "{mode:?}"
-        );
-
-        assert_eq!(
-            previous.metadata().unwrap().scanned_at,
-            next.metadata().unwrap().scanned_at
-        );
-        // Before a watcher event, a recent miss can hide an edit.
-        fs::write(root.path().join("a.rs"), "fn schemas(){}").unwrap();
-        let stale = picker.grep_swap(&refined, &options, &mut previous, &mut next);
-        assert_eq!(stale.files_with_matches, 2, "{mode:?}");
-        let (mut previous, mut next) = (previous.release_picker(), next.release_picker());
-        picker
-            .handle_create_or_modify(root.path().join("a.rs"))
-            .unwrap();
-        let all = picker.grep(&refined, &options);
-        picker.grep_swap(&refined, &options, &mut previous, &mut next);
-        let page = &previous.page;
-        assert_eq!(previous.metadata().unwrap().grep_files_reused, 0);
-        assert_eq!(all.files_with_matches, 3, "{mode:?}");
-        assert_same_page(page, &all);
-        fs::write(root.path().join("a.rs"), "nothing here!\n").unwrap();
-    }
-}
-
-#[test]
-fn expired_and_disabled_buffers_search_unreported_edits() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("source.txt");
-    fs::write(&path, "old value").unwrap();
-    let picker = picker(root.path());
-    for ttl in [Duration::from_millis(1), Duration::ZERO] {
-        fs::write(&path, "old value").unwrap();
-        let mut previous = SearchBuffer::with_ttl(ttl);
-        let mut next = SearchBuffer::with_ttl(ttl);
-        let options = GrepSearchOptions::default();
-        picker.grep_swap(&parse_grep_query("new"), &options, &mut previous, &mut next);
-        fs::write(&path, "new value").unwrap();
-        std::thread::sleep(ttl);
-        let query = parse_grep_query("new value");
-        picker.grep_swap(&query, &options, &mut previous, &mut next);
-        let page = &previous.page;
-        assert_eq!(previous.metadata().unwrap().grep_files_reused, 0);
-        assert_eq!(page.matches.len(), 1);
-    }
-}
-
-#[test]
-fn grep_swap_carries_misses_across_words_and_keystrokes() {
-    let root = tempfile::tempdir().unwrap();
-    for i in 0..130 {
-        let text = if i % 3 == 0 { "matches" } else { "other" };
-        fs::write(root.path().join(format!("{i}.txt")), text).unwrap();
-    }
-    let picker = picker(root.path());
-    let options = GrepSearchOptions {
-        page_limit: usize::MAX,
-        ..Default::default()
-    };
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-    for (input, reused) in [("mat", 0), ("match", 86), ("matches", 86)] {
-        let query = parse_grep_query(input);
-        picker.grep_swap(&query, &options, &mut previous, &mut next);
-        let page = &previous.page;
-        assert_same_page(page, &picker.grep(&query, &options));
-        assert_eq!(previous.metadata().unwrap().grep_files_reused, reused);
-    }
-}
-
-#[test]
-fn grep_swap_widening_queries_find_new_matches() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("a.rs"), "fn schema() {}\nfn other() {}\n").unwrap();
-    fs::write(root.path().join("b.rs"), "xxxxxxxx\n").unwrap();
-    let picker = picker(root.path());
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-    for (mode, first, second) in [
-        (GrepMode::Regex, "absent", "absent|other"),
-        (GrepMode::Regex, "absent", "absent?"),
-        (GrepMode::PlainText, "otherx", "other"),
-        (GrepMode::Fuzzy, "xch", "xchema"),
-        (GrepMode::Regex, "schema(", "schema()"),
-        (GrepMode::PlainText, "schema\\", "schema\\n"),
-    ] {
-        let options = GrepSearchOptions {
-            mode,
-            ..Default::default()
-        };
-        picker.grep_swap(&parse_grep_query(first), &options, &mut previous, &mut next);
-        let query = parse_grep_query(second);
-        picker.grep_swap(&query, &options, &mut previous, &mut next);
-        let page = &previous.page;
-        assert_eq!(
-            previous.metadata().unwrap().grep_files_reused,
-            0,
-            "{first} -> {second}"
-        );
-        assert_same_page(page, &picker.grep(&query, &options));
-    }
-}
-
-#[test]
-fn regex_misses_do_not_hide_the_literal_fallback() {
-    let root = tempfile::tempdir().unwrap();
-    let prefix = "x[yz]";
-    let oversized = format!("{prefix}{}", "a".repeat(600_000));
-    fs::write(root.path().join("source.txt"), &oversized).unwrap();
-    let picker = picker(root.path());
-    let options = GrepSearchOptions {
-        mode: GrepMode::Regex,
-        ..Default::default()
-    };
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-    picker.grep_swap(
-        &parse_grep_query(prefix),
-        &options,
-        &mut previous,
-        &mut next,
-    );
-    let query = parse_grep_query(&oversized);
-    let page = picker.grep_swap(&query, &options, &mut previous, &mut next);
-    assert!(page.regex_fallback_error.is_some());
-    assert_eq!(page.matches.len(), 1);
-}
-
-#[test]
-fn fuzzy_grep_keeps_raw_candidates_that_missed_the_score_cutoff() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("a.rs"), "ab....cdefghijkl").unwrap();
-    fs::write(root.path().join("b.rs"), "zzzzz").unwrap();
-    let picker = picker(root.path());
-    let options = GrepSearchOptions {
-        mode: GrepMode::Fuzzy,
-        ..Default::default()
-    };
-    let mut previous = SearchBuffer::default();
-    let mut next = SearchBuffer::default();
-    let prefix = picker.grep_swap(&parse_grep_query("abc"), &options, &mut previous, &mut next);
-    assert!(prefix.matches.is_empty());
-    let query = parse_grep_query("abcd");
-    picker.grep_swap(&query, &options, &mut previous, &mut next);
-    let page = &previous.page;
-    assert_eq!(page.matches.len(), 1);
-    assert_eq!(previous.metadata().unwrap().grep_files_reused, 1);
-    assert_same_page(page, &picker.grep(&query, &options));
-}
-
-#[test]
-fn grep_swap_keeps_unsearched_files_and_lines_hidden_by_filters() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("a.rs"), "schemas();\n").unwrap();
-    fs::write(root.path().join("b.rs"), "fn schema() {}\nschemas();\n").unwrap();
-    fs::write(root.path().join("c.txt"), "schemas();\n").unwrap();
-    let picker = picker(root.path());
-
-    for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
-        let mut previous = SearchBuffer::default();
-        let mut next = SearchBuffer::default();
-        let mut options = GrepSearchOptions {
-            mode,
-            file_offset: 1,
-            classify_definitions: fff_search::DefinitionMode::DefinitionOnly,
-            max_matches_per_file: 1,
-            ..Default::default()
-        };
-        picker.grep_swap(
-            &parse_grep_query("schema *.rs"),
-            &options,
-            &mut previous,
-            &mut next,
-        );
-        options.file_offset = 0;
-        options.classify_definitions = fff_search::DefinitionMode::UsageOnly;
-        let query = parse_grep_query("schemas");
-        let full = picker.grep(&query, &options);
-        assert_eq!(full.files_with_matches, 3);
-        let page = picker.grep_swap(&query, &options, &mut previous, &mut next);
-        assert_same_page(page, &full);
-    }
-}
-
-#[test]
-fn fuzzy_swap_fills_the_alternating_page_allocations() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("controller.rs"), "").unwrap();
-    let picker = picker(root.path());
-    let parser = QueryParser::new(FileSearchConfig);
-    let options = FuzzySearchOptions::default();
-    let [mut previous, mut next] = std::array::from_fn(|_| SearchBuffer::default());
-    for _ in 0..2 {
-        let page = picker.fuzzy_search_swap(
-            &parser.parse("cont"),
-            None,
-            options,
-            &mut previous,
-            &mut next,
-        );
-        assert_eq!(page.items.len(), 1);
-    }
-
-    for input in ["controller", "absent_xyz", "", "cont"] {
-        let items = allocation(&next.page.items);
-        let scores = allocation(&next.page.scores);
-        let offsets = allocation(&next.page.match_byte_offsets);
-        let old_items = allocation(&previous.page.items);
-        let page = picker.fuzzy_search_swap(
-            &parser.parse(input),
-            None,
-            options,
-            &mut previous,
-            &mut next,
-        );
-        assert_eq!(allocation(&page.items), items);
-        assert_eq!(allocation(&page.scores), scores);
-        assert_eq!(allocation(&page.match_byte_offsets), offsets);
-        assert_eq!(page.items.is_empty(), input == "absent_xyz");
-        assert_eq!(allocation(&next.page.items), old_items);
-        assert_eq!(previous.metadata().unwrap().raw_query, input);
-    }
-    let items = allocation(&previous.page.items);
-    let released = previous.release_picker();
-    assert!(released.page.items.is_empty());
-    assert_eq!(allocation(&released.page.items), items);
-}
-
-#[test]
-fn grep_swap_fills_the_alternating_page_allocations_in_every_mode() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("a.rs"), "controller()\n*.txt needle\n").unwrap();
-    let picker = picker(root.path());
-    let [mut previous, mut next] = std::array::from_fn(|_| SearchBuffer::default());
-    for _ in 0..2 {
-        let page = picker.grep_swap(
-            &parse_grep_query("cont"),
-            &GrepSearchOptions::default(),
-            &mut previous,
-            &mut next,
-        );
-        assert_eq!(page.matches.len(), 1);
-    }
-    for (input, mode) in [
-        ("controller", GrepMode::PlainText),
-        ("", GrepMode::PlainText),
-        ("contr.ller", GrepMode::Regex),
-        ("controller(", GrepMode::Regex),
-        ("cont", GrepMode::Fuzzy),
-        ("absent_xyz", GrepMode::Fuzzy),
-        ("*.txt needle", GrepMode::PlainText),
-    ] {
-        let files = allocation(&next.page.files);
-        let matches = allocation(&next.page.matches);
-        let old_matches = allocation(&previous.page.matches);
-        let query = parse_grep_query(input);
-        let options = GrepSearchOptions {
-            mode,
-            classify_definitions: fff_search::DefinitionMode::UsageOnly,
-            ..Default::default()
-        };
-        let page = picker.grep_swap(&query, &options, &mut previous, &mut next);
-        assert_same_page(page, &picker.grep(&query, &options));
-        assert_eq!(page.literal_fallback, input == "*.txt needle");
-        assert_eq!(allocation(&page.files), files);
-        assert_eq!(allocation(&page.matches), matches);
-        assert_eq!(allocation(&next.page.matches), old_matches);
-        assert_eq!(previous.metadata().unwrap().raw_query, input);
-    }
-    let files = allocation(&previous.page.files);
-    let released = previous.release_picker();
-    assert!(released.page.files.is_empty());
-    assert_eq!(allocation(&released.page.files), files);
-}
-
-fn allocation<T>(rows: &Vec<T>) -> (*const T, usize) {
-    (rows.as_ptr(), rows.capacity())
-}
-
-fn picker(base: &Path) -> FilePicker {
-    let mut picker = FilePicker::new(FilePickerOptions {
-        base_path: base.to_string_lossy().into_owned(),
-        watch: false,
-        ..Default::default()
-    })
-    .unwrap();
-    picker.collect_files().unwrap();
-    picker
-}
-
-fn assert_same_page(page: &GrepResult<'_>, expected: &GrepResult<'_>) {
-    assert_eq!(page.matches, expected.matches);
+fn assert_items<T>(page: &[&T], expected: &[&T]) {
     assert!(
-        page.files
-            .iter()
-            .map(|file| std::ptr::from_ref(*file))
-            .eq(expected.files.iter().map(|file| std::ptr::from_ref(*file)))
+        page.len() == expected.len() && page.iter().zip(expected).all(|(a, b)| ptr::eq(*a, *b))
     );
-    assert_eq!(page.next_file_offset, expected.next_file_offset);
-    assert_eq!(page.filtered_file_count, expected.filtered_file_count);
-    assert_eq!(page.regex_fallback_error, expected.regex_fallback_error);
-    assert_eq!(page.literal_fallback, expected.literal_fallback);
 }

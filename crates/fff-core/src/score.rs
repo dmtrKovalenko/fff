@@ -170,40 +170,22 @@ pub(crate) fn fuzzy_match_and_score_files_into<'a>(
         return rank_by_frecency_into(files, context, base_count, base_arena, overflow_arena, page);
     }
 
-    let (base_candidates, overflow_candidates) =
-        if let Some(Candidates { previous, next }) = candidates {
-            let [base, overflow] = next;
-            (
-                Some(Candidates {
-                    previous: previous.map(|rows| &rows[0]),
-                    next: base,
-                }),
-                Some(Candidates {
-                    previous: previous.map(|rows| &rows[1]),
-                    next: overflow,
-                }),
-            )
-        } else {
-            (None, None)
-        };
-
-    // Process overflow files first: newly added files (created after the
-    // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search. Exact ties are broken by index order.
-    let (results, total_matched) = if files.len() > base_count {
-        let (mut results, overflow_matched) = match_and_score_in_arena(
-            &files[base_count..],
-            context,
-            overflow_arena,
-            overflow_candidates,
-        );
-        let (base_results, base_matched) =
-            match_and_score_in_arena(&files[..base_count], context, base_arena, base_candidates);
-        results.extend(base_results);
-
-        (results, overflow_matched + base_matched)
+    let mut candidates = candidates;
+    let mut score_arena = |slice, arena, i: usize| {
+        let rows = candidates.as_mut().map(|pair| Candidates {
+            previous: pair.previous.map(|rows| &rows[i]),
+            next: &mut pair.next[i],
+        });
+        match_and_score_in_arena(slice, context, arena, rows)
+    };
+    let (base, overflow) = files.split_at(base_count.min(files.len()));
+    let (results, total_matched) = if overflow.is_empty() {
+        score_arena(base, base_arena, 0)
     } else {
-        match_and_score_in_arena(files, context, base_arena, base_candidates)
+        let (mut results, count) = score_arena(overflow, overflow_arena, 1);
+        let (base_results, base_count) = score_arena(base, base_arena, 0);
+        results.extend(base_results);
+        (results, count + base_count)
     };
 
     let rows = ranked_files(results, context, |score| score.total).0;
@@ -1385,7 +1367,6 @@ fn fuzzy_match_and_score_files<'a>(
     base_count: usize,
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-    candidates: Option<Candidates<'_, [Vec<u32>; 2]>>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let mut page = SearchResult::default();
     let count = fuzzy_match_and_score_files_into(
@@ -1394,40 +1375,10 @@ fn fuzzy_match_and_score_files<'a>(
         base_count,
         base_arena,
         overflow_arena,
-        candidates,
+        None,
         &mut page,
     );
     (page.items, page.scores, count)
-}
-
-#[cfg(test)]
-fn rank_by_frecency<'a>(
-    files: &'a [FileItem],
-    context: &ScoringContext,
-    base_count: usize,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
-) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    let mut page = SearchResult::default();
-    let count = rank_by_frecency_into(
-        files,
-        context,
-        base_count,
-        base_arena,
-        overflow_arena,
-        &mut page,
-    );
-    (page.items, page.scores, count)
-}
-
-#[cfg(test)]
-fn sort_and_paginate_dirs<'a>(
-    results: Vec<(&'a DirItem, Score)>,
-    context: &ScoringContext,
-) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    let (page, count) = ranked_dirs(results, context);
-    let (items, scores) = page.unzip();
-    (items, scores, count)
 }
 
 #[cfg(test)]
@@ -1625,14 +1576,8 @@ mod tests {
                 let (sequential_items, sequential_scores, expected_count) =
                     sort_and_paginate(sequential, &context, |score| score.total);
                 context.max_threads = 4;
-                let (parallel_items, parallel_scores, count) = fuzzy_match_and_score_files(
-                    &files,
-                    &context,
-                    files.len() / 2,
-                    arena,
-                    arena,
-                    None,
-                );
+                let (parallel_items, parallel_scores, count) =
+                    fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
                 assert_eq!(count, expected_count);
                 assert_eq!(
                     parallel_items
@@ -1679,7 +1624,6 @@ mod tests {
                         files.len() / 3,
                         arena,
                         arena,
-                        None,
                     );
                     assert_eq!(
                         total, parallel_total,
@@ -1748,7 +1692,7 @@ mod tests {
             context.max_threads = 4;
             let (expected_items, expected_scores, expected_total) =
                 sort_and_paginate(parallel, &context, |score| score.total);
-            let (items, scores, total) = rank_by_frecency(
+            let (items, scores, total) = fuzzy_match_and_score_files(
                 &files[..count],
                 &context,
                 count / 2,
@@ -1832,7 +1776,7 @@ mod tests {
                     let (expected_items, expected_scores, expected_total) =
                         sort_and_paginate(full, &context, |score| score.total);
                     let (items, scores, total) =
-                        rank_by_frecency(&files, &context, base_count, arena, arena);
+                        fuzzy_match_and_score_files(&files, &context, base_count, arena, arena);
                     let case = format!("{current_file:?}, {offset}+{limit}, threads={max_threads}");
                     assert_eq!(total, expected_total, "{case}");
                     assert_eq!(items.len(), expected_items.len(), "{case}");
@@ -1915,11 +1859,10 @@ mod tests {
                         .enumerate()
                         .map(|(index, (_, score))| (&dirs[index], score.clone()))
                         .collect();
-                    let (items, scores, total) = sort_and_paginate_dirs(dir_results, &context);
+                    let (rows, total) = ranked_dirs(dir_results, &context);
                     assert_eq!(total, count);
-                    assert_eq!(items.len(), expected_page.len());
                     assert_eq!(
-                        scores.iter().map(|score| score.total).collect::<Vec<_>>(),
+                        rows.map(|(_, score)| score.total).collect::<Vec<_>>(),
                         expected_page
                     );
                 }
@@ -2014,7 +1957,7 @@ mod tests {
                 < files[matched.index as usize].filename_offset_in_relative_path()
         }));
         let (expected, expected_scores, total) =
-            fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena, None);
+            fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
         assert_eq!(total, files.len());
         assert!(
             expected_scores.iter().all(|score| {
@@ -2030,14 +1973,8 @@ mod tests {
             context.pagination = PaginationArgs { offset, limit: 50 };
             for max_threads in [1, 4] {
                 context.max_threads = max_threads;
-                let (items, scores, matched) = fuzzy_match_and_score_files(
-                    &files,
-                    &context,
-                    files.len() / 2,
-                    arena,
-                    arena,
-                    None,
-                );
+                let (items, scores, matched) =
+                    fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
                 assert_eq!(matched, total);
                 assert_eq!(items.len(), 50);
                 assert!(
@@ -2406,7 +2343,7 @@ mod filename_bonus_tests {
             },
         };
         let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, None);
+            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
         items
             .iter()
             .zip(scores.iter())
@@ -2648,7 +2585,7 @@ mod git_recency_scoring_tests {
             },
         };
         let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, None);
+            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
         items
             .iter()
             .zip(scores)
@@ -2736,8 +2673,7 @@ mod typo_resistance_tests {
                 limit: 100,
             },
         };
-        let (items, _, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, None);
+        let (items, _, _) = fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
@@ -2847,7 +2783,7 @@ mod constraint_only_query_tests {
         };
 
         let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena, None);
+            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
 
         assert_eq!(
             total_matched, 1,
@@ -2898,7 +2834,7 @@ mod constraint_only_query_tests {
         };
 
         let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena, None);
+            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
 
         assert_eq!(total_matched, 1);
         assert_eq!(items[0].relative_path(arena), "a.rs");
