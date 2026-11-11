@@ -1,0 +1,33 @@
+name: Fuzzy filename scoring diagram
+on:
+  push:
+    branches: [ci/filename-guard-pr1005]
+permissions:
+  contents: read
+jobs:
+  publish:
+    name: Verify and attach MP4
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Verify rendered video
+        run: sha256sum --check filename-guard.sha256
+      - name: Attach filename scoring animation
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: filename-guard
+          path: filename-guard.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Link the video in the run summary
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          echo "The filename guard in [PR #1005](https://github.com/dmtrKovalenko/fff/pull/1005) keeps both path matches. One match needs a filename read to calculate its bonus." >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "[Download the 19.4-second animation]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"
