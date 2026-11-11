@@ -190,6 +190,11 @@ fn rank_by_frecency<'a>(
     overflow_arena: ArenaPtr,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let base_count = base_count.min(files.len());
+    let keep = context
+        .pagination
+        .offset
+        .saturating_add(context.pagination.limit);
+    let mut total_matched = 0;
     let mut totals: Vec<(&FileItem, i32)> = Vec::new();
     for (slice, arena) in [
         (&files[base_count..], overflow_arena),
@@ -201,10 +206,58 @@ fn rank_by_frecency<'a>(
         let Some(working_files) = filter_by_constraints(slice, context, arena) else {
             continue;
         };
-        frecency_totals(&working_files, context, arena, &mut totals);
+        if let FileItems::All(files) = &working_files
+            && context.pagination.limit > 0
+            && keep <= 128
+            && files.len() >= 65_536
+        {
+            let chunk_top = |chunk: &'a [FileItem]| {
+                let mut best = Vec::with_capacity(keep * 2);
+                let mut cutoff: Option<(&FileItem, i32)> = None;
+                let mut count = 0;
+                let compare = |a: &(&FileItem, i32), b: &(&FileItem, i32)| {
+                    compare_file_scores(a.0, a.1, b.0, b.1)
+                };
+                for file in chunk.iter().filter(|file| !file.is_deleted()) {
+                    count += 1;
+                    let candidate = (file, frecency_total(file, context, arena));
+                    if cutoff.is_some_and(|worst| !compare(&candidate, &worst).is_lt()) {
+                        continue;
+                    }
+                    best.push(candidate);
+                    if best.len() == keep * 2 {
+                        best.select_nth_unstable_by(keep - 1, compare);
+                        best.truncate(keep);
+                        cutoff = best.last().copied();
+                    }
+                }
+                if best.len() > keep {
+                    best.select_nth_unstable_by(keep - 1, compare);
+                    best.truncate(keep);
+                }
+                (count, best)
+            };
+            let chunks: Vec<_> = if context.max_threads > 1 {
+                files
+                    .par_chunks(SCORING_CHUNK_SIZE)
+                    .with_min_len((files.len() / SCORING_CHUNK_SIZE / context.max_threads).max(1))
+                    .map(chunk_top)
+                    .collect()
+            } else {
+                files.chunks(SCORING_CHUNK_SIZE).map(chunk_top).collect()
+            };
+            for (count, best) in chunks {
+                total_matched += count;
+                totals.extend(best);
+            }
+        } else {
+            let previous = totals.len();
+            frecency_totals(&working_files, context, arena, &mut totals);
+            total_matched += totals.len() - previous;
+        }
     }
 
-    let (items, _, total_matched) = sort_and_paginate(totals, context, |total| *total);
+    let (items, _, _) = sort_and_paginate(totals, context, |total| *total);
     let scores = items
         .iter()
         .map(|file| {
@@ -1475,7 +1528,7 @@ mod tests {
 
     #[test]
     fn frecency_parallel_and_sequential_scores_match() {
-        let files: Vec<_> = (0..33_000)
+        let files: Vec<_> = (0..132_000)
             .map(|index| {
                 let mut file =
                     FileItem::new_raw(0, 0, index, Some(git2::Status::WT_MODIFIED), false);
@@ -1502,7 +1555,7 @@ mod tests {
                 limit: 50,
             },
         };
-        for count in [0, 1, 1000, 33_000] {
+        for count in [0, 1, 1000, 132_000] {
             let items = FileItems::All(&files[..count]);
             context.max_threads = 4;
             let parallel = frecency_scores(&items, &context, ArenaPtr::null());
@@ -1540,6 +1593,90 @@ mod tests {
                 assert!(std::ptr::eq(*a, *b));
                 assert_eq!(a_score.total, b_score.total);
                 assert_eq!(a_score.match_type, "frecency");
+            }
+        }
+    }
+
+    #[test]
+    fn frecency_fast_path_matches_full_sort() {
+        let paths: Vec<_> = (0..140_000)
+            .map(|index| format!("src/group_{}/file_{index}.rs", index / 100))
+            .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = FileItem::new_raw(
+                    path.rfind('/').unwrap() as u16 + 1,
+                    0,
+                    index as u64,
+                    Some(git2::Status::WT_MODIFIED),
+                    false,
+                );
+                file.access_frecency_score = (index % 97) as i16;
+                file.modification_frecency_score = (index % 29) as i16;
+                file.git_recency_score = (index % 13) as i16;
+                // The tail leaves chunks with fewer live files than any tested page.
+                file.set_deleted(index % 11 == 0 || (index >= 138_000 && index % 50 != 0));
+                file
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        let base_count = files.len() / 2;
+        let pages = [
+            (0, 1),
+            (30, 50),
+            (78, 50),
+            (127, 1),
+            (1, 128),
+            (100, 29),
+            (0, 129),
+        ];
+        for current_file in [None, Some(paths[3].as_str())] {
+            for (offset, limit) in pages {
+                for max_threads in [1, 4] {
+                    let context = ScoringContext {
+                        query: &query,
+                        max_threads,
+                        max_typos: 0,
+                        project_path: None,
+                        current_file,
+                        last_same_query_match: None,
+                        combo_boost_score_multiplier: 0,
+                        min_combo_count: 0,
+                        pagination: PaginationArgs { offset, limit },
+                    };
+                    let mut full = Vec::new();
+                    for slice in [&files[base_count..], &files[..base_count]] {
+                        full.extend(frecency_scores(&FileItems::All(slice), &context, arena));
+                    }
+                    let (expected_items, expected_scores, expected_total) =
+                        sort_and_paginate(full, &context, |score| score.total);
+                    let (items, scores, total) =
+                        rank_by_frecency(&files, &context, base_count, arena, arena);
+                    let case = format!("{current_file:?}, {offset}+{limit}, threads={max_threads}");
+                    assert_eq!(total, expected_total, "{case}");
+                    assert_eq!(items.len(), expected_items.len(), "{case}");
+                    assert!(
+                        items
+                            .iter()
+                            .zip(&expected_items)
+                            .all(|(a, b)| std::ptr::eq(*a, *b)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        format!("{scores:?}"),
+                        format!("{expected_scores:?}"),
+                        "{case}"
+                    );
+                }
             }
         }
     }
