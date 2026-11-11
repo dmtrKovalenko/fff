@@ -626,3 +626,44 @@ fn a_saved_base_with_names_windows_cannot_store_loads_on_unix() {
     assert_eq!(live_paths(&restored), live_paths(&scanned));
     assert_eq!(live_paths(&restored).len(), 3);
 }
+
+#[test]
+fn incremental_search_tracks_matches_across_layer_sealing() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("needles_base.rs"), "").unwrap();
+    let mut picker = picker(tmp.path());
+    // Unsorted on purpose: sealing sorts the layer without changing the file count.
+    let paths = ["z/needles_3.rs", "a_2.rs", "needles_1.rs", "m/a_0.rs"];
+    picker
+        .add_entries(paths.iter().map(|path| IndexEntry::new(path)))
+        .unwrap();
+    let mut expected = vec!["needles_1.rs", "needles_base.rs", "z/needles_3.rs"];
+    expected.sort();
+
+    let mut initial = search_paths(&picker, "needl");
+    initial.sort();
+    assert_eq!(initial, expected);
+    let before = picker.get_files().len();
+    picker.create_layer(None).expect("create layer");
+    assert_eq!(picker.get_files().len(), before);
+    let mut after = search_paths(&picker, "needles");
+    after.sort();
+    assert_eq!(after, expected);
+}
+
+#[test]
+fn incremental_search_tracks_same_length_base_replacement_and_rescan() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("zzzzzz.rs"), "").unwrap();
+    let mut picker = picker(tmp.path());
+    assert!(search_paths(&picker, "needl").is_empty());
+
+    let mut replacement = LayerBuilder::new(None);
+    assert!(replacement.push(&IndexEntry::new("needles_restored.rs")));
+    picker.import_base(replacement.finish(), None).unwrap();
+    assert_eq!(search_paths(&picker, "needle"), ["needles_restored.rs"]);
+
+    assert!(search_paths(&picker, "zzzzz").is_empty());
+    picker.collect_files().unwrap();
+    assert_eq!(search_paths(&picker, "zzzzzz"), ["zzzzzz.rs"]);
+}

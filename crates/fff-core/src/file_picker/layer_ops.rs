@@ -602,6 +602,7 @@ impl FilePicker {
     /// overlays exist and [`Error::IndexBusy`] during a scan or post-scan indexing.
     pub fn create_layer(&mut self, label: Option<&str>) -> Result<LayerId, Error> {
         self.ensure_index_idle()?;
+        *self.fuzzy_cache.get_mut() = None;
         let id = self.sync_data.create_layer(label)?;
         debug!(layer = id, ?label, "Opened new index layer");
 
@@ -666,6 +667,7 @@ impl FilePicker {
     ) -> Result<usize, Error> {
         let entries: Vec<IndexEntry<'a>> = entries.into_iter().collect();
         self.reserve_index(entries.len(), entries.len())?;
+        *self.fuzzy_cache.get_mut() = None;
         let added = self.sync_data.add_entries(&entries)?;
         debug!(
             added,
@@ -685,6 +687,7 @@ impl FilePicker {
         self.ensure_index_idle()?;
         let id = self.sync_data.layers.free_id().ok_or(Error::LayerLimit)?;
         self.reserve_index(snapshot.files.len(), snapshot.dirs.len())?;
+        *self.fuzzy_cache.get_mut() = None;
         let added = self.sync_data.attach_snapshot(id, snapshot, Attach::Import);
         info!(layer = id, added, "Imported index layer");
 
