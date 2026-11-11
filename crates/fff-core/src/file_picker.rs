@@ -127,8 +127,7 @@ pub(crate) struct FileSync {
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
-    /// Ignore rules the walker assembled (zlob backend only). Shared with the
-    /// background watcher so filesystem events can be filtered without libgit2.
+    // The watcher reuses these rules to filter filesystem events.
     pub(crate) ignore_rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
 }
 

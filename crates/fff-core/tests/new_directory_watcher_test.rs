@@ -694,3 +694,40 @@ fn gitignored_new_directory_excluded() {
         assert_eq!(grep_count, 0, "Gitignored content should NOT be grepable");
     }
 }
+
+#[test]
+fn non_git_watcher_skips_hidden_paths() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    fs::write(base.join("seed.txt"), "seed").unwrap();
+    let (shared_picker, _frecency) = make_watched_picker(&base);
+    wait_ready(&shared_picker);
+
+    fs::create_dir(base.join(".hidden")).unwrap();
+    let hidden = base.join(".hidden/output.txt");
+    fs::write(&hidden, "build output").unwrap();
+    let dotfile = base.join(".marker");
+    fs::write(&dotfile, "hidden").unwrap();
+
+    let visible = base.join("visible");
+    fs::create_dir(&visible).unwrap();
+    // The second write reaches the watcher after it has processed the directory creation.
+    for name in ["first.txt", "second.txt"] {
+        let path = visible.join(name);
+        fs::write(&path, "visible").unwrap();
+        poll_until(&shared_picker, WATCHER_TIMEOUT, name, |picker| {
+            picker.get_file_by_path(&path).is_some()
+        });
+    }
+
+    let guard = shared_picker.read().unwrap();
+    let picker = guard.as_ref().unwrap();
+    assert!(
+        picker.get_file_by_path(&hidden).is_none(),
+        "indexed {hidden:?}"
+    );
+    assert!(
+        picker.get_file_by_path(&dotfile).is_none(),
+        "indexed {dotfile:?}"
+    );
+}

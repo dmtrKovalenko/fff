@@ -25,16 +25,21 @@ pub(crate) struct WalkOutput {
     pub(crate) ignore_rules: Option<WalkIgnoreRules>,
 }
 
+#[cfg_attr(not(feature = "zlob"), derive(Clone))]
 pub(crate) struct WalkIgnoreRules {
     #[cfg(feature = "zlob")]
     inner: ::zlob::walk::WalkerOutcomeRules,
+    #[cfg(feature = "zlob")]
+    skip_hidden: bool,
     #[cfg(not(feature = "zlob"))]
-    _never: std::convert::Infallible,
+    inner: ::ignore::IncrementalIgnore,
 }
 
 // SAFETY: the underlying storage is immutable, heap-owned, and thread-safe to
 // read from concurrently (mirrors zlob's `IgnoreRules: Send + Sync`).
+#[cfg(feature = "zlob")]
 unsafe impl Send for WalkIgnoreRules {}
+#[cfg(feature = "zlob")]
 unsafe impl Sync for WalkIgnoreRules {}
 
 impl std::fmt::Debug for WalkIgnoreRules {
@@ -43,30 +48,25 @@ impl std::fmt::Debug for WalkIgnoreRules {
     }
 }
 
-// In ripgrep builds `WalkIgnoreRules` is never constructed (the `_never`
-// field is uninhabited), so its methods are legitimately dead there.
-#[cfg_attr(not(feature = "zlob"), allow(dead_code))]
 impl WalkIgnoreRules {
-    /// Returns `true` if the provided path is ignored by the collected rule set
-    ///
-    /// `relative_path` has to be relative to the walker's provided base path
-    pub(crate) fn is_ignored(&self, relative_path: &Path) -> bool {
-        #[cfg(feature = "zlob")]
+    #[cfg(feature = "zlob")]
+    pub(crate) fn is_ignored(&self, relative_path: &Path, _is_dir: bool) -> bool {
+        if self.skip_hidden
+            && relative_path
+                .iter()
+                .any(|name| name.as_encoded_bytes().starts_with(b"."))
         {
-            self.inner
-                .rules()
-                .is_some_and(|rules| rules.is_ignored(relative_path))
+            return true;
         }
-        #[cfg(not(feature = "zlob"))]
-        {
-            let _ = relative_path;
-            match self._never {}
-        }
+        self.inner
+            .rules()
+            .is_some_and(|rules| rules.is_ignored(relative_path))
     }
 
-    // The old `is_ignored_untrusted` variant was folded away when zlob's
-    // ignore matcher moved to full ancestor enumeration — trailing-slash
-    // sniffing on the input is now sufficient for external queries.
+    #[cfg(not(feature = "zlob"))]
+    pub(crate) fn is_ignored(&mut self, relative_path: &Path, is_dir: bool) -> bool {
+        self.inner.matched(relative_path, is_dir).is_ignore()
+    }
 }
 
 #[cfg(test)]
@@ -225,8 +225,6 @@ mod tests {
         assert_eq!(names, ["projects.toml"]);
     }
 
-    // Only the zlob backend surfaces reusable ignore rules; they must match
-    // the same tree the walk respected.
     #[cfg(feature = "zlob")]
     #[test]
     fn surfaces_reusable_ignore_rules() {
@@ -243,9 +241,9 @@ mod tests {
             walk_collect_files(root, true, false, 1, &counter, &Default::default(), None).unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
-        assert!(rules.is_ignored(Path::new("target/")));
-        assert!(rules.is_ignored(Path::new("debug.log")));
-        assert!(!rules.is_ignored(Path::new("Cargo.toml")));
+        assert!(rules.is_ignored(Path::new("target/"), true));
+        assert!(rules.is_ignored(Path::new("debug.log"), false));
+        assert!(!rules.is_ignored(Path::new("Cargo.toml"), false));
     }
 
     // Both backends must honor `info/exclude`, which linked worktrees read from
@@ -304,9 +302,9 @@ mod tests {
             #[cfg(feature = "zlob")]
             {
                 let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
-                assert!(rules.is_ignored(Path::new("excluded/later/new.txt")));
-                assert!(rules.is_ignored(Path::new("debug.log")));
-                assert!(!rules.is_ignored(Path::new("src/a.txt")));
+                assert!(rules.is_ignored(Path::new("excluded/later/new.txt"), false));
+                assert!(rules.is_ignored(Path::new("debug.log"), false));
+                assert!(!rules.is_ignored(Path::new("src/a.txt"), false));
             }
         }
     }
@@ -353,8 +351,8 @@ mod tests {
 
         // The watcher filters incremental updates with these rules.
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
-        assert!(rules.is_ignored(std::path::Path::new(".worktrees/wt1/new.ts")));
-        assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts")));
+        assert!(rules.is_ignored(std::path::Path::new(".worktrees/wt1/new.ts"), false));
+        assert!(!rules.is_ignored(std::path::Path::new("src/hit.ts"), false));
     }
 
     // disable_git must also turn off the git exclude files, not only .gitignore.
