@@ -386,8 +386,8 @@ regardless of display truncation or whitespace trimming. For multiline regex
 matches, it applies to the first physical line.
 
 Supported language families are Rust, Python, Go, JavaScript/TypeScript, Lua,
-C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Elixir,
-Zig, PHP, shell, OCaml/ReScript/F#, and Haskell. The byte-keyword rules in
+C/C++/Objective-C, Java/C#/Dart/Groovy, Kotlin, Scala, Swift, Ruby, Zig,
+and OCaml/Reason/ReScript/F#. The byte-keyword rules in
 `definition/languages.rs` <crates/fff-core/src/definition/languages.rs> compile
 into per-language checkers. Each checker has fixed grammar constants and
 returns a boolean without a runtime rule dispatcher. Language detection checks
