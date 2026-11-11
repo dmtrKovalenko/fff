@@ -38,7 +38,7 @@ jobs:
       RUN_URL: ${{ github.event.workflow_run.html_url }}
     steps:
       - name: Download the comparison plan
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@v8
         with:
           github-token: ${{ github.token }}
           run-id: ${{ env.BENCH_RUN }}
@@ -54,7 +54,7 @@ jobs:
           printf 'number=%s\nkind=%s\nbase=%s\n' "$number" "$kind" "$base" >>"$GITHUB_OUTPUT"
       - name: Check out the trusted reporting tools
         if: steps.plan.outputs.kind == 'pr' && env.RESULT == 'success'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           sparse-checkout: perf
@@ -96,7 +96,7 @@ jobs:
           path: ${{ runner.temp }}/fff-chart
       - name: Download measured timings
         if: steps.plan.outputs.kind == 'pr' && env.RESULT == 'success'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@v8
         with:
           github-token: ${{ github.token }}
           run-id: ${{ env.BENCH_RUN }}

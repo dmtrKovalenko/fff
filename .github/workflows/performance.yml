@@ -80,7 +80,7 @@ jobs:
           printf '%s %s %s\n' "$kind" "$PR_NUMBER" "$BASE_SHA" >"$RUNNER_TEMP/comparison"
       - name: Save the comparison for publication
         if: steps.resolve.outputs.kind == 'pr' || steps.resolve.outputs.kind == 'skip'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7
         with:
           name: fff-plan
           path: ${{ runner.temp }}/comparison
@@ -121,7 +121,7 @@ jobs:
           git -C source -c core.hooksPath=/dev/null checkout -q --detach "$REVISION"
           git -C source -c core.hooksPath=/dev/null checkout "$HARNESS" -- crates/fff-core/benches
       - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
           use-cache: false
@@ -141,7 +141,7 @@ jobs:
           trap 'printf "::%s::\n" "$token"' EXIT
           bash "$RUNNER_TEMP/build.sh" source "$RUNNER_TEMP/fff-build"
       - name: Upload benchmark binaries
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7
         with:
           name: fff-bench-${{ matrix.variant }}
           path: ${{ runner.temp }}/fff-build/bins
@@ -165,7 +165,7 @@ jobs:
           git -C "$repo" fetch -q --depth=1 https://github.com/dmtrKovalenko/fff.git "$HARNESS"
           git -C "$repo" show "$HARNESS:perf/benchmark.sh" > "$RUNNER_TEMP/benchmark.sh"
       - name: Download benchmark binaries
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        uses: actions/download-artifact@v8
         with:
           pattern: fff-bench-*
           path: ${{ runner.temp }}/fff-binaries
@@ -189,7 +189,7 @@ jobs:
           esac 2>&1 | tee "$output/benchmark.log"
       - name: Upload measurement logs and timings
         if: ${{ !cancelled() && (steps.measure.outcome == 'success' || steps.measure.outcome == 'failure') }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7
         with:
           name: fff-measurements
           path: |

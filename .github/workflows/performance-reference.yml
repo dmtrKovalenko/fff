@@ -83,7 +83,7 @@ jobs:
           exit 1
       - name: Upload reference logs and timings
         if: ${{ !cancelled() && (steps.timings.outcome == 'success' || steps.timings.outcome == 'failure') }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7
         with:
           name: fff-measurements
           path: |
