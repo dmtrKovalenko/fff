@@ -62,62 +62,54 @@ fn bench_grep(c: &mut Criterion) {
     let mut group = c.benchmark_group("grep_e2e");
     group.sample_size(30);
 
-    // Case-sensitive, 40k matched lines: hottest find_at/highlight path
-    let query = parse_grep_query("Controller");
-    let opts = options(GrepMode::PlainText);
-    group.bench_function("plain_case_sensitive_many_matches", |b| {
-        b.iter(|| {
-            let r = picker.grep(&query, &opts);
-            assert_eq!(r.files_with_matches, 400);
-            std::hint::black_box(r.matches.len())
-        });
-    });
-
-    // Case-insensitive (SIMD folding path), 120k matched spans
-    let query = parse_grep_query("controller");
-    group.bench_function("plain_case_insensitive_many_matches", |b| {
-        b.iter(|| {
-            let r = picker.grep(&query, &opts);
-            assert_eq!(r.files_with_matches, 400);
-            std::hint::black_box(r.matches.len())
-        });
-    });
-
-    // No matches anywhere: whole-file prefilter dominates
-    let query = parse_grep_query("Qqzyx");
-    group.bench_function("plain_no_matches", |b| {
-        b.iter(|| {
-            let r = picker.grep(&query, &opts);
-            assert_eq!(r.files_with_matches, 0);
-            std::hint::black_box(r.total_files_searched)
-        });
-    });
-
-    // Regex mode: must be unaffected by NeedleFinder changes
-    let query = parse_grep_query("Contr[a-z]+ller");
-    let regex_opts = options(GrepMode::Regex);
-    group.bench_function("regex_many_matches", |b| {
-        b.iter(|| {
-            let r = picker.grep(&query, &regex_opts);
-            assert_eq!(r.files_with_matches, 400);
-            std::hint::black_box(r.matches.len())
-        });
-    });
-
-    let fuzzy_opts = options(GrepMode::Fuzzy);
-    for (name, text) in [
-        ("fuzzy_exact_many_matches", "controller"),
-        ("fuzzy_typo_many_matches", "contrller"),
+    for (name, text, mode) in [
+        (
+            "plain_case_sensitive_many_matches",
+            "Controller",
+            GrepMode::PlainText,
+        ),
+        (
+            "plain_case_insensitive_many_matches",
+            "controller",
+            GrepMode::PlainText,
+        ),
+        ("regex_many_matches", "Contr[a-z]+ller", GrepMode::Regex),
+        ("fuzzy_exact_many_matches", "controller", GrepMode::Fuzzy),
+        ("fuzzy_typo_many_matches", "contrller", GrepMode::Fuzzy),
     ] {
+        let prefix = &text[..text.len() - 1];
         let query = parse_grep_query(text);
+        let opts = options(mode);
         group.bench_function(name, |b| {
             b.iter(|| {
-                let result = picker.grep(&query, &fuzzy_opts);
+                let result = picker.grep(&query, &opts);
                 assert_eq!(result.files_with_matches, 400);
                 std::hint::black_box(result.matches.len())
             });
         });
+        support::previous_results(
+            &mut group,
+            name,
+            &parse_grep_query(prefix),
+            &query,
+            400 * 100,
+            |q, previous, next| {
+                std::hint::black_box(picker.grep_swap(q, &opts, previous, next))
+                    .matches
+                    .len()
+            },
+        );
     }
+
+    let query = parse_grep_query("Qqzyx");
+    let opts = options(GrepMode::PlainText);
+    group.bench_function("plain_no_matches", |b| {
+        b.iter(|| {
+            let result = picker.grep(&query, &opts);
+            assert_eq!(result.files_with_matches, 0);
+            std::hint::black_box(result.total_files_searched)
+        });
+    });
 
     group.finish();
 }
