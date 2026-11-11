@@ -803,6 +803,7 @@ impl FileItem {
 
     // Uncached files remain searchable after the persistent cache budget fills.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
         buf: &'a mut Vec<u8>,
@@ -811,14 +812,13 @@ impl FileItem {
         base_path: &Path,
         budget: &ContentCacheBudget,
         base_dir: Option<&std::fs::File>,
-    ) -> Option<(&'a [u8], Option<std::fs::File>)> {
+        #[cfg_attr(windows, allow(unused_variables))] snapshot: bool,
+    ) -> Option<&'a [u8]> {
         #[cfg(not(target_os = "windows"))]
         {
-            // Fast path: persistent cache hit (zero-copy). Safe here because
-            // grep callers hold the picker read lock for the lifetime of the
-            // returned slice — see [`Self::get_cached_content`] safety note.
+            // The picker read lock keeps the cached mapping alive during this search.
             if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
-                return Some((cached, None));
+                return Some(mapped_search_bytes(cached, buf, snapshot));
             }
         }
 
@@ -833,7 +833,7 @@ impl FileItem {
         if self.size >= FRESH_MMAP_THRESHOLD {
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
-            return Some((&stored[..], None));
+            return Some(mapped_search_bytes(stored, buf, snapshot));
         } else {
             let _ = (mmap_slot, arena);
         }
@@ -842,7 +842,7 @@ impl FileItem {
         buf.resize(len, 0);
 
         file.read_exact(buf).ok()?;
-        Some((buf.as_slice(), Some(file)))
+        Some(buf.as_slice())
     }
 
     fn open_for_search(
@@ -1127,6 +1127,17 @@ impl Default for ContentCacheBudget {
     }
 }
 
+#[cfg(not(windows))]
+fn mapped_search_bytes<'a>(mapped: &'a [u8], buf: &'a mut Vec<u8>, snapshot: bool) -> &'a [u8] {
+    if !snapshot {
+        return mapped;
+    }
+    // Match and fingerprint the same bytes even if another process edits the mapping.
+    buf.clear();
+    buf.extend_from_slice(mapped);
+    buf
+}
+
 #[cfg(test)]
 mod content_cache_budget_tests {
     use super::*;
@@ -1151,7 +1162,7 @@ mod content_cache_budget_tests {
             for base_dir in [Some(&directory), None] {
                 let mut buf = Vec::new();
                 let mut mmap = MmapSlot::default();
-                let (actual, _) = file
+                let actual = file
                     .get_content_for_search(
                         &mut buf,
                         &mut mmap,
@@ -1159,12 +1170,26 @@ mod content_cache_budget_tests {
                         root.path(),
                         &budget,
                         base_dir,
+                        false,
                     )
                     .unwrap();
                 assert_eq!(actual, contents);
                 assert_eq!(budget.cached_count.load(Ordering::Relaxed), 0);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffered_search_keeps_mapped_bytes_stable_until_the_miss_is_recorded() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        let mapping = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let mut scratch = Vec::new();
+        let snapshot = mapped_search_bytes(&mapping, &mut scratch, true);
+        std::os::unix::fs::FileExt::write_all_at(&file, b"edit", 0).unwrap();
+        assert_eq!(&mapping[..4], b"edit");
+        assert_eq!(&snapshot[..4], &[0; 4]);
     }
 
     #[test]

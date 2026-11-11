@@ -455,7 +455,7 @@ fn grep_search_parsed<'a>(
         &mut files_to_search,
         options,
         &GrepContext {
-            reuse,
+            reuse: reuse.filter(|_| regex_fallback_error.is_none()),
             total_files,
             filtered_file_count,
             budget,

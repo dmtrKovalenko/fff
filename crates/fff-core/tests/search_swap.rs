@@ -63,13 +63,14 @@ fn fuzzy_swap_reuses_candidates_beyond_the_page() {
     }
 
     assert!(picker.remove_file_by_path(&controller));
-    picker.fuzzy_search_swap(
+    let removed = picker.fuzzy_search_swap(
         &parser.parse("control"),
         None,
         options,
         &previous,
         &mut next,
     );
+    assert_eq!(removed.total_matched, 0);
     mem::swap(&mut previous, &mut next);
     picker.handle_create_or_modify(&controller).unwrap();
     let page = picker.fuzzy_search_swap(
@@ -106,6 +107,42 @@ fn fuzzy_swap_reuses_candidates_beyond_the_page() {
     let query = parser.parse("contr1");
     let page = picker.fuzzy_search_swap(&query, None, options, &previous, &mut next);
     assert_eq!(page.items[0].relative_path(&picker), "contr1");
+}
+
+#[test]
+fn fuzzy_swap_preserves_rank_and_highlights_through_consecutive_edits() {
+    let root = tempfile::tempdir().unwrap();
+    for prefix in ["controller", "comptroller", "container", "connector"] {
+        for suffix in ["service", "services", "server", "servant"] {
+            fs::write(root.path().join(format!("{prefix}_{suffix}.rs")), "").unwrap();
+        }
+    }
+    let picker = picker(root.path());
+    let parser = QueryParser::new(FileSearchConfig);
+    let options = FuzzySearchOptions::default();
+    let mut previous = SearchBuffer::default();
+    let mut next = SearchBuffer::default();
+    let input = "controller_service";
+    for end in 2..=input.len() {
+        let query = parser.parse(&input[..end]);
+        let full = picker.fuzzy_search(&query, None, options);
+        let page = picker.fuzzy_search_swap(&query, None, options, &previous, &mut next);
+        assert_eq!(page.total_matched, full.total_matched);
+        assert!(
+            page.items
+                .iter()
+                .map(|&f| std::ptr::from_ref(f))
+                .eq(full.items.iter().map(|&f| std::ptr::from_ref(f)))
+        );
+        assert!(
+            page.scores
+                .iter()
+                .map(|s| s.total)
+                .eq(full.scores.iter().map(|s| s.total))
+        );
+        assert_eq!(page.match_byte_offsets, full.match_byte_offsets);
+        mem::swap(&mut previous, &mut next);
+    }
 }
 
 #[test]
@@ -268,6 +305,42 @@ fn grep_swap_reuses_misses_but_searches_edited_and_unvisited_files() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn grep_swap_sees_edits_through_an_open_writable_mapping() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.txt");
+    fs::write(&path, b"old value").unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut mapping = unsafe { memmap2::MmapMut::map_mut(&file) }.unwrap();
+    mapping[0] = b'O';
+    let picker = picker(root.path());
+    let options = GrepSearchOptions::default();
+    let mut previous = SearchBuffer::default();
+    let mut next = SearchBuffer::default();
+
+    // Start a later second so a timestamp-only check would accept the unchanged inode.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        picker
+            .grep_swap(&parse_grep_query("new"), &options, &next, &mut previous)
+            .matches
+            .is_empty()
+    );
+    mapping[..3].copy_from_slice(b"new");
+    let query = parse_grep_query("new value");
+    let full = picker.grep(&query, &options);
+    assert_eq!(full.matches.len(), 1);
+    assert_same_page(
+        &picker.grep_swap(&query, &options, &previous, &mut next),
+        &full,
+    );
+}
+
 #[test]
 fn grep_swap_widening_queries_find_new_matches() {
     let root = tempfile::tempdir().unwrap();
@@ -298,6 +371,26 @@ fn grep_swap_widening_queries_find_new_matches() {
         );
         assert_same_page(&page, &picker.grep(&query, &options));
     }
+}
+
+#[test]
+fn regex_misses_do_not_hide_the_literal_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let prefix = "x[yz]";
+    let oversized = format!("{prefix}{}", "a".repeat(600_000));
+    fs::write(root.path().join("source.txt"), &oversized).unwrap();
+    let picker = picker(root.path());
+    let options = GrepSearchOptions {
+        mode: GrepMode::Regex,
+        ..Default::default()
+    };
+    let mut previous = SearchBuffer::default();
+    let mut next = SearchBuffer::default();
+    picker.grep_swap(&parse_grep_query(prefix), &options, &next, &mut previous);
+    let query = parse_grep_query(&oversized);
+    let page = picker.grep_swap(&query, &options, &previous, &mut next);
+    assert!(page.regex_fallback_error.is_some());
+    assert_eq!(page.matches.len(), 1);
 }
 
 #[test]

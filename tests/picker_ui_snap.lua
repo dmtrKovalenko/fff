@@ -375,7 +375,7 @@ T['picker_search']['typing_and_resume'] = function(prompt_position)
 
     for _, open in ipairs({ fff.find_files, fff.live_grep }) do
       open({ layout = { prompt_position = prompt_position } })
-      for _, query in ipairs({ 'hel', 'helper' }) do
+      for _, query in ipairs({ 'help', 'helper' }) do
         vim.api.nvim_buf_set_lines(ui.state.input_buf, 0, -1, false, { ui.state.config.prompt .. query })
         assert(vim.wait(2000, function() return last_query == query and #ui.state.items > 0 end))
       end
