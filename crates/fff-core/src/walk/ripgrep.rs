@@ -87,9 +87,7 @@ pub(crate) fn walk_collect_files(
         dirs,
         // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
         ignore_rules: (!is_git_repo).then(|| WalkIgnoreRules {
-            inner: parking_lot::Mutex::new(
-                walk_builder.build_matchers().pop().expect("one walk root"),
-            ),
+            inner: walk_builder.build_matchers().pop().expect("one walk root"),
         }),
     })
 }

@@ -25,13 +25,14 @@ pub(crate) struct WalkOutput {
     pub(crate) ignore_rules: Option<WalkIgnoreRules>,
 }
 
+#[cfg_attr(not(feature = "zlob"), derive(Clone))]
 pub(crate) struct WalkIgnoreRules {
     #[cfg(feature = "zlob")]
     inner: ::zlob::walk::WalkerOutcomeRules,
     #[cfg(feature = "zlob")]
     skip_hidden: bool,
     #[cfg(not(feature = "zlob"))]
-    inner: parking_lot::Mutex<::ignore::IncrementalIgnore>,
+    inner: ::ignore::IncrementalIgnore,
 }
 
 // SAFETY: the underlying storage is immutable, heap-owned, and thread-safe to
@@ -48,25 +49,23 @@ impl std::fmt::Debug for WalkIgnoreRules {
 }
 
 impl WalkIgnoreRules {
-    pub(crate) fn is_ignored(&self, relative_path: &Path, is_dir: bool) -> bool {
-        #[cfg(feature = "zlob")]
+    #[cfg(feature = "zlob")]
+    pub(crate) fn is_ignored(&self, relative_path: &Path, _is_dir: bool) -> bool {
+        if self.skip_hidden
+            && relative_path
+                .iter()
+                .any(|name| name.as_encoded_bytes().starts_with(b"."))
         {
-            let _ = is_dir;
-            if self.skip_hidden
-                && relative_path
-                    .iter()
-                    .any(|name| name.as_encoded_bytes().starts_with(b"."))
-            {
-                return true;
-            }
-            self.inner
-                .rules()
-                .is_some_and(|rules| rules.is_ignored(relative_path))
+            return true;
         }
-        #[cfg(not(feature = "zlob"))]
-        {
-            self.inner.lock().matched(relative_path, is_dir).is_ignore()
-        }
+        self.inner
+            .rules()
+            .is_some_and(|rules| rules.is_ignored(relative_path))
+    }
+
+    #[cfg(not(feature = "zlob"))]
+    pub(crate) fn is_ignored(&mut self, relative_path: &Path, is_dir: bool) -> bool {
+        self.inner.matched(relative_path, is_dir).is_ignore()
     }
 }
 

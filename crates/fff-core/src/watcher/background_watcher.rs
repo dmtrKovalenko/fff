@@ -387,7 +387,7 @@ pub(crate) fn handle_debounced_events(
         .read()
         .ok()
         .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
-    let filter = IgnoreFilter::new(
+    let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
         repo.as_ref(),
@@ -890,13 +890,13 @@ fn index_new_directory(
     };
 
     // Subtree-rooted walks still need to check the original root's ignore rules.
-    let filter = IgnoreFilter::new(
+    let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
         repo.as_ref(),
         ignore_options.disable_git,
     );
-    let join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
+    let mut join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
         let path = walk_base.join(relative_path);
         (scope.is_some() || !filter.is_ignored(&path, is_dir)).then_some(path)
     };
@@ -1031,15 +1031,14 @@ impl<'a> IgnoreFilter<'a> {
         }
     }
 
-    /// Whether `path` (absolute) is ignored.
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        if let Some(rules) = self.rules.as_ref() {
+    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        if let Some(rules) = self.rules.as_mut() {
             let Ok(relative) = path.strip_prefix(self.base_path) else {
                 return false;
             };
-            // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
-            // layer internally, so a leaf under an ignored directory (rule
-            // `build/`, path `build/out.rs`) is caught in one call.
+            // Ripgrep caches directory rules. Start each batch with the unloaded matcher.
+            #[cfg(not(feature = "zlob"))]
+            let rules = Arc::make_mut(rules);
             return rules.is_ignored(relative, is_dir);
         }
         match self.repo {
