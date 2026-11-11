@@ -3,6 +3,7 @@ use crate::types::FileItem;
 use crate::{GrepMode, GrepSearchOptions};
 use fff_query_parser::{FFFQuery, FuzzyQuery};
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 
 /// The search engine that produced a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,8 @@ pub enum SearchMode {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct SearchMetadata {
+    /// Start of the scan that supplied these candidates, retained across refinements.
+    pub scanned_at: Instant,
     pub raw_query: String,
     /// Pattern after parsing. Multipart path patterns are joined with spaces.
     pub effective_pattern: String,
@@ -25,14 +28,15 @@ pub struct SearchMetadata {
     pub mode: SearchMode,
     /// Typo budget for fuzzy matching. Match positions are on the result page.
     pub max_typos: Option<u16>,
-    /// Files skipped because the previous grep ruled out their current contents.
+    /// Files skipped because an unexpired previous grep ruled them out.
     pub grep_files_reused: usize,
 }
 
 /// Caller-owned storage for a search. Swap two buffers to reuse their allocations.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SearchBuffer {
     metadata: Option<SearchMetadata>,
+    ttl: Duration,
     pub(crate) index_revision: Option<u64>,
     files: [Vec<u32>; 2],
     dirs: Vec<u32>,
@@ -50,7 +54,26 @@ pub(crate) struct FuzzyBuffers<'a> {
     next: &'a mut SearchBuffer,
 }
 
+impl Default for SearchBuffer {
+    fn default() -> Self {
+        Self::with_ttl(Duration::from_secs(15))
+    }
+}
+
 impl SearchBuffer {
+    /// Set the maximum age from the original scan. The default is 15 seconds. Zero disables reuse.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            metadata: None,
+            index_revision: None,
+            files: Default::default(),
+            dirs: Vec::new(),
+            grep_misses: Vec::new(),
+            grep_insensitive: false,
+        }
+    }
+
     /// The query last written to this buffer, if it has been used.
     pub fn metadata(&self) -> Option<&SearchMetadata> {
         self.metadata.as_ref()
@@ -58,13 +81,16 @@ impl SearchBuffer {
 
     pub(crate) fn record_grep(
         &mut self,
-        raw_query: &str,
         pattern: &str,
         mode: GrepMode,
         max_typos: Option<u16>,
         reused: usize,
     ) {
-        let metadata = self.reset(raw_query, SearchMode::Grep(mode));
+        let metadata = self
+            .metadata
+            .as_mut()
+            .expect("begin_grep initializes metadata");
+        metadata.mode = SearchMode::Grep(mode);
         metadata.effective_pattern.push_str(pattern);
         metadata.max_typos = max_typos;
         metadata.grep_files_reused = reused;
@@ -75,28 +101,38 @@ impl SearchBuffer {
         previous: &'a Self,
         revision: u64,
         files: &'a [FileItem],
+        raw_query: &str,
         pattern: &str,
         options: &GrepSearchOptions,
-    ) -> GrepReuse<'a> {
+    ) -> Option<GrepReuse<'a>> {
         let insensitive = options.effective_casing().is_insensitive_for(pattern);
-        let reuse = previous.index_revision == Some(revision)
-            && previous.grep_insensitive == insensitive
-            && previous.metadata().is_some_and(|old| {
-                old.mode == SearchMode::Grep(options.mode)
-                    && !old.effective_pattern.is_empty()
-                    && grep_refines(&old.effective_pattern, pattern, options.mode)
-            });
-        self.grep_misses.clear();
-        if !pattern.is_empty() {
-            self.grep_misses
-                .resize_with(files.len(), AtomicU64::default);
+        let mode = SearchMode::Grep(options.mode);
+        let capture = !self.ttl.is_zero() && !pattern.is_empty();
+        let (metadata, old) = self.begin(previous, revision, raw_query, mode);
+        let old = old.filter(|old| {
+            previous.grep_insensitive == insensitive
+                && !old.effective_pattern.is_empty()
+                && grep_refines(&old.effective_pattern, pattern, options.mode)
+        });
+        if let Some(old) = old {
+            metadata.scanned_at = old.scanned_at;
         }
         self.grep_insensitive = insensitive;
-        GrepReuse::new(
+        self.grep_misses.clear();
+        if !capture {
+            return None;
+        }
+        self.grep_misses
+            .resize_with(files.len().div_ceil(64), AtomicU64::default);
+        Some(GrepReuse::new(
             files,
-            if reuse { &previous.grep_misses } else { &[] },
+            if old.is_some() {
+                &previous.grep_misses
+            } else {
+                &[]
+            },
             &self.grep_misses,
-        )
+        ))
     }
 
     pub(crate) fn begin_fuzzy<'a>(
@@ -106,7 +142,8 @@ impl SearchBuffer {
         mode: SearchMode,
         index_revision: u64,
     ) -> Option<FuzzyBuffers<'a>> {
-        let metadata = self.reset(query.raw_query, mode);
+        let capture = !self.ttl.is_zero();
+        let (metadata, old) = self.begin(previous, index_revision, query.raw_query, mode);
         let parts = match &query.fuzzy_query {
             FuzzyQuery::Text(text) => std::slice::from_ref(text),
             FuzzyQuery::Parts(parts) => parts.as_slice(),
@@ -125,7 +162,8 @@ impl SearchBuffer {
         let FuzzyQuery::Text(needle) = query.fuzzy_query else {
             return None;
         };
-        if !query.constraints.is_empty()
+        if !capture
+            || !query.constraints.is_empty()
             || needle.len() < 2
             || !needle.is_ascii()
             || mode == SearchMode::Mixed && dirs_only(query)
@@ -133,37 +171,52 @@ impl SearchBuffer {
             return None;
         }
 
-        let reuse = previous.index_revision == Some(index_revision)
-            && previous.metadata.as_ref().is_some_and(|old| {
-                old.mode == mode
-                    && old.max_typos == metadata.max_typos
-                    && needle.starts_with(&old.effective_pattern)
-                    && has_uppercase(needle) == has_uppercase(&old.effective_pattern)
-            });
+        let old = old.filter(|old| {
+            old.max_typos == metadata.max_typos
+                && needle.starts_with(&old.effective_pattern)
+                && has_uppercase(needle) == has_uppercase(&old.effective_pattern)
+        });
+        if let Some(old) = old {
+            metadata.scanned_at = old.scanned_at;
+        }
         Some(FuzzyBuffers {
-            previous: reuse.then_some(previous),
+            previous: old.map(|_| previous),
             next: self,
         })
     }
 
-    fn reset(&mut self, raw_query: &str, mode: SearchMode) -> &mut SearchMetadata {
+    fn begin<'a>(
+        &mut self,
+        previous: &'a Self,
+        revision: u64,
+        raw_query: &str,
+        mode: SearchMode,
+    ) -> (&mut SearchMetadata, Option<&'a SearchMetadata>) {
+        let now = Instant::now();
+        let old = previous.metadata().filter(|old| {
+            previous.index_revision == Some(revision)
+                && old.mode == mode
+                && now.duration_since(old.scanned_at) < self.ttl.min(previous.ttl)
+        });
         self.index_revision = None;
         self.files.iter_mut().for_each(Vec::clear);
         self.dirs.clear();
         let metadata = self.metadata.get_or_insert_with(|| SearchMetadata {
+            scanned_at: now,
             raw_query: String::new(),
             effective_pattern: String::new(),
             mode,
             max_typos: None,
             grep_files_reused: 0,
         });
+        metadata.scanned_at = now;
         metadata.raw_query.clear();
         metadata.raw_query.push_str(raw_query);
         metadata.effective_pattern.clear();
         metadata.mode = mode;
         metadata.max_typos = None;
         metadata.grep_files_reused = 0;
-        metadata
+        (metadata, old)
     }
 }
 

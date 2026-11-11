@@ -154,6 +154,15 @@ end
 function M.create_ui()
   local config = S.config
   if not config then return false end
+  local ttl = config.search_ttl_ms
+  vim.validate({
+    search_ttl_ms = {
+      ttl,
+      function(v) return type(v) == 'number' and v >= 0 and v % 1 == 0 end,
+      'a nonnegative integer',
+    },
+  })
+  local search = fuzzy.new_picker_search and ttl > 0 and fuzzy.new_picker_search(S.mode == 'grep', ttl) or nil
 
   -- Prompt editing should behave consistently even if the user has :set paste.
   S.restore_paste = vim.o.paste
@@ -195,7 +204,7 @@ function M.create_ui()
 
   S.input_win = vim.api.nvim_open_win(S.input_buf, false, win_configs.input)
 
-  picker_ui_state.search = fuzzy.new_picker_search and fuzzy.new_picker_search(S.mode == 'grep')
+  picker_ui_state.search = search
   M.setup_buffers()
   M.setup_windows()
   M.setup_keymaps()

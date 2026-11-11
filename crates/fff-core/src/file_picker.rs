@@ -1668,7 +1668,7 @@ impl FilePicker {
             .0
     }
 
-    /// Reuse files ruled out by a compatible grep and record the next page’s search metadata.
+    /// Skip files ruled out by a compatible grep until the original scan expires.
     /// Partial pages leave unsearched files eligible for the next call.
     pub fn grep_swap(
         &self,
@@ -1682,14 +1682,15 @@ impl FilePicker {
             previous,
             self.index_revision,
             self.get_files(),
+            query.raw_query,
             &pattern,
             options,
         );
-        let (result, pattern) = self.grep_with_pattern(query, options, pattern, Some(&reuse));
+        let (result, pattern) = self.grep_with_pattern(query, options, pattern, reuse.as_ref());
         let skipped = if result.literal_fallback {
             0
         } else {
-            reuse.files_skipped()
+            reuse.as_ref().map_or(0, GrepReuse::files_skipped)
         };
         let mode = if result.regex_fallback_error.is_some() {
             GrepMode::PlainText
@@ -1698,10 +1699,9 @@ impl FilePicker {
         };
         let max_typos = (mode == GrepMode::Fuzzy && !pattern.is_empty())
             .then(|| fuzzy_grep_max_typos(&pattern));
-        next.record_grep(query.raw_query, &pattern, mode, max_typos, skipped);
-        if !result.literal_fallback && mode == options.mode {
-            next.index_revision = Some(self.index_revision);
-        }
+        let captured = reuse.is_some() && !result.literal_fallback && mode == options.mode;
+        next.record_grep(&pattern, mode, max_typos, skipped);
+        next.index_revision = captured.then_some(self.index_revision);
         result
     }
 
@@ -2035,6 +2035,7 @@ impl FilePicker {
             }
         };
 
+        self.index_revision = next_index_revision();
         let (_arena, file) = self.sync_data.get_file_mut(pos)?;
 
         let size = metadata.len();

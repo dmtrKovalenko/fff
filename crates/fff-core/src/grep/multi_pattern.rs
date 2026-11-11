@@ -170,7 +170,7 @@ pub(crate) fn multi_grep_search<'a>(
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
         },
-        |file: &FileItem, file_bytes: &[u8], max_matches: usize, _| {
+        |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
                 file,
                 definition_mode: options.classify_definitions,

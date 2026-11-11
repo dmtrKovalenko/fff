@@ -1,4 +1,4 @@
-use std::{fs, mem, path::Path};
+use std::{fs, mem, path::Path, time::Duration};
 
 use fff_search::{
     DirSearchConfig, FilePicker, FilePickerOptions, FileSearchConfig, FuzzySearchOptions, GrepMode,
@@ -37,6 +37,10 @@ fn fuzzy_swap_reuses_candidates_beyond_the_page() {
         "components/controller.rs"
     );
     assert_eq!(next.metadata().unwrap().max_typos, Some(2));
+    assert_eq!(
+        next.metadata().unwrap().scanned_at,
+        previous.metadata().unwrap().scanned_at
+    );
     assert!(!page.match_byte_offsets[0].is_empty());
     mem::swap(&mut previous, &mut next);
 
@@ -295,50 +299,68 @@ fn grep_swap_reuses_misses_but_searches_edited_and_unvisited_files() {
         assert_same_page(&page, &all);
         assert!(next.metadata().unwrap().grep_files_reused > 0, "{mode:?}");
 
-        // Same length, no watcher notification.
+        assert_eq!(
+            next.metadata().unwrap().scanned_at,
+            previous.metadata().unwrap().scanned_at
+        );
+        // Before a watcher event, a recent miss can hide an edit.
         fs::write(root.path().join("a.rs"), "fn schemas(){}").unwrap();
+        let stale = picker.grep_swap(&refined, &options, &previous, &mut next);
+        assert_eq!(stale.files_with_matches, 2, "{mode:?}");
+        picker
+            .handle_create_or_modify(root.path().join("a.rs"))
+            .unwrap();
         let all = picker.grep(&refined, &options);
         let page = picker.grep_swap(&refined, &options, &previous, &mut next);
+        assert_eq!(next.metadata().unwrap().grep_files_reused, 0);
         assert_eq!(all.files_with_matches, 3, "{mode:?}");
         assert_same_page(&page, &all);
         fs::write(root.path().join("a.rs"), "nothing here!\n").unwrap();
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn grep_swap_sees_edits_through_an_open_writable_mapping() {
+fn expired_and_disabled_buffers_search_unreported_edits() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.txt");
-    fs::write(&path, b"old value").unwrap();
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap();
-    let mut mapping = unsafe { memmap2::MmapMut::map_mut(&file) }.unwrap();
-    mapping[0] = b'O';
+    fs::write(&path, "old value").unwrap();
     let picker = picker(root.path());
-    let options = GrepSearchOptions::default();
+    for ttl in [Duration::from_millis(1), Duration::ZERO] {
+        fs::write(&path, "old value").unwrap();
+        let mut previous = SearchBuffer::with_ttl(ttl);
+        let mut next = SearchBuffer::with_ttl(ttl);
+        let options = GrepSearchOptions::default();
+        picker.grep_swap(&parse_grep_query("new"), &options, &next, &mut previous);
+        fs::write(&path, "new value").unwrap();
+        std::thread::sleep(ttl);
+        let query = parse_grep_query("new value");
+        let page = picker.grep_swap(&query, &options, &previous, &mut next);
+        assert_eq!(next.metadata().unwrap().grep_files_reused, 0);
+        assert_eq!(page.matches.len(), 1);
+    }
+}
+
+#[test]
+fn grep_swap_carries_misses_across_words_and_keystrokes() {
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..130 {
+        let text = if i % 3 == 0 { "matches" } else { "other" };
+        fs::write(root.path().join(format!("{i}.txt")), text).unwrap();
+    }
+    let picker = picker(root.path());
+    let options = GrepSearchOptions {
+        page_limit: usize::MAX,
+        ..Default::default()
+    };
     let mut previous = SearchBuffer::default();
     let mut next = SearchBuffer::default();
-
-    // Start a later second so a timestamp-only check would accept the unchanged inode.
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    assert!(
-        picker
-            .grep_swap(&parse_grep_query("new"), &options, &next, &mut previous)
-            .matches
-            .is_empty()
-    );
-    mapping[..3].copy_from_slice(b"new");
-    let query = parse_grep_query("new value");
-    let full = picker.grep(&query, &options);
-    assert_eq!(full.matches.len(), 1);
-    assert_same_page(
-        &picker.grep_swap(&query, &options, &previous, &mut next),
-        &full,
-    );
+    for (input, reused) in [("mat", 0), ("match", 86), ("matches", 86)] {
+        let query = parse_grep_query(input);
+        let page = picker.grep_swap(&query, &options, &previous, &mut next);
+        assert_same_page(&page, &picker.grep(&query, &options));
+        assert_eq!(next.metadata().unwrap().grep_files_reused, reused);
+        mem::swap(&mut previous, &mut next);
+    }
 }
 
 #[test]

@@ -370,7 +370,7 @@ vim.api.nvim_create_autocmd('User', {
 
 ### Configuration
 
-Defaults are sensible. Override only what you care about.
+File search and live grep reuse candidates while you type. The window starts at the original scan. If the watcher misses an edit, the next search after expiry rechecks previously skipped files.
 
 ```lua
 require('fff').setup({
@@ -379,6 +379,7 @@ require('fff').setup({
   title = 'FFFiles',
   max_results = 100,
   max_threads = 4,
+  search_ttl_ms = 15000, -- reuse candidates for this long after a fresh scan (0 disables)
   lazy_sync = true,
   prompt_vim_mode = false,
   wrap_around = false, -- true to wrap the cursor around when moving past the first/last item

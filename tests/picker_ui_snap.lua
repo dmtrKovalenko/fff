@@ -360,8 +360,10 @@ T['picker_search']['typing_and_resume'] = function(prompt_position)
     local new_search = assert(fuzzy.new_picker_search)
     local live = setmetatable({}, { __mode = 'k' })
     local last_query
-    fuzzy.new_picker_search = function(grep)
-      local native = new_search(grep)
+    local expected_ttl = 15000
+    fuzzy.new_picker_search = function(grep, ttl_ms)
+      assert(ttl_ms == expected_ttl)
+      local native = new_search(grep, ttl_ms)
       local fresh = grep and fuzzy.live_grep or fuzzy.fuzzy_search_files
       local function search(query, ...)
         local page = native(query, ...)
@@ -395,6 +397,15 @@ T['picker_search']['typing_and_resume'] = function(prompt_position)
       assert(vim.wait(2000, function() return last_query == 'helper' and #ui.state.items > 0 end))
       ui.close()
     end
+
+    expected_ttl = 75
+    fff.live_grep({ search_ttl_ms = expected_ttl })
+    assert(require('fff.picker_ui.picker_ui_state').search)
+    ui.close()
+    fff.find_files({ query = 'helper', search_ttl_ms = 0 })
+    assert(require('fff.picker_ui.picker_ui_state').search == nil)
+    assert(vim.wait(2000, function() return #ui.state.items > 0 end))
+    ui.close()
   ]],
     { prompt_position }
   )

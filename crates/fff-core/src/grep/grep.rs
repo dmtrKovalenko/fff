@@ -467,7 +467,7 @@ fn grep_search_parsed<'a>(
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
-        |file: &FileItem, file_bytes: &[u8], max_matches: usize, miss| {
+        |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
                 file,
                 definition_mode: options.classify_definitions,
@@ -492,9 +492,9 @@ fn grep_search_parsed<'a>(
                     if let Err(e) = searcher.search_slice(&regex_matcher, file_bytes, &mut sink) {
                         tracing::error!(error = %e, "Grep (regex) search failed");
                     } else if !sink.saw_match
-                        && let Some(miss) = miss
+                        && let Some(reuse) = reuse
                     {
-                        miss.record();
+                        reuse.record_miss(file);
                     }
                     sink.state.matches
                 }
@@ -618,7 +618,7 @@ pub(super) fn perform_grep<'a, F>(
     search_file: F,
 ) -> GrepResult<'a>
 where
-    F: Fn(&FileItem, &[u8], usize, Option<&super::reuse::GrepMiss<'_>>) -> Vec<GrepMatch> + Sync,
+    F: Fn(&FileItem, &[u8], usize) -> Vec<GrepMatch> + Sync,
 {
     let time_budget = if options.time_budget_ms > 0 {
         Some(std::time::Duration::from_millis(options.time_budget_ms))
@@ -685,9 +685,10 @@ where
                         return None;
                     }
 
-                    let (content, miss) = super::reuse::read_candidate(
-                        ctx.reuse,
-                        file,
+                    if ctx.reuse.is_some_and(|reuse| reuse.skips(file)) {
+                        return None;
+                    }
+                    let content = file.get_content_for_search(
                         buf,
                         mmap_slot,
                         ctx.arena_for_file(file),
@@ -702,14 +703,13 @@ where
                     if let Some(pf) = ctx.prefilter
                         && pf.find(content).is_none()
                     {
-                        if let Some(miss) = miss {
-                            miss.record();
+                        if let Some(reuse) = ctx.reuse {
+                            reuse.record_miss(file);
                         }
                         return None;
                     }
 
-                    let file_matches =
-                        search_file(file, content, options.max_matches_per_file, miss.as_ref());
+                    let file_matches = search_file(file, content, options.max_matches_per_file);
 
                     if file_matches.is_empty() {
                         return None;

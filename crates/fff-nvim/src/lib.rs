@@ -1168,8 +1168,11 @@ fn parse_grep_args(
     (query, options)
 }
 
-fn new_picker_search(lua: &Lua, grep: bool) -> LuaResult<LuaFunction> {
-    let mut buffers = [SearchBuffer::default(), SearchBuffer::default()];
+fn new_picker_search(lua: &Lua, (grep, ttl_ms): (bool, Option<u64>)) -> LuaResult<LuaFunction> {
+    let mut buffers = std::array::from_fn(|_| match ttl_ms {
+        Some(ms) => SearchBuffer::with_ttl(Duration::from_millis(ms)),
+        None => SearchBuffer::default(),
+    });
     lua.create_function_mut(move |lua, args: LuaMultiValue| {
         let page = if grep {
             grep_from_lua(lua, args, Some(&mut buffers))

@@ -174,9 +174,10 @@ pub(super) fn fuzzy_grep_search<'a>(
                         arena
                     };
 
-                    let (file_bytes, miss) = super::reuse::read_candidate(
-                        reuse,
-                        file,
+                    if reuse.is_some_and(|reuse| reuse.skips(file)) {
+                        return None;
+                    }
+                    let file_bytes = file.get_content_for_search(
                         buf,
                         mmap_slot,
                         file_arena,
@@ -196,8 +197,8 @@ pub(super) fn fuzzy_grep_search<'a>(
                             }
                         }
                         if chars_found < min_chars_required {
-                            if let Some(miss) = miss {
-                                miss.record();
+                            if let Some(reuse) = reuse {
+                                reuse.record_miss(file);
                             }
                             return None;
                         }
@@ -243,9 +244,9 @@ pub(super) fn fuzzy_grep_search<'a>(
                     let matches_with_indices = matcher.match_list_indices(&file_lines);
                     // Only the raw subsequence test stays monotone as the query grows.
                     if matches_with_indices.is_empty()
-                        && let Some(miss) = miss
+                        && let Some(reuse) = reuse
                     {
-                        miss.record();
+                        reuse.record_miss(file);
                     }
                     let mut file_matches: Vec<GrepMatch> = Vec::new();
 
