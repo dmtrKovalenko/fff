@@ -2,6 +2,7 @@ use crate::{
     git::is_modified_status,
     index::constraints::apply_constraints,
     match_offsets::char_indices_to_byte_offsets,
+    parallelism::SEARCH_THREAD_POOL,
     path_utils::DirectoryDistance,
     simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
     sort_buffer::sort_with_buffer,
@@ -11,7 +12,10 @@ use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::Scoring;
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::{borrow::Cow, path::MAIN_SEPARATOR};
+use std::{
+    path::MAIN_SEPARATOR,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 enum FileItems<'a> {
     All(&'a [FileItem]),
@@ -80,7 +84,7 @@ fn match_fuzzy_parts(
     }
 
     // Narrow two-part queries with the longer part before scoring the shorter part.
-    let first_part_matches = match_file_range(
+    let first_part_matches = match_path_range(
         valid_parts[first_part],
         working_files.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
@@ -109,7 +113,7 @@ fn match_fuzzy_parts(
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_matches = match_file_range(
+        let sub_matches = match_path_range(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
@@ -439,7 +443,7 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
-    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
+    let first_part_matches = match_path_range(
         valid_parts[0],
         working_dirs.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
@@ -462,7 +466,7 @@ fn match_fuzzy_parts_dirs(
         // Match only the dirs that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_matches = neo_frizbee::match_range_parallel_resolved(
+        let sub_matches = match_path_range(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
@@ -772,50 +776,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
 
-    let mut fallback_indices: Vec<u32> = Vec::new();
-    let filename_fallback_matches = if query_contains_path_separator || path_matches.len() > 15_000
-    {
-        vec![]
-    } else {
-        let mut fallback_filenames: Vec<Cow<'_, str>> = Vec::new();
-
-        for (i, path_match) in path_matches.iter().enumerate() {
-            let file = working_files.index(path_match.index as usize);
-            let filename_start = file.filename_offset_in_relative_path() as u16;
-            let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
-
-            if match_start_approx < filename_start {
-                fallback_indices.push(i as u32);
-                fallback_filenames.push(file.path.filename_cow(arena));
-            }
-        }
-
-        if fallback_filenames.is_empty() {
-            vec![]
-        } else {
-            // Match on `&str` so frizbee reuses the instantiation its index
-            // resolver already emits instead of a separate `Cow<str>` copy.
-            let filename_strs: Vec<&str> = fallback_filenames.iter().map(Cow::as_ref).collect();
-            neo_frizbee::Matcher::new(fuzzy_parts[0], &options).match_list_parallel(
-                &filename_strs,
-                if path_matches.len() > 4096 {
-                    context.max_threads.div_ceil(2048)
-                } else {
-                    1
-                },
-            )
-        }
-    };
-
-    // path-match index -> position in filename_fallback_matches (u32::MAX = none)
-    let mut fallback_by_match: Vec<u32> = Vec::new();
-    if !filename_fallback_matches.is_empty() {
-        fallback_by_match.resize(path_matches.len(), u32::MAX);
-        for (position, m) in filename_fallback_matches.iter().enumerate() {
-            fallback_by_match[fallback_indices[m.index as usize] as usize] = position as u32;
-        }
-    }
-
+    let check_filename = !query_contains_path_separator && path_matches.len() <= 15_000;
     let distance = context
         .current_file
         .filter(|_| WITH_CURRENT_FILE)
@@ -826,11 +787,12 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
         .map(|entry| entry.file_path.to_string_lossy());
 
     let score_match =
-        |bufs: &mut ScoreBuffers, (match_idx, path_match): (usize, &neo_frizbee::Match)| {
+        |bufs: &mut ScoreBuffers, path_match: &neo_frizbee::Match| -> (&'a FileItem, Score) {
             let ScoreBuffers {
                 dir_buf,
                 fname_buf,
                 last_dir_penalty,
+                filename_matcher,
             } = bufs;
             let file_idx = path_match.index as usize;
             let file = working_files.index(file_idx);
@@ -865,32 +827,32 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
 
             let end_col_filename_match = match_start_approx >= filename_start;
-            let simd_filename_match = if !end_col_filename_match {
-                fallback_by_match
-                    .get(match_idx)
-                    .and_then(|&position| filename_fallback_matches.get(position as usize))
+            let fname_len = file.path.byte_len as usize - filename_start as usize;
+            let check_exact = end_col_filename_match && main_needle.len() == fname_len;
+            let check_fallback = !end_col_filename_match && check_filename;
+            let check_special = !end_col_filename_match && (5..=11).contains(&fname_len);
+            let filename = if check_exact || check_fallback || check_special {
+                file.path.filename_str(arena, fname_buf)
+            } else {
+                ""
+            };
+            let simd_filename_match = if check_fallback {
+                filename_matcher
+                    .get_or_insert_with(|| neo_frizbee::Matcher::new(fuzzy_parts[0], &options))
+                    .match_one(filename, 0)
             } else {
                 None
             };
 
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
-            let fname_len = file.path.byte_len as usize - file.path.filename_offset as usize;
-
             let is_exact_filename = simd_filename_match.is_some_and(|m| m.exact)
-                || (end_col_filename_match && main_needle_len as usize == fname_len && {
-                    file.write_file_name_from_arena(arena, fname_buf);
-                    main_needle.eq_ignore_ascii_case(fname_buf.as_bytes())
-                });
+                || (check_exact && main_needle.eq_ignore_ascii_case(filename.as_bytes()));
 
             let mut has_special_filename_bonus = false;
             let filename_bonus = if is_exact_filename {
                 base_score / 5 * 2 // 40% bonus for exact filename match
             } else if is_filename_match {
-                // 16% bonus for fuzzy filename match that landed in the filename region.
-                // For fallback matches (where the path match landed in a directory segment),
-                // scale the bonus by the quality of the filename match — a contiguous match
-                // like "rename" in "rename.ts" gets the full bonus, while a scattered
-                // subsequence like r-e-n-a-m-e in "generateSessionName.ts" gets much less.
+                // Scale the fallback bonus by the quality of the filename match.
                 let max_bonus = (base_score / 6).min(30);
                 if let Some(fm) = simd_filename_match {
                     let max_possible = main_needle_len as i32 * 16;
@@ -899,16 +861,9 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
                 } else {
                     max_bonus
                 }
-            } else if !is_filename_match && (5..=11).contains(&fname_len) {
-                file.write_file_name_from_arena(arena, fname_buf);
-                // 5% bonus for special file but not as much as file name to avoid situations
-                // when you have /user_service/server.rs and /user_service/server/mod.rs
-                if is_special_entry_point_file(fname_buf) {
-                    has_special_filename_bonus = true;
-                    base_score * 5 / 100
-                } else {
-                    0
-                }
+            } else if check_special && is_special_entry_point_file(filename) {
+                has_special_filename_bonus = true;
+                base_score * 5 / 100
             } else {
                 0
             };
@@ -1010,57 +965,55 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             .offset
             .saturating_add(context.pagination.limit)
     };
-    let results: Vec<_> =
-        if total_matched >= PARALLEL_SCORING_MIN_MATCHES && items_needed < SCORING_CHUNK_SIZE / 2 {
-            // Every global top-k result must belong to its chunk's top-k.
-            let score_chunk =
-                |bufs: &mut ScoreBuffers, (chunk_idx, matches): (usize, &[neo_frizbee::Match])| {
-                    let start = chunk_idx * SCORING_CHUNK_SIZE;
-                    let mut results: Vec<_> = matches
-                        .iter()
-                        .enumerate()
-                        .map(|(index, matched)| score_match(bufs, (start + index, matched)))
-                        .collect();
-                    if results.len() > items_needed {
-                        results.select_nth_unstable_by(items_needed - 1, |a, b| {
-                            compare_file_scores(a.0, a.1.total, b.0, b.1.total)
-                        });
-                        results.truncate(items_needed);
-                    }
-                    results
-                };
-            if context.max_threads > 1 {
+    let results = if total_matched >= PARALLEL_SCORING_MIN_MATCHES
+        && items_needed < SCORING_CHUNK_SIZE / 2
+    {
+        // Every global top-k result must belong to its chunk's top-k.
+        let score_chunk = |bufs: &mut ScoreBuffers, matches: &[neo_frizbee::Match]| {
+            let scores = matches.iter().map(|matched| score_match(bufs, matched));
+            if total_matched >= 16_384 && items_needed <= SCORING_CHUNK_SIZE / 8 {
+                return best_in_chunk(scores, items_needed);
+            }
+            let mut results: Vec<_> = scores.collect();
+            if results.len() > items_needed {
+                results.select_nth_unstable_by(items_needed - 1, |a, b| {
+                    compare_file_scores(a.0, a.1.total, b.0, b.1.total)
+                });
+                results.truncate(items_needed);
+            }
+            results
+        };
+        if context.max_threads > 1 {
+            SEARCH_THREAD_POOL.install(|| {
                 path_matches
                     .par_chunks(SCORING_CHUNK_SIZE)
-                    .enumerate()
                     .with_min_len((total_matched / SCORING_CHUNK_SIZE / context.max_threads).max(1))
                     .map_init(ScoreBuffers::new, score_chunk)
                     .flatten_iter()
                     .collect()
-            } else {
-                let mut bufs = ScoreBuffers::new();
-                path_matches
-                    .chunks(SCORING_CHUNK_SIZE)
-                    .enumerate()
-                    .flat_map(|chunk| score_chunk(&mut bufs, chunk))
-                    .collect()
-            }
-        } else if total_matched >= PARALLEL_SCORING_MIN_MATCHES && context.max_threads > 1 {
-            path_matches
-                .par_iter()
-                .enumerate()
-                .with_min_len((path_matches.len() / context.max_threads).max(4096))
-                .map_init(ScoreBuffers::new, score_match)
-                .collect()
+            })
         } else {
             let mut bufs = ScoreBuffers::new();
             path_matches
-                .iter()
-                .enumerate()
-                .map(|item| score_match(&mut bufs, item))
+                .chunks(SCORING_CHUNK_SIZE)
+                .flat_map(|chunk| score_chunk(&mut bufs, chunk))
                 .collect()
-        };
-
+        }
+    } else if total_matched >= PARALLEL_SCORING_MIN_MATCHES && context.max_threads > 1 {
+        SEARCH_THREAD_POOL.install(|| {
+            path_matches
+                .par_iter()
+                .with_min_len((total_matched / context.max_threads).max(SCORING_CHUNK_SIZE))
+                .map_init(ScoreBuffers::new, score_match)
+                .collect()
+        })
+    } else {
+        let mut bufs = ScoreBuffers::new();
+        path_matches
+            .iter()
+            .map(|item| score_match(&mut bufs, item))
+            .collect()
+    };
     (results, total_matched)
 }
 
@@ -1071,6 +1024,7 @@ struct ScoreBuffers {
     dir_buf: String,
     fname_buf: String,
     last_dir_penalty: Option<(u32, i32)>,
+    filename_matcher: Option<neo_frizbee::Matcher>,
 }
 
 impl ScoreBuffers {
@@ -1079,6 +1033,7 @@ impl ScoreBuffers {
             dir_buf: String::with_capacity(64),
             fname_buf: String::with_capacity(32),
             last_dir_penalty: None,
+            filename_matcher: None,
         }
     }
 }
@@ -1248,7 +1203,7 @@ fn sort_and_paginate<'a, S>(
     (items, scores, total_matched)
 }
 
-fn match_file_range<F>(
+fn match_path_range<F>(
     needle: &str,
     len: usize,
     resolve: &F,
@@ -1258,55 +1213,86 @@ fn match_file_range<F>(
 where
     F: Fn(u32, &mut [*const u8; MAX_PATH_CHUNKS]) -> Option<(usize, u16)> + Sync,
 {
-    // The rayon path below flattens per-worker results and never sorts, so
-    // any sorted strategy stays on frizbee's own k-merge implementation.
-    let unsorted = matches!(options.sort, neo_frizbee::SortStrategy::Unsorted);
-    if len < 32_768 || !unsorted {
-        return neo_frizbee::match_range_parallel_resolved(
-            needle,
-            len,
-            resolve,
-            options,
-            max_threads,
-        );
-    }
     assert!(
         len <= u32::MAX as usize,
-        "too many files for fuzzy matching"
+        "too many paths for fuzzy matching"
     );
     let mut matcher = neo_frizbee::Matcher::new(needle, options);
-    let max_threads = if max_threads == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2))
-            .unwrap_or(1)
-    } else {
-        max_threads
-    };
-    let workers = max_threads.max(1).min(len.div_ceil(2000));
-    if workers <= 1 {
+    if len <= 2000
+        || max_threads == 1
+        || !matches!(options.sort, neo_frizbee::SortStrategy::Unsorted)
+    {
         return matcher.match_range_resolved(len, resolve);
     }
-    let chunk_size = len.div_ceil(workers * 4).clamp(2048, 16_384);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    (0..workers)
-        .into_par_iter()
-        .map(|_| {
-            let mut matcher = matcher.clone();
-            let mut matches = Vec::new();
-            loop {
-                let start = next.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                if start >= len {
-                    break;
+    let pool = &*SEARCH_THREAD_POOL;
+    let mut workers = pool.current_num_threads().min(len.div_ceil(2000));
+    if max_threads != 0 {
+        workers = workers.min(max_threads);
+    }
+    // Grouped paths can have very different match costs. Let workers claim more ranges as they finish.
+    let chunk_size = len.div_ceil(workers * 8).clamp(256, 2048);
+    let chunks = len.div_ceil(chunk_size);
+    let next = AtomicUsize::new(0);
+    let batches: Vec<_> = pool.install(|| {
+        (0..workers)
+            .into_par_iter()
+            .map(|_| {
+                let mut matcher = matcher.clone();
+                let mut matches = Vec::new();
+                loop {
+                    let chunk = next.fetch_add(1, Ordering::Relaxed);
+                    if chunk >= chunks {
+                        break;
+                    }
+                    let start = chunk * chunk_size;
+                    let end = start.saturating_add(chunk_size).min(len);
+                    matcher.match_range_resolved_into(
+                        start as u32..end as u32,
+                        resolve,
+                        &mut matches,
+                    );
                 }
-                let end = (start + chunk_size).min(len);
-                matcher.match_range_resolved_into(start as u32..end as u32, resolve, &mut matches);
-            }
-            matches
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
+                matches
+            })
+            .collect()
+    });
+
+    let mut batches = batches.into_iter();
+    let mut matches = batches.next().unwrap_or_default();
+    matches.reserve(batches.as_slice().iter().map(Vec::len).sum());
+    for batch in batches {
+        matches.extend(batch);
+    }
+    matches
+}
+
+fn best_in_chunk<'a>(
+    scores: impl Iterator<Item = (&'a FileItem, Score)>,
+    keep: usize,
+) -> Vec<(&'a FileItem, Score)> {
+    let mut best = Vec::with_capacity(2 * keep);
+    let mut cutoff = None;
+    let compare = |a: &(&FileItem, Score), b: &(&FileItem, Score)| {
+        compare_file_scores(a.0, a.1.total, b.0, b.1.total)
+    };
+    for (file, score) in scores {
+        if cutoff.is_some_and(|(other, total)| {
+            !compare_file_scores(file, score.total, other, total).is_lt()
+        }) {
+            continue;
+        }
+        best.push((file, score));
+        if best.len() == 2 * keep {
+            let (_, worst, _) = best.select_nth_unstable_by(keep - 1, compare);
+            cutoff = Some((worst.0, worst.1.total));
+            best.truncate(keep);
+        }
+    }
+    if best.len() > keep {
+        best.select_nth_unstable_by(keep - 1, compare);
+        best.truncate(keep);
+    }
+    best
 }
 
 fn compare_file_scores(
@@ -1326,6 +1312,41 @@ mod tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
+
+    #[test]
+    fn fuzzy_ranges_use_the_search_pool_above_the_serial_cutoff() {
+        let options = neo_frizbee::Config {
+            sort: neo_frizbee::SortStrategy::Unsorted,
+            ..Default::default()
+        };
+        let caller = std::thread::current().id();
+        for (len, threads, pooled) in [
+            (2000, 4, false),
+            (2001, 4, true),
+            (32_768, 1, false),
+            (32_768, 4, true),
+        ] {
+            let resolve = |index: u32, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                if pooled {
+                    assert!(SEARCH_THREAD_POOL.current_thread_index().is_some());
+                } else {
+                    assert_eq!(std::thread::current().id(), caller);
+                }
+                buf[0] = b"src/lib.rs      ".as_ptr();
+                (!index.is_multiple_of(3)).then_some((1, 10))
+            };
+            let mut indices: Vec<_> = match_path_range("lib", len, &resolve, &options, threads)
+                .into_iter()
+                .map(|m| m.index)
+                .collect();
+            indices.sort_unstable();
+            assert!(
+                indices
+                    .into_iter()
+                    .eq((0..len as u32).filter(|i| !i.is_multiple_of(3)))
+            );
+        }
+    }
 
     #[test]
     fn longer_second_part_preserves_matches_and_first_part_positions() {
@@ -1463,10 +1484,16 @@ mod tests {
                     assert!(std::ptr::eq(*a, *b));
                     assert_eq!(format!("{a_score:?}"), format!("{b_score:?}"), "{text}");
                 }
-                let (parallel_items, parallel_scores, _) =
-                    sort_and_paginate(parallel, &context, |score| score.total);
-                let (sequential_items, sequential_scores, _) =
+                context.pagination = PaginationArgs {
+                    offset: 37,
+                    limit: 50,
+                };
+                let (sequential_items, sequential_scores, expected_count) =
                     sort_and_paginate(sequential, &context, |score| score.total);
+                context.max_threads = 4;
+                let (parallel_items, parallel_scores, count) =
+                    fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
+                assert_eq!(count, expected_count);
                 assert_eq!(
                     parallel_items
                         .iter()
@@ -1484,8 +1511,12 @@ mod tests {
                 if text != "controller" {
                     continue;
                 }
+                context.pagination = PaginationArgs {
+                    offset: 0,
+                    limit: 0,
+                };
                 let (all_items, all_scores, all_total) =
-                    fuzzy_match_and_score_files(&files, &context, files.len() / 3, arena, arena);
+                    sort_and_paginate(parallel, &context, |score| score.total);
                 assert_eq!(all_total, parallel_total);
                 let cases = [
                     (0, 1, 1),
@@ -1787,13 +1818,16 @@ mod tests {
                 min_combo_count: 0,
                 pagination: PaginationArgs { offset, limit: 8 },
             };
-            sort_and_paginate(results, &context, |s| s.total).0
+            let best = best_in_chunk(results.into_iter(), offset + 8);
+            sort_and_paginate(best, &context, |s| s.total).0
         };
         for offset in [0, 8, 16] {
             let expected: Vec<_> = files[offset..offset + 8].iter().collect();
             for shuffle in [0, 7, 1500, 2999] {
+                let actual = page(shuffle, offset);
+                assert_eq!(actual.len(), expected.len());
                 assert!(
-                    page(shuffle, offset)
+                    actual
                         .iter()
                         .zip(&expected)
                         .all(|(a, b)| std::ptr::eq(*a, *b)),

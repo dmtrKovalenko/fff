@@ -27,7 +27,7 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
         .expect("failed to create background rayon pool")
 });
 
-/// Grep pool sized to non-efficiency cores on macOS and full parallelism elsewhere.
+/// Search pool sized to non-efficiency cores on macOS and full parallelism elsewhere.
 pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     #[cfg(target_os = "macos")]
     let threads = non_efficiency_core_count();
