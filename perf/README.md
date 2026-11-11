@@ -24,15 +24,17 @@ the resulting executables directly on `load` as the runner service user.
 When a timing moves by more than 10%, the worker takes two more measurements
 of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
-benchmark slows down by more than 10%. The PR workflow draws the chart and
-passes it with the timings to **Publish FFF performance**. Same-repository PRs
-call the publisher directly. GitHub runs it from `main` after fork benchmarks
-finish because fork workflow tokens are read-only.
+benchmark slows down by more than 10%. After the PR workflow finishes,
+**Publish FFF performance** reads its comparison plan and timings, draws
+the chart, and posts the result. It runs from `main` for all PRs, including forks.
 
 The chart is drawn with [fframes](https://github.com/dmtrKovalenko/fframes)
-by `perf/chart`, a package outside the main workspace. The image is uploaded
-as `pr-<number>.png` to the `perf-charts` prerelease, so it stays out of the
-git history. To draw one locally:
+by `perf/chart`, a package outside the main workspace. The publisher builds
+the Linux renderer on the first measured run for each distinct `perf/chart`
+tree on `main`. It saves the executable in the `perf-charts` prerelease.
+Subsequent runs download it and upload the chart as `pr-<number>.png`.
+
+To draw a chart locally, run
 
 ```sh
 cargo run --release --manifest-path perf/chart/Cargo.toml --example chart -- \
