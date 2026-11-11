@@ -1016,11 +1016,14 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             let score_chunk =
                 |bufs: &mut ScoreBuffers, (chunk_idx, matches): (usize, &[neo_frizbee::Match])| {
                     let start = chunk_idx * SCORING_CHUNK_SIZE;
-                    let mut results: Vec<_> = matches
+                    let scores = matches
                         .iter()
                         .enumerate()
-                        .map(|(index, matched)| score_match(bufs, (start + index, matched)))
-                        .collect();
+                        .map(|(index, matched)| score_match(bufs, (start + index, matched)));
+                    if total_matched >= 16_384 && items_needed <= SCORING_CHUNK_SIZE / 8 {
+                        return best_in_chunk(scores, items_needed);
+                    }
+                    let mut results: Vec<_> = scores.collect();
                     if results.len() > items_needed {
                         results.select_nth_unstable_by(items_needed - 1, |a, b| {
                             compare_file_scores(a.0, a.1.total, b.0, b.1.total)
@@ -1049,7 +1052,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
             path_matches
                 .par_iter()
                 .enumerate()
-                .with_min_len((path_matches.len() / context.max_threads).max(4096))
+                .with_min_len((total_matched / context.max_threads).max(4096))
                 .map_init(ScoreBuffers::new, score_match)
                 .collect()
         } else {
@@ -1288,7 +1291,7 @@ where
     }
     let chunk_size = len.div_ceil(workers * 4).clamp(2048, 16_384);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    (0..workers)
+    let batches: Vec<_> = (0..workers)
         .into_par_iter()
         .map(|_| {
             let mut matcher = matcher.clone();
@@ -1303,10 +1306,42 @@ where
             }
             matches
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
+        .collect();
+
+    let mut batches = batches.into_iter();
+    let mut matches = batches.next().unwrap_or_default();
+    matches.reserve(batches.as_slice().iter().map(Vec::len).sum());
+    for batch in batches {
+        matches.extend(batch);
+    }
+    matches
+}
+
+fn best_in_chunk<'a>(
+    scores: impl Iterator<Item = (&'a FileItem, Score)>,
+    keep: usize,
+) -> Vec<(&'a FileItem, Score)> {
+    let mut best = Vec::with_capacity(2 * keep);
+    let mut cutoff = None;
+    let compare = |a: &(&FileItem, Score), b: &(&FileItem, Score)| {
+        compare_file_scores(a.0, a.1.total, b.0, b.1.total)
+    };
+    for (file, score) in scores {
+        if cutoff.is_some_and(|(other, total)| !compare_file_scores(file, score.total, other, total).is_lt()) {
+            continue;
+        }
+        best.push((file, score));
+        if best.len() == 2 * keep {
+            let (_, worst, _) = best.select_nth_unstable_by(keep - 1, compare);
+            cutoff = Some((worst.0, worst.1.total));
+            best.truncate(keep);
+        }
+    }
+    if best.len() > keep {
+        best.select_nth_unstable_by(keep - 1, compare);
+        best.truncate(keep);
+    }
+    best
 }
 
 fn compare_file_scores(
@@ -1463,10 +1498,16 @@ mod tests {
                     assert!(std::ptr::eq(*a, *b));
                     assert_eq!(format!("{a_score:?}"), format!("{b_score:?}"), "{text}");
                 }
-                let (parallel_items, parallel_scores, _) =
-                    sort_and_paginate(parallel, &context, |score| score.total);
-                let (sequential_items, sequential_scores, _) =
+                context.pagination = PaginationArgs {
+                    offset: 37,
+                    limit: 50,
+                };
+                let (sequential_items, sequential_scores, expected_count) =
                     sort_and_paginate(sequential, &context, |score| score.total);
+                context.max_threads = 4;
+                let (parallel_items, parallel_scores, count) =
+                    fuzzy_match_and_score_files(&files, &context, files.len() / 2, arena, arena);
+                assert_eq!(count, expected_count);
                 assert_eq!(
                     parallel_items
                         .iter()
@@ -1484,8 +1525,12 @@ mod tests {
                 if text != "controller" {
                     continue;
                 }
+                context.pagination = PaginationArgs {
+                    offset: 0,
+                    limit: 0,
+                };
                 let (all_items, all_scores, all_total) =
-                    fuzzy_match_and_score_files(&files, &context, files.len() / 3, arena, arena);
+                    sort_and_paginate(parallel, &context, |score| score.total);
                 assert_eq!(all_total, parallel_total);
                 let cases = [
                     (0, 1, 1),
@@ -1787,13 +1832,16 @@ mod tests {
                 min_combo_count: 0,
                 pagination: PaginationArgs { offset, limit: 8 },
             };
-            sort_and_paginate(results, &context, |s| s.total).0
+            let best = best_in_chunk(results.into_iter(), offset + 8);
+            sort_and_paginate(best, &context, |s| s.total).0
         };
         for offset in [0, 8, 16] {
             let expected: Vec<_> = files[offset..offset + 8].iter().collect();
             for shuffle in [0, 7, 1500, 2999] {
+                let actual = page(shuffle, offset);
+                assert_eq!(actual.len(), expected.len());
                 assert!(
-                    page(shuffle, offset)
+                    actual
                         .iter()
                         .zip(&expected)
                         .all(|(a, b)| std::ptr::eq(*a, *b)),
