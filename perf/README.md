@@ -30,9 +30,10 @@ the chart, and posts the result. It runs from `main` for all PRs, including fork
 
 The chart is drawn with [fframes](https://github.com/dmtrKovalenko/fframes)
 by `perf/chart`, a package outside the main workspace. The publisher builds
-the Linux renderer on the first measured run for each distinct `perf/chart`
-tree on `main`. It saves the executable in the `perf-charts` prerelease.
-Subsequent runs download it and upload the chart as `pr-<number>.png`.
+the Linux renderer on an Actions cache miss. The cache key includes a version
+and the Git tree hash of `perf/chart/` on `main`. On a hit, the publisher runs
+the cached executable directly. It uploads the PNG to the `perf-charts`
+prerelease as `pr-<number>.png`.
 
 To draw a chart locally, run
 
