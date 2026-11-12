@@ -75,8 +75,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
     bigram_candidates: Option<&[u64]>,
     base_count: usize,
     options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> (RankedFiles<'a>, usize) {
     let (files_to_search, filtered_file_count) = prefilter_files(
         files,
@@ -84,8 +83,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         bigram_candidates,
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
     );
 
     if !files_to_search.is_empty()
@@ -104,8 +102,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         bigram_candidates,
         base_count,
         options,
-        arena,
-        overflow_arena,
+        arenas,
     )
 }
 
@@ -118,8 +115,7 @@ pub(super) fn prefilter_files<'a>(
     bigram_candidates: Option<&[u64]>,
     base_count: usize,
     options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> (RankedFiles<'a>, usize) {
     let max_file_size = options.max_file_size;
     let definition_only = options.classify_definitions == super::DefinitionMode::DefinitionOnly;
@@ -132,8 +128,7 @@ pub(super) fn prefilter_files<'a>(
         Some(ConstraintPlan::build_with_prefilter(
             constraints,
             files,
-            arena,
-            overflow_arena,
+            arenas,
             sparse,
         ))
     };
@@ -176,7 +171,7 @@ pub(super) fn prefilter_files<'a>(
                             continue;
                         }
                         if let Some(plan) = plan.as_ref()
-                            && !plan.matches(f, file_idx, arena, overflow_arena, &mut scratch)
+                            && !plan.matches(f, file_idx, arenas, &mut scratch)
                         {
                             continue;
                         }
@@ -208,7 +203,7 @@ pub(super) fn prefilter_files<'a>(
                     continue;
                 }
                 if let Some(ref p) = plan
-                    && !p.matches(f, boundary + offset, arena, overflow_arena, &mut scratch)
+                    && !p.matches(f, boundary + offset, arenas, &mut scratch)
                 {
                     continue;
                 }
@@ -227,7 +222,7 @@ pub(super) fn prefilter_files<'a>(
                     continue;
                 }
                 if let Some(ref p) = plan
-                    && !p.matches(f, idx, arena, overflow_arena, &mut scratch)
+                    && !p.matches(f, idx, arenas, &mut scratch)
                 {
                     continue;
                 }
@@ -322,7 +317,9 @@ mod tests {
                 let mut file = FileItem::new_raw(0, size, 1000 - idx, None, idx == 6);
                 file.mark_definition_language(["file.rs", "file.txt", "file.py"][idx as usize % 3]);
                 file.set_deleted(idx == 8);
-                file.set_overflow(idx >= 65);
+                if idx >= 65 {
+                    file.set_layer(crate::SESSION_LAYER);
+                }
                 file
             })
             .collect();
@@ -357,8 +354,7 @@ mod tests {
                         candidates,
                         65,
                         &options,
-                        ArenaPtr::null(),
-                        ArenaPtr::null(),
+                        crate::LayerArenas::uniform(ArenaPtr::null()),
                     );
                     assert_eq!(count, expected.len());
                     assert_eq!(

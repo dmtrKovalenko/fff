@@ -1,5 +1,4 @@
 use crate::match_offsets::char_indices_to_byte_offsets;
-use crate::simd_path::ArenaPtr;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::lines::LineStep;
 use rayon::prelude::*;
@@ -20,8 +19,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     budget: &ContentCacheBudget,
     abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     #[cfg(unix)]
     let base_dir = std::fs::File::open(base_path).ok();
@@ -167,11 +165,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                         return None;
                     }
 
-                    let file_arena = if file.is_overflow() {
-                        overflow_arena
-                    } else {
-                        arena
-                    };
+                    let file_arena = arenas.get(file.layer_id());
 
                     let file_bytes = file.get_content_for_search(
                         buf,

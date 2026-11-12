@@ -564,6 +564,30 @@ export interface MultiGrepOptions {
   classifyDefinitions?: DefinitionMode | boolean;
 }
 
+/** Metadata for a file added to an index layer without touching the filesystem. */
+export interface LayerEntry {
+  /** Path relative to the indexed root, `/` separated. */
+  path: string;
+  /** Size in bytes (default 0). */
+  size?: number;
+  /** Modification time as unix seconds (default 0). */
+  modified?: number;
+}
+
+/** One overlay layer of the index. */
+export interface LayerInfo {
+  id: number;
+  label: string | null;
+  /** Index slots owned by the layer, tombstones included. */
+  fileCount: number;
+  liveFileCount: number;
+  dirCount: number;
+  /** Bytes held by the layer's path arena. */
+  arenaBytes: number;
+  /** True for the single writable layer at the top of the stack. */
+  isOpen: boolean;
+}
+
 /**
  * The shared instance surface implemented by `FileFinder` in both
  * `@ff-labs/fff-node` and `@ff-labs/fff-bun`.
@@ -663,6 +687,51 @@ export interface FileFinderApi {
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;
+
+  /**
+   * Seal the open index layer and open a new one for `addPaths`. Returns its id.
+   * Layer ids and labels never change, and the watcher writes only to layer 1.
+   * At most three overlays exist. Creating a fourth fails.
+   */
+  createLayer(label?: string): Result<number>;
+
+  /** Id of the layer `addPaths` writes to. Layer 1, the session layer, until a layer is open. */
+  currentLayer(): Result<number>;
+
+  /** Every overlay layer, oldest first. The base scan (layer 0) is not listed. */
+  listLayers(): Result<LayerInfo[]>;
+
+  /** Live file count of `layer` (0 = base scan). */
+  layerFileCount(layer: number): Result<number>;
+
+  /**
+   * Append paths to the open layer without touching the filesystem. Opens an
+   * unlabeled layer when none is open. Paths already indexed are skipped.
+   * Returns the number added.
+   */
+  addPaths(entries: Array<string | LayerEntry>): Result<number>;
+
+  /** Write `layer` (0 = base scan) to a file. Returns bytes written. */
+  saveLayer(layer: number, filePath: string): Result<number>;
+
+  /** Load a layer file as a new sealed overlay. Returns its id. Fails when three overlays exist. */
+  loadLayer(filePath: string): Result<number>;
+
+  /**
+   * Load a layer file as the base scan in the background, like a rescan:
+   * explicit overlays are kept, frecency and content indexing are applied.
+   * Returns the file count; wait with `waitForScan` before searching.
+   * Wait with `waitForIndexReady` before changing layers or loading another base.
+   */
+  loadBase(filePath: string): Result<number>;
+}
+
+/** @internal The C API addresses layers with a u8. */
+export function checkLayerId(layer: number): Result<number> {
+  if (!Number.isInteger(layer) || layer < 0 || layer > 255) {
+    return err(`layer must be an integer in 0..255, got ${layer}`);
+  }
+  return ok(layer);
 }
 
 /** @internal Convert the public mode to the C integer argument. */

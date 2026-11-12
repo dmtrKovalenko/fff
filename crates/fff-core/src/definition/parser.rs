@@ -84,15 +84,6 @@ where
 
     pub(super) fn qualified_name(&mut self) -> Option<Range<usize>> {
         let mut name = self.identifier()?;
-        if Self::LANGUAGE == Language::Shell {
-            while self.line.get(self.pos).is_some_and(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':')
-            }) {
-                self.pos += 1;
-            }
-            name.end = self.pos;
-            return Some(name);
-        }
         loop {
             let start = self.pos;
             if Self::LANGUAGE == Language::Kotlin && self.peek() == Some(b'<') {
@@ -102,15 +93,13 @@ where
                 }
             } else if !(self.eat(b".")
                 || self.eat(b"::")
-                || (Self::LANGUAGE == Language::Lua && self.eat(b":"))
-                || (Self::LANGUAGE == Language::Php && self.eat(b"\\")))
+                || (Self::LANGUAGE == Language::Lua && self.eat(b":")))
             {
                 break;
             }
             name = self.identifier()?;
         }
-        if matches!(Self::LANGUAGE, Language::Ruby | Language::Elixir)
-            && matches!(self.line.get(self.pos), Some(b'?' | b'!'))
+        if Self::LANGUAGE == Language::Ruby && matches!(self.line.get(self.pos), Some(b'?' | b'!'))
         {
             self.pos += 1;
             name.end = self.pos;
@@ -185,27 +174,6 @@ where
             Fallback::CFunction => {
                 self.pos = name.start;
                 self.c_function(modifiers)
-            }
-            Fallback::Shell => {
-                self.pos = name.start;
-                let name = self.qualified_name()?;
-                if !self.eat(b"(") || !self.eat(b")") {
-                    return None;
-                }
-                Some(name)
-            }
-            Fallback::Haskell => {
-                if name.start != 0 {
-                    return None;
-                }
-                if self.eat(b"::") {
-                    return Some(name);
-                }
-                let equals = memchr::memchr(b'=', &self.line[self.pos..])? + self.pos;
-                let assignment = self.line.get(equals + 1) != Some(&b'=')
-                    && self.line.get(equals + 1) != Some(&b'>')
-                    && !self.line[self.pos..equals].contains(&b'-');
-                assignment.then_some(name)
             }
         }
     }
