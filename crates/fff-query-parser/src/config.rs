@@ -203,15 +203,10 @@ impl ParserConfig for AiGrepConfig {
             return false;
         }
         let bytes = token.as_bytes();
-        if bytes.len() >= 3
+        bytes.len() >= 3
             && bytes[0] == b'*'
             && bytes[bytes.len() - 1] == b'*'
             && bytes[1..bytes.len() - 1].iter().all(|&b| b != b'*')
-        {
-            return true;
-        }
-
-        false
     }
 }
 
