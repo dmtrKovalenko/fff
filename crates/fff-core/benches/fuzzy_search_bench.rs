@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use fff_search::{FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser};
 use std::{hint::black_box, time::Duration};
 
@@ -86,6 +86,31 @@ fn bench_picker(
                 b.iter(|| black_box(picker.fuzzy_search(black_box(&query), None, options)));
             });
         }
+    }
+    // Measure the same final keystroke, with and without a reusable prefix.
+    let parsed = parser.parse("group_57/controller_570");
+    let options = FuzzySearchOptions {
+        max_threads: 4,
+        pagination: PaginationArgs {
+            offset: 0,
+            limit: 50,
+        },
+        ..Default::default()
+    };
+    for (name, previous) in [
+        ("cold", "unrelated_query"),
+        ("warm", "group_57/controller_57"),
+    ] {
+        let previous = parser.parse(previous);
+        group.bench_function(BenchmarkId::new("incremental", name), |b| {
+            b.iter_batched(
+                || {
+                    black_box(picker.fuzzy_search(&previous, None, options));
+                },
+                |()| black_box(picker.fuzzy_search(&parsed, None, options)),
+                BatchSize::PerIteration,
+            );
+        });
     }
     group.finish();
 }
