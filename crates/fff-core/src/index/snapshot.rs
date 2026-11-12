@@ -817,7 +817,8 @@ mod tests {
             builder.push(&IndexEntry::new(path));
         }
         let snap = builder.finish();
-        assert_eq!(snap.file_count(), if cfg!(windows) { 1 } else { 4 });
+        // Windows reads `a\b.rs` as `a/b.rs` and rejects the drive prefixes.
+        assert_eq!(snap.file_count(), if cfg!(windows) { 2 } else { 4 });
         let mut bytes = Vec::new();
         snap.write_to(&mut bytes).unwrap();
         assert_eq!(
