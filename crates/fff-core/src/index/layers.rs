@@ -115,11 +115,12 @@ struct IndexLayer {
     // layers are looked up through `index`.
     sorted: bool,
     index: PathIndex,
+    dir_index: PathIndex,
 }
 
 // Overlays above the base scan in storage order. Each owns a contiguous range
-// of `files`/`dirs` plus its own path arena. Ids never move between layers, and
-// the session layer stays last so watcher additions append in place.
+// of `files`/`dirs` plus its own path arena. Ids never move between layers. The
+// open layer sits right below the session layer, so appends only move the session.
 #[derive(Clone)]
 pub(crate) struct LayerStack {
     layers: Vec<IndexLayer>,
@@ -136,6 +137,7 @@ impl LayerStack {
             store: LayerStore::Open(None),
             sorted: false,
             index: PathIndex::default(),
+            dir_index: PathIndex::default(),
         });
 
         Self { layers }
@@ -211,20 +213,27 @@ impl LayerStack {
         self.insert(id, label, LayerStore::Sealed(store), sorted);
     }
 
-    // New layers start empty right below the session layer.
+    // New layers start empty below the open layer, or below the session layer
+    // when none is open.
     fn insert(&mut self, id: LayerId, label: Option<Box<str>>, store: LayerStore, sorted: bool) {
         debug_assert!(id != SESSION_LAYER && self.index_of(id).is_none());
-        let session = self.layers.last().expect("layer stack is never empty");
+        let at = self
+            .layers
+            .iter()
+            .position(|l| l.id != SESSION_LAYER && l.store.is_open())
+            .unwrap_or(self.layers.len() - 1);
+        let next = &self.layers[at];
         let layer = IndexLayer {
             id,
             label,
-            files_start: session.files_start,
-            dirs_start: session.dirs_start,
+            files_start: next.files_start,
+            dirs_start: next.dirs_start,
             store,
             sorted,
             index: PathIndex::default(),
+            dir_index: PathIndex::default(),
         };
-        self.layers.insert(self.layers.len() - 1, layer);
+        self.layers.insert(at, layer);
     }
 
     // Moves every layer above `id` after slots were inserted at the end of it.
@@ -247,6 +256,17 @@ impl LayerStack {
             .into_iter()
             .zip(self.layers.iter())
             .map(|((start, end, _, arena), layer)| (start, end, arena, layer.sorted, &layer.index))
+    }
+
+    // `(start, end, index)` per overlay dir range.
+    pub fn dir_lookup_ranges(
+        &self,
+        dirs_len: usize,
+    ) -> impl Iterator<Item = (usize, usize, &PathIndex)> + '_ {
+        (0..self.layers.len()).map(move |i| {
+            let (start, end) = self.range_at(i, dirs_len, |l| l.dirs_start);
+            (start, end, &self.layers[i].dir_index)
+        })
     }
 
     // `files_len` closes the range of the session layer.
@@ -493,6 +513,21 @@ mod tests {
     }
 
     #[test]
+    fn sealed_layers_go_below_the_open_layer() {
+        let mut stack = LayerStack::new(100, 10);
+        stack.insert_open(2, None);
+        stack.shift_above(2, 4, 1);
+        stack.insert_sealed(3, None, Arc::new(ChunkedPathStore::empty()), true);
+        stack.shift_above(3, 2, 0);
+
+        assert_eq!(stack.ids().collect::<Vec<_>>(), [3, 2, SESSION_LAYER]);
+        assert_eq!(stack.file_range(3, 110), Some((100, 102)));
+        assert_eq!(stack.file_range(2, 110), Some((102, 106)));
+        assert_eq!(stack.dir_range(2, 12), Some((10, 11)));
+        assert_eq!(stack.open_layer(), Some(2));
+    }
+
+    #[test]
     fn ranges_stay_in_bounds_when_the_index_is_shorter_than_a_layer_start() {
         let mut stack = LayerStack::new(100, 10);
         stack.insert_open(2, None);
@@ -513,6 +548,10 @@ mod tests {
         let mut stack = LayerStack::new(0, 0);
         let mut ids = Vec::new();
         while let Some(id) = stack.free_id() {
+            // `create_layer` seals the open layer first.
+            if let Some(open) = stack.open_layer() {
+                stack.seal(open);
+            }
             stack.insert_open(id, None);
             ids.push(id);
         }
@@ -520,7 +559,6 @@ mod tests {
         assert_eq!(ids.len(), MAX_OVERLAY_LAYERS - 1);
         assert_eq!(ids, (2..=MAX_OVERLAY_LAYERS as LayerId).collect::<Vec<_>>());
         assert_eq!(stack.ids().last(), Some(SESSION_LAYER));
-        // The newest open layer receives explicit paths.
         assert_eq!(stack.open_layer(), ids.last().copied());
     }
 

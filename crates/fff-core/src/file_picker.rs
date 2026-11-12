@@ -36,7 +36,6 @@ use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::layers::{LayerArenas, LayerId, LayerStack, SESSION_LAYER};
-use crate::index::path_index::PathIndex;
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
@@ -128,8 +127,6 @@ pub(crate) struct FileSync {
     /// Overlay layers stacked on the base arena. Each layer owns a contiguous
     /// range of `files`/`dirs` plus its own path arena.
     layers: LayerStack,
-    /// Point lookups into the unsorted overlay dirs.
-    overlay_dir_index: PathIndex,
     bigram_index: Option<Arc<BigramFilter>>,
     bigram_overlay: Option<Arc<parking_lot::RwLock<BigramOverlay>>>,
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
@@ -151,7 +148,6 @@ impl FileSync {
             base_dirs_count: 0,
             live_dirs_count: 0,
             layers: LayerStack::new(0, 0),
-            overlay_dir_index: PathIndex::default(),
             git: None,
             shared_base: None,
             bigram_index: None,
@@ -269,8 +265,12 @@ impl FileSync {
         let dir_rel = &relative_path[..parent_end];
         let filename = &relative_path[parent_end..];
 
-        if let Some(dir_idx) = find_dir(dir_rel)
-            && let Some(pos) = self.find_base_file_index(dir_idx as u32, filename, arena)
+        // A tombstoned base slot loses to a layer entry for the same path,
+        // which a rescan leaves when an explicit path shows up on disk.
+        let base = find_dir(dir_rel)
+            .and_then(|dir_idx| self.find_base_file_index(dir_idx as u32, filename, arena));
+        if let Some(pos) = base
+            && !self.files[pos].is_deleted()
         {
             return Some(pos);
         }
@@ -300,7 +300,7 @@ impl FileSync {
             }
         }
 
-        None
+        base
     }
 
     fn find_base_file_index(&self, dir_idx: u32, filename: &str, arena: ArenaPtr) -> Option<usize> {
@@ -443,18 +443,18 @@ impl FileSync {
             return Some(idx);
         }
 
-        // Overlay region: unsorted, hash indexed.
+        // Each overlay hashes its own range, so moving one layer keeps the
+        // others' indexes. A dir pending a move reads through its own arena.
         let arenas = self.layer_arenas();
-        self.overlay_dir_index.lookup(
-            self.base_dirs_count,
-            self.dirs.len(),
-            dir_rel,
-            &mut |slot, buf| {
-                let dir = &self.dirs[slot];
-                dir.read_relative_path(arenas.get(dir.layer_id()), buf)
-                    .len()
-            },
-        )
+        self.layers
+            .dir_lookup_ranges(self.dirs.len())
+            .find_map(|(start, end, index)| {
+                index.lookup(start, end, dir_rel, &mut |slot, buf| {
+                    let dir = &self.dirs[slot];
+                    dir.read_relative_path(arenas.get(dir.layer_id()), buf)
+                        .len()
+                })
+            })
     }
 
     /// Finds or appends the DirItem for `dir_rel` in the session layer, returning its index.
@@ -2010,6 +2010,14 @@ impl FilePicker {
             &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
         );
 
+        // Register (or revive) the parent dir so directory search and layer
+        // export see the file. Explicit layers share the dir table, so grow it.
+        let dir_rel = crate::path_utils::to_canonical_slashes(
+            &rel_path[..file_item.path.filename_offset as usize],
+        );
+        self.sync_data.ensure_capacity(0, 1);
+        let parent_dir = self.sync_data.find_or_add_dir(&dir_rel)?;
+
         let chunked = self
             .sync_data
             .layers
@@ -2018,17 +2026,7 @@ impl FilePicker {
 
         file_item.set_path(chunked);
         file_item.set_layer(SESSION_LAYER);
-
-        // Keep the dir table consistent: register (or revive) the parent dir
-        // so directory search reflects watcher-added files immediately.
-        let dir_rel = crate::path_utils::to_canonical_slashes(
-            &rel_path[..file_item.path.filename_offset as usize],
-        );
-
-        if let Some(dir_idx) = self.sync_data.find_or_add_dir(&dir_rel) {
-            file_item.parent_dir_index = dir_idx;
-        }
-        let parent_dir = file_item.parent_dir_index;
+        file_item.parent_dir_index = parent_dir;
 
         if !self.sync_data.files.push(file_item) {
             return None;
@@ -2466,7 +2464,6 @@ impl FileSync {
             base_dirs_count,
             live_dirs_count: base_dirs_count,
             layers: LayerStack::new(base_count, base_dirs_count),
-            overlay_dir_index: PathIndex::default(),
             git,
             shared_base,
             bigram_index: None,

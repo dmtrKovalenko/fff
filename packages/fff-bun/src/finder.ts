@@ -806,7 +806,8 @@ export class FileFinder implements FileFinderApi {
 
   /**
    * Build a layer file from `entries` without an instance; load it later with
-   * `loadLayer`. Returns bytes written.
+   * `loadLayer`. Returns bytes written. Fails without writing when a path is
+   * not a relative file path.
    */
   static buildLayerFile(
     entries: Array<string | LayerEntry>,

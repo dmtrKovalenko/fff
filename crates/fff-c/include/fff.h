@@ -1454,6 +1454,7 @@ struct FffResult *fff_layer_add_paths(void *fff_handle,
 
 /**
  * Write a snapshot from a path batch and return the number of bytes written.
+ * Fails without writing when a path is not a relative file path.
  * # Safety
  * Use the buffers specified by `fff_layer_add_paths`. Provide a NUL-terminated UTF-8 output path and an optional NUL-terminated UTF-8 label.
  */

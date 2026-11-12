@@ -79,6 +79,11 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     const built = path.join(tmp, "built.fff");
     const entries = Array.from({ length: 500 }, (_, i) => `gen/${i % 7}/m${i}.ts`);
     assert.ok(FileFinder.buildLayerFile(entries, built, "generated").ok);
+    const rejected = path.join(tmp, "rejected.fff");
+    const failed = FileFinder.buildLayerFile(["fine.ts", "../rejected.ts"], rejected);
+    assert.equal(failed.ok, false);
+    assert.match(failed.error, /Path 1/);
+    assert.equal(fs.existsSync(rejected), false);
 
     const other = await open();
     try {

@@ -547,3 +547,82 @@ fn export_base_before_scan_is_none_and_unknown_layer_fails() {
     assert!(picker.export_layer(0).is_none());
     assert!(picker.save_layer(42, tmp.path().join("x.fff")).is_err());
 }
+
+#[test]
+fn an_explicit_path_stays_in_its_layer_when_a_rescan_finds_it_on_disk() {
+    let tmp = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    fs::write(tmp.path().join("scanned.rs"), "").unwrap();
+    let mut picker = picker(tmp.path());
+    let layer = picker.create_layer(Some("generated")).unwrap();
+    picker
+        .add_entries([IndexEntry::new("generated.rs")])
+        .unwrap();
+
+    fs::write(tmp.path().join("generated.rs"), "fn main() {}").unwrap();
+    picker.collect_files().unwrap();
+    assert_eq!(layer_paths(&picker, layer), ["generated.rs"]);
+    assert_eq!(picker.files_in_layer(layer)[0].size, 12);
+    assert_eq!(search_paths(&picker, "generated"), ["generated.rs"]);
+    let saved = out.path().join("generated.fff");
+    picker.save_layer(layer, &saved).unwrap();
+    assert_eq!(LayerSnapshot::load(&saved).unwrap().file_count(), 1);
+
+    fs::remove_file(tmp.path().join("generated.rs")).unwrap();
+    picker.collect_files().unwrap();
+    assert_eq!(layer_paths(&picker, layer), ["generated.rs"]);
+    assert_eq!(search_paths(&picker, "generated"), ["generated.rs"]);
+}
+
+#[test]
+fn rescans_keep_the_arena_of_a_layer_with_foreign_parents_the_same_size() {
+    let tmp = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    for i in 0..50 {
+        let dir = tmp.path().join(format!("dir{i}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("real.rs"), "").unwrap();
+    }
+    let mut picker = picker(tmp.path());
+    let layer = picker.create_layer(None).unwrap();
+    let paths: Vec<String> = (0..50).map(|i| format!("dir{i}/virtual.rs")).collect();
+    picker.add_entries(entries(&paths)).unwrap();
+
+    let mut sizes = Vec::new();
+    for round in 0..4 {
+        let info = picker.layers();
+        let arena = info.iter().find(|l| l.id == layer).unwrap().arena_bytes;
+        let file = out.path().join(format!("{round}.fff"));
+        sizes.push((arena, picker.save_layer(layer, &file).unwrap()));
+        picker.collect_files().unwrap();
+    }
+
+    assert!(sizes.windows(2).all(|w| w[0] == w[1]), "{sizes:?}");
+    assert_eq!(layer_paths(&picker, layer).len(), 50);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_saved_base_with_names_windows_cannot_store_loads_on_unix() {
+    let tmp = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    for name in [r"a\b.rs", "c:x.rs", "ok.rs"] {
+        fs::write(tmp.path().join(name), "").unwrap();
+    }
+    let scanned = picker(tmp.path());
+    let file = out.path().join("base.fff");
+    scanned.save_layer(0, &file).unwrap();
+
+    let mut restored = FilePicker::new(FilePickerOptions {
+        base_path: tmp.path().to_string_lossy().to_string(),
+        watch: false,
+        enable_home_dir_scanning: true,
+        ..Default::default()
+    })
+    .unwrap();
+    restored
+        .import_base(LayerSnapshot::load(&file).unwrap(), None)
+        .unwrap();
+    assert_eq!(live_paths(&restored), live_paths(&scanned));
+    assert_eq!(live_paths(&restored).len(), 3);
+}

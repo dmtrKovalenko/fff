@@ -690,13 +690,21 @@ fn check_duplicate_paths(
     Ok(())
 }
 
+// The scan, `push` and the decoder share these rules. `\` and drive prefixes
+// only split paths on Windows, so elsewhere they are plain name bytes.
 fn is_file_name(name: &str) -> bool {
-    !matches!(name, "" | "." | "..") && memchr::memchr3(b'/', b'\\', 0, name.as_bytes()).is_none()
+    let bytes = name.as_bytes();
+    let separator = if cfg!(windows) {
+        memchr::memchr3(b'/', b'\\', 0, bytes)
+    } else {
+        memchr::memchr2(b'/', 0, bytes)
+    };
+    !matches!(name, "" | "." | "..") && separator.is_none()
 }
 
 fn has_drive_prefix(path: &str) -> bool {
     let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    cfg!(windows) && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn is_relative_file_path(path: &str) -> bool {
@@ -780,17 +788,42 @@ mod tests {
             "dir/../file",
             "dir/./file",
             "dir//file",
+            "file\0name",
+        ] {
+            assert!(!builder.push(&IndexEntry::new(invalid)), "{invalid:?}");
+        }
+        // Separators only on Windows; legal file names elsewhere.
+        for windows_only in [
             "C:/file",
             "d:file",
             r"..\file",
             r"\file",
             r"\\host\share\file",
-            "file\0name",
         ] {
-            assert!(!builder.push(&IndexEntry::new(invalid)), "{invalid:?}");
+            assert_eq!(
+                builder.push(&IndexEntry::new(windows_only)),
+                !cfg!(windows),
+                "{windows_only:?}"
+            );
         }
         assert!(builder.push(&IndexEntry::new("./ok.rs")));
-        assert_eq!(builder.len(), 1);
+        assert_eq!(builder.len(), if cfg!(windows) { 1 } else { 6 });
+    }
+
+    #[test]
+    fn every_name_the_builder_accepts_decodes_on_the_same_platform() {
+        let mut builder = LayerBuilder::new(None);
+        for path in [r"a\b.rs", "c:x.rs", "d:/e.rs", "ok.rs"] {
+            builder.push(&IndexEntry::new(path));
+        }
+        let snap = builder.finish();
+        assert_eq!(snap.file_count(), if cfg!(windows) { 1 } else { 4 });
+        let mut bytes = Vec::new();
+        snap.write_to(&mut bytes).unwrap();
+        assert_eq!(
+            LayerSnapshot::from_bytes(&bytes).unwrap().file_count(),
+            snap.file_count()
+        );
     }
 
     #[test]
@@ -884,7 +917,11 @@ mod tests {
 
         let arena_start = HEADER_BYTES + SIMD_CHUNK_BYTES;
         let arena_end = arena_start + snap.store.chunks().len() * SIMD_CHUNK_BYTES;
-        for bad_prefix in [b"../", b"C:/", b"/x/", b"x//", b"x\\/"] {
+        let mut bad_prefixes = vec![b"../", b"/x/", b"x//"];
+        if cfg!(windows) {
+            bad_prefixes.extend([b"C:/", b"x\\/"]);
+        }
+        for bad_prefix in bad_prefixes {
             let mut bad = bytes.clone();
             let (chunks, _) = bad[arena_start..arena_end].as_chunks_mut::<SIMD_CHUNK_BYTES>();
             for chunk in chunks {

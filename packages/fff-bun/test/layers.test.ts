@@ -119,6 +119,14 @@ describe("FileFinder - index layers", () => {
     }
   });
 
+  test("buildLayerFile fails on a path it cannot store", () => {
+    const file = path.join(tmp, "rejected.fff");
+    const built = FileFinder.buildLayerFile(["fine.ts", "../rejected.ts"], file);
+    expect(built.ok).toBe(false);
+    if (!built.ok) expect(built.error).toContain("Path 1");
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
   test("saveLayer(0) / loadBase restores the scan", async () => {
     const file = path.join(tmp, "base.fff");
     expect(finder.saveLayer(0, file).ok).toBe(true);

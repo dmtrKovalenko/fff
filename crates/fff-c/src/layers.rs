@@ -114,6 +114,7 @@ pub unsafe extern "C" fn fff_layer_add_paths(
 }
 
 /// Write a snapshot from a path batch and return the number of bytes written.
+/// Fails without writing when a path is not a relative file path.
 /// # Safety
 /// Use the buffers specified by `fff_layer_add_paths`. Provide a NUL-terminated UTF-8 output path and an optional NUL-terminated UTF-8 label.
 #[unsafe(no_mangle)]
@@ -136,8 +137,13 @@ pub unsafe extern "C" fn fff_layer_build(
     };
 
     let mut builder = LayerBuilder::with_capacity(label, entries.len());
-    for entry in &entries {
-        builder.push(entry);
+    for (i, entry) in entries.iter().enumerate() {
+        if !builder.push(entry) {
+            return FffResult::err(&format!(
+                "Path {i} is not a relative file path: {:?}",
+                entry.relative_path
+            ));
+        }
     }
 
     match builder.finish().save(Path::new(out_path)) {
