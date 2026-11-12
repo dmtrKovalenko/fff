@@ -388,30 +388,3 @@ pub(super) fn fuzzy_grep_search<'a>(
 pub(crate) fn fuzzy_grep_max_typos(pattern: &str) -> usize {
     (pattern.len() / 3).min(2)
 }
-
-/// Fuzzy-filter caller-supplied `(path, line)` hits in input order.
-/// The indices in `rows` refer to that same input.
-pub fn refine_grep_into<'a>(
-    hits: impl IntoIterator<Item = (&'a str, &'a str)>,
-    query: &str,
-    rows: &mut Vec<usize>,
-) {
-    rows.clear();
-    let hits = hits.into_iter();
-    if query.is_empty() {
-        rows.extend(hits.enumerate().map(|(index, _)| index));
-        return;
-    }
-
-    let mut matcher = neo_frizbee::Matcher::new(query, &neo_frizbee::Config::default());
-    let mut text = String::new();
-    for (index, (path, line)) in hits.enumerate() {
-        text.clear();
-        text.push_str(line);
-        text.push(' ');
-        text.push_str(path);
-        if matcher.match_one(&text, 0).is_some() {
-            rows.push(index);
-        }
-    }
-}

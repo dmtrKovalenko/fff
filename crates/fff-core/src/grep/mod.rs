@@ -24,7 +24,6 @@ pub use classify::*;
 
 pub use definition_mode::DefinitionMode;
 pub(crate) use fuzzy_grep::fuzzy_grep_max_typos;
-pub use fuzzy_grep::refine_grep_into;
 pub(crate) use multi_pattern::multi_grep_search;
 pub use regex::has_regex_metacharacters;
 pub use types::*;
