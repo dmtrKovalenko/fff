@@ -1690,7 +1690,7 @@ impl FilePicker {
             options.mode
         };
         let max_typos = (mode == GrepMode::Fuzzy && !pattern.is_empty())
-            .then(|| fuzzy_grep_max_typos(&pattern));
+            .then(|| fuzzy_grep_max_typos(&pattern) as u16);
         let captured = reuse.is_some() && !result.literal_fallback && mode == options.mode;
         next.state.record_grep(&pattern, mode, max_typos, skipped);
         next.state.index_revision = captured.then_some(self.index_revision);

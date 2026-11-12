@@ -38,7 +38,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     // Cap at 2: higher values (3+) let the SIMD prefilter pass lines
     // missing key characters entirely (e.g. query "flvencodeX" matching
     // lines without 'l' or 'v'). Quality comes from the post-match filters.
-    let max_typos = usize::from(fuzzy_grep_max_typos(grep_text));
+    let max_typos = fuzzy_grep_max_typos(grep_text);
     let scoring = neo_frizbee::Scoring {
         // Use default gap penalties. Higher values (e.g. 20) cause
         // smith-waterman to prefer *dropping needle chars* over paying
@@ -385,8 +385,8 @@ pub(super) fn fuzzy_grep_search<'a>(
     )
 }
 
-pub(crate) fn fuzzy_grep_max_typos(pattern: &str) -> u16 {
-    (pattern.len() / 3).min(2) as u16
+pub(crate) fn fuzzy_grep_max_typos(pattern: &str) -> usize {
+    (pattern.len() / 3).min(2)
 }
 
 /// Fuzzy-filter caller-supplied `(path, line)` hits in input order.
