@@ -110,16 +110,14 @@ jobs:
       - name: Fetch source and benchmark harness
         env:
           HARNESS: ${{ github.sha }}
-          BASE: ${{ needs.plan.outputs.base_sha }}
           REVISION: ${{ matrix.variant == 'base' && needs.plan.outputs.base_sha || needs.plan.outputs.head_sha }}
         run: |
-          [[ "$HARNESS" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ && "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS" =~ ^[0-9a-f]{40}$ && "$REVISION" =~ ^[0-9a-f]{40}$ ]]
           repo=https://github.com/dmtrKovalenko/fff.git
           git init -q source
-          git -C source fetch -q --depth=1 "$repo" "$HARNESS" "$BASE" "$REVISION"
+          git -C source fetch -q --depth=1 "$repo" "$HARNESS" "$REVISION"
           git -C source show "$HARNESS:perf/build.sh" > "$RUNNER_TEMP/build.sh"
           git -C source -c core.hooksPath=/dev/null checkout -q --detach "$REVISION"
-          git -C source -c core.hooksPath=/dev/null checkout "$HARNESS" -- crates/fff-core/benches
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:

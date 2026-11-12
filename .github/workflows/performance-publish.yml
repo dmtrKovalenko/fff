@@ -134,7 +134,7 @@ jobs:
             echo "$message" >"$report"
           else
             code=2
-            if [[ "$RESULT" == success && -s "$timings/base.bench" && -s "$timings/head.bench" ]]; then
+            if [[ "$RESULT" == success && -f "$timings/base.bench" && -f "$timings/head.bench" ]]; then
               chart="pr-$PR_NUMBER.png" chart_url=''
               if [[ "$CHART" == success ]] &&
                  { gh release view perf-charts >/dev/null 2>&1 ||
