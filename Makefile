@@ -244,7 +244,7 @@ test-stress-seeded:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
-		--no-default-features --features zlob \
+		--no-default-features --features zlob,libgit2 \
 		-- --nocapture stress_seeded
 
 test-stress-random:
@@ -252,7 +252,7 @@ test-stress-random:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
-		--no-default-features --features zlob \
+		--no-default-features --features zlob,libgit2 \
 		-- --nocapture stress_random
 
 test-stress-regressions:
@@ -260,7 +260,7 @@ test-stress-regressions:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
-		--no-default-features --features zlob \
+		--no-default-features --features zlob,libgit2 \
 		-- --nocapture stress_regression stress_merge_conflict_convergence
 
 test-stress-repos:
@@ -268,7 +268,7 @@ test-stress-repos:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_real_repos \
-		--no-default-features --features zlob \
+		--no-default-features --features zlob,libgit2 \
 		-- --nocapture
 
 test-stress: test-stress-seeded test-stress-random test-stress-regressions test-stress-repos

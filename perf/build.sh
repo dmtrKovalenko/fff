@@ -5,6 +5,10 @@ source_dir=$(realpath "$1")
 mkdir -p "$2"
 output=$(realpath "$2")
 target=x86_64-unknown-linux-musl
+features=zlob
+if grep -Eq '^libgit2[[:space:]]*=[[:space:]]*\[' "$source_dir/crates/fff-core/Cargo.toml"; then
+  features+=,libgit2
+fi
 benches=(fuzzy_search_bench grep_bench parse_bench definition_bench glob_bench bigram_bench memmem_bench)
 mkdir "$output/work" "$output/bins"
 
@@ -35,7 +39,7 @@ docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
   --env PATH=/zig:/rust/bin:/tools:/usr/local/bin:/usr/bin:/bin \
   --workdir /src fff-perf-build \
   cargo zigbuild --locked --profile ci --target "$target" -p fff-search \
-    --no-default-features --features zlob,libgit2 --benches --message-format=json-render-diagnostics \
+    --no-default-features --features "$features" --benches --message-format=json-render-diagnostics \
   | jq -Rr 'fromjson? | if .reason == "compiler-message" then .message.rendered // empty
     elif .reason == "compiler-artifact" and .target.kind == ["bench"] and .executable
     then [.target.name, .executable] | @tsv else empty end' > "$output/build.log" || {
