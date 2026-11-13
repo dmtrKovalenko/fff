@@ -94,6 +94,7 @@ local M = {}
 --- @field title string
 --- @field max_results number
 --- @field max_threads number
+--- @field search_ttl_ms integer Maximum age of a picker search, in milliseconds. Zero disables reuse.
 --- @field lazy_sync boolean
 --- @field prompt_vim_mode boolean
 --- @field follow_symlinks boolean
@@ -262,6 +263,7 @@ local function init()
     title = 'FFFiles',
     max_results = 100,
     max_threads = 4,
+    search_ttl_ms = 15000,
     lazy_sync = true, -- set to false if you want file indexing to start on open
     prompt_vim_mode = false, -- set to true to enable vim-mode in the prompt: <Esc> leaves insert for normal mode bindings (also allows <leader>p or <leader>l to jump around) the second <Esc> closes the picker
     wrap_around = false, -- set to true to wrap cursor to the opposite end when reaching the first/last item

@@ -4,38 +4,41 @@ use crate::{
     match_offsets::char_indices_to_byte_offsets,
     parallelism::SEARCH_THREAD_POOL,
     path_utils::DirectoryDistance,
+    search_buffer::Candidates,
     simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
     sort_buffer::sort_with_buffer,
-    types::{DirItem, FileItem, Score, ScoringContext},
+    types::{DirItem, DirSearchResult, FileItem, Score, ScoringContext, SearchResult},
 };
 use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::Scoring;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::{
+    iter::{Skip, Take},
     path::MAIN_SEPARATOR,
     sync::atomic::{AtomicUsize, Ordering},
+    vec::IntoIter,
 };
 
-enum FileItems<'a> {
-    All(&'a [FileItem]),
-    Filtered(Vec<&'a FileItem>),
+enum SearchItems<'a, T> {
+    All(&'a [T]),
+    Filtered(Vec<&'a T>),
 }
 
-impl<'a> FileItems<'a> {
+impl<'a, T> SearchItems<'a, T> {
     #[inline]
     fn len(&self) -> usize {
         match self {
-            FileItems::All(s) => s.len(),
-            FileItems::Filtered(v) => v.len(),
+            Self::All(s) => s.len(),
+            Self::Filtered(v) => v.len(),
         }
     }
 
     #[inline]
-    fn index(&self, index: usize) -> &'a FileItem {
+    fn index(&self, index: usize) -> &'a T {
         match self {
-            FileItems::All(s) => &s[index],
-            FileItems::Filtered(v) => v[index],
+            Self::All(s) => &s[index],
+            Self::Filtered(v) => v[index],
         }
     }
 }
@@ -58,7 +61,7 @@ fn resolve_file_chunks(
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
-    working_files: &FileItems<'_>,
+    working_files: &SearchItems<'_, FileItem>,
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
@@ -153,46 +156,51 @@ fn match_fuzzy_parts(
     matches
 }
 
-/// Match + score across base and overflow files, each with their own arena.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) fn fuzzy_match_and_score_files<'a>(
+pub(crate) fn fuzzy_match_and_score_files_into<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     base_count: usize,
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    candidates: Option<Candidates<'_, [Vec<u32>; 2]>>,
+    page: &mut SearchResult<'a>,
+) -> usize {
     if fuzzy_parts(context.query).is_none() {
-        return rank_by_frecency(files, context, base_count, base_arena, overflow_arena);
+        return rank_by_frecency_into(files, context, base_count, base_arena, overflow_arena, page);
     }
 
-    // Process overflow files first: newly added files (created after the
-    // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search. Exact ties are broken by index order.
-    let (results, total_matched) = if files.len() > base_count {
-        let (mut results, overflow_matched) =
-            match_and_score_in_arena(&files[base_count..], context, overflow_arena);
-        let (base_results, base_matched) =
-            match_and_score_in_arena(&files[..base_count], context, base_arena);
-        results.extend(base_results);
-
-        (results, overflow_matched + base_matched)
+    let mut candidates = candidates;
+    let mut score_arena = |slice, arena, i: usize| {
+        let rows = candidates.as_mut().map(|pair| Candidates {
+            previous: pair.previous.map(|rows| &rows[i]),
+            next: &mut pair.next[i],
+        });
+        match_and_score_in_arena(slice, context, arena, rows)
+    };
+    let (base, overflow) = files.split_at(base_count.min(files.len()));
+    let (results, total_matched) = if overflow.is_empty() {
+        score_arena(base, base_arena, 0)
     } else {
-        match_and_score_in_arena(files, context, base_arena)
+        let (mut results, count) = score_arena(overflow, overflow_arena, 1);
+        let (base_results, base_count) = score_arena(base, base_arena, 0);
+        results.extend(base_results);
+        (results, count + base_count)
     };
 
-    let (items, scores, _) = sort_and_paginate(results, context, |score| score.total);
-    (items, scores, total_matched)
+    let rows = ranked_files(results, context, |score| score.total).0;
+    fill_page(rows, &mut page.items, &mut page.scores);
+    total_matched
 }
 
-// Ranks on a 16-byte (file, total) pair and builds the full Score only for the page.
-fn rank_by_frecency<'a>(
+fn rank_by_frecency_into<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     base_count: usize,
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    page: &mut SearchResult<'a>,
+) -> usize {
     let base_count = base_count.min(files.len());
     let keep = context
         .pagination
@@ -210,7 +218,7 @@ fn rank_by_frecency<'a>(
         let Some(working_files) = filter_by_constraints(slice, context, arena) else {
             continue;
         };
-        if let FileItems::All(files) = &working_files
+        if let SearchItems::All(files) = &working_files
             && context.pagination.limit > 0
             && keep <= 128
             && files.len() >= 65_536
@@ -261,19 +269,18 @@ fn rank_by_frecency<'a>(
         }
     }
 
-    let (items, _, _) = sort_and_paginate(totals, context, |total| *total);
-    let scores = items
-        .iter()
-        .map(|file| {
+    let rows = ranked_files(totals, context, |total| *total)
+        .0
+        .map(|(file, _)| {
             let arena = if file.is_overflow() {
                 overflow_arena
             } else {
                 base_arena
             };
-            frecency_score(file, context, arena)
-        })
-        .collect();
-    (items, scores, total_matched)
+            (file, frecency_score(file, context, arena))
+        });
+    fill_page(rows, &mut page.items, &mut page.scores);
+    total_matched
 }
 
 fn fuzzy_parts<'q>(query: &'q FFFQuery<'q>) -> Option<&'q [&'q str]> {
@@ -289,34 +296,38 @@ fn filter_by_constraints<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
-) -> Option<FileItems<'a>> {
+) -> Option<SearchItems<'a, FileItem>> {
     let constraints = &context.query.constraints;
     if constraints.is_empty() {
-        return Some(FileItems::All(files));
+        return Some(SearchItems::All(files));
     }
     match apply_constraints(files, constraints, arena, arena) {
-        Some(filtered) if !filtered.is_empty() => Some(FileItems::Filtered(filtered)),
+        Some(filtered) if !filtered.is_empty() => Some(SearchItems::Filtered(filtered)),
         Some(_) => None,
-        None => Some(FileItems::All(files)),
+        None => Some(SearchItems::All(files)),
     }
 }
 
-pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
+pub(crate) fn fuzzy_match_byte_offsets_into<'q>(
     query: &'q FFFQuery<'q>,
     items: &[&FileItem],
     max_typos: u16,
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-) -> Vec<SmallVec<[(u32, u32); 4]>> {
+    ranges_by_item: &mut Vec<SmallVec<[(u32, u32); 4]>>,
+) {
     let parts: SmallVec<[&str; 4]> = match &query.fuzzy_query {
         FuzzyQuery::Text(text) if text.len() >= 2 => smallvec::smallvec![*text],
         FuzzyQuery::Parts(parts) => parts.iter().copied().filter(|p| p.len() >= 2).collect(),
         _ => SmallVec::new(),
     };
 
-    let mut ranges_by_item = vec![SmallVec::new(); items.len()];
+    ranges_by_item.resize_with(items.len(), SmallVec::new);
+    for ranges in ranges_by_item.iter_mut() {
+        ranges.clear();
+    }
     if parts.is_empty() || items.is_empty() {
-        return ranges_by_item;
+        return;
     }
 
     let mut paths = String::with_capacity(items.iter().map(|item| item.relative_path_len()).sum());
@@ -372,11 +383,9 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         }
     }
 
-    for ranges in &mut ranges_by_item {
+    for ranges in ranges_by_item.iter_mut() {
         *ranges = merge_byte_offsets(std::mem::take(ranges));
     }
-
-    ranges_by_item
 }
 
 fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, u32); 4]> {
@@ -427,7 +436,7 @@ fn resolve_dir_chunks(
 /// through each query part — same pipeline as file matching.
 fn match_fuzzy_parts_dirs(
     fuzzy_parts: &[&str],
-    working_dirs: &[&DirItem],
+    working_dirs: &SearchItems<'_, DirItem>,
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
@@ -447,7 +456,12 @@ fn match_fuzzy_parts_dirs(
         valid_parts[0],
         working_dirs.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
+            resolve_dir_chunks(
+                working_dirs.index(index as usize),
+                arena,
+                overflow_arena,
+                buf,
+            )
         },
         options,
         max_threads,
@@ -470,7 +484,7 @@ fn match_fuzzy_parts_dirs(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                let dir = working_dirs[survivors[index as usize].index as usize];
+                let dir = working_dirs.index(survivors[index as usize].index as usize);
                 resolve_dir_chunks(dir, arena, overflow_arena, buf)
             },
             &part_options,
@@ -510,22 +524,26 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    candidates: Option<Candidates<'_, Vec<u32>>>,
+    page: &mut DirSearchResult<'a>,
+) -> usize {
     if dirs.is_empty() {
-        return (vec![], vec![], 0);
+        return 0;
     }
 
     let parsed_query = context.query;
     // Ghost dirs (all files tombstoned) never surface in search results.
-    let working_dirs: Vec<&DirItem> = if parsed_query.constraints.is_empty() {
-        dirs.iter().filter(|d| !d.is_deleted()).collect()
+    let working_dirs = if candidates.is_some() {
+        SearchItems::All(dirs)
+    } else if parsed_query.constraints.is_empty() {
+        SearchItems::Filtered(dirs.iter().filter(|d| !d.is_deleted()).collect())
     } else {
         match apply_constraints(dirs, &parsed_query.constraints, arena, overflow_arena) {
             Some(filtered) if !filtered.is_empty() => {
-                filtered.into_iter().filter(|d| !d.is_deleted()).collect()
+                SearchItems::Filtered(filtered.into_iter().filter(|d| !d.is_deleted()).collect())
             }
-            Some(_) => return (vec![], vec![], 0),
-            None => dirs.iter().filter(|d| !d.is_deleted()).collect(),
+            Some(_) => return 0,
+            None => SearchItems::Filtered(dirs.iter().filter(|d| !d.is_deleted()).collect()),
         }
     };
 
@@ -533,7 +551,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_dirs_by_frecency(&working_dirs, context);
+            return score_dirs_by_frecency(&working_dirs, context, page);
         }
     };
 
@@ -544,7 +562,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .collect();
 
     if valid_parts.is_empty() {
-        return score_dirs_by_frecency(&working_dirs, context);
+        return score_dirs_by_frecency(&working_dirs, context, page);
     }
 
     let has_uppercase = valid_parts
@@ -562,14 +580,26 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         ..Default::default()
     };
 
-    let path_matches = match_fuzzy_parts_dirs(
-        fuzzy_parts,
-        &working_dirs,
-        &options,
-        context.max_threads,
-        arena,
-        overflow_arena,
-    );
+    let path_matches = if let Some(candidates) = candidates {
+        match_candidate_rows(
+            valid_parts[0],
+            dirs.len(),
+            &|index, buf| resolve_dir_chunks(&dirs[index as usize], arena, overflow_arena, buf),
+            &options,
+            context.max_threads,
+            candidates,
+            |row| !dirs[row as usize].is_deleted(),
+        )
+    } else {
+        match_fuzzy_parts_dirs(
+            fuzzy_parts,
+            &working_dirs,
+            &options,
+            context.max_threads,
+            arena,
+            overflow_arena,
+        )
+    };
 
     let main_needle = valid_parts[0].as_bytes();
     let main_needle_len = main_needle.len() as u16;
@@ -581,7 +611,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     let results: Vec<(&DirItem, Score)> = path_matches
         .into_iter()
         .map(|path_match| {
-            let dir = working_dirs[path_match.index as usize];
+            let dir = working_dirs.index(path_match.index as usize);
             let dir_arena = if dir.is_overflow() {
                 overflow_arena
             } else {
@@ -650,16 +680,19 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         })
         .collect();
 
-    sort_and_paginate_dirs(results, context)
+    let (rows, count) = ranked_dirs(results, context);
+    fill_page(rows, &mut page.items, &mut page.scores);
+    count
 }
 
 fn score_dirs_by_frecency<'a>(
-    dirs: &[&'a DirItem],
+    dirs: &SearchItems<'a, DirItem>,
     context: &ScoringContext,
-) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    let results: Vec<(&DirItem, Score)> = dirs
-        .iter()
-        .map(|&dir| {
+    page: &mut DirSearchResult<'a>,
+) -> usize {
+    let results: Vec<(&DirItem, Score)> = (0..dirs.len())
+        .map(|index| {
+            let dir = dirs.index(index);
             let score = Score {
                 total: dir.max_access_frecency(),
                 frecency_boost: dir.max_access_frecency(),
@@ -671,59 +704,32 @@ fn score_dirs_by_frecency<'a>(
         })
         .collect();
 
-    sort_and_paginate_dirs(results, context)
+    let (rows, count) = ranked_dirs(results, context);
+    fill_page(rows, &mut page.items, &mut page.scores);
+    count
 }
 
-/// Sort dir results by total score (descending) and apply pagination.
-fn sort_and_paginate_dirs<'a>(
-    mut results: Vec<(&'a DirItem, Score)>,
+fn ranked_dirs<'a>(
+    results: Vec<(&'a DirItem, Score)>,
     context: &ScoringContext,
-) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    let total_matched = results.len();
-    if total_matched == 0 {
-        return (vec![], vec![], 0);
-    }
-
-    let offset = context.pagination.offset;
-    let limit = if context.pagination.limit > 0 {
-        context.pagination.limit
-    } else {
-        total_matched
-    };
-
-    if offset >= total_matched {
-        return (vec![], vec![], total_matched);
-    }
-
-    let items_needed = offset.saturating_add(limit).min(total_matched);
-    let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
-
-    let compare = |a: &(&DirItem, Score), b: &(&DirItem, Score)| {
+) -> (impl ExactSizeIterator<Item = (&'a DirItem, Score)>, usize) {
+    ranked_page(results, context.pagination, |a, b| {
         b.1.total
             .cmp(&a.1.total)
             .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
-    };
-    if use_partial_sort {
-        results.select_nth_unstable_by(items_needed - 1, compare);
-        results.truncate(items_needed);
-    }
-
-    sort_with_buffer(&mut results, compare);
-
-    let (items, scores): (Vec<&DirItem>, Vec<Score>) =
-        results.into_iter().skip(offset).take(limit).unzip();
-    (items, scores, total_matched)
+    })
 }
 
 fn match_and_score_in_arena<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    candidates: Option<Candidates<'_, Vec<u32>>>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if context.current_file.is_some() {
-        match_and_score_in_arena_inner::<true>(files, context, arena)
+        match_and_score_in_arena_inner::<true>(files, context, arena, candidates)
     } else {
-        match_and_score_in_arena_inner::<false>(files, context, arena)
+        match_and_score_in_arena_inner::<false>(files, context, arena, candidates)
     }
 }
 
@@ -731,6 +737,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    candidates: Option<Candidates<'_, Vec<u32>>>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.is_empty() {
         return (vec![], 0);
@@ -765,13 +772,28 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
         ..Default::default()
     };
 
-    let path_matches = match_fuzzy_parts(
-        fuzzy_parts,
-        &working_files,
-        &options,
-        context.max_threads,
-        arena,
-    );
+    let path_matches = if let Some(candidates) = candidates {
+        match_candidate_rows(
+            fuzzy_parts[0],
+            files.len(),
+            &|index, buf| {
+                let path = &files[index as usize].path;
+                Some((path.resolve_ptrs(arena, buf).len(), path.byte_len))
+            },
+            &options,
+            context.max_threads,
+            candidates,
+            |row| !files[row as usize].is_deleted(),
+        )
+    } else {
+        match_fuzzy_parts(
+            fuzzy_parts,
+            &working_files,
+            &options,
+            context.max_threads,
+            arena,
+        )
+    };
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
@@ -1100,7 +1122,7 @@ fn frecency_score(file: &FileItem, context: &ScoringContext, arena: ArenaPtr) ->
 }
 
 fn frecency_totals<'a>(
-    files: &FileItems<'a>,
+    files: &SearchItems<'a, FileItem>,
     context: &ScoringContext,
     arena: ArenaPtr,
     out: &mut Vec<(&'a FileItem, i32)>,
@@ -1108,21 +1130,21 @@ fn frecency_totals<'a>(
     let total = |file: &'a FileItem| (file, frecency_total(file, context, arena));
     match files {
         // Small indexes cannot amortize Rayon scheduling for this cheap scoring pass.
-        FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => out.par_extend(
+        SearchItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => out.par_extend(
             s.par_iter()
                 .with_min_len(4096)
                 .filter(|f| !f.is_deleted())
                 .map(total),
         ),
-        FileItems::All(s) => out.extend(s.iter().filter(|f| !f.is_deleted()).map(total)),
-        FileItems::Filtered(v) => {
+        SearchItems::All(s) => out.extend(s.iter().filter(|f| !f.is_deleted()).map(total)),
+        SearchItems::Filtered(v) => {
             out.extend(v.iter().copied().filter(|f| !f.is_deleted()).map(total))
         }
     }
 }
 
 fn frecency_scores<'a>(
-    files: &FileItems<'a>,
+    files: &SearchItems<'a, FileItem>,
     context: &ScoringContext,
     arena: ArenaPtr,
 ) -> Vec<(&'a FileItem, Score)> {
@@ -1152,55 +1174,15 @@ fn calculate_current_file_penalty(
     penalty
 }
 
-/// Sorts elements by total score (descending) and returns the requested page.
-/// Always returns results in descending order (best scores first).
-/// The UI layer handles rendering order based on prompt position.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-fn sort_and_paginate<'a, S>(
-    mut results: Vec<(&'a FileItem, S)>,
+fn ranked_files<'a, S>(
+    results: Vec<(&'a FileItem, S)>,
     context: &ScoringContext,
     total: impl Fn(&S) -> i32,
-) -> (Vec<&'a FileItem>, Vec<S>, usize) {
-    let total_matched = results.len();
-
-    if total_matched == 0 {
-        return (vec![], vec![], 0);
-    }
-
-    let offset = context.pagination.offset;
-    let limit = if context.pagination.limit > 0 {
-        context.pagination.limit
-    } else {
-        total_matched
-    };
-
-    // Check if offset is out of bounds
-    if offset >= total_matched {
-        tracing::warn!(
-            offset = offset,
-            total_matched = total_matched,
-            "Pagination: offset >= total_matched, returning empty"
-        );
-
-        return (vec![], vec![], total_matched);
-    }
-
-    let items_needed = offset.saturating_add(limit).min(total_matched);
-    let compare = |a: &(&FileItem, S), b: &(&FileItem, S)| {
+) -> (impl ExactSizeIterator<Item = (&'a FileItem, S)>, usize) {
+    ranked_page(results, context.pagination, |a, b| {
         compare_file_scores(a.0, total(&a.1), b.0, total(&b.1))
-    };
-    // Use partial sort if we need less than half the results and dataset is large
-    if items_needed < total_matched / 2 && total_matched > 100 {
-        results.select_nth_unstable_by(items_needed - 1, compare);
-        results.truncate(items_needed);
-    }
-
-    // select nth does not sort the results, we have to sort accordingly anyway
-    sort_with_buffer(&mut results, compare);
-
-    let (items, scores): (Vec<&FileItem>, Vec<S>) =
-        results.into_iter().skip(offset).take(limit).unzip();
-    (items, scores, total_matched)
+    })
 }
 
 fn match_path_range<F>(
@@ -1307,6 +1289,109 @@ fn compare_file_scores(
         .then_with(|| std::ptr::from_ref(a).cmp(&std::ptr::from_ref(b)))
 }
 
+fn match_candidate_rows<F>(
+    needle: &str,
+    len: usize,
+    resolve: &F,
+    options: &neo_frizbee::Config,
+    max_threads: usize,
+    Candidates { previous, next }: Candidates<'_, Vec<u32>>,
+    is_live: impl Fn(u32) -> bool,
+) -> Vec<neo_frizbee::Match>
+where
+    F: Fn(u32, &mut [*const u8; MAX_PATH_CHUNKS]) -> Option<(usize, u16)> + Sync,
+{
+    let mut matches = if let Some(rows) = previous {
+        match_path_range(
+            needle,
+            rows.len(),
+            &|index, buf| resolve(rows[index as usize], buf),
+            options,
+            max_threads,
+        )
+    } else {
+        match_path_range(needle, len, resolve, options, max_threads)
+    };
+    next.reserve(matches.len());
+    matches.retain_mut(|hit| {
+        if let Some(rows) = previous {
+            hit.index = rows[hit.index as usize];
+        }
+        // Capture deleted paths too so restoring a row can bring it back.
+        next.push(hit.index);
+        is_live(hit.index)
+    });
+    matches
+}
+
+fn ranked_page<T>(
+    mut results: Vec<T>,
+    pagination: crate::types::PaginationArgs,
+    compare: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> (Take<Skip<IntoIter<T>>>, usize) {
+    let count = results.len();
+    let offset = pagination.offset;
+    let limit = if pagination.limit == 0 {
+        count
+    } else {
+        pagination.limit
+    };
+    if offset < count {
+        let needed = offset.saturating_add(limit).min(count);
+        if needed < count / 2 && count > 100 {
+            results.select_nth_unstable_by(needed - 1, &compare);
+            results.truncate(needed);
+        }
+        sort_with_buffer(&mut results, compare);
+    }
+    (results.into_iter().skip(offset).take(limit), count)
+}
+
+fn fill_page<T>(
+    rows: impl ExactSizeIterator<Item = (T, Score)>,
+    items: &mut Vec<T>,
+    scores: &mut Vec<Score>,
+) {
+    items.reserve(rows.len());
+    scores.reserve(rows.len());
+    for (item, score) in rows {
+        items.push(item);
+        scores.push(score);
+    }
+}
+
+#[cfg(test)]
+fn fuzzy_match_and_score_files<'a>(
+    files: &'a [FileItem],
+    context: &ScoringContext,
+    base_count: usize,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
+) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    let mut page = SearchResult::default();
+    let count = fuzzy_match_and_score_files_into(
+        files,
+        context,
+        base_count,
+        base_arena,
+        overflow_arena,
+        None,
+        &mut page,
+    );
+    (page.items, page.scores, count)
+}
+
+#[cfg(test)]
+fn sort_and_paginate<'a, S>(
+    results: Vec<(&'a FileItem, S)>,
+    context: &ScoringContext,
+    total: impl Fn(&S) -> i32,
+) -> (Vec<&'a FileItem>, Vec<S>, usize) {
+    let (page, count) = ranked_files(results, context, total);
+    let (items, scores) = page.unzip();
+    (items, scores, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,7 +1456,7 @@ mod tests {
             file.set_path(path);
         }
         let arena = store.as_arena_ptr();
-        let working = FileItems::All(&files);
+        let working = SearchItems::All(&files);
         for parts in [
             ["src", "controller"],
             ["rs", "contrller"],
@@ -1472,10 +1557,10 @@ mod tests {
                     },
                 };
                 let (mut parallel, parallel_total) =
-                    match_and_score_in_arena(&files, &context, arena);
+                    match_and_score_in_arena(&files, &context, arena, None);
                 context.max_threads = 1;
                 let (mut sequential, sequential_total) =
-                    match_and_score_in_arena(&files, &context, arena);
+                    match_and_score_in_arena(&files, &context, arena, None);
                 parallel.sort_unstable_by_key(|(file, _)| file.modified);
                 sequential.sort_unstable_by_key(|(file, _)| file.modified);
                 assert_eq!(parallel_total, sequential_total);
@@ -1587,7 +1672,7 @@ mod tests {
             },
         };
         for count in [0, 1, 1000, 132_000] {
-            let items = FileItems::All(&files[..count]);
+            let items = SearchItems::All(&files[..count]);
             context.max_threads = 4;
             let parallel = frecency_scores(&items, &context, ArenaPtr::null());
             context.max_threads = 1;
@@ -1607,7 +1692,7 @@ mod tests {
             context.max_threads = 4;
             let (expected_items, expected_scores, expected_total) =
                 sort_and_paginate(parallel, &context, |score| score.total);
-            let (items, scores, total) = rank_by_frecency(
+            let (items, scores, total) = fuzzy_match_and_score_files(
                 &files[..count],
                 &context,
                 count / 2,
@@ -1686,12 +1771,12 @@ mod tests {
                     };
                     let mut full = Vec::new();
                     for slice in [&files[base_count..], &files[..base_count]] {
-                        full.extend(frecency_scores(&FileItems::All(slice), &context, arena));
+                        full.extend(frecency_scores(&SearchItems::All(slice), &context, arena));
                     }
                     let (expected_items, expected_scores, expected_total) =
                         sort_and_paginate(full, &context, |score| score.total);
                     let (items, scores, total) =
-                        rank_by_frecency(&files, &context, base_count, arena, arena);
+                        fuzzy_match_and_score_files(&files, &context, base_count, arena, arena);
                     let case = format!("{current_file:?}, {offset}+{limit}, threads={max_threads}");
                     assert_eq!(total, expected_total, "{case}");
                     assert_eq!(items.len(), expected_items.len(), "{case}");
@@ -1774,11 +1859,10 @@ mod tests {
                         .enumerate()
                         .map(|(index, (_, score))| (&dirs[index], score.clone()))
                         .collect();
-                    let (items, scores, total) = sort_and_paginate_dirs(dir_results, &context);
+                    let (rows, total) = ranked_dirs(dir_results, &context);
                     assert_eq!(total, count);
-                    assert_eq!(items.len(), expected_page.len());
                     assert_eq!(
-                        scores.iter().map(|score| score.total).collect::<Vec<_>>(),
+                        rows.map(|(_, score)| score.total).collect::<Vec<_>>(),
                         expected_page
                     );
                 }
@@ -1853,7 +1937,7 @@ mod tests {
         };
         let path_matches = match_fuzzy_parts(
             &["controller"],
-            &FileItems::All(&files),
+            &SearchItems::All(&files),
             &neo_frizbee::Config {
                 max_typos: Some(context.max_typos),
                 sort: neo_frizbee::SortStrategy::Unsorted,
@@ -2137,12 +2221,14 @@ mod filename_bonus_tests {
         overflow[0].set_overflow(true);
         let parser = QueryParser::default();
         let query = parser.parse("controller");
-        let ranges = fuzzy_match_byte_offsets_for_page(
+        let mut ranges = Vec::new();
+        fuzzy_match_byte_offsets_into(
             &query,
             &[&base[0], &overflow[0]],
             0,
             base_arena,
             overflow_arena,
+            &mut ranges,
         );
         for (path, ranges) in [base_path, overflow_path].into_iter().zip(ranges) {
             let start = path.find("controller").unwrap() as u32;
@@ -2178,7 +2264,7 @@ mod filename_bonus_tests {
                 limit: 50,
             },
         };
-        let (results, _) = match_and_score_in_arena(&files, &context, arena);
+        let (results, _) = match_and_score_in_arena(&files, &context, arena, None);
         assert_eq!(results.len(), files.len());
         for (file, score) in results {
             assert_eq!(

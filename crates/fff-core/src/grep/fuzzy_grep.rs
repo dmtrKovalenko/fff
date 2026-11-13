@@ -13,7 +13,9 @@ use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 pub(super) fn fuzzy_grep_search<'a>(
     grep_text: &str,
     files_to_search: &mut super::prefilter::RankedFiles<'a>,
+    page: GrepResult<'a>,
     options: &GrepSearchOptions,
+    reuse: Option<&super::GrepReuse<'_>>,
     total_files: usize,
     filtered_file_count: usize,
     case_insensitive: bool,
@@ -36,7 +38,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     // Cap at 2: higher values (3+) let the SIMD prefilter pass lines
     // missing key characters entirely (e.g. query "flvencodeX" matching
     // lines without 'l' or 'v'). Quality comes from the post-match filters.
-    let max_typos = (grep_text.len() / 3).min(2);
+    let max_typos = fuzzy_grep_max_typos(grep_text);
     let scoring = neo_frizbee::Scoring {
         // Use default gap penalties. Higher values (e.g. 20) cause
         // smith-waterman to prefer *dropping needle chars* over paying
@@ -173,6 +175,9 @@ pub(super) fn fuzzy_grep_search<'a>(
                         arena
                     };
 
+                    if reuse.is_some_and(|reuse| reuse.skips(file)) {
+                        return None;
+                    }
                     let file_bytes = file.get_content_for_search(
                         buf,
                         mmap_slot,
@@ -193,6 +198,9 @@ pub(super) fn fuzzy_grep_search<'a>(
                             }
                         }
                         if chars_found < min_chars_required {
+                            if let Some(reuse) = reuse {
+                                reuse.record_miss(file);
+                            }
                             return None;
                         }
                     }
@@ -235,6 +243,12 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                     // Single-pass: score + indices in one Smith-Waterman run per line (not parallel)
                     let matches_with_indices = matcher.match_list_indices(&file_lines);
+                    // Only the raw subsequence test stays monotone as the query grows.
+                    if matches_with_indices.is_empty()
+                        && let Some(reuse) = reuse
+                    {
+                        reuse.record_miss(file);
+                    }
                     let mut file_matches: Vec<GrepMatch> = Vec::new();
 
                     for mut match_indices in matches_with_indices {
@@ -361,7 +375,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     }
 
     let abort_resume = Some(first_skipped.load(Ordering::Relaxed)).filter(|&i| i != usize::MAX);
-    GrepResult::collect(
+    page.collect(
         per_file_results,
         files_to_search.len(),
         options,
@@ -369,4 +383,8 @@ pub(super) fn fuzzy_grep_search<'a>(
         filtered_file_count,
         abort_resume,
     )
+}
+
+pub(crate) fn fuzzy_grep_max_typos(pattern: &str) -> usize {
+    (pattern.len() / 3).min(2)
 }

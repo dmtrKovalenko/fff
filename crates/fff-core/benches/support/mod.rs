@@ -1,4 +1,5 @@
-use fff_search::{FilePicker, FilePickerOptions};
+use criterion::{BatchSize, BenchmarkGroup, measurement::WallTime};
+use fff_search::{FFFQuery, FilePicker, FilePickerOptions, SearchBuffer};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 pub(super) fn repo_picker() -> Option<FilePicker> {
@@ -42,4 +43,32 @@ pub(super) fn repo_picker() -> Option<FilePicker> {
         fingerprint.finish()
     );
     Some(picker)
+}
+
+pub(super) fn previous_results<P: Default>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    case: &str,
+    prefix: &FFFQuery<'_>,
+    query: &FFFQuery<'_>,
+    expected: usize,
+    search: impl Fn(&FFFQuery<'_>, &mut SearchBuffer<P>, &mut SearchBuffer<P>) -> usize,
+) {
+    for (suffix, filled) in [("empty_previous", false), ("filled_previous", true)] {
+        group.bench_function(format!("{case}/{suffix}"), |b| {
+            b.iter_batched_ref(
+                || {
+                    let [mut previous, mut next] = Default::default();
+                    // Warm both slots with the same prefix. Only the previous state differs.
+                    search(prefix, &mut previous, &mut next);
+                    search(prefix, &mut previous, &mut next);
+                    if !filled {
+                        previous = SearchBuffer::default();
+                    }
+                    [previous, next]
+                },
+                |[previous, next]| assert_eq!(search(query, previous, next), expected),
+                BatchSize::PerIteration,
+            )
+        });
+    }
 }

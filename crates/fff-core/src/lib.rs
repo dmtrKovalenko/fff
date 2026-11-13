@@ -161,6 +161,8 @@ mod git_status_worker;
 mod ignore;
 mod scan;
 mod score;
+mod search_buffer;
+pub use search_buffer::{SearchBuffer, SearchMetadata, SearchMode};
 mod sort_buffer;
 
 pub(crate) mod index;

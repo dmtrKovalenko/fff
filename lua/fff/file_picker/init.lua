@@ -52,8 +52,17 @@ end
 --- @param min_combo_count_override number|nil Optional override for min_combo_count (nil uses config)
 --- @param page_index number Page index (0-based: 0, 1, 2, ...)
 --- @param page_size number|nil Items per page (nil uses config default)
+--- @param search? function Picker-owned fuzzy search function
 --- @return table List of matching files
-function M.search_files_paginated(query, current_file, max_threads, min_combo_count_override, page_index, page_size)
+function M.search_files_paginated(
+  query,
+  current_file,
+  max_threads,
+  min_combo_count_override,
+  page_index,
+  page_size,
+  search
+)
   local config = require('fff.conf').get()
   if not M.state.initialized then return {} end
 
@@ -70,7 +79,7 @@ function M.search_files_paginated(query, current_file, max_threads, min_combo_co
   local offset = page_index * page_size
 
   local ok, search_result = pcall(
-    fuzzy.fuzzy_search_files,
+    search or fuzzy.fuzzy_search_files,
     query,
     max_threads,
     current_file,

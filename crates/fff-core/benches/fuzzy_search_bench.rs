@@ -85,6 +85,19 @@ fn bench_picker(
             group.bench_function(BenchmarkId::new(name, suffix), |b| {
                 b.iter(|| black_box(picker.fuzzy_search(black_box(&query), None, options)));
             });
+            if name == "filename" {
+                support::previous_results(
+                    &mut group,
+                    &format!("{name}/{suffix}"),
+                    &parser.parse("controlle"),
+                    &query,
+                    picker.fuzzy_search(&query, None, options).total_matched,
+                    |q, previous, next| {
+                        black_box(picker.fuzzy_search_swap(q, None, options, previous, next))
+                            .total_matched
+                    },
+                );
+            }
         }
     }
     group.finish();

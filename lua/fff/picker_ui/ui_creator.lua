@@ -1,6 +1,7 @@
 local M = {}
 
 local conf = require('fff.conf')
+local fuzzy = require('fff.fuzzy')
 local layout = require('fff.layout')
 local preview = require('fff.file_picker.preview')
 local list_separator = require('fff.list_separator')
@@ -153,13 +154,19 @@ end
 function M.create_ui()
   local config = S.config
   if not config then return false end
+  local ttl = config.search_ttl_ms
+  vim.validate({
+    search_ttl_ms = {
+      ttl,
+      function(v) return type(v) == 'number' and v >= 0 and v % 1 == 0 end,
+      'a nonnegative integer',
+    },
+  })
+  local search = fuzzy.new_picker_search and ttl > 0 and fuzzy.new_picker_search(S.mode == 'grep', ttl) or nil
 
   -- Prompt editing should behave consistently even if the user has :set paste.
-  S.restore_paste = (function()
-    if not vim.o.paste then return false end
-    vim.o.paste = false
-    return true
-  end)()
+  S.restore_paste = vim.o.paste
+  if S.restore_paste then vim.o.paste = false end
 
   if not S.ns_id then
     S.ns_id = vim.api.nvim_create_namespace('fff_picker_status')
@@ -197,6 +204,7 @@ function M.create_ui()
 
   S.input_win = vim.api.nvim_open_win(S.input_buf, false, win_configs.input)
 
+  picker_ui_state.search = search
   M.setup_buffers()
   M.setup_windows()
   M.setup_keymaps()

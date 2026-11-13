@@ -224,7 +224,7 @@ fn pagination_keeps_unreturned_files_before_abort() {
                 (idx, &file, vec![matched])
             })
             .collect();
-        let result = GrepResult::collect(results, 5, &options, 15, 15, Some(3));
+        let result = GrepResult::default().collect(results, 5, &options, 15, 15, Some(3));
         assert_eq!(result.matches.len(), page_limit.min(3));
         assert_eq!(result.next_file_offset, next_offset);
     }

@@ -7,23 +7,23 @@ use fff::{
 use mlua::prelude::*;
 
 pub struct SearchResultLua<'a> {
-    inner: SearchResult<'a>,
+    inner: &'a SearchResult<'a>,
     picker: &'a FilePicker,
 }
 
 impl<'a> SearchResultLua<'a> {
-    pub fn new(inner: SearchResult<'a>, picker: &'a FilePicker) -> Self {
+    pub fn new(inner: &'a SearchResult<'a>, picker: &'a FilePicker) -> Self {
         Self { inner, picker }
     }
 }
 
 pub struct GrepResultLua<'a> {
-    inner: GrepResult<'a>,
+    inner: &'a GrepResult<'a>,
     picker: &'a FilePicker,
 }
 
 impl<'a> GrepResultLua<'a> {
-    pub fn new(inner: GrepResult<'a>, picker: &'a FilePicker) -> Self {
+    pub fn new(inner: &'a GrepResult<'a>, picker: &'a FilePicker) -> Self {
         Self { inner, picker }
     }
 }

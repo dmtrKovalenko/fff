@@ -155,6 +155,7 @@ mod tests {
 pub(super) struct RegexSink<'r> {
     pub(super) state: SinkState<'r>,
     pub(super) re: &'r regex::bytes::Regex,
+    pub(super) saw_match: bool,
 }
 
 impl Sink for RegexSink<'_> {
@@ -165,6 +166,7 @@ impl Sink for RegexSink<'_> {
         searcher: &Searcher,
         sink_match: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
+        self.saw_match = true;
         debug_assert_newline_terminator(searcher);
         let line_bytes = sink_match.bytes();
         let (display_bytes, _, line_number, byte_offset) =

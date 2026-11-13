@@ -34,11 +34,17 @@ use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
 use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
-use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
+use crate::grep::{
+    GrepMode, GrepResult, GrepReuse, GrepSearchOptions, extract_grep_text, fuzzy_grep_max_typos,
+    grep_search, multi_grep_search,
+};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+use crate::score::{fuzzy_match_and_score_files_into, fuzzy_match_byte_offsets_into};
+use crate::search_buffer::{
+    Candidates, FuzzyBuffers, SearchBuffer, SearchMode, dirs_only, fuzzy_max_typos,
+};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
@@ -57,7 +63,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::JoinHandle;
 use std::time::SystemTime;
@@ -688,6 +694,7 @@ pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
     sync_data: FileSync,
+    index_revision: u64,
     pub(crate) signals: ScanSignals,
     pub(crate) background_watcher: Option<BackgroundWatcher>,
     /// Single serialized writer for all git-status updates (scan, watcher,
@@ -822,6 +829,7 @@ impl FilePicker {
     }
 
     pub fn get_file_mut(&mut self, index: usize) -> Option<(ArenaPtr, &mut FileItem)> {
+        self.index_revision = next_index_revision();
         self.sync_data.get_file_mut(index)
     }
 
@@ -1054,6 +1062,7 @@ impl FilePicker {
             mode: options.mode,
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
+            index_revision: next_index_revision(),
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
@@ -1206,6 +1215,7 @@ impl FilePicker {
         )?;
 
         self.sync_data = sync;
+        self.index_revision = next_index_revision();
 
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
@@ -1247,13 +1257,55 @@ impl FilePicker {
     /// The query should be parsed using [`crate::FFFQuery`] before calling
     /// this function. If a [`crate::QueryTracker`] is provided, the search will
     /// automatically look up the last selected file for this query and boost it
-    #[tracing::instrument(skip_all, name = "Fuzzy file search", fields(query = query.raw_query))]
     pub fn fuzzy_search<'q>(
         &self,
         query: &'q FFFQuery<'q>,
         query_tracker: Option<&QueryTracker>,
         options: FuzzySearchOptions<'q>,
     ) -> SearchResult<'_> {
+        let mut page = SearchResult::default();
+        self.fuzzy_search_impl(query, query_tracker, options, None, &mut page);
+        page
+    }
+
+    /// Fill next in place and swap the buffers. The returned page borrows previous.
+    /// Reuse applies to compatible prefix edits against the same index revision.
+    pub fn fuzzy_search_swap<'p, 'b, 'q>(
+        &'p self,
+        query: &'q FFFQuery<'q>,
+        query_tracker: Option<&QueryTracker>,
+        options: FuzzySearchOptions<'q>,
+        previous: &'b mut SearchBuffer<SearchResult<'p>>,
+        next: &mut SearchBuffer<SearchResult<'p>>,
+    ) -> &'b mut SearchResult<'p> {
+        previous.fuzzy_swap(
+            next,
+            query,
+            SearchMode::Files,
+            self.index_revision,
+            |mut buffers, page| {
+                self.fuzzy_search_impl(
+                    query,
+                    query_tracker,
+                    options,
+                    buffers.as_mut().map(FuzzyBuffers::files),
+                    page,
+                );
+            },
+        )
+    }
+
+    #[tracing::instrument(skip_all, name = "Fuzzy file search", fields(query = query.raw_query))]
+    fn fuzzy_search_impl<'p, 'q>(
+        &'p self,
+        query: &'q FFFQuery<'q>,
+        query_tracker: Option<&QueryTracker>,
+        options: FuzzySearchOptions<'q>,
+        candidates: Option<Candidates<'_, [Vec<u32>; 2]>>,
+        page: &mut SearchResult<'p>,
+    ) {
+        page.items.clear();
+        page.scores.clear();
         let files = self.get_files();
         let max_threads = if options.max_threads == 0 {
             std::thread::available_parallelism()
@@ -1274,15 +1326,7 @@ impl FilePicker {
         let total_files = self.live_file_count();
         let location = query.location;
 
-        // Get effective query for max_typos calculation (without location suffix)
-        let effective_query = match &query.fuzzy_query {
-            fff_query_parser::FuzzyQuery::Text(t) => *t,
-            fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
-            _ => query.raw_query.trim(),
-        };
-
-        // small queries with a large number of results can match absolutely everything
-        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
+        let max_typos = fuzzy_max_typos(query);
         // Look up the last file selected for this query (combo-boost scoring)
         let last_same_query_entry =
             query_tracker
@@ -1315,33 +1359,36 @@ impl FilePicker {
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
 
-        let (items, scores, total_matched) = fuzzy_match_and_score_files(
+        let total_matched = fuzzy_match_and_score_files_into(
             files,
             &context,
             self.sync_data.base_count,
             base_arena,
             overflow_arena,
+            candidates,
+            page,
         );
-        let match_byte_offsets =
-            fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
+        fuzzy_match_byte_offsets_into(
+            query,
+            &page.items,
+            max_typos,
+            base_arena,
+            overflow_arena,
+            &mut page.match_byte_offsets,
+        );
 
         info!(
             ?query,
             completed_in = ?time.elapsed(),
             total_matched,
-            returned_count = items.len(),
+            returned_count = page.items.len(),
             pagination = ?options.pagination,
             "Fuzzy search completed",
         );
 
-        SearchResult {
-            items,
-            scores,
-            match_byte_offsets,
-            total_matched,
-            total_files,
-            location,
-        }
+        page.total_matched = total_matched;
+        page.total_files = total_files;
+        page.location = location;
     }
 
     /// Perform fuzzy search on indexed directories.
@@ -1352,6 +1399,44 @@ impl FilePicker {
         query: &'q FFFQuery<'q>,
         options: FuzzySearchOptions<'q>,
     ) -> DirSearchResult<'_> {
+        let mut page = DirSearchResult::default();
+        self.fuzzy_search_directories_impl(query, options, None, &mut page);
+        page
+    }
+
+    /// Search directories using caller-owned buffers, as in [`Self::fuzzy_search_swap`].
+    pub fn fuzzy_search_directories_swap<'p, 'b, 'q>(
+        &'p self,
+        query: &'q FFFQuery<'q>,
+        options: FuzzySearchOptions<'q>,
+        previous: &'b mut SearchBuffer<DirSearchResult<'p>>,
+        next: &mut SearchBuffer<DirSearchResult<'p>>,
+    ) -> &'b mut DirSearchResult<'p> {
+        previous.fuzzy_swap(
+            next,
+            query,
+            SearchMode::Directories,
+            self.index_revision,
+            |mut buffers, page| {
+                self.fuzzy_search_directories_impl(
+                    query,
+                    options,
+                    buffers.as_mut().map(FuzzyBuffers::dirs),
+                    page,
+                );
+            },
+        )
+    }
+
+    fn fuzzy_search_directories_impl<'p, 'q>(
+        &'p self,
+        query: &'q FFFQuery<'q>,
+        options: FuzzySearchOptions<'q>,
+        candidates: Option<Candidates<'_, Vec<u32>>>,
+        page: &mut DirSearchResult<'p>,
+    ) {
+        page.items.clear();
+        page.scores.clear();
         let dirs = self.get_dirs();
         let max_threads = if options.max_threads == 0 {
             std::thread::available_parallelism()
@@ -1363,13 +1448,7 @@ impl FilePicker {
 
         let total_dirs = self.sync_data.live_dirs_count;
 
-        let effective_query = match &query.fuzzy_query {
-            fff_query_parser::FuzzyQuery::Text(t) => *t,
-            fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
-            _ => query.raw_query.trim(),
-        };
-
-        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
+        let max_typos = fuzzy_max_typos(query);
 
         let context = ScoringContext {
             query,
@@ -1387,23 +1466,25 @@ impl FilePicker {
         let overflow_arena = self.sync_data.arena_overflow_ptr();
         let time = std::time::Instant::now();
 
-        let (items, scores, total_matched) =
-            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena, overflow_arena);
+        let total_matched = crate::score::fuzzy_match_and_score_dirs(
+            dirs,
+            &context,
+            arena,
+            overflow_arena,
+            candidates,
+            page,
+        );
 
         info!(
             ?query,
             completed_in = ?time.elapsed(),
             total_matched,
-            returned_count = items.len(),
+            returned_count = page.items.len(),
             "Directory search completed",
         );
 
-        DirSearchResult {
-            items,
-            scores,
-            total_matched,
-            total_dirs,
-        }
+        page.total_matched = total_matched;
+        page.total_dirs = total_dirs;
     }
 
     /// Perform a mixed fuzzy search across both files and directories.
@@ -1421,6 +1502,41 @@ impl FilePicker {
         query_tracker: Option<&QueryTracker>,
         options: FuzzySearchOptions<'q>,
     ) -> MixedSearchResult<'_> {
+        let mut page = MixedSearchResult::default();
+        self.fuzzy_search_mixed_impl(query, query_tracker, options, None, &mut page);
+        page
+    }
+
+    /// Search files and directories using caller-owned buffers, as in [`Self::fuzzy_search_swap`].
+    pub fn fuzzy_search_mixed_swap<'p, 'b, 'q>(
+        &'p self,
+        query: &'q FFFQuery<'q>,
+        query_tracker: Option<&QueryTracker>,
+        options: FuzzySearchOptions<'q>,
+        previous: &'b mut SearchBuffer<MixedSearchResult<'p>>,
+        next: &mut SearchBuffer<MixedSearchResult<'p>>,
+    ) -> &'b mut MixedSearchResult<'p> {
+        previous.fuzzy_swap(
+            next,
+            query,
+            SearchMode::Mixed,
+            self.index_revision,
+            |buffers, page| {
+                self.fuzzy_search_mixed_impl(query, query_tracker, options, buffers, page);
+            },
+        )
+    }
+
+    fn fuzzy_search_mixed_impl<'p, 'q>(
+        &'p self,
+        query: &'q FFFQuery<'q>,
+        query_tracker: Option<&QueryTracker>,
+        options: FuzzySearchOptions<'q>,
+        mut buffers: Option<FuzzyBuffers<'_>>,
+        page: &mut MixedSearchResult<'p>,
+    ) {
+        page.items.clear();
+        page.scores.clear();
         let location = query.location;
         let page_offset = options.pagination.offset;
         let page_limit = if options.pagination.limit > 0 {
@@ -1429,70 +1545,55 @@ impl FilePicker {
             100
         };
 
-        let dirs_only =
-            query.raw_query.ends_with(std::path::MAIN_SEPARATOR) || query.raw_query.ends_with('/');
+        let dirs_only = dirs_only(query);
 
         // Run file search and dir search with no pagination (we merge then paginate).
         let internal_limit = page_offset.saturating_add(page_limit).saturating_mul(2);
 
-        let dir_options = FuzzySearchOptions {
+        let ranking_options = FuzzySearchOptions {
             pagination: PaginationArgs {
                 offset: 0,
                 limit: internal_limit,
             },
             ..options
         };
-        let dir_results = self.fuzzy_search_directories(query, dir_options);
+        let mut dir_results = DirSearchResult::default();
+        self.fuzzy_search_directories_impl(
+            query,
+            ranking_options,
+            buffers.as_mut().map(FuzzyBuffers::dirs),
+            &mut dir_results,
+        );
 
+        page.total_dirs = dir_results.total_dirs;
+        page.total_files = self.live_file_count();
+        page.total_matched = dir_results.total_matched;
+        page.location = location;
         if dirs_only {
-            let total_matched = dir_results.total_matched;
-            let total_dirs = dir_results.total_dirs;
-
-            let mut merged: Vec<(MixedItemRef<'_>, Score)> =
-                Vec::with_capacity(dir_results.items.len());
-            for (dir, score) in dir_results.items.into_iter().zip(dir_results.scores) {
-                merged.push((MixedItemRef::Dir(dir), score));
+            for (dir, score) in dir_results
+                .items
+                .into_iter()
+                .zip(dir_results.scores)
+                .skip(page_offset)
+                .take(page_limit)
+            {
+                page.items.push(MixedItemRef::Dir(dir));
+                page.scores.push(score);
             }
-
-            if page_offset >= merged.len() {
-                return MixedSearchResult {
-                    items: vec![],
-                    scores: vec![],
-                    total_matched,
-                    total_files: self.live_file_count(),
-                    total_dirs,
-                    location,
-                };
-            }
-
-            let end = (page_offset + page_limit).min(merged.len());
-            let page = merged.drain(page_offset..end);
-            let (items, scores): (Vec<_>, Vec<_>) = page.unzip();
-
-            return MixedSearchResult {
-                items,
-                scores,
-                total_matched,
-                total_files: self.live_file_count(),
-                total_dirs,
-                location,
-            };
+            return;
         }
 
-        let file_options = FuzzySearchOptions {
-            pagination: PaginationArgs {
-                offset: 0,
-                limit: internal_limit,
-            },
-            ..options
-        };
-        let file_results = self.fuzzy_search(query, query_tracker, file_options);
+        let mut file_results = SearchResult::default();
+        self.fuzzy_search_impl(
+            query,
+            query_tracker,
+            ranking_options,
+            buffers.as_mut().map(FuzzyBuffers::files),
+            &mut file_results,
+        );
 
         // Merge by score descending.
-        let total_matched = file_results.total_matched + dir_results.total_matched;
-        let total_files = file_results.total_files;
-        let total_dirs = dir_results.total_dirs;
-
+        page.total_matched += file_results.total_matched;
         let mut merged: Vec<(MixedItemRef<'_>, Score)> =
             Vec::with_capacity(file_results.items.len() + dir_results.items.len());
 
@@ -1506,29 +1607,9 @@ impl FilePicker {
         // Sort merged results by total score descending.
         merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.1.total));
 
-        // Paginate.
-        if page_offset >= merged.len() {
-            return MixedSearchResult {
-                items: vec![],
-                scores: vec![],
-                total_matched,
-                total_files,
-                total_dirs,
-                location,
-            };
-        }
-
-        let end = (page_offset + page_limit).min(merged.len());
-        let page = merged.drain(page_offset..end);
-        let (items, scores): (Vec<_>, Vec<_>) = page.unzip();
-
-        MixedSearchResult {
-            items,
-            scores,
-            total_matched,
-            total_files,
-            total_dirs,
-            location,
+        for (item, score) in merged.into_iter().skip(page_offset).take(page_limit) {
+            page.items.push(item);
+            page.scores.push(score);
         }
     }
 
@@ -1563,6 +1644,69 @@ impl FilePicker {
     /// If `options.abort_signal` is set it overrides the picker's internal
     /// cancellation flag, giving the caller full control over when to stop.
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
+        self.grep_with_pattern(
+            query,
+            options,
+            extract_grep_text(query),
+            None,
+            Default::default(),
+        )
+        .0
+    }
+
+    /// Fill next and swap it into previous. A compatible grep skips known misses until the scan expires.
+    /// Partial pages leave unsearched files eligible for the next call.
+    pub fn grep_swap<'p, 'b>(
+        &'p self,
+        query: &FFFQuery<'_>,
+        options: &GrepSearchOptions,
+        previous: &'b mut SearchBuffer<GrepResult<'p>>,
+        next: &mut SearchBuffer<GrepResult<'p>>,
+    ) -> &'b mut GrepResult<'p> {
+        let pattern = extract_grep_text(query);
+        let reuse = next.state.begin_grep(
+            &previous.state,
+            self.index_revision,
+            self.get_files(),
+            query.raw_query,
+            &pattern,
+            options,
+        );
+        let (result, pattern) = self.grep_with_pattern(
+            query,
+            options,
+            pattern,
+            reuse.as_ref(),
+            std::mem::take(&mut next.page),
+        );
+        let skipped = if result.literal_fallback {
+            0
+        } else {
+            reuse.as_ref().map_or(0, GrepReuse::files_skipped)
+        };
+        let mode = if result.regex_fallback_error.is_some() {
+            GrepMode::PlainText
+        } else {
+            options.mode
+        };
+        let max_typos = (mode == GrepMode::Fuzzy && !pattern.is_empty())
+            .then(|| fuzzy_grep_max_typos(&pattern) as u16);
+        let captured = reuse.is_some() && !result.literal_fallback && mode == options.mode;
+        next.state.record_grep(&pattern, mode, max_typos, skipped);
+        next.state.index_revision = captured.then_some(self.index_revision);
+        next.page = result;
+        std::mem::swap(previous, next);
+        &mut previous.page
+    }
+
+    fn grep_with_pattern<'p>(
+        &'p self,
+        query: &FFFQuery<'_>,
+        options: &GrepSearchOptions,
+        pattern: String,
+        reuse: Option<&GrepReuse<'_>>,
+        page: GrepResult<'p>,
+    ) -> (GrepResult<'p>, String) {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
@@ -1576,7 +1720,10 @@ impl FilePicker {
                 self.get_files(),
                 self.live_file_count(),
                 query,
+                pattern,
+                page,
                 options,
+                reuse,
                 self.cache_budget(),
                 self.sync_data.bigram_index.as_deref(),
                 overlay_guard.as_deref(),
@@ -1698,6 +1845,7 @@ impl FilePicker {
     // Returns the replaced index so the caller can compare against it and drop it off the lock
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) -> FileSync {
         self.cache_budget.reset();
+        self.index_revision = next_index_revision();
         std::mem::replace(&mut self.sync_data, sync)
     }
 
@@ -1840,8 +1988,8 @@ impl FilePicker {
         path: impl AsRef<Path>,
     ) -> Option<(ArenaPtr, &mut FileItem)> {
         let path = path.as_ref();
-        let index = self.sync_data.find_file_index(path, &self.base_path);
-        index.and_then(|i| self.sync_data.get_file_mut(i))
+        let index = self.sync_data.find_file_index(path, &self.base_path)?;
+        self.get_file_mut(index)
     }
 
     /// Handle the event of certain file being modified or adds a neww file if it is not added
@@ -1883,6 +2031,7 @@ impl FilePicker {
             }
         };
 
+        self.index_revision = next_index_revision();
         let (_arena, file) = self.sync_data.get_file_mut(pos)?;
 
         let size = metadata.len();
@@ -1969,6 +2118,7 @@ impl FilePicker {
             &rel_path[..file_item.path.filename_offset as usize],
         );
 
+        self.index_revision = next_index_revision();
         if let Some(dir_idx) = self.sync_data.find_or_add_dir(&dir_rel) {
             file_item.parent_dir_index = dir_idx;
         }
@@ -2715,6 +2865,11 @@ pub(crate) fn hint_allocator_collect(pool: &rayon::ThreadPool) {
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };
     }
+}
+
+fn next_index_revision() -> u64 {
+    static NEXT_REVISION: AtomicU64 = AtomicU64::new(0);
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

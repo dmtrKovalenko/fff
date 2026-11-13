@@ -96,6 +96,7 @@ function M.close()
 
   vim.cmd('stopinsert')
   P.state.active = false
+  picker_ui_state.search = nil
 
   restore_paste(S.restore_paste)
 

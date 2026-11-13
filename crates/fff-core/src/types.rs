@@ -814,9 +814,7 @@ impl FileItem {
     ) -> Option<&'a [u8]> {
         #[cfg(not(target_os = "windows"))]
         {
-            // Fast path: persistent cache hit (zero-copy). Safe here because
-            // grep callers hold the picker read lock for the lifetime of the
-            // returned slice — see [`Self::get_cached_content`] safety note.
+            // The picker read lock keeps the cached mapping alive during this search.
             if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
                 return Some(cached);
             }

@@ -51,7 +51,7 @@ function M.update_results_sync()
       S.pagination.grep_file_offsets = {}
       S.pagination.grep_next_file_offset = 0
     else
-      local grep_result = grep.search(S.query, 0, page_size, S.grep_config, S.grep_mode)
+      local grep_result = grep.search(S.query, 0, page_size, S.grep_config, S.grep_mode, picker_ui_state.search)
       results = grep_result.items or {}
       S.pagination.total_matched = grep_result.total_matched or 0
       S.pagination.grep_file_offsets = { 0 }
@@ -69,7 +69,8 @@ function M.update_results_sync()
       S.config.max_threads,
       min_combo_override,
       0,
-      page_size
+      page_size,
+      picker_ui_state.search
     )
     S.location = file_picker.get_search_location()
     local metadata = file_picker.get_search_metadata()
@@ -169,6 +170,7 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
     local file_offset = S.pagination.grep_file_offsets[new_page_index + 1]
     if file_offset == nil then return false end
 
+    -- Keep the first page’s search buffer for the next edit.
     ok, results = pcall(grep.search, S.query, file_offset, page_size, S.grep_config, S.grep_mode)
     if ok and results then
       local grep_result = results
@@ -189,7 +191,8 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
       S.config.max_threads,
       nil,
       new_page_index,
-      page_size
+      page_size,
+      picker_ui_state.search
     )
   end
 
