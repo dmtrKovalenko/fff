@@ -22,6 +22,7 @@ const DIM: &str = "#74747e";
 const INK: &str = "#18181b";
 const GREEN: &str = "#17a34a";
 const RED: &str = "#e5484d";
+const BLUE: &str = "#2563b0";
 
 const MARGIN: f32 = 60.0;
 const LABEL_X: f32 = 84.0;
@@ -46,13 +47,17 @@ struct Chart {
 
 impl Chart {
     fn new(timings: Vec<Timing>) -> Self {
-        let worst = timings.iter().map(|t| t.change().abs()).fold(0.0, f64::max);
+        let worst = timings
+            .iter()
+            .filter_map(Timing::change)
+            .map(f64::abs)
+            .fold(0.0, f64::max);
         let span = (worst / 10.0).ceil().clamp(2.0, 10.0) as f32 * 10.0;
         let mut groups: Vec<Group> = Vec::new();
         for timing in timings {
             let name = group_name(&timing.name);
-            match groups.last_mut() {
-                Some(group) if group.name == name => group.timings.push(timing),
+            match groups.iter_mut().find(|group| group.name == name) {
+                Some(group) => group.timings.push(timing),
                 _ => groups.push(Group {
                     name,
                     timings: vec![timing],
@@ -84,7 +89,9 @@ impl Chart {
         let faster = all()
             .filter(|t| matches!(t.verdict(), Verdict::Faster))
             .count();
-        let within = all().count() - slower - faster;
+        let within = all()
+            .filter(|t| matches!(t.verdict(), Verdict::Within))
+            .count();
         let mut x = MARGIN;
         let legend: Vec<_> = [
             (RED, format!("{slower} slower")),
@@ -174,12 +181,14 @@ impl Chart {
     }
 
     fn row(&self, timing: &Timing, y: f32) -> Svgr<'static> {
-        let change = timing.change() as f32;
         let (fill, text, weight) = match timing.verdict() {
             Verdict::Slower => (RED, INK, 600),
             Verdict::Faster => (GREEN, INK, 600),
             Verdict::Within => (EDGE, DIM, 400),
+            Verdict::New(ns) => return self.unpaired_row(timing, y, BLUE, "NEW", ns),
+            Verdict::Removed(ns) => return self.unpaired_row(timing, y, DIM, "REMOVED", ns),
         };
+        let change = timing.change().unwrap() as f32;
         let (from, to) = (self.x(change.min(0.0)), self.x(change.max(0.0)));
         svgr!(
             <g font-size="18">
@@ -194,6 +203,24 @@ impl Chart {
                     fill={if weight == 600 { fill } else { DIM }}>
                     {format!("{change:+.1}%")}
                 </text>
+            </g>
+        )
+    }
+
+    fn unpaired_row(
+        &self,
+        timing: &Timing,
+        y: f32,
+        color: &'static str,
+        status: &'static str,
+        ns: f64,
+    ) -> Svgr<'static> {
+        let elapsed = std::time::Duration::from_secs_f64(ns / 1e9);
+        svgr!(
+            <g font-size="18" fill={color}>
+                <text x={LABEL_X} y={y + 6.0}>{label(&timing.name)}</text>
+                <text x={TRACK.0} y={y + 6.0} font-weight="600">{status.to_owned()}</text>
+                <text x={CHANGE_X} y={y + 6.0} text-anchor="end">{format!("{elapsed:.2?}")}</text>
             </g>
         )
     }
@@ -265,7 +292,7 @@ fn render(base: &str, head: &str, output: &str) -> Result<(), Box<dyn std::error
         &std::fs::read_to_string(head)?,
     );
     if timings.is_empty() {
-        return Err("no benchmark is in both files".into());
+        return Err("no benchmark timings".into());
     }
     let chart = Chart::new(timings);
     let media = ChartMedia::prepare()?;

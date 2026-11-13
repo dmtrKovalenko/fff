@@ -6,10 +6,6 @@ mkdir -p "$2"
 output=$(realpath "$2")
 target=x86_64-unknown-linux-musl
 benches=(fuzzy_search_bench grep_bench parse_bench definition_bench glob_bench bigram_bench memmem_bench)
-bench_args=()
-for name in "${benches[@]}"; do
-  bench_args+=(--bench "$name")
-done
 mkdir "$output/work" "$output/bins"
 
 docker build --tag fff-perf-build - <<'DOCKERFILE'
@@ -39,7 +35,7 @@ docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
   --env PATH=/zig:/rust/bin:/tools:/usr/local/bin:/usr/bin:/bin \
   --workdir /src fff-perf-build \
   cargo zigbuild --locked --profile ci --target "$target" -p fff-search \
-    --no-default-features --features zlob "${bench_args[@]}" --message-format=json-render-diagnostics \
+    --no-default-features --features zlob --benches --message-format=json-render-diagnostics \
   | jq -Rr 'fromjson? | if .reason == "compiler-message" then .message.rendered // empty
     elif .reason == "compiler-artifact" and .target.kind == ["bench"] and .executable
     then [.target.name, .executable] | @tsv else empty end' > "$output/build.log" || {
@@ -47,12 +43,15 @@ docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
     exit 1
   }
 
+: > "$output/bins/targets"
 for name in "${benches[@]}"; do
   binary=$(awk -F '\t' -v name="$name" '$1 == name { print $2 }' "$output/build.log")
+  [[ -n "$binary" ]] || continue
   [[ "$binary" =~ ^/build/target/$target/ci/(deps/)?${name}(-[0-9a-f]+)?$ ]]
   binary=$(realpath -e "$output/work/${binary#/build/}")
   [[ "$binary" == "$output/work/target/$target/ci/"* && -f "$binary" ]]
   headers=$(readelf -l "$binary")
   [[ "$headers" != *INTERP* ]]
   install -m 0555 "$binary" "$output/bins/$name"
+  echo "$name" >> "$output/bins/targets"
 done
