@@ -94,7 +94,7 @@ run_bench() {
     ulimit -f 8192 -v 8388608 || exit
     exec timeout --kill-after=10s 10m taskset -c "$cpus" \
       env -i PATH=/usr/bin:/bin LC_ALL=C TMPDIR="$work" CARGO_TARGET_DIR="$work/target" \
-      RAYON_NUM_THREADS=4 FFF_BENCH_PATH="$fixture_path" "$@" "$bins/${bench}_bench" \
+      RAYON_NUM_THREADS=4 ${fixture_path:+"FFF_BENCH_PATH=$fixture_path"} "$@" "$bins/${bench}_bench" \
       --bench --color never --noplot --output-format bencher --nresamples 10000 \
       --warm-up-time 1 --measurement-time 2 --sample-size 30 "$filter"
   ) >"$work/stdout" 2>"$work/stderr"; then
@@ -213,7 +213,7 @@ for fs in ext4 btrfs; do
     fi
     path="$state/$fs/$name-${revision:0:12}"
     pair "$fs/$name" fuzzy_search \
-      '^fuzzy_search_repo/(empty/no_current_file|short/current_file|path/no_current_file|multipart/current_file|extension/no_current_file)$' \
+      '^fuzzy_search_repo/(empty/no_current_file|short/current_file|path/no_current_file|multipart/current_file|extension/no_current_file|filename/no_current_file(/.*)?)$' \
       "$path" "FFF_BENCH_CURRENT_FILE=$file" \
       "FFF_BENCH_PATH_QUERY=$path_query" "FFF_BENCH_MULTIPART_QUERY=$multipart"
     pair "$fs/$name" grep '^grep_repo/' "$path"
@@ -221,6 +221,7 @@ for fs in ext4 btrfs; do
 done
 
 path="$state/ext4/fff-${fff:0:12}"
+pair core grep '^grep_e2e/plain_case_sensitive_many_matches(/|$)' ''
 pair core parse '^realistic_queries/' "$path"
 pair core definition '/mixed_256$' "$path"
 pair core glob '^glob_(reuse_10k|mixed_100k)/' "$path"
