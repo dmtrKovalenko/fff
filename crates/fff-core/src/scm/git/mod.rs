@@ -1,157 +1,31 @@
-mod backend;
+#[cfg(feature = "libgit2")]
+pub(super) mod backend;
 #[cfg(feature = "gitoxide")]
 pub(crate) mod gitoxide;
+#[cfg(feature = "libgit2")]
+mod libgit2_status;
 pub mod recency;
-mod worker;
+pub(super) mod worker;
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
 use crate::scm::ScmStatusCache;
-pub(crate) use backend::LibGit2;
+#[cfg(feature = "libgit2")]
+pub use git2::Status;
+#[cfg(not(feature = "libgit2"))]
+mod status;
+#[cfg(not(feature = "libgit2"))]
+pub use status::Status;
 
-use crate::error::Result;
-use ahash::AHashMap;
-use git2::{Repository, Status, StatusOptions};
-use std::{
-    fmt::Debug,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+use std::time::{Duration, Instant};
 
-/// Process-wide libgit2 tuning for read-heavy local use. By default libgit2
-/// never caches trees over 4KB and additionally verifies every object. This roughly costs 150% of
-/// its valuable runtime
-pub(crate) fn tune_libgit2_for_local_reads() {
-    static TUNE: std::sync::Once = std::sync::Once::new();
-    TUNE.call_once(|| {
-        // Same tradeoff cargo makes: local objects are trusted, skip hashing.
-        git2::opts::strict_hash_verification(false);
-        // SAFETY: plain process-global size limit; total memory stays bounded
-        // by libgit2's 256MB odb cache.
-        let _ =
-            unsafe { git2::opts::set_cache_object_limit(git2::ObjectType::Tree, 8 * 1024 * 1024) };
-    });
-}
-
-pub(crate) fn default_status_options() -> StatusOptions {
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_unmodified(true)
-        .exclude_submodules(true);
-    opts
-}
-
-/// Status options for the initial scan / rescan.
-///
-/// Skips `include_unmodified` because every `FileItem` starts with
-/// `git_status: None` (== clean), so a missing cache entry already means
-/// "clean" — no need to ask libgit2 to enumerate every tracked path.
-/// Saves seconds on huge dirty trees (e.g. chromium with 400k+ entries).
-pub(crate) fn initial_scan_status_options() -> StatusOptions {
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .exclude_submodules(true);
-    opts
-}
-
-impl ScmStatusCache {
-    #[tracing::instrument(skip(repo, status_options))]
-    pub(crate) fn read_status(
-        repo: &Repository,
-        status_options: &mut StatusOptions,
-    ) -> Result<Self> {
-        let statuses = repo.statuses(Some(status_options))?;
-        let Some(repo_path) = repo.workdir() else {
-            return Ok(Self(AHashMap::new())); // repo is bare
-        };
-
-        let repo_path = crate::path_utils::normalize(repo_path.to_path_buf());
-
-        let mut entries = AHashMap::with_capacity(statuses.len());
-        for entry in &statuses {
-            if let Ok(entry_path) = entry.path() {
-                // libgit2 returns entry paths with forward slashes on every platform
-                // fff stores native paths - meaning we have forward slash issue on windows
-                let full_path = crate::path_utils::normalize(repo_path.join(entry_path));
-                entries.insert(full_path, entry.status());
-            }
-        }
-
-        Ok(Self(entries))
-    }
-
-    /// Keep clean entries out of libgit2's two diff lists on large, case-sensitive
-    /// working trees. Status flags for changes still come directly from libgit2.
-    pub(crate) fn read_full_status(repo: &Repository) -> Result<Self> {
-        let full = || Self::read_status(repo, &mut default_status_options());
-        let Some(root) = repo.workdir() else {
-            return full();
-        };
-        let Ok(index) = repo.index() else {
-            return full();
-        };
-        if !cfg!(target_os = "linux")
-            || index.len() < 16_384
-            || index.has_conflicts()
-            || repo.config()?.get_bool("core.ignorecase").unwrap_or(false)
-        {
-            return full();
-        }
-        Self::read_status_from_index(repo, &index, root)
-    }
-
-    fn read_status_from_index(repo: &Repository, index: &git2::Index, root: &Path) -> Result<Self> {
-        let mut cache = Self::read_status(repo, &mut initial_scan_status_options())?;
-        let additional = index.len().saturating_sub(cache.0.len());
-        cache.0.reserve(additional);
-        let root = crate::path_utils::normalize(root.to_owned());
-        for entry in index.iter() {
-            // A gitlink is a submodule. The full refresh excludes submodules.
-            if entry.mode != 0o160000
-                && let Ok(path) = std::str::from_utf8(&entry.path)
-            {
-                let path = crate::path_utils::normalize(root.join(path));
-                cache.0.entry(path).or_insert(Status::CURRENT);
-            }
-        }
-        Ok(cache)
-    }
-
-    #[tracing::instrument(skip(repo), fields(paths_count = paths.len()), level = tracing::Level::DEBUG)]
-    pub fn git_status_for_paths<TPath: AsRef<Path> + Debug>(
-        repo: &Repository,
-        paths: &[TPath],
-    ) -> Result<Self> {
-        if paths.is_empty() {
-            return Ok(Self(AHashMap::new()));
-        }
-
-        let Some(workdir) = repo.workdir() else {
-            return Ok(Self(AHashMap::new()));
-        };
-        let workdir = crate::path_utils::normalize(workdir.to_path_buf());
-
-        // git pathspec is pretty slow and requires to walk the whole directory
-        // so for a single file which is the most general use case we query directly the file
-        if paths.len() == 1 {
-            let full_path = paths[0].as_ref();
-            let relative_path = full_path.strip_prefix(&workdir)?;
-            let status = repo.status_file(relative_path)?;
-
-            let mut map = AHashMap::with_capacity(1);
-            map.insert(full_path.to_path_buf(), status);
-            return Ok(Self(map));
-        }
-
-        // literal paths make libgit2 use a sorted pathlist instead of wildmatching
-        // every entry against every pathspec (O(entries * paths), minutes on 80k paths)
-        let mut status_options = default_status_options();
-        status_options.disable_pathspec_match(true);
-        for path in paths {
-            status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
-        }
-
-        let git_status_cache = Self::read_status(repo, &mut status_options)?;
-        Ok(git_status_cache)
-    }
+/// Returns the configured backend and the working tree containing `path`, when present.
+pub fn backend_info(path: &Path) -> (Option<&'static str>, Option<PathBuf>) {
+    let backend = crate::scm::ScmBackend::configured();
+    (
+        backend.name(),
+        backend.discover(path).map(|workspace| workspace.workdir),
+    )
 }
 
 #[inline]
@@ -202,8 +76,9 @@ pub fn format_git_status(status: Option<Status>) -> &'static str {
 
 // Same as git's main worktree: the common dir without its `.git` suffix, so bare
 // and separate git dirs key the shared history by the common dir itself.
-fn main_checkout_root(repo: &Repository) -> PathBuf {
-    let common_dir: PathBuf = repo.commondir().components().collect();
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+fn main_checkout_root(common_dir: &Path) -> PathBuf {
+    let common_dir: PathBuf = common_dir.components().collect();
     match common_dir.parent() {
         Some(main_root) if common_dir.file_name().is_some_and(|name| name == ".git") => {
             main_root.to_path_buf()
@@ -214,15 +89,26 @@ fn main_checkout_root(repo: &Repository) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "libgit2")]
+    use super::libgit2_status::default_status_options;
+    #[cfg(all(feature = "libgit2", feature = "gitoxide"))]
+    use super::libgit2_status::initial_scan_status_options;
     use super::*;
+    #[cfg(feature = "libgit2")]
+    use git2::Repository;
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     use std::fs;
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     use std::process::Command;
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     use tempfile::TempDir;
 
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     fn git(dir: &Path, args: &[&str]) {
         assert!(git_status(dir, args), "git {args:?} failed");
     }
 
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     fn git_status(dir: &Path, args: &[&str]) -> bool {
         Command::new("git")
             .args(args)
@@ -238,6 +124,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "libgit2")]
     fn index_and_changed_entries_match_the_full_refresh() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -292,15 +179,19 @@ mod tests {
             let statuses: Vec<_> = expected.0.values().copied().collect();
             assert!(statuses.contains(&Status::CONFLICTED));
             assert!(statuses.contains(&(Status::INDEX_NEW | Status::WT_MODIFIED)));
-            let actual = gitoxide::scan(&repo, full).expect("fixture must use gitoxide");
-            for name in ["libgit2", "gitoxide"] {
-                let workspace = crate::scm::select_backend(Some(name))
-                    .discover(root)
-                    .unwrap();
+            let gix = gitoxide::open(root).unwrap();
+            assert_eq!(
+                gitoxide::read_status(&gix, full, &[]).unwrap().0,
+                expected.0
+            );
+            for backend in [
+                crate::scm::ScmBackend::LibGit2,
+                crate::scm::ScmBackend::Gitoxide,
+            ] {
+                let workspace = backend.discover(root).unwrap();
                 let session = workspace.open().unwrap();
                 assert_eq!(session.status(full).unwrap().0, expected.0);
             }
-            assert_eq!(actual.0, expected.0);
         }
         let expected = ScmStatusCache::read_status(&repo, &mut default_status_options()).unwrap();
         let actual = ScmStatusCache::read_status_from_index(
@@ -310,6 +201,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual.0, expected.0);
+    }
+
+    #[cfg(feature = "gitoxide")]
+    #[test]
+    fn gitoxide_preserves_linked_worktree_history_and_ignores() {
+        let tmp = TempDir::new().unwrap();
+        let root = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        let main = root.join("main");
+        let linked = root.join("linked");
+        git(&root, &["init", "-b", "main", "main"]);
+        fs::write(main.join("original"), "main").unwrap();
+        fs::write(main.join(".gitignore"), "ignored/\n").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-m", "seed", "--no-gpg-sign"]);
+        git(&main, &["worktree", "add", "-b", "feature", "../linked"]);
+        fs::create_dir(linked.join("src")).unwrap();
+        fs::write(linked.join("src/added"), "feature").unwrap();
+        git(&linked, &["add", "."]);
+        git(&linked, &["commit", "-m", "feature", "--no-gpg-sign"]);
+        fs::create_dir(linked.join("ignored")).unwrap();
+        let backend = crate::scm::ScmBackend::Gitoxide;
+        let workspace = backend.discover(&linked.join("src")).unwrap();
+        assert_eq!(workspace.workdir, linked);
+        assert_eq!(
+            workspace.shared_base(&linked.join("src")),
+            Some(main.join("src"))
+        );
+        let repo = workspace.open().unwrap();
+        assert!(repo.is_ignored(&linked.join("ignored/file")));
+        assert!(!repo.is_ignored(&linked.join("src/added")));
+        let scores = repo.recency(&Default::default(), &linked).unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores["src/added"], 1);
+        let scores = repo
+            .recency(&Default::default(), &linked.join("src"))
+            .unwrap();
+        assert_eq!(scores["added"], 1);
     }
 
     #[test]
@@ -341,15 +269,9 @@ mod tests {
         );
     }
 
-    /// Regression: on case-insensitive filesystems libgit2 returns
-    /// statuses in a case-insensitive order. Our previous sorted-`Vec` +
-    /// `binary_search_by(Path::cmp)` lookup silently missed entries
-    /// because `Path::cmp` is byte-wise.
-    ///
-    /// This test uses deliberately mixed-case filenames so the two
-    /// orderings disagree, then checks every lookup succeeds.
     #[test]
-    fn lookup_is_case_exact_regardless_of_libgit2_sort_order() {
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
+    fn lookup_is_case_exact() {
         let tmp = TempDir::new().unwrap();
         // `std::fs::canonicalize` on Windows adds a `\\?\` UNC prefix that
         // libgit2's workdir string lacks. Use dunce so both sides match.
@@ -381,9 +303,9 @@ mod tests {
             fs::write(&p, format!("// {n}\n// edit\n")).unwrap();
         }
 
-        let repo = Repository::open(&base).unwrap();
+        let repo = crate::scm::ScmBackend::configured().open(&base).unwrap();
         let paths: Vec<PathBuf> = names.iter().map(|n| base.join(n)).collect();
-        let cache = ScmStatusCache::git_status_for_paths(&repo, &paths).unwrap();
+        let cache = repo.status_for_paths(&paths).unwrap();
 
         for (n, abs) in names.iter().zip(paths.iter()) {
             let status = cache.lookup_status(abs);
@@ -402,6 +324,7 @@ mod tests {
 
     // Paths are literal: `[id]` must not glob-match `i`/`d`, and new/deleted files still resolve.
     #[test]
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     fn status_for_paths_treats_paths_literally() {
         let tmp = TempDir::new().unwrap();
         let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
@@ -420,18 +343,45 @@ mod tests {
         fs::create_dir_all(base.join("fresh/dir")).unwrap();
         fs::write(base.join("fresh/dir/new.rs"), "z\n").unwrap();
 
-        let repo = Repository::open(&base).unwrap();
+        let repo = crate::scm::ScmBackend::configured().open(&base).unwrap();
         let paths: Vec<PathBuf> = ["app/[id]/page.tsx", "gone.rs", "fresh/dir/new.rs"]
             .iter()
             .map(|n| base.join(n))
             .collect();
-        let cache = ScmStatusCache::git_status_for_paths(&repo, &paths).unwrap();
+        let cache = repo.status_for_paths(&paths).unwrap();
 
         let status = |n: &str| cache.lookup_status(&base.join(n));
         assert!(status("app/[id]/page.tsx").is_some_and(|s| s.contains(Status::WT_MODIFIED)));
         assert!(status("gone.rs").is_some_and(|s| s.contains(Status::WT_DELETED)));
         assert!(status("fresh/dir/new.rs").is_some_and(|s| s.contains(Status::WT_NEW)));
         assert_eq!(status("app/i/page.tsx"), None);
+        fs::write(base.join("app/[id]/page.tsx"), "x\n").unwrap();
+        let clean = repo.status_for_paths(&paths[..1]).unwrap();
+        assert_eq!(clean.lookup_status(&paths[0]), Some(Status::CURRENT));
+
         assert_eq!(cache.statuses_len(), 3);
+    }
+}
+
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+fn wait_for_git_index_lock_release(git_dir: &Path) {
+    const GIT_LOCK_POLL: Duration = Duration::from_millis(10);
+    const GIT_LOCK_MAX_WAIT: Duration = Duration::from_millis(500);
+
+    let lock = git_dir.join("index.lock");
+    // Fast path: no lock present.
+    if !lock.exists() {
+        return;
+    }
+    let deadline = Instant::now() + GIT_LOCK_MAX_WAIT;
+    while lock.exists() && Instant::now() < deadline {
+        std::thread::sleep(GIT_LOCK_POLL);
+    }
+    if lock.exists() {
+        tracing::warn!(
+            "Proceeding with git status refresh despite lingering \
+             .git/index.lock at {} — will retry once it clears",
+            lock.display()
+        );
     }
 }

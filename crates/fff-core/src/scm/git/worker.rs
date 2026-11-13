@@ -23,7 +23,7 @@ impl Pending {
 }
 
 /// Condvar based queue that is used for batch processing events
-pub(super) struct GitStatusWorker {
+pub(in crate::scm) struct GitStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
@@ -37,7 +37,7 @@ impl GitStatusWorker {
         Self::with_pause_flag(Arc::default())
     }
 
-    pub(super) fn with_pause_flag(paused: Arc<AtomicBool>) -> Arc<Self> {
+    pub(in crate::scm) fn with_pause_flag(paused: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Pending::default()),
             cv: Condvar::new(),
@@ -155,7 +155,7 @@ impl ScmStatusWorker for GitStatusWorker {
     }
 }
 
-pub(super) fn spawn_initial_status(
+pub(in crate::scm) fn spawn_initial_status(
     workspace: ScmWorkspace,
 ) -> std::thread::JoinHandle<Option<ScmStatusCache>> {
     std::thread::spawn(move || {

@@ -1,5 +1,8 @@
+#[cfg(feature = "libgit2")]
 use ahash::AHashMap;
+#[cfg(feature = "libgit2")]
 use git2::{DiffOptions, Oid, Repository};
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -20,9 +23,11 @@ impl Default for GitRecencyConfig {
     }
 }
 
-const MAX_COMMITS_HARD_CAP: usize = 128;
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+pub(super) const MAX_COMMITS_HARD_CAP: usize = 128;
 
 // Computes per file recency bonuses
+#[cfg(feature = "libgit2")]
 #[tracing::instrument(skip(repo), level = tracing::Level::DEBUG)]
 pub(crate) fn compute_git_recency(
     repo: &Repository,
@@ -38,7 +43,9 @@ pub(crate) fn compute_git_recency(
     let head = head_ref.target()?;
     let head_branch = head_ref.shorthand().ok().map(str::to_owned);
 
-    let subdir = base_path_within_repo(repo, base_path);
+    let subdir = repo
+        .workdir()
+        .and_then(|root| base_path_within_repo(root, base_path));
     let max_commits = config.max_commits.min(MAX_COMMITS_HARD_CAP);
 
     let mut revwalk = repo.revwalk().ok()?;
@@ -133,8 +140,9 @@ pub(crate) fn compute_git_recency(
     Some(scores)
 }
 
-fn base_path_within_repo(repo: &Repository, base_path: &Path) -> Option<String> {
-    let workdir = crate::path_utils::normalize(repo.workdir()?.to_path_buf());
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+pub(super) fn base_path_within_repo(root: &Path, base_path: &Path) -> Option<String> {
+    let workdir = crate::path_utils::normalize(root.to_path_buf());
     let subdir = base_path.strip_prefix(workdir).ok()?;
     let subdir = crate::path_utils::to_canonical_slashes(&subdir.to_string_lossy()).into_owned();
     (!subdir.is_empty()).then_some(subdir)
@@ -142,6 +150,7 @@ fn base_path_within_repo(repo: &Repository, base_path: &Path) -> Option<String> 
 
 // The branch feature work is measured against: `origin/HEAD`, else
 // `init.defaultBranch` when configured, else `main`, else `master`.
+#[cfg(feature = "libgit2")]
 fn resolve_base_branch(repo: &Repository) -> Option<(String, Oid)> {
     let remote_head = repo
         .find_reference("refs/remotes/origin/HEAD")

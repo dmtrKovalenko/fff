@@ -873,6 +873,7 @@ version = "0.11.0"
 dependencies = [
  "ahash",
  "aho-corasick",
+ "bitflags 2.11.0",
  "blake3",
  "criterion",
  "ctor",
@@ -1750,6 +1751,7 @@ dependencies = [
  "gix-date",
  "gix-error",
  "gix-hash",
+ "gix-hashtable",
  "gix-object",
  "gix-revwalk",
  "gix-trace",

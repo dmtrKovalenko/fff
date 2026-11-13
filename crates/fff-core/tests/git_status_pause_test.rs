@@ -4,8 +4,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use fff_search::file_picker::FilePicker;
+use fff_search::git::Status;
 use fff_search::{FilePickerOptions, SharedFilePicker, SharedFrecency};
-use git2::Status;
 use tempfile::TempDir;
 
 const TIMEOUT: Duration = Duration::from_secs(30);

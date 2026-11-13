@@ -1,5 +1,6 @@
 PLENARY_DIR ?= ../plenary.nvim
 MINI_DIR ?= ../mini.nvim
+NVIM_FEATURES ?= zlob,gitoxide
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
@@ -16,7 +17,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
+.PHONY: build build-nvim build-e2e build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
 
 all: format test lint
 
@@ -44,13 +45,16 @@ sync-js-api-check:
 	done; \
 	exit $$status
 
-build:
-	cargo build --release --no-default-features --features zlob
+build: build-nvim
+	cargo build --release --workspace --exclude fff-nvim --no-default-features --features zlob
+
+build-nvim:
+	cargo build --release -p fff-nvim --no-default-features --features $(NVIM_FEATURES)
 
 # Only the crates the e2e suites load (nvim lua tests + C/bun/node FFI tests),
 # skipping fff-python (pyo3) and fff-mcp (tokio/rmcp) which e2e never touches.
-build-e2e:
-	cargo build --release -p fff-nvim -p fff-c --no-default-features --features zlob
+build-e2e: build-nvim
+	cargo build --release -p fff-c --no-default-features --features zlob
 
 # Build the C library, header, and pkg-config file via cargo-c.
 build-c-lib:
@@ -87,31 +91,31 @@ test-rust:
 	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim --exclude fff-python
 
 bench-search:
-	cargo bench -p fff-search --no-default-features --features zlob --bench fuzzy_search_bench -- $(BENCH_ARGS)
+	cargo bench -p fff-search --no-default-features --features zlob,libgit2 --bench fuzzy_search_bench -- $(BENCH_ARGS)
 
 bench-grep:
-	cargo bench -p fff-search --no-default-features --features zlob --bench grep_bench -- $(BENCH_ARGS)
+	cargo bench -p fff-search --no-default-features --features zlob,libgit2 --bench grep_bench -- $(BENCH_ARGS)
 
 bench-definition:
-	cargo bench -p fff-search --no-default-features --features zlob --bench definition_bench -- $(BENCH_ARGS)
+	cargo bench -p fff-search --no-default-features --features zlob,libgit2 --bench definition_bench -- $(BENCH_ARGS)
 
 # Watcher rescan harness: asserts that editing, build output, git activity and
 # preview reads all stay on the incremental path instead of re-walking the tree.
 test-rescan:
-	cargo test -p fff-search --no-default-features --features zlob \
+	cargo test -p fff-search --no-default-features --features zlob,libgit2 \
 		--lib --test rescan_regression -- rescan
 
 # Live probe for watcher rescan requests and their causes.
 # Usage: make rescan-probe DIR=~/some/repo [SECONDS=120]
 rescan-probe:
 	cargo run --release -p fff-nvim --bin rescan_probe \
-		--no-default-features --features zlob,rescan-stats -- \
+		--no-default-features --features $(NVIM_FEATURES),rescan-stats -- \
 		$(or $(DIR),.) $(if $(SECONDS),--seconds $(SECONDS),)
 
 # The same harness, restricted to cases that currently fail on purpose. Each
 # `#[ignore]` reason names the code that causes the unnecessary rescan.
 test-rescan-known-defects:
-	cargo test --no-fail-fast -p fff-search --no-default-features --features zlob \
+	cargo test --no-fail-fast -p fff-search --no-default-features --features zlob,libgit2 \
 		--lib --test rescan_regression -- --ignored --nocapture
 
 CC ?= cc

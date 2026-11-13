@@ -394,7 +394,7 @@ pub(crate) fn handle_debounced_events(
     let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
-        repo.as_deref(),
+        repo.as_ref(),
         ignore_options.disable_git,
     );
     let mut need_full_git_rescan = false;
@@ -899,7 +899,7 @@ fn index_new_directory(
     let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
-        repo.as_deref(),
+        repo.as_ref(),
         ignore_options.disable_git,
     );
     let mut join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
@@ -1017,7 +1017,7 @@ struct IgnoreFilter<'a> {
     // Ignore rules from the last walk.
     rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
     // Consult the active repository when the walker has no cached rules.
-    repo: Option<&'a dyn ScmRepository>,
+    repo: Option<&'a ScmRepository>,
     disable_git: bool,
 }
 
@@ -1025,7 +1025,7 @@ impl<'a> IgnoreFilter<'a> {
     fn new(
         base_path: &'a Path,
         rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-        repo: Option<&'a dyn ScmRepository>,
+        repo: Option<&'a ScmRepository>,
         disable_git: bool,
     ) -> Self {
         Self {
@@ -1268,7 +1268,7 @@ mod tests {
             &shared_picker,
             &SharedFrecency::noop(),
             &None,
-            &crate::scm::configured_backend().create_worker(Arc::default()),
+            &crate::scm::ScmBackend::configured().create_worker(Arc::default()),
         );
         {
             let guard = shared_picker.read().unwrap();
@@ -1360,7 +1360,7 @@ mod tests {
             &None,
             &shared_picker,
             &shared_frecency,
-            &crate::scm::configured_backend().create_worker(Arc::default()),
+            &crate::scm::ScmBackend::configured().create_worker(Arc::default()),
         );
 
         let received = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1475,12 +1475,19 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     #[test]
     fn dotgit_status_filter_matches_worktree_state_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-        let git_dir = repo.path().to_path_buf();
-        let repo = ScmWorkspace::discover(tmp.path());
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let workspace = ScmWorkspace::discover(tmp.path()).unwrap();
+        let git_dir = workspace.metadata.clone();
+        let repo = Some(workspace);
 
         let affecting = ["index", "index.lock", "HEAD", "logs/HEAD", "MERGE_HEAD"];
         for p in affecting {

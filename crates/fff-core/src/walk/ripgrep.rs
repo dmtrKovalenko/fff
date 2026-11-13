@@ -13,7 +13,7 @@ use std::sync::{
 #[tracing::instrument(skip_all, name = "ripgrep walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
-    backend: Option<&dyn crate::scm::ScmBackend>,
+    backend: Option<crate::scm::ScmBackend>,
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
@@ -88,7 +88,7 @@ pub(crate) fn walk_collect_files(
         pairs,
         dirs,
         // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
-        ignore_rules: (!is_git_repo).then(|| WalkIgnoreRules {
+        ignore_rules: backend.is_none().then(|| WalkIgnoreRules {
             inner: walk_builder.build_matchers().pop().expect("one walk root"),
         }),
     })

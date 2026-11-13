@@ -594,7 +594,9 @@ Caveat: the chosen file replaces the buffer in the invoking window even if it's 
 
 ### Git status highlighting
 
-The default build uses libgit2. Build with `cargo build --release -p fff-nvim --features gitoxide` to use gitoxide for repository-wide status scans. Set `FFF_SCM_BACKEND=libgit2` before starting Neovim to switch back without rebuilding. `FFF_SCM_BACKEND=gitoxide` on a build without the feature logs a warning and uses libgit2. Gitoxide can reduce scan time on large repositories but can increase peak memory. It shares Git discovery, targeted status updates, ignore rules, and commit history with the libgit2 backend. If a gitoxide scan fails, FFF logs a warning and uses libgit2 for the rest of the session.
+The Neovim binary uses gitoxide for Git status, repository discovery, ignore rules, and commit history. The Rust SDK defaults to libgit2.
+
+To build Neovim with libgit2 alone, run `make build-nvim NVIM_FEATURES=zlob,libgit2`. A single-backend build selects its backend at compile time. To include both backends, use `NVIM_FEATURES=zlob,gitoxide,libgit2`. A dual-backend build defaults to gitoxide. If a repository-wide status scan fails, this build uses libgit2 for that scan and subsequent repository-wide scans in the process. In that build, set `FFF_SCM_BACKEND=libgit2` before launching Neovim to select libgit2 explicitly.
 
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
 
@@ -988,7 +990,7 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm. It
 - **Content grep with three modes.** Plain literal (SIMD memmem), regex (the Rust `regex` crate), and fuzzy (Smith-Waterman per line). Auto-detects which mode to use from the pattern, falls back to fuzzy when a plain search returns zero hits.
 - **Multi-pattern OR search.** SIMD Aho-Corasick for "find any of these 20 identifiers at once", which is faster than regex alternation and a lot faster than 20 separate ripgrep runs.
 - **Background file watcher.** The index updates as files change. You never pay for a rescan on the hot path.
-- **Git status awareness.** Modified, staged, untracked, and ignored states are cached and returned with every result, so callers can sort or filter them without shelling out to git. The watcher talks to libgit2 directly instead of spawning the `git` CLI.
+- **Git status awareness.** Modified, staged, untracked, and ignored states are cached and returned with every result, so callers can sort or filter them without shelling out to git. The watcher reads status through the configured Git backend.
 - **Definition classifier.** A byte-level scanner on the Rust side checks whether the query matches the declared name in a `struct`, `fn`, `class`, `def`, or another supported declaration.
 
 ### Performance choices that matter

@@ -49,7 +49,7 @@ pub(crate) struct ScanConfig {
 /// current `FilePicker`) or [`ScanJob::initial`] (for the bootstrap
 /// scan, before the picker is published to `SharedPicker`).
 pub(crate) struct ScanJob {
-    backend: &'static dyn crate::scm::ScmBackend,
+    backend: crate::scm::ScmBackend,
     shared_picker: SharedFilePicker,
     shared_frecency: SharedFrecency,
     base_path: PathBuf,
@@ -116,7 +116,7 @@ impl ScanJob {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_initial(
-        backend: &'static dyn crate::scm::ScmBackend,
+        backend: crate::scm::ScmBackend,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         base_path: PathBuf,

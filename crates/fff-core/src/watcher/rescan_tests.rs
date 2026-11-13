@@ -714,7 +714,7 @@ impl Fixture {
             picker: SharedFilePicker::default(),
             frecency: shared_frecency,
             git_workdir,
-            git_worker: crate::scm::configured_backend().create_worker(Arc::default()),
+            git_worker: crate::scm::ScmBackend::configured().create_worker(Arc::default()),
             _tmp: tmp,
             _frecency_tmp: frecency_tmp,
         }

@@ -12,8 +12,9 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 gitoxide = ["fff/gitoxide"]
+libgit2 = ["fff/libgit2", "dep:git2"]
 # Pure-Rust walker by default; zlob is opt-in (needs Zig).
-default = ["ripgrep"]
+default = ["ripgrep", "gitoxide"]
 ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep", "dep:ignore"]
 zlob = ["fff/zlob", "fff-query-parser/zlob", "dep:zlob"]
 # Keep full-rescan accounting in a release build; required by rescan_probe.
@@ -32,7 +33,7 @@ fff = { package = "fff-search", path = "../fff-core", version = "0.11.0", defaul
 fff-query-parser = { path = "../fff-query-parser", version = "0.11.0", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 ctrlc = "3.4.2"
-git2 = { workspace = true }
+git2 = { workspace = true, optional = true }
 ignore = { version = "0.4.22", optional = true }
 mimalloc = { version = "0.1.47", features = ["local_dynamic_tls"] }
 mlua = { version = "0.11.1", features = ["module", "luajit"] }

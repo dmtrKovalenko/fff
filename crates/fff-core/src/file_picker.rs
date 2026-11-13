@@ -32,6 +32,7 @@ use crate::FFFStringStorage;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
+use crate::git::Status;
 use crate::git_recency::GitRecencyConfig;
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
@@ -52,7 +53,6 @@ use crate::walk::WalkOutput;
 use crate::watch::BackgroundWatcher;
 use ahash::AHashMap;
 use fff_query_parser::FFFQuery;
-use git2::Status;
 use rayon::prelude::*;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
@@ -694,7 +694,7 @@ pub struct FilePicker {
     /// Single serialized writer for all git-status updates (scan, watcher,
     /// FFI). Owned by the picker so it exists before the first scan; its
     /// consumer thread is spawned lazily once a git workdir is discovered.
-    pub(crate) scm_backend: &'static dyn ScmBackend,
+    pub(crate) scm_backend: ScmBackend,
     pub(crate) scm_status_worker: Arc<dyn ScmStatusWorker>,
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
@@ -1047,7 +1047,7 @@ impl FilePicker {
         let trace_id = crate::log::generate_trace_id();
         let trace_span = crate::log::trace_span(&trace_id, "picker");
 
-        let scm_backend = crate::scm::configured_backend();
+        let scm_backend = crate::scm::ScmBackend::configured();
         Ok(FilePicker {
             scm_backend,
             background_watcher: None,
@@ -2269,7 +2269,7 @@ pub struct ScanProgress {
 
 impl FileSync {
     pub(crate) fn discover_scm(
-        backend: &'static dyn ScmBackend,
+        backend: ScmBackend,
         base_path: &Path,
         disabled: bool,
     ) -> Option<ScmWorkspace> {

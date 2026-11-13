@@ -408,7 +408,7 @@ impl FrecencyTracker {
     pub fn get_modification_score(
         &self,
         modified_time: u64,
-        git_status: Option<git2::Status>,
+        git_status: Option<crate::git::Status>,
         mode: FFFMode,
     ) -> i64 {
         modification_score(modified_time, git_status, mode, self.get_now())
@@ -448,7 +448,7 @@ impl FrecencyReader<'_> {
     pub(crate) fn modification_score(
         &self,
         modified_time: u64,
-        git_status: Option<git2::Status>,
+        git_status: Option<crate::git::Status>,
         mode: FFFMode,
     ) -> i64 {
         modification_score(modified_time, git_status, mode, self.now)
@@ -478,7 +478,7 @@ fn decay_sum(accesses: &VecDeque<u64>, now: u64, mode: FFFMode) -> f64 {
 
 fn modification_score(
     modified_time: u64,
-    git_status: Option<git2::Status>,
+    git_status: Option<crate::git::Status>,
     mode: FFFMode,
     now: u64,
 ) -> i64 {
@@ -615,7 +615,7 @@ mod tests {
         let tracker = FrecencyTracker::open(temp_dir.to_str().unwrap()).unwrap();
 
         let current_time = tracker.get_now();
-        let git_status = Some(git2::Status::WT_MODIFIED);
+        let git_status = Some(crate::git::Status::WT_MODIFIED);
 
         // At 5 minutes: should interpolate between 16 and 8 points
         let five_minutes_ago = current_time - (5 * 60);

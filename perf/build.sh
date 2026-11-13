@@ -35,7 +35,7 @@ docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
   --env PATH=/zig:/rust/bin:/tools:/usr/local/bin:/usr/bin:/bin \
   --workdir /src fff-perf-build \
   cargo zigbuild --locked --profile ci --target "$target" -p fff-search \
-    --no-default-features --features zlob --benches --message-format=json-render-diagnostics \
+    --no-default-features --features zlob,libgit2 --benches --message-format=json-render-diagnostics \
   | jq -Rr 'fromjson? | if .reason == "compiler-message" then .message.rendered // empty
     elif .reason == "compiler-artifact" and .target.kind == ["bench"] and .executable
     then [.target.name, .executable] | @tsv else empty end' > "$output/build.log" || {

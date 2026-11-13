@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, SharedFilePicker, SharedFrecency};
+use fff_search::{
+    FilePickerOptions, FuzzySearchOptions, QueryParser, SharedFilePicker, SharedFrecency,
+};
 
 const MARKER: &str = "__jai_runtime_init";
 
@@ -43,6 +45,47 @@ fn plain_opts() -> GrepSearchOptions {
         trim_whitespace: false,
         abort_signal: None,
     }
+}
+
+#[test]
+fn file_search_reports_binary_without_content_indexing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let binary = format!("{}\0", "text header\n".repeat(4096));
+    fs::write(tmp.path().join("sample-blob.txt"), binary).unwrap();
+    fs::write(tmp.path().join("sample-note.txt"), "plain text\n").unwrap();
+
+    let shared = SharedFilePicker::default();
+    FilePicker::new_with_shared_state(
+        shared.clone(),
+        SharedFrecency::noop(),
+        FilePickerOptions {
+            base_path: tmp.path().to_string_lossy().into_owned(),
+            enable_content_indexing: false,
+            watch: false,
+            mode: FFFMode::Ai,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(shared.wait_for_indexing_complete(Duration::from_secs(10)));
+
+    let guard = shared.read().unwrap();
+    let picker = guard.as_ref().unwrap();
+    let query = QueryParser::default().parse("sample");
+    let result = picker.fuzzy_search(&query, None, FuzzySearchOptions::default());
+    let mut flags: Vec<_> = result
+        .items
+        .iter()
+        .map(|file| (file.relative_path(picker), file.is_binary()))
+        .collect();
+    flags.sort_unstable();
+    assert_eq!(
+        flags,
+        [
+            ("sample-blob.txt".to_owned(), true),
+            ("sample-note.txt".to_owned(), false),
+        ]
+    );
 }
 
 #[test]

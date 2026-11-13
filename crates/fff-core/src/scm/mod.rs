@@ -1,24 +1,15 @@
 use crate::error::Result;
+mod backend;
 pub mod git;
+mod repository;
 use crate::shared::{SharedFrecency, WeakFilePicker};
-use std::sync::{Arc, LazyLock, atomic::AtomicBool};
-use std::thread::JoinHandle;
+pub(crate) use backend::ScmBackend;
+pub(crate) use repository::ScmRepository;
+use std::sync::Arc;
 
-use crate::git_recency::GitRecencyConfig;
 use ahash::AHashMap;
-use git::LibGit2;
-use git2::Status;
+use git::Status;
 use std::path::{Path, PathBuf};
-
-pub(crate) trait ScmBackend: std::fmt::Debug + Sync {
-    fn discover(&'static self, path: &Path) -> Option<ScmWorkspace>;
-    fn open(&self, root: &Path) -> Result<Box<dyn ScmRepository>>;
-    fn metadata_dir_name(&self) -> &'static str;
-    fn status_metadata_changed(&self, relative: &Path) -> bool;
-    fn create_worker(&self, paused: Arc<AtomicBool>) -> Arc<dyn ScmStatusWorker>;
-    fn spawn_initial_status(&self, workspace: ScmWorkspace) -> JoinHandle<Option<ScmStatusCache>>;
-    fn watch_dirs(&self, metadata: &Path) -> Vec<PathBuf>;
-}
 
 pub(crate) trait ScmStatusWorker: Send + Sync {
     fn on_workspace_scan(self: Arc<Self>, picker: WeakFilePicker, frecency: SharedFrecency);
@@ -29,17 +20,9 @@ pub(crate) trait ScmStatusWorker: Send + Sync {
     fn signal_shutdown(&self);
 }
 
-pub(crate) trait ScmRepository {
-    fn status(&self, full: bool) -> Result<ScmStatusCache>;
-    fn status_for_paths(&self, paths: &[PathBuf]) -> Result<ScmStatusCache>;
-    fn recency(&self, config: &GitRecencyConfig, base: &Path) -> Option<AHashMap<String, i16>>;
-    fn is_ignored(&self, path: &Path) -> bool;
-    fn wait_for_write(&self);
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ScmWorkspace {
-    pub(crate) backend: &'static dyn ScmBackend,
+    pub(crate) backend: ScmBackend,
     pub(crate) workdir: PathBuf,
     pub(crate) metadata: PathBuf,
     pub(crate) shared_root: Option<PathBuf>,
@@ -48,10 +31,10 @@ pub(crate) struct ScmWorkspace {
 impl ScmWorkspace {
     #[cfg(test)]
     pub(crate) fn discover(path: &Path) -> Option<Self> {
-        configured_backend().discover(path)
+        ScmBackend::configured().discover(path)
     }
 
-    pub(crate) fn open(&self) -> Result<Box<dyn ScmRepository>> {
+    pub(crate) fn open(&self) -> Result<ScmRepository> {
         self.backend.open(&self.workdir)
     }
 
@@ -77,33 +60,10 @@ impl ScmWorkspace {
     }
 }
 
-pub(crate) fn is_metadata_path(path: &Path, backend: Option<&dyn ScmBackend>) -> bool {
-    let name = backend.unwrap_or(&LibGit2).metadata_dir_name();
+pub(crate) fn is_metadata_path(path: &Path, backend: Option<ScmBackend>) -> bool {
+    let name = backend.map_or(".git", ScmBackend::metadata_dir_name);
     path.components()
         .any(|component| component.as_os_str() == name)
-}
-
-pub(crate) fn configured_backend() -> &'static dyn ScmBackend {
-    static BACKEND: LazyLock<&'static dyn ScmBackend> =
-        LazyLock::new(|| select_backend(std::env::var("FFF_SCM_BACKEND").ok().as_deref()));
-    *BACKEND
-}
-
-pub(crate) fn select_backend(name: Option<&str>) -> &'static dyn ScmBackend {
-    let default = if cfg!(feature = "gitoxide") {
-        "gitoxide"
-    } else {
-        "libgit2"
-    };
-    match name.unwrap_or(default) {
-        #[cfg(feature = "gitoxide")]
-        "gitoxide" => &git::gitoxide::GITOXIDE,
-        "libgit2" => &LibGit2,
-        name => {
-            tracing::warn!(name, "Unavailable SCM backend, using libgit2");
-            &LibGit2
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]

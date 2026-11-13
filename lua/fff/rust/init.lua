@@ -65,7 +65,7 @@ if not backend or load_err then
   end
 
   local err_msg = string.format(
-    'Failed to load fff rust backend.\nError: %s\nSearched paths:\n%s\nMake sure binary exists or make it exists using \n `:lua require("fff.download").download_or_build_binary()`\nor\n`cargo build --release`\n(and rerun neovim after)',
+    'Failed to load fff rust backend.\nError: %s\nSearched paths:\n%s\nMake sure binary exists or make it exists using \n `:lua require("fff.download").download_or_build_binary()`\nor\n`cargo build --release -p fff-nvim`\n(and rerun neovim after)',
     tostring(load_err),
     vim.inspect(resolved)
   )

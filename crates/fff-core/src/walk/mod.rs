@@ -95,7 +95,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(
             root,
-            Some(&crate::scm::git::LibGit2),
+            Some(crate::scm::ScmBackend::configured()),
             false,
             1,
             &counter,
@@ -247,7 +247,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(
             root,
-            Some(&crate::scm::git::LibGit2),
+            Some(crate::scm::ScmBackend::configured()),
             false,
             1,
             &counter,
@@ -306,7 +306,7 @@ mod tests {
             let counter = Arc::new(AtomicUsize::new(0));
             let out = walk_collect_files(
                 base,
-                Some(&crate::scm::git::LibGit2),
+                Some(crate::scm::ScmBackend::configured()),
                 false,
                 1,
                 &counter,
@@ -366,7 +366,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(
             root,
-            Some(&crate::scm::git::LibGit2),
+            Some(crate::scm::ScmBackend::configured()),
             false,
             1,
             &counter,
@@ -426,7 +426,7 @@ mod tests {
             let counter = Arc::new(AtomicUsize::new(0));
             walk_collect_files(
                 &root,
-                Some(&crate::scm::git::LibGit2),
+                Some(crate::scm::ScmBackend::configured()),
                 false,
                 1,
                 &counter,

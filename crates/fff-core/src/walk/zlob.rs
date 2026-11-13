@@ -26,7 +26,7 @@ struct WorkerFiles {
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
-    backend: Option<&dyn crate::scm::ScmBackend>,
+    backend: Option<crate::scm::ScmBackend>,
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
