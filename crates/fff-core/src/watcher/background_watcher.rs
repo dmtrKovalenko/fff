@@ -1,6 +1,7 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::{FFFMode, FilePickerIgnoreOptions};
+use crate::parallelism::indexing_pool;
 use crate::rescan_stats::RescanReason;
 use crate::scm::ScmStatusWorker;
 use crate::scm::{ScmRepository, ScmWorkspace};
@@ -8,9 +9,10 @@ use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
+use rayon::slice::ParallelSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -260,39 +262,65 @@ impl BackgroundWatcher {
             let mut watched = 0usize;
             let mut consecutive_failures = 0usize;
 
-            // `inotify` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding this lock is free
+            let mut directories = Vec::new();
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
-                use std::ops::ControlFlow;
                 picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+                    directories.push(PathOp::watch_non_recursive(dir));
+                    std::ops::ControlFlow::Continue(())
+                });
+            }
+            // The debouncer keeps sorted roots; append in order and register off-lock.
+            indexing_pool().install(|| {
+                directories.par_sort_unstable_by(|left, right| left.as_path().cmp(right.as_path()));
+            });
+            let mut directories = directories.into_iter();
+            'register: loop {
+                let mut batch = directories.by_ref().take(1024).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                loop {
+                    let batch_len = batch.len();
+                    match debouncer.update_paths(batch) {
                         Ok(()) => {
-                            watched += 1;
+                            watched += batch_len;
                             consecutive_failures = 0;
-                            ControlFlow::Continue(())
+                            break;
                         }
-                        Err(e) => {
+                        Err(error) => {
+                            let applied = batch_len.saturating_sub(
+                                error.remaining.len() + usize::from(error.origin.is_some()),
+                            );
+                            watched += applied;
+                            if applied > 0 {
+                                consecutive_failures = 0;
+                            }
                             consecutive_failures += 1;
                             if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
+                                warn!(
+                                    error = %error.source,
+                                    path = ?error.origin.as_ref().map(PathOp::as_path),
+                                    watched,
+                                    "Failed to register directory watch"
+                                );
                             }
-
                             if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
                                 warn!(
                                     consecutive_failures,
                                     watched,
                                     "Giving up setting file watcher for all the directories. Check if your system has enough fs watchers limit."
                                 );
-
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
+                                break 'register;
+                            }
+                            batch = error.remaining;
+                            if batch.is_empty() {
+                                break;
                             }
                         }
                     }
-                });
+                }
             }
 
             tracing::info!(
@@ -363,7 +391,7 @@ pub(crate) fn handle_debounced_events(
         .read()
         .ok()
         .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
-    let filter = IgnoreFilter::new(
+    let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
         repo.as_deref(),
@@ -418,7 +446,7 @@ pub(crate) fn handle_debounced_events(
                     .paths
                     .iter()
                     // but we are smart enough and not falling into the paths
-                    .all(|p| !p.is_dir() && !filter.is_ignored(p));
+                    .all(|p| !p.is_dir() && !filter.is_ignored(p, false));
 
             if !small_and_known && try_trigger_full_rescan(RescanReason::KernelEventLoss) {
                 return Vec::new();
@@ -447,7 +475,7 @@ pub(crate) fn handle_debounced_events(
             if ignore_file_changed {
                 if path
                     .parent()
-                    .is_some_and(|parent| filter.is_ignored(parent))
+                    .is_some_and(|parent| filter.is_ignored(parent, true))
                 {
                     continue;
                 }
@@ -507,7 +535,8 @@ pub(crate) fn handle_debounced_events(
             let (is_dir, is_ignored) = if is_removed {
                 (false, true)
             } else {
-                (path.is_dir(), filter.is_ignored(path))
+                let is_dir = path.is_dir();
+                (is_dir, filter.is_ignored(path, is_dir))
             };
 
             if is_folder_removal {
@@ -867,27 +896,27 @@ fn index_new_directory(
     };
 
     // Subtree-rooted walks still need to check the original root's ignore rules.
-    let filter = IgnoreFilter::new(
+    let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
         repo.as_deref(),
         ignore_options.disable_git,
     );
-    let join_unless_ignored = |relative_path: &str| -> Option<PathBuf> {
+    let mut join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
         let path = walk_base.join(relative_path);
-        (scope.is_some() || !filter.is_ignored(&path)).then_some(path)
+        (scope.is_some() || !filter.is_ignored(&path, is_dir)).then_some(path)
     };
 
     let files_to_add: Vec<PathBuf> = walk
         .pairs
         .iter()
-        .filter_map(|(_, path)| join_unless_ignored(path))
+        .filter_map(|(_, path)| join_unless_ignored(path, false))
         .collect();
 
     let subdirs: Vec<PathBuf> = walk
         .dirs
         .iter()
-        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/')))
+        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/'), true))
         .collect();
 
     if files_to_add.is_empty() {
@@ -985,7 +1014,7 @@ fn watch_dirs_nonrecursive<'a>(
 
 struct IgnoreFilter<'a> {
     base_path: &'a Path,
-    /// Reusable ignore rules from the last walk (zlob backend only).
+    // Ignore rules from the last walk.
     rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
     // Consult the active repository when the walker has no cached rules.
     repo: Option<&'a dyn ScmRepository>,
@@ -1007,16 +1036,15 @@ impl<'a> IgnoreFilter<'a> {
         }
     }
 
-    /// Whether `path` (absolute) is ignored.
-    fn is_ignored(&self, path: &Path) -> bool {
-        if let Some(rules) = self.rules.as_ref() {
+    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        if let Some(rules) = self.rules.as_mut() {
             let Ok(relative) = path.strip_prefix(self.base_path) else {
                 return false;
             };
-            // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
-            // layer internally, so a leaf under an ignored directory (rule
-            // `build/`, path `build/out.rs`) is caught in one call.
-            return rules.is_ignored(relative);
+            // Ripgrep caches directory rules. Start each batch with the unloaded matcher.
+            #[cfg(not(feature = "zlob"))]
+            let rules = Arc::make_mut(rules);
+            return rules.is_ignored(relative, is_dir);
         }
         match self.repo {
             Some(repo) => repo.is_ignored(path),

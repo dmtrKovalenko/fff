@@ -21,17 +21,52 @@ const NO_COLUMN: u16 = u16::MAX;
 /// Bigram keys only ever pair printable bytes (32..=126) which is 95 ^ 2
 pub const BIGRAM_KEY_SLOTS: usize = 95 * 95;
 
-// Slot in the compact lookup for a printable bigram key (`hi << 8 | lo`).
+// A bigram key holds two bytes in one `u16`. The first byte is in the high 8 bits.
+// The second byte is in the low 8 bits. The key is equal to `u16::from_be_bytes([first, second])`.
+// Each byte keeps all its 8 bits. Thus, two different byte pairs cannot have the same key.
+// The scratch bitmap of the builder uses `SEEN_BYTE_BITS`, because it holds only normalized bytes.
+pub(crate) const BIGRAM_KEY_SHIFT: u32 = u8::BITS;
+
+#[inline(always)]
+pub(crate) fn bigram_key(first: u8, second: u8) -> u16 {
+    (first as u16) << BIGRAM_KEY_SHIFT | second as u16
+}
+
+#[inline(always)]
+fn split_bigram_key(key: u16) -> (u8, u8) {
+    ((key >> BIGRAM_KEY_SHIFT) as u8, key as u8)
+}
+
+// Slot in the compact lookup for a printable bigram key.
 #[inline(always)]
 fn key_slot(key: u16) -> usize {
-    let hi = (key >> 8) as usize;
-    let lo = (key & 0xFF) as usize;
+    let (first, second) = split_bigram_key(key);
+    pair_slot(first as usize, second as usize)
+}
+
+#[inline(always)]
+fn pair_slot(hi: usize, lo: usize) -> usize {
     debug_assert!((32..=126).contains(&hi) && (32..=126).contains(&lo));
     (hi - 32) * 95 + (lo - 32)
 }
 
-/// 1024 × u64 = 8 KB covers all 65536 possible bigram keys.
-const SEEN_WORDS: usize = 1024;
+// Normalized bytes are 0 or 32..=126, so the largest one, `~`, sets the width.
+const SEEN_BYTE_BITS: u32 = u8::BITS - b'~'.leading_zeros();
+const SEEN_BYTE_MASK: usize = (1 << SEEN_BYTE_BITS) - 1;
+// One bit per normalized pair: 2^14 bits = 256 × u64 = 2 KiB per scratch bitmap.
+const SEEN_WORDS: usize = (1 << (2 * SEEN_BYTE_BITS)) / u64::BITS as usize;
+// Bitmap words that share one leading byte.
+const SEEN_WORDS_PER_BYTE: usize = SEEN_WORDS >> SEEN_BYTE_BITS;
+
+#[inline(always)]
+fn seen_key(hi: u8, lo: u8) -> usize {
+    (hi as usize) << SEEN_BYTE_BITS | lo as usize
+}
+
+#[inline(always)]
+fn seen_key_slot(key: usize) -> usize {
+    pair_slot(key >> SEEN_BYTE_BITS, key & SEEN_BYTE_MASK)
+}
 
 /// Below this many bitset words (512 KB) sparse encoding runs inline instead of on the pool.
 const PARALLEL_ENCODE_MIN_WORDS: usize = 1 << 16;
@@ -41,6 +76,8 @@ const PARALLEL_ENCODE_MIN_WORDS: usize = 1 << 16;
 struct SlabPtrs {
     consec: *mut u64,
     skip: *mut u64,
+    consec_words: usize,
+    skip_words: usize,
 }
 
 /// Content size where the branchless two-pass `add_long_content` overtakes
@@ -115,8 +152,7 @@ impl BigramIndexBuilder {
     }
 
     #[inline]
-    fn get_or_alloc_column(&self, key: u16) -> u16 {
-        let slot = key_slot(key);
+    fn get_or_alloc_column(&self, slot: usize) -> u16 {
         let current = self.lookup[slot].load(Ordering::Relaxed);
         if current != NO_COLUMN {
             return current;
@@ -146,24 +182,54 @@ impl BigramIndexBuilder {
 
     #[doc(hidden)] // `pub` (via `#[doc(hidden)]`) only for benchmarking
     pub fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
-        if content.len() < 2 {
-            return;
+        if self.add_file_content_untracked(skip_builder, file_idx, content) {
+            self.populated.fetch_add(1, Ordering::Relaxed);
+            skip_builder.populated.fetch_add(1, Ordering::Relaxed);
         }
+    }
 
-        debug_assert!(file_idx < self.file_count);
-        let word_idx = file_idx / 64;
-        let bit_mask = 1u64 << (file_idx % 64);
+    fn add_file_content_untracked(
+        &self,
+        skip_builder: &Self,
+        file_idx: usize,
+        content: &[u8],
+    ) -> bool {
+        if content.len() < 2 {
+            return false;
+        }
 
         // No slab means the OS refused the mapping: leave the index empty.
         let (Some(consec_base), Some(skip_base)) =
             (self.col_data_ptr(), skip_builder.col_data_ptr())
         else {
-            return;
+            return false;
         };
-        let bases = SlabPtrs {
-            consec: consec_base,
-            skip: skip_base,
-        };
+        self.add_file_content_to(
+            skip_builder,
+            file_idx,
+            content,
+            SlabPtrs {
+                consec: consec_base,
+                skip: skip_base,
+                consec_words: self.words,
+                skip_words: skip_builder.words,
+            },
+        )
+    }
+
+    fn add_file_content_to(
+        &self,
+        skip_builder: &Self,
+        file_idx: usize,
+        content: &[u8],
+        bases: SlabPtrs,
+    ) -> bool {
+        if content.len() < 2 {
+            return false;
+        }
+        debug_assert!(file_idx < self.file_count);
+        let word_idx = file_idx / 64;
+        let bit_mask = 1u64 << (file_idx % 64);
 
         NORM_BUF.with_borrow_mut(|buf| {
             let len = content.len();
@@ -183,8 +249,7 @@ impl BigramIndexBuilder {
             }
         });
 
-        self.populated.fetch_add(1, Ordering::Relaxed);
-        skip_builder.populated.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     // Branchless two-pass: set every pair in stack-local bitmaps, including
@@ -199,21 +264,19 @@ impl BigramIndexBuilder {
         bit_mask: u64,
         bases: SlabPtrs,
     ) {
-        // Stack-local dedup bitsets: 1024 × u64 = 8 KB each, covers all 65536
-        // bigram keys. Has to fit in L1 cache.
         let mut seen_consec = [0u64; SEEN_WORDS];
         let mut seen_skip = [0u64; SEEN_WORDS];
 
         let mut n0 = n[0];
         let mut n1 = n[1];
 
-        let key = (n0 as usize) << 8 | n1 as usize;
-        // SAFETY: key < 65536, so key >> 6 < 1024 = SEEN_WORDS.
+        let key = seen_key(n0, n1);
+        // SAFETY: seen_key of two normalized bytes is below SEEN_WORDS * 64.
         unsafe { *seen_consec.get_unchecked_mut(key >> 6) |= 1u64 << (key & 63) };
 
         for &cur in &n[2..] {
-            let ck = (n1 as usize) << 8 | cur as usize;
-            let sk = (n0 as usize) << 8 | cur as usize;
+            let ck = seen_key(n1, cur);
+            let sk = seen_key(n0, cur);
             unsafe {
                 *seen_consec.get_unchecked_mut(ck >> 6) |= 1u64 << (ck & 63);
                 *seen_skip.get_unchecked_mut(sk >> 6) |= 1u64 << (sk & 63);
@@ -223,8 +286,14 @@ impl BigramIndexBuilder {
             n1 = cur;
         }
 
-        self.flush_seen(&seen_consec, word_idx, bit_mask, bases.consec);
-        skip_builder.flush_seen(&seen_skip, word_idx, bit_mask, bases.skip);
+        self.flush_seen(
+            &seen_consec,
+            word_idx,
+            bit_mask,
+            bases.consec,
+            bases.consec_words,
+        );
+        skip_builder.flush_seen(&seen_skip, word_idx, bit_mask, bases.skip, bases.skip_words);
     }
 
     #[inline(always)]
@@ -242,15 +311,15 @@ impl BigramIndexBuilder {
         let SlabPtrs {
             consec: consec_base,
             skip: skip_base,
+            consec_words,
+            skip_words,
         } = bases;
-        let consec_words = self.words;
-        let skip_words = skip_builder.words;
 
         let mut n0 = n[0];
         let mut n1 = n[1];
 
         if n0 != 0 && n1 != 0 {
-            let key = (n0 as u16) << 8 | n1 as u16;
+            let key = seen_key(n0, n1);
             self.record_bigram(
                 &mut seen_consec,
                 key,
@@ -264,7 +333,7 @@ impl BigramIndexBuilder {
         for &cur in &n[2..] {
             if cur != 0 {
                 if n1 != 0 {
-                    let key = (n1 as u16) << 8 | cur as u16;
+                    let key = seen_key(n1, cur);
                     self.record_bigram(
                         &mut seen_consec,
                         key,
@@ -275,7 +344,7 @@ impl BigramIndexBuilder {
                     );
                 }
                 if n0 != 0 {
-                    let key = (n0 as u16) << 8 | cur as u16;
+                    let key = seen_key(n0, cur);
                     skip_builder.record_bigram(
                         &mut seen_skip,
                         key,
@@ -295,22 +364,21 @@ impl BigramIndexBuilder {
     fn record_bigram(
         &self,
         seen: &mut [u64; SEEN_WORDS],
-        key: u16,
+        key: usize,
         word_idx: usize,
         bit_mask: u64,
         col_base: *mut u64,
         words: usize,
     ) {
-        let k = key as usize;
-        let w = k >> 6;
-        let bit = 1u64 << (k & 63);
-        // SAFETY: w = key/64 with key: u16, so w < 1024 = SEEN_WORDS.
+        let w = key >> 6;
+        let bit = 1u64 << (key & 63);
+        // SAFETY: callers pass seen_key of normalized bytes, so w < SEEN_WORDS.
         let prev = unsafe { *seen.get_unchecked(w) };
         if prev & bit == 0 {
             unsafe {
                 *seen.get_unchecked_mut(w) = prev | bit;
             }
-            let col = self.get_or_alloc_column(key);
+            let col = self.get_or_alloc_column(seen_key_slot(key));
             if col != NO_COLUMN {
                 unsafe {
                     let p = col_base.add(col as usize * words + word_idx);
@@ -326,8 +394,8 @@ impl BigramIndexBuilder {
         word_idx: usize,
         bit_mask: u64,
         col_base: *mut u64,
+        words: usize,
     ) {
-        let words = self.words;
         // SEEN_WORDS is a multiple of 8, so the remainder is always empty.
         for (blk, block) in seen.as_chunks::<8>().0.iter().enumerate() {
             // OR-test whole blocks so the mostly-empty bitmap scans fast.
@@ -336,15 +404,16 @@ impl BigramIndexBuilder {
             }
             for (j, &word_bits) in block.iter().enumerate() {
                 let w = blk * 8 + j;
-                let mut bits = match w & 3 {
-                    _ if w < 4 => 0,
+                // Skip 0-sentinel pairs: (0, x) fills the first words, (x, 0) is bit 0 of each run.
+                let mut bits = match w % SEEN_WORDS_PER_BYTE {
+                    _ if w < SEEN_WORDS_PER_BYTE => 0,
                     0 => word_bits & !1,
                     _ => word_bits,
                 };
                 while bits != 0 {
-                    let key = (w << 6 | bits.trailing_zeros() as usize) as u16;
+                    let key = w << 6 | bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let col = self.get_or_alloc_column(key);
+                    let col = self.get_or_alloc_column(seen_key_slot(key));
                     if col != NO_COLUMN {
                         unsafe {
                             let p = col_base.add(col as usize * words + word_idx);
@@ -352,6 +421,24 @@ impl BigramIndexBuilder {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn flush_chunk(&self, chunk: &[u64], base_idx: usize, len: usize, col_base: *mut u64) {
+        let chunk_words = BIGRAM_CHUNK_FILES / 64;
+        let words = len.div_ceil(64);
+        for (col, bits) in chunk.chunks_exact(chunk_words).enumerate() {
+            if bits.iter().all(|&word| word == 0) {
+                continue;
+            }
+            // Each chunk owns disjoint, word-aligned file indices in every column.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bits.as_ptr(),
+                    col_base.add(col * self.words + base_idx / 64),
+                    words,
+                );
             }
         }
     }
@@ -370,6 +457,14 @@ impl BigramIndexBuilder {
     /// Ubiquitous columns (≥90%) are omitted because they barely filter.
     #[inline(always)]
     pub fn compress(self, min_density_pct: Option<u32>) -> BigramFilter {
+        self.compress_in_pool(min_density_pct, &crate::parallelism::BACKGROUND_THREAD_POOL)
+    }
+
+    fn compress_in_pool(
+        self,
+        min_density_pct: Option<u32>,
+        pool: &rayon::ThreadPool,
+    ) -> BigramFilter {
         let cols = self.columns_used() as usize;
         let words = self.words;
         let file_count = self.file_count;
@@ -388,7 +483,9 @@ impl BigramIndexBuilder {
         // Pass 1: pick the columns worth keeping, in slab order so the in-place
         // compaction below only ever moves a column towards the front.
         let mut kept: Vec<(usize, u16, u32)> = Vec::new();
-        if let Some(col_data) = col_data.as_deref() {
+        if populated > 0
+            && let Some(col_data) = col_data.as_deref()
+        {
             for (slot, old_col) in old_lookup.iter().enumerate() {
                 let old_col = old_col.load(Ordering::Relaxed);
                 if old_col == NO_COLUMN || old_col as usize >= cols {
@@ -442,8 +539,7 @@ impl BigramIndexBuilder {
         let encoded: Vec<Option<Vec<u8>>> = if kept.len() * words < PARALLEL_ENCODE_MIN_WORDS {
             kept.iter().map(encode).collect()
         } else {
-            crate::parallelism::BACKGROUND_THREAD_POOL
-                .install(|| kept.par_iter().map(encode).collect())
+            pool.install(|| kept.par_iter().map(encode).collect())
         };
 
         // Pass 3: compact dense columns to the front of the builder slab (no
@@ -452,7 +548,8 @@ impl BigramIndexBuilder {
         let mut dense_count: usize = 0;
         let mut sparse_slots: Vec<usize> = Vec::new();
         let mut sparse_offsets: Vec<u32> = vec![0];
-        let mut sparse_data: Vec<u8> = Vec::new();
+        let sparse_bytes = encoded.iter().flatten().map(Vec::len).sum();
+        let mut sparse_data: Vec<u8> = Vec::with_capacity(sparse_bytes);
 
         for ((slot, old_col, _), sparse) in kept.iter().zip(encoded) {
             match sparse {
@@ -484,8 +581,6 @@ impl BigramIndexBuilder {
         for (i, slot) in sparse_slots.into_iter().enumerate() {
             lookup[slot] = (dense_count + i) as u16;
         }
-        sparse_data.shrink_to_fit();
-
         BigramFilter {
             rare_keys,
             lookup,
@@ -619,7 +714,7 @@ impl BigramFilter {
         let mut prev = pattern[0];
         for &b in &pattern[1..] {
             if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key = bigram_key(prev.to_ascii_lowercase(), b.to_ascii_lowercase());
                 if let Some(col) = self.column_ref(key) {
                     Self::and_column(&mut result, col);
                     has_filter = true;
@@ -628,13 +723,8 @@ impl BigramFilter {
             prev = b;
         }
 
-        // strid-1 bigrams
-        if let Some(skip) = &self.skip_index
-            && pattern.len() >= 3
-            && let Some(skip_candidates) = skip.query_skip(pattern)
-        {
-            bitset_and(&mut result, &skip_candidates);
-            has_filter = true;
+        if let Some(skip) = &self.skip_index {
+            has_filter |= skip.query_skip_into(pattern, &mut result);
         }
 
         has_filter.then_some(result)
@@ -642,28 +732,27 @@ impl BigramFilter {
 
     /// Query using stride-2 bigrams from the pattern.
     /// For "ABCDE" queries with keys (A,C), (B,D), (C,E).
-    fn query_skip(&self, pattern: &[u8]) -> Option<Vec<u64>> {
-        let mut result = vec![u64::MAX; self.words];
-        if !self.file_count.is_multiple_of(64) {
-            let last = self.words - 1;
-            result[last] = (1u64 << (self.file_count % 64)) - 1;
-        }
-
+    fn query_skip_into(&self, pattern: &[u8], result: &mut [u64]) -> bool {
+        let len = self.words.min(result.len());
+        let result = &mut result[..len];
         let mut has_filter = false;
 
         for i in 0..pattern.len().saturating_sub(2) {
             let a = pattern[i];
             let b = pattern[i + 2];
             if (32..=126).contains(&a) && (32..=126).contains(&b) {
-                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key = bigram_key(a.to_ascii_lowercase(), b.to_ascii_lowercase());
                 if let Some(col) = self.column_ref(key) {
-                    Self::and_column(&mut result, col);
+                    Self::and_column(result, col);
                     has_filter = true;
                 }
             }
         }
 
-        has_filter.then_some(result)
+        if has_filter && len == self.words && !self.file_count.is_multiple_of(64) {
+            result[len - 1] &= (1u64 << (self.file_count % 64)) - 1;
+        }
+        has_filter
     }
 
     /// Resolve a bigram key to its stored column, if the index kept one.
@@ -773,9 +862,8 @@ impl BigramFilter {
     /// Dense column for a printable bigram key, or `u16::MAX` when absent.
     #[inline]
     pub fn column(&self, key: u16) -> u16 {
-        let hi = key >> 8;
-        let lo = key & 0xFF;
-        if !(32..=126).contains(&hi) || !(32..=126).contains(&lo) {
+        let (first, second) = split_bigram_key(key);
+        if !(32..=126).contains(&first) || !(32..=126).contains(&second) {
             return NO_COLUMN;
         }
         self.lookup[key_slot(key)]
@@ -958,14 +1046,14 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
     if content.len() < 2 {
         return Vec::new();
     }
-    // Use a flat bitset (65536 bits = 8 KB) for dedup — faster than HashSet.
-    let mut seen = vec![0u64; 1024]; // 1024 * 64 = 65536 bits
+    // One bit per possible key (2^16 bits = 8 KiB). Dedup with a flat bitset is faster than a HashSet.
+    let mut seen = vec![0u64; (1 << (2 * BIGRAM_KEY_SHIFT)) / u64::BITS as usize];
     let mut bigrams = Vec::new();
 
     let mut prev = content[0];
     for &b in &content[1..] {
         if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-            let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+            let key = bigram_key(prev.to_ascii_lowercase(), b.to_ascii_lowercase());
             let word = key as usize / 64;
             let bit = 1u64 << (key as usize % 64);
             if seen[word] & bit == 0 {
@@ -1062,6 +1150,8 @@ pub(crate) const SKIP_INDEX_MIN_DENSITY_PCT: u32 = 12;
 thread_local! {
     /// Per-thread file read buffer, grown on demand and released after the build.
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CHUNK_BUF: std::cell::RefCell<[Vec<u64>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
 }
 
 /// Reads bigram chunk, we *SHOULD NOT* use mmap cache here because bigram is built off-lock
@@ -1093,6 +1183,7 @@ pub(crate) fn build_bigram_index(
     files: &[crate::types::FileItem],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
+    pool: &rayon::ThreadPool,
 ) -> BigramFilter {
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
@@ -1107,47 +1198,74 @@ pub(crate) fn build_bigram_index(
     // pass runs detached on the background pool without holding the picker
     // read lock, so a watcher event mutating a `FileItem` would race any
     // borrow we took from a cached `Mmap`.
-    crate::parallelism::BACKGROUND_THREAD_POOL.install(|| {
+    pool.install(|| {
         files
             .par_chunks(BIGRAM_CHUNK_FILES)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 let base_idx = chunk_idx * BIGRAM_CHUNK_FILES;
-                for (offset, file) in chunk.iter().enumerate() {
-                    let file_idx = base_idx + offset;
-
-                    if file.is_binary() || file.size == 0 {
-                        continue;
+                CHUNK_BUF.with_borrow_mut(|buffers| {
+                    let [consec, skip] = buffers;
+                    let chunk_words = BIGRAM_CHUNK_FILES / 64;
+                    for buf in [&mut *consec, &mut *skip] {
+                        buf.resize(MAX_BIGRAM_COLUMNS * chunk_words, 0);
+                        buf.fill(0);
                     }
-
-                    READ_BUF.with(|read_cell| {
-                        let mut buf = read_cell.borrow_mut();
-                        let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
-                        if buf.len() < want {
-                            buf.resize(want, 0);
+                    let bases = SlabPtrs {
+                        consec: consec.as_mut_ptr(),
+                        skip: skip.as_mut_ptr(),
+                        consec_words: chunk_words,
+                        skip_words: chunk_words,
+                    };
+                    let mut populated = 0;
+                    for (offset, file) in chunk.iter().enumerate() {
+                        if file.is_binary() || file.size == 0 {
+                            continue;
                         }
-                        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
 
-                        if let Some(content) = read_bigram_chunk(
-                            file,
-                            base_fd,
-                            base_path,
-                            arena,
-                            &mut buf[..want],
-                            &mut path_buf,
-                        ) {
-                            // we have to manually ensure that every byte is a valid text byte to
-                            // perform this we have to scan every file, first 512 bytes is not enough
-                            // so basically we rely on the fact that first 2MB will always contain
-                            // an invalid text sequence if this is not a binary file.
-                            //
-                            // Need to find a better way to do this.
-                            file.set_binary(crate::types::detect_binary_content(content));
+                        READ_BUF.with(|read_cell| {
+                            let mut buf = read_cell.borrow_mut();
+                            let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
+                            if buf.len() < want {
+                                buf.resize(want, 0);
+                            }
+                            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
 
-                            builder.add_file_content(&skip_builder, file_idx, content);
-                        }
-                    });
-                }
+                            if let Some(content) = read_bigram_chunk(
+                                file,
+                                base_fd,
+                                base_path,
+                                arena,
+                                &mut buf[..want],
+                                &mut path_buf,
+                            ) {
+                                let is_binary = crate::types::detect_binary_content(content);
+                                file.set_binary(is_binary);
+                                if !is_binary
+                                    && builder.add_file_content_to(
+                                        &skip_builder,
+                                        offset,
+                                        content,
+                                        bases,
+                                    )
+                                {
+                                    populated += 1;
+                                }
+                            }
+                        });
+                    }
+                    if populated > 0
+                        && let (Some(consec_base), Some(skip_base)) =
+                            (builder.col_data_ptr(), skip_builder.col_data_ptr())
+                    {
+                        builder.flush_chunk(consec, base_idx, chunk.len(), consec_base);
+                        skip_builder.flush_chunk(skip, base_idx, chunk.len(), skip_base);
+                        builder.populated.fetch_add(populated, Ordering::Relaxed);
+                        skip_builder
+                            .populated
+                            .fetch_add(populated, Ordering::Relaxed);
+                    }
+                });
             });
     });
 
@@ -1156,14 +1274,9 @@ pub(crate) fn build_bigram_index(
         unsafe { libc::close(base_fd) };
     }
 
-    let mut index = builder.compress(None);
-    let skip_index = skip_builder.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT));
+    let mut index = builder.compress_in_pool(None, pool);
+    let skip_index = skip_builder.compress_in_pool(Some(SKIP_INDEX_MIN_DENSITY_PCT), pool);
     index.set_skip_index(skip_index);
-
-    // in progress bigram walk + rust's ignore crate allocates shit ton of garbage memory
-    // all custom allocators would think this is available resource while we do not allocate
-    // after the sync, so it's very important to let the unused memory go back to the OS
-    crate::file_picker::hint_allocator_collect();
 
     index
 }
@@ -1205,15 +1318,14 @@ pub(crate) fn sniff_binary_for_non_indexable(
     }
 }
 
-/// Drop the per-thread read/normalize buffers (up to 2 x 2 MiB per pool thread)
-/// so idle workers don't pin them in RSS. Call after the index is installed:
-/// the broadcast waits for every worker and must not delay searchability.
-pub(crate) fn release_thread_buffers() {
+// Release worker buffers after publishing the index, before allocator collection.
+pub(crate) fn release_thread_buffers(pool: &rayon::ThreadPool) {
     fn release() {
         READ_BUF.with_borrow_mut(|buf| *buf = Vec::new());
         NORM_BUF.with_borrow_mut(|buf| *buf = Vec::new());
+        CHUNK_BUF.with_borrow_mut(|buf| *buf = [Vec::new(), Vec::new()]);
     }
-    crate::parallelism::BACKGROUND_THREAD_POOL.broadcast(|_| release());
+    pool.broadcast(|_| release());
     release();
 }
 
@@ -1286,6 +1398,28 @@ mod tests {
     }
 
     #[test]
+    fn skip_bigrams_filter_across_control_bytes_and_partial_words() {
+        let builder = BigramIndexBuilder::new(66);
+        let skip = BigramIndexBuilder::new(66);
+        let mut expected = vec![0; 2];
+        for file_idx in 0..66 {
+            let content: &[u8] = if file_idx % 8 == 1 {
+                expected[file_idx / 64] |= 1 << (file_idx % 64);
+                b"a\nb"
+            } else {
+                b"xy"
+            };
+            builder.add_file_content(&skip, file_idx, content);
+        }
+        let mut index = builder.compress(None);
+        index.set_skip_index(skip.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT)));
+
+        assert_eq!(index.query(b"a\nb"), Some(expected));
+        assert_eq!(index.query(b"a\nq"), None);
+        assert_eq!(index.query(b"a"), None);
+    }
+
+    #[test]
     fn sparse_column_roundtrip_variants() {
         sparse_roundtrip(&[]);
         sparse_roundtrip(&[0]);
@@ -1318,6 +1452,14 @@ mod tests {
         assert_eq!(index.columns_used(), 0);
         assert!(!index.has_key(key(b'h', b'e')));
         assert_eq!(skip.compress(Some(1)).columns_used(), 0);
+
+        // A sibling mapping can fail after scratch chunks discover their keys.
+        let partial = BigramIndexBuilder::new(64);
+        assert!(partial.col_data_ptr().is_some());
+        partial.get_or_alloc_column(key_slot(key(b'h', b'e')));
+        let index = partial.compress(None);
+        assert_eq!(index.query(b"hello"), None);
+        assert_eq!(index.columns_used(), 0);
     }
 
     #[test]
@@ -1363,19 +1505,37 @@ mod tests {
         let builder = BigramIndexBuilder::new(64);
         let mut keys = (32..=126).flat_map(|a| (32..=126).map(move |b| u16::from_be_bytes([a, b])));
         for id in 0..MAX_BIGRAM_COLUMNS as u16 {
-            assert_eq!(builder.get_or_alloc_column(keys.next().unwrap()), id);
+            assert_eq!(
+                builder.get_or_alloc_column(key_slot(keys.next().unwrap())),
+                id
+            );
         }
         let absent = keys.next().unwrap();
         for _ in 0..=u16::MAX {
-            assert_eq!(builder.get_or_alloc_column(absent), NO_COLUMN);
+            assert_eq!(builder.get_or_alloc_column(key_slot(absent)), NO_COLUMN);
         }
         assert_eq!(builder.columns_used() as usize, MAX_BIGRAM_COLUMNS);
     }
 
+    #[test]
+    fn seen_keys_match_query_slots_and_sentinel_masks() {
+        for hi in 32..=126u8 {
+            for lo in 32..=126u8 {
+                let seen = seen_key(hi, lo);
+                assert!(seen >> 6 < SEEN_WORDS);
+                assert_eq!(seen_key_slot(seen), key_slot(u16::from_be_bytes([hi, lo])));
+            }
+            assert!(seen_key(0, hi) >> 6 < SEEN_WORDS_PER_BYTE);
+            let tail = seen_key(hi, 0);
+            assert_eq!(tail & 63, 0);
+            assert_eq!((tail >> 6) % SEEN_WORDS_PER_BYTE, 0);
+        }
+    }
+
     /// Build a key the same way `add_file_content` does: two printable-ASCII
-    /// bytes, lowercased, packed as `(hi << 8) | lo`.
+    /// bytes, lowercased.
     fn key(a: u8, b: u8) -> u16 {
-        ((a.to_ascii_lowercase() as u16) << 8) | b.to_ascii_lowercase() as u16
+        bigram_key(a.to_ascii_lowercase(), b.to_ascii_lowercase())
     }
 
     /// Return the sorted list of (consec, skip) bigram keys that should appear
@@ -1403,7 +1563,8 @@ mod tests {
 
     /// Query: does the builder record file 0 as having this bigram set?
     fn builder_has_key_for_file_0(b: &BigramIndexBuilder, k: u16) -> bool {
-        if (k >> 8) < 32 || (k >> 8) > 126 || (k & 0xFF) < 32 || (k & 0xFF) > 126 {
+        let (first, second) = split_bigram_key(k);
+        if !(32..=126).contains(&first) || !(32..=126).contains(&second) {
             return false;
         }
         let col = b.lookup[key_slot(k)].load(Ordering::Relaxed);
@@ -1608,12 +1769,7 @@ mod tests {
         // are validated against the reference implementation.
         let mut mixed = Vec::with_capacity(LONG_CONTENT_MIN_LEN * 2);
         for i in 0..LONG_CONTENT_MIN_LEN * 2 {
-            mixed.push(match i % 11 {
-                0 => 0,
-                1 => 0x7F,
-                2 => b'\n',
-                _ => 32 + ((i * 31) % 95) as u8,
-            });
+            mixed.push((i * 31) as u8);
         }
         run_and_compare(&mixed[..LONG_CONTENT_MIN_LEN - 1]);
         run_and_compare(&mixed[..LONG_CONTENT_MIN_LEN]);
@@ -1651,13 +1807,21 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path();
 
-        // Index 0 is empty, so the guard fires on the very first file of the
-        // chunk; the nine text files behind it must still be indexed.
+        // Cross chunk boundaries with empty, binary, single-byte, and text files.
         let mut names: Vec<String> = vec!["a_empty.txt".to_string()];
         std::fs::write(base.join("a_empty.txt"), "").unwrap();
-        for i in 0..9 {
+        let long_content = "Alpha z9?! \t énding and more content\n".repeat(64);
+        for i in 0..BIGRAM_CHUNK_FILES * 2 + 17 {
             let name = format!("f{i}.txt");
-            let body = if i < 2 {
+            let body = if i == BIGRAM_CHUNK_FILES {
+                "unicorn\0binary\n"
+            } else if i == BIGRAM_CHUNK_FILES * 2 {
+                "x"
+            } else if i == BIGRAM_CHUNK_FILES / 2 {
+                "zq xv? unique to the first chunk"
+            } else if i % 17 == 3 {
+                &long_content
+            } else if i % 9 < 2 {
                 "the unicorn line\n"
             } else {
                 "plain filler content\n"
@@ -1679,7 +1843,39 @@ mod tests {
             file.set_path(path);
         }
 
-        let index = build_bigram_index(&files, base, store.as_arena_ptr());
+        let index = build_bigram_index(
+            &files,
+            base,
+            store.as_arena_ptr(),
+            &crate::parallelism::BACKGROUND_THREAD_POOL,
+        );
+        let reference = BigramIndexBuilder::new(files.len());
+        let reference_skip = BigramIndexBuilder::new(files.len());
+        for (file_idx, name) in names.iter().enumerate() {
+            let content = std::fs::read(base.join(name)).unwrap();
+            if !content.contains(&0) {
+                reference.add_file_content(&reference_skip, file_idx, &content);
+            }
+        }
+        let mut reference = reference.compress(/*min_density_pct*/ None);
+        reference.set_skip_index(reference_skip.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT)));
+
+        for hi in 32u8..=126 {
+            for lo in 32u8..=126 {
+                let key = key(hi, lo);
+                assert_eq!(
+                    (
+                        index.column_bitset(key),
+                        index.skip_index.as_ref().unwrap().column_bitset(key),
+                    ),
+                    (
+                        reference.column_bitset(key),
+                        reference.skip_index.as_ref().unwrap().column_bitset(key),
+                    ),
+                    "parallel build differs for bigram {key:#06x}",
+                );
+            }
+        }
         let candidates = index
             .query(b"unicorn")
             .expect("the text files must be in the index");

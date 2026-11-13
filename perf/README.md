@@ -19,20 +19,24 @@ present, new revisions are measured. External contributors' workflows require
 GitHub's approval before their jobs can start.
 
 The PR workflow compiles both revisions on GitHub-hosted runners using the
-same benchmark sources and the release `zlob` feature. One job at a time runs
+benchmark sources from each revision and the release `zlob` feature. One job at a time runs
 the resulting executables directly on `load` as the runner service user.
 When a timing moves by more than 10%, the worker takes two more measurements
 of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
-benchmark slows down by more than 10%. The PR workflow draws the chart and
-passes it with the timings to **Publish FFF performance**. Same-repository PRs
-call the publisher directly. GitHub runs it from `main` after fork benchmarks
-finish because fork workflow tokens are read-only.
+shared benchmark slows down by more than 10%. Added and removed cases show their
+available timing. Give a changed workload a new benchmark ID. After the PR workflow finishes,
+**Publish FFF performance** reads its comparison plan and timings, draws
+the chart, and posts the result. It runs from `main` for all PRs, including forks.
 
 The chart is drawn with [fframes](https://github.com/dmtrKovalenko/fframes)
-by `perf/chart`, a package outside the main workspace. The image is uploaded
-as `pr-<number>.png` to the `perf-charts` prerelease, so it stays out of the
-git history. To draw one locally:
+by `perf/chart`, a package outside the main workspace. The publisher builds
+the Linux renderer on an Actions cache miss. The cache key includes a version
+and the Git tree hash of `perf/chart/` on `main`. On a hit, the publisher runs
+the cached executable directly. It uploads the PNG to the `perf-charts`
+prerelease as `pr-<number>.png`.
+
+To draw a chart locally, run
 
 ```sh
 cargo run --release --manifest-path perf/chart/Cargo.toml --example chart -- \

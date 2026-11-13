@@ -72,6 +72,12 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: cargo test -p fff-search --no-default-features --features zlob,gitoxide --lib -- scm::
 
+      - name: Test hidden paths with the ripgrep watcher
+        if: runner.os == 'Linux'
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo test -p fff-search --test new_directory_watcher_test -- non_git_watcher_skips_hidden_paths --exact
+
   stress-test:
     name: Fuzz Tests
     runs-on: ${{ matrix.os }}

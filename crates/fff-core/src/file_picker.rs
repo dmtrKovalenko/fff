@@ -64,7 +64,7 @@ use std::sync::{
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
-use crate::parallelism::{BACKGROUND_THREAD_POOL, SEARCH_THREAD_POOL};
+use crate::parallelism::{SEARCH_THREAD_POOL, indexing_pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FFFMode {
@@ -128,8 +128,7 @@ pub(crate) struct FileSync {
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
-    /// Ignore rules the walker assembled (zlob backend only). Shared with the
-    /// background watcher so filesystem events can be filtered without libgit2.
+    // The watcher reuses these rules to filter filesystem events.
     pub(crate) ignore_rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
 }
 
@@ -2312,7 +2311,8 @@ impl FileSync {
                 "Linked git worktree, sharing the main checkout history"
             );
         }
-        let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
+        let pool = indexing_pool();
+        let walk_threads = pool.current_num_threads();
 
         let WalkOutput {
             dirs: mut walked_dirs,
@@ -2322,7 +2322,7 @@ impl FileSync {
             base_path,
             git.as_ref().map(|workspace| workspace.backend),
             follow_symlinks,
-            bg_threads,
+            walk_threads,
             synced_files_count,
             ignore_options,
             None,
@@ -2330,7 +2330,7 @@ impl FileSync {
         let ignore_rules = ignore_rules.map(Arc::new);
 
         // group walked dirs and files with a dir part to the same order
-        BACKGROUND_THREAD_POOL.install(|| {
+        pool.install(|| {
             rayon::join(
                 || {
                     pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
@@ -2362,7 +2362,7 @@ impl FileSync {
         if let Some(frecency) = frecency.as_ref() {
             let dirs_ref = &dirs;
             let shared_base = shared_base.as_deref();
-            BACKGROUND_THREAD_POOL.install(|| {
+            pool.install(|| {
                 files.par_iter_mut().for_each_init(
                     || frecency.reader(),
                     |reader, file| {
@@ -2380,33 +2380,27 @@ impl FileSync {
         }
         drop(frecency);
 
-        // un-indexable files that are binary or not fitting the size cap has to beplaced in the end
+        // Preserve the existing (parent_dir, filename) order within both partitions.
         let is_indexable = |f: &FileItem| {
             !f.is_binary()
                 && f.size > 0
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        BACKGROUND_THREAD_POOL.install(|| {
-            files.par_sort_unstable_by(|a, b| {
-                (!is_indexable(a))
-                    .cmp(&!is_indexable(b))
-                    // this just makes it faster in terms of allocation - we store the dir indexes
-                    .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
-            });
-        });
-        let indexable_count = files.partition_point(is_indexable);
+        let indexable_count = files.iter().filter(|file| is_indexable(file)).count();
+        let mut unindexable = Vec::with_capacity(files.len() - indexable_count);
+        unindexable.extend(files.extract_if(.., |file| !is_indexable(file)));
+        files.extend(unindexable);
 
         // Ask the allocator to return freed pages to the OS.
-        hint_allocator_collect();
+        hint_allocator_collect(pool);
 
         let file_item_size = std::mem::size_of::<FileItem>();
         let files_vec_bytes = files.len() * file_item_size;
         let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
             + dirs
                 .iter()
-                .map(|d| d.relative_path(arena).len())
+                .map(|d| usize::from(d.path.byte_len))
                 .sum::<usize>();
 
         let total_time = scan_start.elapsed();
@@ -2526,7 +2520,7 @@ fn populates_dirs_files_chunked_storage<'a>(
             prev_dir = dir_part;
         }
 
-        file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.path = chunk_storage.add_file_with_parent(rel, &dirs[current_dir_idx as usize].path);
         file.parent_dir_index = current_dir_idx;
     }
 
@@ -2714,13 +2708,13 @@ pub extern "C" fn tune_mimalloc() {
 /// Ask the global allocator to return freed pages to the OS.
 /// Enabled via the `mimalloc-collect` feature (set by fff-nvim).
 /// No-op when the feature is off (tests, system allocator).
-pub(crate) fn hint_allocator_collect() {
+pub(crate) fn hint_allocator_collect(pool: &rayon::ThreadPool) {
+    #[cfg(not(feature = "mimalloc-collect"))]
+    let _ = pool;
     #[cfg(feature = "mimalloc-collect")]
     {
-        // Collect BACKGROUND_THREAD_POOL workers — that's where the bigram
-        // builder allocated memory. `rayon::broadcast` would target the global
-        // pool, which is the wrong set of threads.
-        BACKGROUND_THREAD_POOL.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+        // Collect the indexing pool workers, where the bigram builder allocated.
+        pool.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
 
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };

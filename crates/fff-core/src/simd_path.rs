@@ -1,5 +1,4 @@
 use ahash::AHashMap;
-use std::borrow::Cow;
 
 /// SIMD chunk size in bytes (matches NEON/SSE2 register width).
 /// This must stay in sync with neo_frizbee's internal chunk size.
@@ -201,13 +200,12 @@ impl ChunkedString {
         }
     }
 
-    /// Borrow filenames contained in one chunk; copy filenames spanning chunks.
     #[inline]
-    pub fn filename_cow<'a>(&self, arena: ArenaPtr) -> Cow<'a, str> {
+    pub(crate) fn filename_str<'a>(&'a self, arena: ArenaPtr, scratch: &'a mut String) -> &'a str {
         let fname_offset = self.filename_offset as usize;
         let fname_len = self.byte_len as usize - fname_offset;
         if fname_len == 0 {
-            return Cow::Borrowed("");
+            return "";
         }
 
         let indices = self.indices(arena);
@@ -217,19 +215,11 @@ impl ChunkedString {
         if offset_in_chunk + fname_len <= SIMD_CHUNK_BYTES {
             let ptr = arena.chunk_ptr(indices[start_chunk]);
             let slice = unsafe { core::slice::from_raw_parts(ptr.add(offset_in_chunk), fname_len) };
-            return Cow::Borrowed(unsafe { core::str::from_utf8_unchecked(slice) });
+            return unsafe { core::str::from_utf8_unchecked(slice) };
         }
 
-        let mut out = String::with_capacity(fname_len);
-        let needed_chunks = chunks_needed(offset_in_chunk + fname_len);
-        Self::write_slice_to_vec(
-            &indices[start_chunk..start_chunk + needed_chunks],
-            arena,
-            offset_in_chunk,
-            fname_len,
-            unsafe { out.as_mut_vec() },
-        );
-        Cow::Owned(out)
+        self.write_filename_to(arena, scratch);
+        scratch
     }
 
     /// Truncates at `buf.len()` if exceeded -- use `[u8; PATH_BUF_SIZE]` to avoid.
@@ -404,7 +394,34 @@ impl ChunkedPathStoreBuilder {
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
         let index_offset = self.indices.len() as u32;
+        self.add_chunks(path_bytes);
 
+        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
+    }
+
+    // `parent` must be a byte prefix of `relative_path` already stored in this builder.
+    pub(crate) fn add_file_with_parent(
+        &mut self,
+        relative_path: &str,
+        parent: &ChunkedString,
+    ) -> ChunkedString {
+        let index_offset = self.indices.len() as u32;
+        let parent_chunks = usize::from(parent.byte_len) / SIMD_CHUNK_BYTES;
+        let parent_start = parent.index_offset as usize;
+        debug_assert!(usize::from(parent.byte_len) <= relative_path.len());
+        debug_assert!(parent.equals(
+            self.as_arena_ptr(),
+            &relative_path[..usize::from(parent.byte_len)]
+        ));
+        // Only complete parent chunks match; the boundary chunk also contains filename bytes.
+        self.indices
+            .extend_from_within(parent_start..parent_start + parent_chunks);
+        self.add_chunks(&relative_path.as_bytes()[parent_chunks * SIMD_CHUNK_BYTES..]);
+
+        ChunkedString::new(index_offset, relative_path.len() as u16, parent.byte_len)
+    }
+
+    fn add_chunks(&mut self, path_bytes: &[u8]) {
         for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
             chunk_bytes[..chunk.len()].copy_from_slice(chunk);
@@ -421,8 +438,6 @@ impl ChunkedPathStoreBuilder {
 
             self.indices.push(arena_idx);
         }
-
-        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
     }
 }
 
@@ -498,6 +513,57 @@ mod tests {
             file.set_path(strings[i].clone());
         }
         (store, strings, files)
+    }
+
+    #[test]
+    fn file_paths_reuse_complete_parent_chunks() {
+        let mut expected = ChunkedPathStoreBuilder::new(0);
+        let mut actual = ChunkedPathStoreBuilder::new(0);
+        let mut paths = Vec::new();
+        for length in 0..=64 {
+            for suffix in ["", "é/", "日本語/🦀/"] {
+                let parent = if length == 0 {
+                    suffix.to_string()
+                } else {
+                    format!("{}/{suffix}", "d".repeat(length))
+                };
+                expected.add_dir_immediate(&parent);
+                let directory = actual.add_dir_immediate(&parent);
+                for filename in ["file.rs", "filename_beyond_one_chunk.txt", "é🦀.rs"] {
+                    let path = format!("{parent}{filename}");
+                    let expected_string = expected.add_file_immediate(&path, parent.len() as u16);
+                    let actual_string = actual.add_file_with_parent(&path, &directory);
+                    assert_eq!(
+                        (
+                            actual_string.index_offset,
+                            actual_string.byte_len,
+                            actual_string.filename_offset,
+                        ),
+                        (
+                            expected_string.index_offset,
+                            expected_string.byte_len,
+                            expected_string.filename_offset,
+                        ),
+                    );
+                    paths.push((path, actual_string));
+                }
+            }
+        }
+        let expected = expected.finish();
+        let actual = actual.finish();
+        assert_eq!(actual.indices, expected.indices);
+        assert_eq!(
+            actual.arena.iter().map(|chunk| chunk.0).collect::<Vec<_>>(),
+            expected
+                .arena
+                .iter()
+                .map(|chunk| chunk.0)
+                .collect::<Vec<_>>(),
+        );
+        let mut buffer = [0; PATH_BUF_SIZE];
+        for (path, string) in paths {
+            assert_eq!(string.read_to_buf(actual.as_arena_ptr(), &mut buffer), path);
+        }
     }
 
     #[test]
@@ -700,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filename_cow_mid_chunk() {
+    fn test_filename_str_mid_chunk() {
         let (store, strings, _files) = build_test_store(&["src/components/Button.tsx"]);
         let arena = store.as_arena_ptr();
         let cs = &strings[0];
@@ -708,31 +774,34 @@ mod tests {
         assert_eq!(cs.filename_offset, 15);
         assert_eq!(cs.byte_len, 25);
 
-        let fname = cs.filename_cow(arena);
-        assert_eq!(&*fname, "Button.tsx");
+        let mut scratch = String::new();
+        let fname = cs.filename_str(arena, &mut scratch);
+        assert_eq!(fname, "Button.tsx");
     }
 
     #[test]
-    fn test_filename_cow_chunk_aligned() {
+    fn test_filename_str_chunk_aligned() {
         let path = "0123456789abcdef/file.txt";
         let (store, strings, _files) = build_test_store(&[path]);
         let arena = store.as_arena_ptr();
         let cs = &strings[0];
 
         assert_eq!(cs.filename_offset, 17);
-        let fname = cs.filename_cow(arena);
-        assert_eq!(&*fname, "file.txt");
+        let mut scratch = String::new();
+        let fname = cs.filename_str(arena, &mut scratch);
+        assert_eq!(fname, "file.txt");
     }
 
     #[test]
-    fn test_filename_cow_root_file() {
+    fn test_filename_str_root_file() {
         let (store, strings, _files) = build_test_store(&["Cargo.toml"]);
         let arena = store.as_arena_ptr();
         let cs = &strings[0];
 
         assert_eq!(cs.filename_offset, 0);
-        let fname = cs.filename_cow(arena);
-        assert_eq!(&*fname, "Cargo.toml");
+        let mut scratch = String::new();
+        let fname = cs.filename_str(arena, &mut scratch);
+        assert_eq!(fname, "Cargo.toml");
     }
 
     #[test]
@@ -771,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn filename_cow_borrows_at_every_offset_within_a_chunk() {
+    fn filename_str_borrows_at_every_offset_within_a_chunk() {
         for offset in 0..SIMD_CHUNK_BYTES {
             for name in [
                 "x",
@@ -785,13 +854,11 @@ mod tests {
                 let mut builder = ChunkedPathStoreBuilder::new(1);
                 let string = builder.add_file_immediate(&path, offset as u16);
                 let store = builder.finish();
-                let filename = string.filename_cow(store.as_arena_ptr());
+                let mut scratch = String::new();
+                let filename = string.filename_str(store.as_arena_ptr(), &mut scratch);
 
                 assert_eq!(filename, name);
-                assert_eq!(
-                    matches!(filename, Cow::Borrowed(_)),
-                    offset + name.len() <= SIMD_CHUNK_BYTES,
-                );
+                assert_eq!(scratch.is_empty(), offset + name.len() <= SIMD_CHUNK_BYTES);
             }
         }
     }

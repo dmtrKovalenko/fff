@@ -5,6 +5,7 @@ export LC_ALL=C
 # Prints the markdown report, exits 1 when a benchmark slowed down by over 10%.
 awk -v chart="${3:-}" '
   function human(ns) {
+    if (!ns) return "—"
     if (ns >= 1e9) return sprintf("%.2f s", ns / 1e9)
     if (ns >= 1e6) return sprintf("%.2f ms", ns / 1e6)
     if (ns >= 1e3) return sprintf("%.2f µs", ns / 1e3)
@@ -16,25 +17,28 @@ awk -v chart="${3:-}" '
     fence = "`"
     while (index(bench, fence)) fence = fence "`"
     if (length(fence) > 1) bench = " " bench " "
-    return sprintf("| %s | %s%s%s | %s | %s | %+.2f%% |\n", mark[i], fence, bench, fence, human(before[i]), human(after[i]), ratio[i] - 100)
+    return sprintf("| %s | %s%s%s | %s | %s | %s |\n", mark[i], fence, bench, fence, human(base[name[i]]), human(head[name[i]]), change[i])
   }
   $1 != "test" || $3 != "..." || $4 != "bench:" || $5 !~ /^[0-9]+$/ || $5 <= 0 || $6 != "ns/iter" { next }
-  NR == FNR { base[$2] = $5; next }
-  $2 in base {
-    n++
-    name[n] = $2
-    before[n] = base[$2]
-    after[n] = $5
-    ratio[n] = 100 * $5 / base[$2]
-    mark[n] = "⚪"
-    if (10 * $5 > 11 * base[$2]) { mark[n] = "🔴"; slower++ }
-    if (10 * $5 < 9 * base[$2]) { mark[n] = "🟢"; faster++ }
-  }
+  !seen[$2]++ { name[++n] = $2 }
+  FILENAME == ARGV[1] { base[$2] = $5; next }
+  { head[$2] = $5 }
   END {
     if (!n) exit 2
+    for (i = 1; i <= n; i++) {
+      b = base[name[i]]; h = head[name[i]]
+      if (!b) { mark[i] = "🔵"; change[i] = "New"; added++; continue }
+      if (!h) { mark[i] = "➖"; change[i] = "Removed"; removed++; continue }
+      change[i] = sprintf("%+.2f%%", 100 * (h - b) / b)
+      if (10*h > 11*b) { mark[i] = "🔴"; slower++ }
+      else if (10*h < 9*b) { mark[i] = "🟢"; faster++ }
+      else { mark[i] = "⚪"; within++ }
+    }
     header = "| | Benchmark | Base | PR | Change |\n| --- | --- | ---: | ---: | ---: |\n"
-    printf "🔴 %d slower, 🟢 %d faster, ⚪ %d within ±10%%\n\n", slower, faster, n - slower - faster
-    if (slower + faster) {
+    printf "🔴 %d slower, 🟢 %d faster, ⚪ %d within ±10%%", slower, faster, within
+    if (added || removed) printf ", %d new, %d removed", added, removed
+    print "\n"
+    if (slower + faster + added + removed) {
       printf "%s", header
       for (i = 1; i <= n; i++) if (mark[i] != "⚪") printf "%s", row(i)
       print ""

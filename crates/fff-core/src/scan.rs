@@ -8,7 +8,7 @@ use crate::FileSync;
 use crate::error::Error;
 use crate::file_picker::{FFFMode, FilePickerIgnoreOptions};
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
-use crate::parallelism::BACKGROUND_THREAD_POOL;
+use crate::parallelism::{BACKGROUND_THREAD_POOL, indexing_pool};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
 use crate::watch::{BackgroundWatcher, WatcherOptions};
@@ -348,7 +348,9 @@ impl ScanJob {
         if config.content_indexing {
             let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
-            let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
+            let pool = indexing_pool();
+            let index =
+                build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena, pool);
 
             // A root change may have replaced the picker while this index was building.
             if let Ok(mut guard) = shared_picker.write()
@@ -358,7 +360,8 @@ impl ScanJob {
             {
                 picker.set_bigram_index(index);
             }
-            crate::index::release_thread_buffers();
+            crate::index::release_thread_buffers(pool);
+            crate::file_picker::hint_allocator_collect(pool);
 
             // Bigram only sniffs files <= MAX_INDEXABLE_FILE_SIZE; large
             // unknown-extension binaries slip past it and would otherwise be
