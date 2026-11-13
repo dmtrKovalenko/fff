@@ -101,6 +101,41 @@ fn resume_refreshes_a_picker_created_while_paused() {
     );
 }
 
+#[test]
+fn subdirectory_refresh_counts_repo_paths_and_applies_only_matching_files() {
+    let (_tmp, root) = init_repo();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::create_dir(root.join("sub2")).unwrap();
+    for path in ["sub/file", "sub/clean", "sub2/file"] {
+        fs::write(root.join(path), "original").unwrap();
+    }
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "init", "--no-gpg-sign"]);
+    fs::write(sub.join("file"), "staged").unwrap();
+    git(&root, &["add", "sub/file"]);
+    fs::write(sub.join("file"), "unstaged").unwrap();
+    fs::remove_file(root.join("sub2/file")).unwrap();
+
+    let shared = SharedFilePicker::default();
+    shared.pause_git_status();
+    let shared = start_picker_on(shared, &sub, false);
+    let frecency = SharedFrecency::noop();
+    assert_eq!(shared.refresh_git_status(&frecency).unwrap(), 3);
+    assert_eq!(
+        status_of(&shared, &sub, "file"),
+        Some(Status::INDEX_MODIFIED | Status::WT_MODIFIED)
+    );
+    assert_eq!(status_of(&shared, &sub, "clean"), Some(Status::CURRENT));
+
+    git(&root, &["restore", "--staged", "--worktree", "sub/file"]);
+    let path = sub.join("file");
+    shared
+        .update_git_status_for_paths(&[path.clone(), path], &frecency)
+        .unwrap();
+    assert_eq!(status_of(&shared, &sub, "file"), Some(Status::CURRENT));
+}
+
 fn start_picker(base: &Path, watch: bool) -> SharedFilePicker {
     start_picker_on(SharedFilePicker::default(), base, watch)
 }

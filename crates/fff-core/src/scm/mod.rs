@@ -7,7 +7,6 @@ pub(crate) use backend::ScmBackend;
 pub(crate) use repository::ScmRepository;
 use std::sync::Arc;
 
-use ahash::AHashMap;
 use git::Status;
 use std::path::{Path, PathBuf};
 
@@ -66,26 +65,39 @@ pub(crate) fn is_metadata_path(path: &Path, backend: Option<ScmBackend>) -> bool
         .any(|component| component.as_os_str() == name)
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ScmStatusCache(pub(crate) AHashMap<PathBuf, Status>);
-
-impl IntoIterator for ScmStatusCache {
-    type Item = (PathBuf, Status);
-    type IntoIter = <AHashMap<PathBuf, Status> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
+pub(crate) trait StatusMap {
+    fn iter(&self) -> impl Iterator<Item = (&str, Status)>;
 }
 
-impl ScmStatusCache {
-    pub fn statuses_len(&self) -> usize {
-        self.0.len()
-    }
+pub(crate) enum ScmStatusCache {
+    #[cfg(feature = "gitoxide")]
+    Gitoxide(git::gitoxide::Statuses),
+    #[cfg(feature = "libgit2")]
+    LibGit2(git::libgit2_status::Statuses),
+}
 
-    #[inline]
-    pub fn lookup_status(&self, full_path: &Path) -> Option<Status> {
-        self.0.get(full_path).copied()
+impl StatusMap for ScmStatusCache {
+    fn iter(&self) -> impl Iterator<Item = (&str, Status)> {
+        #[cfg(all(feature = "gitoxide", feature = "libgit2"))]
+        {
+            use rayon::iter::Either;
+            match self {
+                Self::Gitoxide(rows) => Either::Left(rows.iter()),
+                Self::LibGit2(rows) => Either::Right(rows.iter()),
+            }
+        }
+        #[cfg(all(feature = "gitoxide", not(feature = "libgit2")))]
+        {
+            let Self::Gitoxide(rows) = self;
+            rows.iter()
+        }
+        #[cfg(all(feature = "libgit2", not(feature = "gitoxide")))]
+        {
+            let Self::LibGit2(rows) = self;
+            rows.iter()
+        }
+        #[cfg(not(any(feature = "gitoxide", feature = "libgit2")))]
+        std::iter::empty()
     }
 }
 

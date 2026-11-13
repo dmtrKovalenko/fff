@@ -3,7 +3,7 @@ pub(super) mod backend;
 #[cfg(feature = "gitoxide")]
 pub(crate) mod gitoxide;
 #[cfg(feature = "libgit2")]
-mod libgit2_status;
+pub(super) mod libgit2_status;
 pub mod recency;
 pub(super) mod worker;
 #[cfg(any(feature = "gitoxide", feature = "libgit2"))]
@@ -94,6 +94,18 @@ mod tests {
     #[cfg(all(feature = "libgit2", feature = "gitoxide"))]
     use super::libgit2_status::initial_scan_status_options;
     use super::*;
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
+    fn status_map(rows: ScmStatusCache) -> ahash::AHashMap<String, Status> {
+        use crate::scm::StatusMap;
+        let mut map = ahash::AHashMap::new();
+        for (path, status) in rows.iter() {
+            assert!(
+                map.insert(path.to_owned(), status).is_none(),
+                "duplicate {path}"
+            );
+        }
+        map
+    }
     #[cfg(feature = "libgit2")]
     use git2::Repository;
     #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
@@ -175,14 +187,14 @@ mod tests {
             } else {
                 initial_scan_status_options()
             };
-            let expected = ScmStatusCache::read_status(&repo, &mut opts).unwrap();
-            let statuses: Vec<_> = expected.0.values().copied().collect();
+            let expected = status_map(ScmStatusCache::read_status(&repo, &mut opts).unwrap());
+            let statuses: Vec<_> = expected.values().copied().collect();
             assert!(statuses.contains(&Status::CONFLICTED));
             assert!(statuses.contains(&(Status::INDEX_NEW | Status::WT_MODIFIED)));
             let gix = gitoxide::open(root).unwrap();
             assert_eq!(
-                gitoxide::read_status(&gix, full, &[]).unwrap().0,
-                expected.0
+                status_map(gitoxide::read_status(&gix, full, &[]).unwrap()),
+                expected
             );
             for backend in [
                 crate::scm::ScmBackend::LibGit2,
@@ -190,17 +202,13 @@ mod tests {
             ] {
                 let workspace = backend.discover(root).unwrap();
                 let session = workspace.open().unwrap();
-                assert_eq!(session.status(full).unwrap().0, expected.0);
+                assert_eq!(status_map(session.status(full).unwrap()), expected);
             }
         }
-        let expected = ScmStatusCache::read_status(&repo, &mut default_status_options()).unwrap();
-        let actual = ScmStatusCache::read_status_from_index(
-            &repo,
-            &repo.index().unwrap(),
-            repo.workdir().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(actual.0, expected.0);
+        let expected =
+            status_map(ScmStatusCache::read_status(&repo, &mut default_status_options()).unwrap());
+        let actual = ScmStatusCache::read_status_from_index(&repo, &repo.index().unwrap()).unwrap();
+        assert_eq!(status_map(actual), expected);
     }
 
     #[cfg(feature = "gitoxide")]
@@ -305,14 +313,14 @@ mod tests {
 
         let repo = crate::scm::ScmBackend::configured().open(&base).unwrap();
         let paths: Vec<PathBuf> = names.iter().map(|n| base.join(n)).collect();
-        let cache = repo.status_for_paths(&paths).unwrap();
+        let cache = status_map(repo.status_for_paths(&paths).unwrap());
 
-        for (n, abs) in names.iter().zip(paths.iter()) {
-            let status = cache.lookup_status(abs);
+        for n in names {
+            let status = cache.get(n).copied();
             assert!(
                 status.is_some(),
                 "lookup for {n} returned None; cache holds {} entries",
-                cache.statuses_len(),
+                cache.len(),
             );
             assert!(
                 status.unwrap().contains(Status::WT_MODIFIED),
@@ -348,18 +356,21 @@ mod tests {
             .iter()
             .map(|n| base.join(n))
             .collect();
-        let cache = repo.status_for_paths(&paths).unwrap();
+        let cache = status_map(repo.status_for_paths(&paths).unwrap());
 
-        let status = |n: &str| cache.lookup_status(&base.join(n));
+        let status = |n: &str| cache.get(n).copied();
         assert!(status("app/[id]/page.tsx").is_some_and(|s| s.contains(Status::WT_MODIFIED)));
         assert!(status("gone.rs").is_some_and(|s| s.contains(Status::WT_DELETED)));
         assert!(status("fresh/dir/new.rs").is_some_and(|s| s.contains(Status::WT_NEW)));
         assert_eq!(status("app/i/page.tsx"), None);
         fs::write(base.join("app/[id]/page.tsx"), "x\n").unwrap();
-        let clean = repo.status_for_paths(&paths[..1]).unwrap();
-        assert_eq!(clean.lookup_status(&paths[0]), Some(Status::CURRENT));
+        let clean = status_map(repo.status_for_paths(&paths[..1]).unwrap());
+        assert_eq!(
+            clean.get("app/[id]/page.tsx").copied(),
+            Some(Status::CURRENT)
+        );
 
-        assert_eq!(cache.statuses_len(), 3);
+        assert_eq!(cache.len(), 3);
     }
 }
 

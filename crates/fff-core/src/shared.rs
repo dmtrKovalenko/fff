@@ -406,9 +406,7 @@ impl SharedFilePicker {
         }
 
         let statuses_count = if let Some(git_status) = git_status {
-            let count = git_status.statuses_len();
-            picker.update_git_statuses(git_status, shared_frecency)?;
-            count
+            picker.update_git_statuses(git_status, shared_frecency)?
         } else {
             0
         };
@@ -445,7 +443,13 @@ impl SharedFilePicker {
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
-        picker.update_git_statuses(status, shared_frecency)
+        if picker
+            .scm_workspace()
+            .is_some_and(|scm| scm.workdir == git_root.workdir)
+        {
+            picker.update_git_statuses(status, shared_frecency)?;
+        }
+        Ok(())
     }
 }
 

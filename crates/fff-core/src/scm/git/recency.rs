@@ -1,4 +1,4 @@
-#[cfg(feature = "libgit2")]
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
 use ahash::AHashMap;
 #[cfg(feature = "libgit2")]
 use git2::{DiffOptions, Oid, Repository};
@@ -24,7 +24,29 @@ impl Default for GitRecencyConfig {
 }
 
 #[cfg(any(feature = "gitoxide", feature = "libgit2"))]
-pub(super) const MAX_COMMITS_HARD_CAP: usize = 128;
+impl GitRecencyConfig {
+    pub(super) fn score_commits<T>(
+        &self,
+        history: impl Iterator<Item = T>,
+        mut score_commit: impl FnMut(T, &mut AHashMap<String, i16>) -> Option<()>,
+    ) -> AHashMap<String, i16> {
+        const MAX_COMMITS: usize = 128;
+        let limit = self.max_commits.min(MAX_COMMITS);
+        // Bound the walk even if most commits are merges or bulk changes.
+        let mut scores = AHashMap::new();
+        let qualifying = history
+            .take((limit * 5).max(64))
+            .filter_map(|commit| score_commit(commit, &mut scores))
+            .take(limit)
+            .count();
+        tracing::debug!(
+            files_scored = scores.len(),
+            commits_analyzed = qualifying,
+            "git recency computed"
+        );
+        scores
+    }
+}
 
 // Computes per file recency bonuses
 #[cfg(feature = "libgit2")]
@@ -46,7 +68,6 @@ pub(crate) fn compute_git_recency(
     let subdir = repo
         .workdir()
         .and_then(|root| base_path_within_repo(root, base_path));
-    let max_commits = config.max_commits.min(MAX_COMMITS_HARD_CAP);
 
     let mut revwalk = repo.revwalk().ok()?;
     revwalk.push(head).ok()?;
@@ -60,84 +81,44 @@ pub(crate) fn compute_git_recency(
         let _ = revwalk.hide(merge_base);
     }
 
-    let mut scores: AHashMap<String, i16> = AHashMap::new();
-    let mut qualifying = 0usize;
-    // Bounds total walked commits so histories full of skipped (merge/bulk)
-    // commits can't turn the walk into a full history scan.
-    let walk_budget = (max_commits * 5).max(64);
-
-    for oid in revwalk.take(walk_budget) {
-        if qualifying >= max_commits {
-            break;
-        }
-
-        let Ok(commit) = oid.and_then(|oid| repo.find_commit(oid)) else {
-            continue;
-        };
-
-        // if merge commit
+    Some(config.score_commits(revwalk, |oid, scores| {
+        let commit = repo.find_commit(oid.ok()?).ok()?;
         if commit.parent_count() > 1 {
-            continue;
+            return None;
         }
-
-        let Ok(tree) = commit.tree() else { continue };
-        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-
-        let mut diff_opts = DiffOptions::new();
+        let tree = commit.tree().ok()?;
+        let parent = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let mut options = DiffOptions::new();
         if let Some(subdir) = subdir.as_deref() {
-            diff_opts.pathspec(subdir);
+            options.pathspec(subdir);
         }
-        let Ok(diff) =
-            repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
-        else {
-            continue;
-        };
-
+        let diff = repo
+            .diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut options))
+            .ok()?;
         let deltas = diff.deltas();
         if deltas.len() > config.max_files_per_commit {
-            continue;
+            return None;
         }
-
         for delta in deltas {
-            let Some(path_bytes) = delta
+            let Some(bytes) = delta
                 .new_file()
                 .path_bytes()
                 .or_else(|| delta.old_file().path_bytes())
             else {
                 continue;
             };
-
-            let repo_relative = String::from_utf8_lossy(path_bytes);
-            // Fold repo-relative down to base_path-relative when indexing a subdir
-            let relative_path = match subdir.as_deref() {
-                Some(subdir) => match repo_relative
-                    .strip_prefix(subdir)
-                    .and_then(|rest| rest.strip_prefix('/'))
-                {
-                    Some(rest) => rest,
-                    None => continue,
-                },
-                None => repo_relative.as_ref(),
+            let path = String::from_utf8_lossy(bytes);
+            let Some(path) = crate::path_utils::path_in_base(&path, subdir.as_deref()) else {
+                continue;
             };
-
-            // get-before-insert keeps repeat participations allocation-free
-            if let Some(count) = scores.get_mut(relative_path) {
+            if let Some(count) = scores.get_mut(path) {
                 *count = count.saturating_add(1);
             } else {
-                scores.insert(relative_path.to_owned(), 1);
+                scores.insert(path.to_owned(), 1);
             }
         }
-
-        qualifying += 1;
-    }
-
-    tracing::debug!(
-        files_scored = scores.len(),
-        commits_analyzed = qualifying,
-        "git recency computed"
-    );
-
-    Some(scores)
+        Some(())
+    }))
 }
 
 #[cfg(any(feature = "gitoxide", feature = "libgit2"))]

@@ -38,9 +38,9 @@ use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search}
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::scm::ScmStatusCache;
 use crate::scm::ScmWorkspace;
 use crate::scm::{ScmBackend, ScmStatusWorker};
+use crate::scm::{ScmStatusCache, StatusMap};
 use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
@@ -247,10 +247,10 @@ impl FileSync {
         self.find_by_relative_path_with(rel_path, |dir| self.find_base_dir_index(dir))
     }
 
-    fn find_by_relative_path_with(
+    fn find_by_relative_path_with<'a>(
         &self,
-        rel_path: &str,
-        find_dir: impl FnOnce(&str) -> Option<usize>,
+        rel_path: &'a str,
+        find_dir: impl FnOnce(&'a str) -> Option<usize>,
     ) -> Option<usize> {
         let arena = self.arena_base_ptr();
         // Split into directory (with trailing '/') and filename.
@@ -1229,16 +1229,7 @@ impl FilePicker {
         if let Some(handle) = git_handle
             && let Ok(Some(git_cache)) = handle.join()
         {
-            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-
-            let arena = self.arena_base_ptr();
-            for file in self.sync_data.files.iter_mut() {
-                file.git_status = git_cache.lookup_status(file.write_absolute_path(
-                    arena,
-                    &self.base_path,
-                    &mut path_buf,
-                ));
-            }
+            self.update_git_statuses(git_cache, &empty_frecency)?;
         }
 
         if let Some(workspace) = self.scm_workspace()
@@ -1721,64 +1712,56 @@ impl FilePicker {
         &mut self,
         status_cache: ScmStatusCache,
         shared_frecency: &SharedFrecency,
-    ) -> Result<(), Error> {
-        debug!(
-            statuses_count = status_cache.statuses_len(),
-            "Updating git status",
-        );
-
-        let mode = self.mode;
-        let bp = self.base_path.clone();
-        let shared_base = self.sync_data.shared_base.clone();
+    ) -> Result<usize, Error> {
+        let Some(workspace) = &self.sync_data.git else {
+            return Ok(0);
+        };
+        let subdir = self
+            .base_path
+            .strip_prefix(&workspace.workdir)?
+            .to_string_lossy();
+        let subdir = crate::path_utils::to_canonical_slashes(&subdir);
+        let subdir = (!subdir.is_empty()).then_some(subdir.as_ref());
         let frecency = shared_frecency.read()?;
         let reader = frecency.as_ref().map(FrecencyTracker::reader);
-
-        let mut directories =
-            (status_cache.statuses_len() >= 8192).then(AHashMap::<String, Option<usize>>::new);
-        status_cache
-            .into_iter()
-            .try_for_each(|(path, status)| -> Result<(), Error> {
-                let index = if let Some(cache) = directories.as_mut() {
-                    self.sync_data.find_file_index_with(&path, &bp, |dir| {
-                        if let Some(&index) = cache.get(dir) {
-                            return index;
-                        }
-                        let index = self.sync_data.find_base_dir_index(dir);
-                        cache.insert(dir.to_owned(), index);
-                        index
-                    })
-                } else {
-                    self.sync_data.find_file_index(&path, &bp)
-                };
-                if let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) {
-                    file.git_status = Some(status);
-                    if let Some(reader) = reader.as_ref() {
-                        file.update_frecency_scores(
-                            reader,
-                            arena,
-                            &bp,
-                            shared_base.as_deref(),
-                            mode,
-                        );
-                    }
-                    // Update parent dir frecency inline. `DirItem` has an
-                    // interior-mutable atomic score, so `&self` access is
-                    // enough — no write aliasing against Arc clones.
-                    let score = file.access_frecency_score as i32;
-                    let dir_idx = file.parent_dir_index as usize;
-                    if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
-                        dir.update_frecency_if_larger(score);
-                    }
-                } else {
-                    // Expected on sparse checkouts: git reports a status for
-                    // a path that isn't materialized on disk and therefore
-                    // isn't in the file index. Don't spam the log (#404).
-                    debug!(?path, "Git status for path not in index, skipping");
+        let shared_base = self.sync_data.shared_base.clone();
+        let mut last_dir = None;
+        let mut count = 0;
+        for (path, status) in status_cache.iter() {
+            count += 1;
+            let Some(path) = crate::path_utils::path_in_base(path, subdir) else {
+                continue;
+            };
+            let index = self.sync_data.find_by_relative_path_with(path, |dir| {
+                if let Some((previous, index)) = last_dir
+                    && dir == previous
+                {
+                    return index;
                 }
-                Ok(())
-            })?;
-
-        Ok(())
+                let index = self.sync_data.find_base_dir_index(dir);
+                last_dir = Some((dir, index));
+                index
+            });
+            let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) else {
+                continue;
+            };
+            file.git_status = Some(status);
+            if let Some(reader) = &reader {
+                file.update_frecency_scores(
+                    reader,
+                    arena,
+                    &self.base_path,
+                    shared_base.as_deref(),
+                    self.mode,
+                );
+            }
+            let score = file.access_frecency_score as i32;
+            let dir_idx = file.parent_dir_index as usize;
+            if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
+                dir.update_frecency_if_larger(score);
+            }
+        }
+        Ok(count)
     }
 
     // Replaces every recency score with a freshly computed set. `None` zeroes

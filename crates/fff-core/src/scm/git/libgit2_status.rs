@@ -1,6 +1,7 @@
 use super::{ScmStatusCache, Status};
 use crate::error::Result;
-use ahash::AHashMap;
+use crate::scm::StatusMap;
+use ahash::AHashSet;
 use git2::{Repository, StatusOptions};
 use std::{fmt::Debug, path::Path};
 
@@ -32,106 +33,105 @@ pub(crate) fn initial_scan_status_options() -> StatusOptions {
     opts
 }
 
+#[derive(Default)]
+pub(crate) struct Statuses {
+    paths: String,
+    entries: Vec<(usize, Status)>,
+}
+
+impl Statuses {
+    fn push(&mut self, path: &str, status: Status) {
+        self.paths.push_str(path);
+        self.entries.push((self.paths.len(), status));
+    }
+}
+
+impl StatusMap for Statuses {
+    fn iter(&self) -> impl Iterator<Item = (&str, Status)> {
+        self.entries.iter().scan(0, |start, &(end, status)| {
+            let path = &self.paths[*start..end];
+            *start = end;
+            Some((path, status))
+        })
+    }
+}
+
 impl ScmStatusCache {
-    #[tracing::instrument(skip(repo, status_options))]
-    pub(crate) fn read_status(
-        repo: &Repository,
-        status_options: &mut StatusOptions,
-    ) -> Result<Self> {
-        let statuses = repo.statuses(Some(status_options))?;
-        let Some(repo_path) = repo.workdir() else {
-            return Ok(Self(AHashMap::new())); // repo is bare
-        };
-
-        let repo_path = crate::path_utils::normalize(repo_path.to_path_buf());
-
-        let mut entries = AHashMap::with_capacity(statuses.len());
-        for entry in &statuses {
-            if let Ok(entry_path) = entry.path() {
-                // libgit2 returns entry paths with forward slashes on every platform
-                // fff stores native paths - meaning we have forward slash issue on windows
-                let full_path = crate::path_utils::normalize(repo_path.join(entry_path));
-                entries.insert(full_path, entry.status());
+    pub(super) fn read_status(repo: &Repository, options: &mut StatusOptions) -> Result<Self> {
+        let native = repo.statuses(Some(options))?;
+        let mut rows = Statuses::default();
+        rows.entries.reserve(native.len());
+        for entry in &native {
+            if let Ok(path) = entry.path() {
+                rows.push(path, entry.status());
             }
         }
-
-        Ok(Self(entries))
+        Ok(Self::LibGit2(rows))
     }
 
-    pub(crate) fn read_full_status(repo: &Repository) -> Result<Self> {
-        let full = || Self::read_status(repo, &mut default_status_options());
-        let Some(root) = repo.workdir() else {
-            return full();
-        };
-        let Ok(index) = repo.index() else {
-            return full();
-        };
-        if !cfg!(target_os = "linux")
-            || index.len() < 16_384
-            || index.has_conflicts()
-            || repo.config()?.get_bool("core.ignorecase").unwrap_or(false)
+    pub(super) fn read_full_status(repo: &Repository) -> Result<Self> {
+        if cfg!(target_os = "linux")
+            && let Ok(index) = repo.index()
+            && index.len() >= 16_384
+            && !index.has_conflicts()
+            && !repo.config()?.get_bool("core.ignorecase").unwrap_or(false)
         {
-            return full();
+            return Self::read_status_from_index(repo, &index);
         }
-        Self::read_status_from_index(repo, &index, root)
+        Self::read_status(repo, &mut default_status_options())
     }
 
-    pub(super) fn read_status_from_index(
-        repo: &Repository,
-        index: &git2::Index,
-        root: &Path,
-    ) -> Result<Self> {
-        let mut cache = Self::read_status(repo, &mut initial_scan_status_options())?;
-        let additional = index.len().saturating_sub(cache.0.len());
-        cache.0.reserve(additional);
-        let root = crate::path_utils::normalize(root.to_owned());
+    pub(super) fn read_status_from_index(repo: &Repository, index: &git2::Index) -> Result<Self> {
+        let changes = repo.statuses(Some(&mut initial_scan_status_options()))?;
+        let mut changed = AHashSet::with_capacity(changes.len());
+        let mut rows = Statuses::default();
+        rows.entries.reserve(index.len().max(changes.len()));
+        for entry in &changes {
+            let delta = entry.head_to_index().or_else(|| entry.index_to_workdir());
+            if let Some(path) = delta.and_then(|d| d.old_file().path_bytes())
+                && let Ok(path) = std::str::from_utf8(path)
+            {
+                changed.insert(path);
+                rows.push(path, entry.status());
+            }
+        }
         for entry in index.iter() {
-            // A gitlink is a submodule. The full refresh excludes submodules.
             if entry.mode != 0o160000
                 && let Ok(path) = std::str::from_utf8(&entry.path)
+                && !changed.contains(path)
             {
-                let path = crate::path_utils::normalize(root.join(path));
-                cache.0.entry(path).or_insert(Status::CURRENT);
+                rows.push(path, Status::CURRENT);
             }
         }
-        Ok(cache)
+        Ok(Self::LibGit2(rows))
     }
 
     #[tracing::instrument(skip(repo), fields(paths_count = paths.len()), level = tracing::Level::DEBUG)]
-    pub fn git_status_for_paths<TPath: AsRef<Path> + Debug>(
+    pub(super) fn git_status_for_paths<TPath: AsRef<Path> + Debug>(
         repo: &Repository,
         paths: &[TPath],
     ) -> Result<Self> {
-        if paths.is_empty() {
-            return Ok(Self(AHashMap::new()));
-        }
-
         let Some(workdir) = repo.workdir() else {
-            return Ok(Self(AHashMap::new()));
+            return Ok(Self::LibGit2(Statuses::default()));
         };
-        let workdir = crate::path_utils::normalize(workdir.to_path_buf());
-
-        // git pathspec is pretty slow and requires to walk the whole directory
-        // so for a single file which is the most general use case we query directly the file
-        if paths.len() == 1 {
-            let full_path = paths[0].as_ref();
-            let relative_path = full_path.strip_prefix(&workdir)?;
-            let status = repo.status_file(relative_path)?;
-
-            let mut map = AHashMap::with_capacity(1);
-            map.insert(full_path.to_path_buf(), status);
-            return Ok(Self(map));
+        let workdir = crate::path_utils::normalize(workdir.to_owned());
+        if paths.is_empty() {
+            return Ok(Self::LibGit2(Statuses::default()));
         }
-
-        // literal paths make libgit2 use a sorted pathlist instead of wildmatching
-        // every entry against every pathspec (O(entries * paths), minutes on 80k paths)
-        let mut status_options = default_status_options();
-        status_options.disable_pathspec_match(true);
+        if let [path] = paths {
+            let relative = path.as_ref().strip_prefix(workdir)?;
+            let status = repo.status_file(relative)?;
+            let mut rows = Statuses::default();
+            if let Some(path) = relative.to_str() {
+                rows.push(&crate::path_utils::to_canonical_slashes(path), status);
+            }
+            return Ok(Self::LibGit2(rows));
+        }
+        let mut options = default_status_options();
+        options.disable_pathspec_match(true);
         for path in paths {
-            status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
+            options.pathspec(path.as_ref().strip_prefix(&workdir)?);
         }
-
-        let git_status_cache = Self::read_status(repo, &mut status_options)?;
-        Ok(git_status_cache)
+        Self::read_status(repo, &mut options)
     }
 }
