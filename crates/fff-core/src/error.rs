@@ -105,6 +105,10 @@ pub enum Error {
     #[error("Expected a path to be child of another path: {0}")]
     StripPrefixError(#[from] StripPrefixError),
 
+    #[cfg(feature = "gitoxide")]
+    #[error("gitoxide error: {0}")]
+    Gitoxide(String),
+    #[cfg(feature = "libgit2")]
     #[error("libgit2 error occurred: {0}")]
     Git(#[from] git2::Error),
 

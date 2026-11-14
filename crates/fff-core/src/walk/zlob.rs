@@ -26,14 +26,14 @@ struct WorkerFiles {
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
-    is_git_repo: bool,
+    backend: Option<crate::scm::ScmBackend>,
     follow_symlinks: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
     ignore_options: &FilePickerIgnoreOptions,
     scope: Option<&Path>,
 ) -> crate::Result<WalkOutput> {
-    let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
+    let use_non_git_defaults = backend.is_none() && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
     if ignore_options.disable_git {
         flags |= WalkFlags::SKIP_GITIGNORE | WalkFlags::NO_GIT_EXCLUDE | WalkFlags::NO_GIT_GLOBAL;
@@ -78,7 +78,19 @@ pub(crate) fn walk_collect_files(
         .collect();
     synced_files_count.store(0, Ordering::Relaxed);
 
+    // zlob already excludes .git during traversal.
+    let extra_metadata = backend
+        .map(|backend| backend.metadata_dir_name())
+        .filter(|name| *name != ".git");
     let outcome = match builder.run(|entry| {
+        if extra_metadata.is_some_and(|name| {
+            entry
+                .path()
+                .components()
+                .any(|component| component.as_os_str() == name)
+        }) {
+            return WalkState::Continue;
+        }
         let collected = &collected[entry.worker_id()];
         if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
         {

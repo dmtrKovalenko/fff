@@ -66,6 +66,19 @@ jobs:
         # fff-python requires full python o3 machinery which is very slow
         run: cargo test --no-default-features --features zlob --workspace --exclude fff-nvim --exclude fff-python
 
+      - name: Check Neovim's gitoxide-only build
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          deps=$(cargo tree --locked -p fff-nvim --no-default-features --features zlob,gitoxide -e normal --prefix none)
+          if grep -Eq '^(git2|libgit2-sys) v' <<< "$deps"; then
+            echo "Neovim links libgit2" >&2
+            exit 1
+          fi
+          cargo test --locked -p fff-search --no-default-features --features zlob,gitoxide --lib -- scm::
+          cargo test --locked -p fff-search --no-default-features --features zlob,gitoxide,libgit2 --lib -- scm::
+
       - name: Test hidden paths with the ripgrep watcher
         if: runner.os == 'Linux'
         env:
