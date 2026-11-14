@@ -53,7 +53,7 @@ fn modified_file_findable_via_overlay() {
             .map(|guard| {
                 guard
                     .as_ref()
-                    .map_or(false, |p| !p.is_scan_active() && p.bigram_index().is_some())
+                    .is_some_and(|p| !p.is_scan_active() && p.bigram_index().is_some())
             })
             .unwrap_or(false);
 
@@ -145,10 +145,10 @@ fn modified_file_findable_via_overlay() {
     }
 
     // Cleanup: stop background watcher.
-    if let Ok(mut guard) = shared_picker.write() {
-        if let Some(ref mut picker) = *guard {
-            picker.stop_background_monitor();
-        }
+    if let Ok(mut guard) = shared_picker.write()
+        && let Some(ref mut picker) = *guard
+    {
+        picker.stop_background_monitor();
     }
 }
 
@@ -216,10 +216,10 @@ fn deleted_file_excluded_via_overlay() {
         );
     }
 
-    if let Ok(mut guard) = shared_picker.write() {
-        if let Some(ref mut picker) = *guard {
-            picker.stop_background_monitor();
-        }
+    if let Ok(mut guard) = shared_picker.write()
+        && let Some(ref mut picker) = *guard
+    {
+        picker.stop_background_monitor();
     }
 }
 
@@ -279,10 +279,10 @@ fn new_file_findable_after_add() {
         );
     }
 
-    if let Ok(mut guard) = shared_picker.write() {
-        if let Some(ref mut picker) = *guard {
-            picker.stop_background_monitor();
-        }
+    if let Ok(mut guard) = shared_picker.write()
+        && let Some(ref mut picker) = *guard
+    {
+        picker.stop_background_monitor();
     }
 }
 
@@ -355,10 +355,10 @@ fn modified_file_findable_via_regex_overlay() {
         assert!(result.matches[0].line_content.contains("NEEDLE"));
     }
 
-    if let Ok(mut guard) = shared_picker.write() {
-        if let Some(ref mut picker) = *guard {
-            picker.stop_background_monitor();
-        }
+    if let Ok(mut guard) = shared_picker.write()
+        && let Some(ref mut picker) = *guard
+    {
+        picker.stop_background_monitor();
     }
 }
 
@@ -398,7 +398,7 @@ fn wait_for_bigram(shared_picker: &SharedFilePicker) {
             .map(|guard| {
                 guard
                     .as_ref()
-                    .map_or(false, |p| !p.is_scan_active() && p.bigram_index().is_some())
+                    .is_some_and(|p| !p.is_scan_active() && p.bigram_index().is_some())
             })
             .unwrap_or(false);
         if ready {

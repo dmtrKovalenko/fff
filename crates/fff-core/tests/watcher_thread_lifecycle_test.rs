@@ -24,10 +24,10 @@ fn count_live_threads_named(name: &str) -> usize {
     let mut count = 0usize;
     for entry in dir.flatten() {
         let comm_path = entry.path().join("comm");
-        if let Ok(content) = fs::read_to_string(&comm_path) {
-            if content.trim_end() == name {
-                count += 1;
-            }
+        if let Ok(content) = fs::read_to_string(&comm_path)
+            && content.trim_end() == name
+        {
+            count += 1;
         }
     }
     count

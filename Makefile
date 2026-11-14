@@ -287,7 +287,7 @@ format-ts:
 format: format-rust format-lua format-ts
 
 lint-rust:
-	cargo clippy --workspace --no-default-features --features zlob -- -D warnings
+	cargo clippy --workspace --all-targets --no-default-features --features zlob -- -D warnings
 # Prefer luacheck from PATH (what CI uses). The luarocks shim is a fallback:
 # it hardcodes the lua binary it was generated against and breaks whenever
 # the interpreter is upgraded.

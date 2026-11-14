@@ -3,7 +3,6 @@ use fff::query_tracker::QueryTracker;
 use rand::distributions::Alphanumeric;
 use rand::prelude::*;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn generate_random_string(len: usize) -> String {
     thread_rng()
@@ -19,19 +18,14 @@ struct TestQueryEntry {
     project_path: PathBuf,
     file_path: PathBuf,
     open_count: u32,
-    last_opened: u64,
 }
 
 fn generate_test_data(num_entries: usize) -> Vec<TestQueryEntry> {
     let mut rng = thread_rng();
     let mut entries = Vec::with_capacity(num_entries);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
 
     // Generate some common queries that will be reused
-    let common_queries = vec![
+    let common_queries = [
         "main",
         "test",
         "config",
@@ -56,7 +50,7 @@ fn generate_test_data(num_entries: usize) -> Vec<TestQueryEntry> {
     ];
 
     // Generate some common project paths
-    let project_paths = vec![
+    let project_paths = [
         "/home/user/project1",
         "/home/user/project2",
         "/home/user/web-app",
@@ -82,11 +76,10 @@ fn generate_test_data(num_entries: usize) -> Vec<TestQueryEntry> {
         let file_path = PathBuf::from(format!("{}/src/{}", project_path, file_name));
 
         let entry = TestQueryEntry {
-            query: query.into(),
+            query,
             project_path: PathBuf::from(project_path),
             file_path,
             open_count: rng.gen_range(1..10),
-            last_opened: now - rng.gen_range(0..30 * 24 * 3600), // Random time within last 30 days
         };
 
         entries.push(entry);
@@ -134,15 +127,13 @@ fn bench_track_query_completion(c: &mut Criterion) {
             let mut rng = thread_rng();
             b.iter(|| {
                 let entry = entries.choose(&mut rng).unwrap();
-                black_box(
-                    tracker
-                        .track_query_completion(
-                            black_box(&entry.query),
-                            black_box(&entry.project_path),
-                            black_box(&entry.file_path),
-                        )
-                        .unwrap(),
-                );
+                tracker
+                    .track_query_completion(
+                        black_box(&entry.query),
+                        black_box(&entry.project_path),
+                        black_box(&entry.file_path),
+                    )
+                    .unwrap();
             });
         });
 
@@ -182,15 +173,13 @@ fn bench_realistic_workload(c: &mut Criterion) {
                     }
                     70..95 => {
                         // Track completion (when user opens file)
-                        black_box(
-                            tracker
-                                .track_query_completion(
-                                    black_box(&entry.query),
-                                    black_box(&entry.project_path),
-                                    black_box(&entry.file_path),
-                                )
-                                .unwrap(),
-                        );
+                        tracker
+                            .track_query_completion(
+                                black_box(&entry.query),
+                                black_box(&entry.project_path),
+                                black_box(&entry.file_path),
+                            )
+                            .unwrap();
                     }
                     95..100 => {
                         // Get historical query (least common)

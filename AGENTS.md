@@ -81,7 +81,7 @@ Located at the score.rs file
 ### Build System
 
 - `Cargo.toml` - Rust dependencies and build configuration (package name: `fff_nvim`)
-- `rust-toolchain.toml` - Specifies Rust nightly toolchain with required components
+- `rust-toolchain.toml` - Specifies the pinned stable Rust toolchain with required components
 - `Cross.toml` - Cross-compilation settings using Zig for Linux targets
 - **CI/CD Workflows**:
   - `.github/workflows/rust.yml` - Rust testing, formatting, and clippy checks

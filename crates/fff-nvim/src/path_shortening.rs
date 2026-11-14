@@ -3,10 +3,9 @@
 //! This module provides functionality to shorten file paths for display
 //! in the picker UI with various strategies.
 
-use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum PathShortenStrategy {
@@ -57,15 +56,10 @@ impl PathCache {
     ) {
         // Simple eviction: clear half the cache when full
         if self.map.len() >= self.max_entries {
-            let keys_to_remove: Vec<_> = self
-                .map
-                .keys()
+            self.map
+                .extract_if(|_, _| true)
                 .take(self.max_entries / 2)
-                .cloned()
-                .collect();
-            for key in keys_to_remove {
-                self.map.remove(&key);
-            }
+                .for_each(drop);
         }
         self.map.insert(
             path,
@@ -81,8 +75,8 @@ impl PathCache {
 // this is the amount of PATHS not entries
 const DEFAULT_CACHE_SIZE: usize = 8192;
 
-static PATH_SHORTEN_CACHE: Lazy<RwLock<PathCache>> =
-    Lazy::new(|| RwLock::new(PathCache::new(DEFAULT_CACHE_SIZE)));
+static PATH_SHORTEN_CACHE: LazyLock<RwLock<PathCache>> =
+    LazyLock::new(|| RwLock::new(PathCache::new(DEFAULT_CACHE_SIZE)));
 
 pub fn shorten_path_with_cache(
     strategy: PathShortenStrategy,
@@ -474,6 +468,38 @@ impl PathShortenStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_evicts_half_when_full() {
+        let mut cache = PathCache::new(4);
+        for i in 0..4 {
+            cache.insert(
+                PathBuf::from(format!("path{i}")),
+                format!("short{i}"),
+                20,
+                PathShortenStrategy::Middle,
+            );
+        }
+        cache.insert(
+            PathBuf::from("new"),
+            "new".into(),
+            20,
+            PathShortenStrategy::Middle,
+        );
+        assert_eq!(cache.map.len(), 3);
+        assert_eq!(
+            cache.get(Path::new("new"), 20, PathShortenStrategy::Middle),
+            Some("new")
+        );
+        assert_eq!(
+            cache.get(Path::new("new"), 30, PathShortenStrategy::Middle),
+            None
+        );
+        assert_eq!(
+            cache.get(Path::new("new"), 20, PathShortenStrategy::End),
+            None
+        );
+    }
 
     #[test]
     fn test_path_shorten_strategy_middle() {

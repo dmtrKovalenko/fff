@@ -171,14 +171,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
 
   clippy:
-    name: cargo clippy
+    name: cargo clippy (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        backend: [ripgrep, zlob]
     steps:
       - uses: actions/checkout@v5
       
@@ -191,7 +194,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           components: clippy
 
       - name: Setup sccache
@@ -202,4 +205,10 @@ jobs:
       - name: Run clippy
         env:
           RUSTC_WRAPPER: sccache
-        run: cargo clippy --no-default-features --features zlob -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --no-default-features --features ${{ matrix.backend }} -- -D warnings
+
+      - name: Lint stress tests
+        if: matrix.backend == 'zlob'
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo clippy -p fff-search --tests --locked --no-default-features --features zlob -- --cfg stress -D warnings

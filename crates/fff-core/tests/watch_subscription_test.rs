@@ -421,7 +421,6 @@ fn empty_pattern_watches_the_whole_tree() {
         "",
         WatchOptions {
             ignore: vec!["*.log".to_string()],
-            ..Default::default()
         },
     );
 
@@ -535,7 +534,6 @@ fn dir_subscription_with_ignore_option() {
         "src",
         WatchOptions {
             ignore: vec!["*.map".to_string(), "src/vendor".to_string()],
-            ..Default::default()
         },
     );
 

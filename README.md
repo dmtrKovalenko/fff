@@ -738,7 +738,7 @@ TypeScript wrapper over the C library for nodejs and bun. Build custom agent too
 
 ### Add the dependency
 
-FFF is written in Rust, so this is the lowest-overhead way to use it.
+FFF is written in Rust, so this is the lowest-overhead way to use it. Building from source requires Rust 1.100 or newer.
 
 ```toml
 [dependencies]
