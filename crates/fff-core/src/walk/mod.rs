@@ -9,7 +9,7 @@ use crate::types::FileItem;
 use std::path::Path;
 
 mod collector;
-pub(crate) use collector::WalkCollector;
+pub(crate) use collector::{WalkBatch, WalkCollector, WalkCursor, WalkPull};
 
 #[cfg(feature = "zlob")]
 mod zlob;
@@ -25,6 +25,7 @@ pub(crate) struct WalkOutput {
     pub(crate) pairs: Vec<(FileItem, String)>,
     /// Every non-ignored directory the walk visited, relative, ending with /
     pub(crate) dirs: Vec<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) ignore_rules: Option<WalkIgnoreRules>,
 }
 

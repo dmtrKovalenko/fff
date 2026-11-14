@@ -305,7 +305,7 @@ pub(crate) fn grep_search<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grep_search_parsed<'a>(
+pub(crate) fn grep_search_parsed<'a>(
     files: &'a [FileItem],
     total_files: usize,
     query: &FFFQuery<'_>,

@@ -31,6 +31,14 @@
 //! access. They provide `read()` / `write()` methods with built-in error
 //! conversion and convenience helpers like `wait_for_scan()`.
 //!
+//! ## Lazy mode
+//!
+//! [`FilePicker::new_lazy_with_shared_state`] publishes an empty picker and
+//! defers indexing. [`SharedFilePicker::grep_lazy`] and
+//! [`SharedFilePicker::fuzzy_search_lazy`] then start the scan, answer the
+//! first page from the files the walker streams, and leave the index building
+//! in the background. Later calls are answered from the built index.
+//!
 //! ## Quick Start
 //!
 //! ```
@@ -123,6 +131,10 @@ pub mod git_recency;
 pub use git_recency::GitRecencyConfig;
 
 mod definition;
+
+/// Search that streams the first page out of a still running initial scan.
+pub mod lazy;
+pub use lazy::{LazyPage, LazySource, LazyStorage, StreamedFiles};
 
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;

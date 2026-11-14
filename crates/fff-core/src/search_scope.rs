@@ -1,5 +1,7 @@
 use crate::file_picker::FuzzySearchOptions;
-use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
+use crate::grep::{
+    GrepResult, GrepSearchOptions, grep_search, grep_search_parsed, multi_grep_search,
+};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::parallelism::SEARCH_THREAD_POOL;
 use crate::query_tracker::QueryTracker;
@@ -100,6 +102,30 @@ impl<'a> SearchScope<'a> {
                 self.budget,
                 self.bigram_index,
                 bigram_overlay,
+                abort_signal,
+                self.base_path,
+                self.arena,
+                self.overflow_arena,
+            )
+        })
+    }
+
+    // Grep without the literal retry of constraint-only misses.
+    pub(crate) fn grep_parsed(
+        &self,
+        query: &FFFQuery<'_>,
+        options: &GrepSearchOptions,
+        abort_signal: &AtomicBool,
+    ) -> GrepResult<'a> {
+        SEARCH_THREAD_POOL.install(|| {
+            grep_search_parsed(
+                self.files,
+                self.live_count,
+                query,
+                options,
+                self.budget,
+                self.bigram_index,
+                None,
                 abort_signal,
                 self.base_path,
                 self.arena,
