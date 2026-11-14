@@ -1,9 +1,9 @@
 use crate::shared::{SharedFrecency, WeakFilePicker};
 use ahash::AHashSet;
 use parking_lot::{Condvar, Mutex};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // we don't really need a queue here
 #[derive(Default)]
@@ -28,6 +28,7 @@ pub(crate) struct GitStatusWorker {
     consumer_spawned: AtomicBool,
     // owned by `SharedPickerInner` so the pause survives picker re-creation
     paused: Arc<AtomicBool>,
+    head_log_len: AtomicU64,
 }
 
 impl GitStatusWorker {
@@ -41,7 +42,15 @@ impl GitStatusWorker {
             cv: Condvar::new(),
             consumer_spawned: AtomicBool::new(false),
             paused,
+            head_log_len: AtomicU64::new(0),
         })
+    }
+
+    // HEAD moves append to `logs/HEAD`; `git reflog expire` (gc, maintenance)
+    // rewrites it with the same or fewer entries and must not trigger a refresh
+    pub(crate) fn head_log_appended(&self, head_log: &Path) -> bool {
+        let len = std::fs::metadata(head_log).map_or(0, |m| m.len());
+        self.head_log_len.swap(len, Ordering::AcqRel) < len
     }
 
     pub(crate) fn spawn_once(
@@ -179,5 +188,30 @@ mod tests {
 
         worker.finish_batch();
         assert!(worker.is_idle());
+    }
+
+    #[test]
+    fn head_log_refreshes_only_on_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("HEAD");
+        let worker = GitStatusWorker::new();
+        let one = "0000 1111 t <t@t> 1 +0000\tcommit (initial): one\n";
+        let two = "1111 2222 t <t@t> 2 +0000\tcommit: two\n";
+
+        assert!(!worker.head_log_appended(&log), "missing reflog");
+        std::fs::write(&log, one).unwrap();
+        assert!(worker.head_log_appended(&log), "first commit");
+        std::fs::write(&log, format!("{one}{two}")).unwrap();
+        assert!(worker.head_log_appended(&log), "commit appends");
+        std::fs::write(&log, format!("{one}{two}")).unwrap();
+        assert!(!worker.head_log_appended(&log), "identical expire rewrite");
+        std::fs::write(&log, two).unwrap();
+        assert!(!worker.head_log_appended(&log), "expire dropped entries");
+        std::fs::write(&log, format!("{two}{one}")).unwrap();
+        assert!(worker.head_log_appended(&log), "append after expire");
+        std::fs::remove_file(&log).unwrap();
+        assert!(!worker.head_log_appended(&log), "reflog deleted");
+        std::fs::write(&log, one).unwrap();
+        assert!(worker.head_log_appended(&log), "reflog recreated");
     }
 }
