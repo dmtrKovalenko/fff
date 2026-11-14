@@ -1,7 +1,7 @@
 use crate::file_picker::FilePickerIgnoreOptions;
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::{WalkIgnoreRules, WalkOutput};
+use crate::walk::{WalkCollector, WalkIgnoreRules};
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -11,7 +11,8 @@ use std::sync::{
 };
 
 #[tracing::instrument(skip_all, name = "ripgrep walker", level = "info")]
-pub(crate) fn walk_collect_files(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walk_into(
     base_path: &Path,
     is_git_repo: bool,
     follow_symlinks: bool,
@@ -19,7 +20,8 @@ pub(crate) fn walk_collect_files(
     synced_files_count: &Arc<AtomicUsize>,
     _ignore_options: &FilePickerIgnoreOptions,
     _scope: Option<&Path>,
-) -> crate::Result<WalkOutput> {
+    collector: &WalkCollector,
+) -> crate::Result<Option<WalkIgnoreRules>> {
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
         // this is a very important guard for the user opening ~/ or other root non-git dir
@@ -37,12 +39,9 @@ pub(crate) fn walk_collect_files(
 
     let walker = walk_builder.build_parallel();
 
-    // Single lock for both collections: every entry is either a file or a
-    // dir, so this keeps one mutex acquisition per entry.
-    let collected =
-        parking_lot::Mutex::new((Vec::<(FileItem, String)>::new(), Vec::<String>::new()));
+    // The ignore crate does not expose worker ids, so every thread shares one shard.
+    collector.start(1);
     walker.run(|| {
-        let collected = &collected;
         let counter = Arc::clone(synced_files_count);
         let base_path = base_path.to_path_buf();
 
@@ -64,7 +63,7 @@ pub(crate) fn walk_collect_files(
                 let (file_item, rel_path) =
                     FileItem::new_from_walk(path, &base_path, None, metadata.as_ref());
 
-                collected.lock().0.push((file_item, rel_path));
+                collector.push_file(0, file_item, rel_path);
                 counter.fetch_add(1, Ordering::Relaxed);
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
@@ -74,20 +73,15 @@ pub(crate) fn walk_collect_files(
                     let mut rel = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy())
                         .into_owned();
                     rel.push('/');
-                    collected.lock().1.push(rel);
+                    collector.push_dir(0, rel);
                 }
             }
             ignore::WalkState::Continue
         })
     });
 
-    let (pairs, dirs) = collected.into_inner();
-    Ok(WalkOutput {
-        pairs,
-        dirs,
-        // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
-        ignore_rules: (!is_git_repo).then(|| WalkIgnoreRules {
-            inner: walk_builder.build_matchers().pop().expect("one walk root"),
-        }),
-    })
+    // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
+    Ok((!is_git_repo).then(|| WalkIgnoreRules {
+        inner: walk_builder.build_matchers().pop().expect("one walk root"),
+    }))
 }

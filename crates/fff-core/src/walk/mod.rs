@@ -8,15 +8,18 @@
 use crate::types::FileItem;
 use std::path::Path;
 
+mod collector;
+pub(crate) use collector::WalkCollector;
+
 #[cfg(feature = "zlob")]
 mod zlob;
 #[cfg(feature = "zlob")]
-pub(crate) use zlob::walk_collect_files;
+pub(crate) use zlob::walk_into;
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 mod ripgrep;
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
-pub(crate) use ripgrep::walk_collect_files;
+pub(crate) use ripgrep::walk_into;
 
 pub(crate) struct WalkOutput {
     pub(crate) pairs: Vec<(FileItem, String)>,
@@ -67,6 +70,35 @@ impl WalkIgnoreRules {
     pub(crate) fn is_ignored(&mut self, relative_path: &Path, is_dir: bool) -> bool {
         self.inner.matched(relative_path, is_dir).is_ignore()
     }
+}
+
+// One-shot walk that returns everything it collected.
+pub(crate) fn walk_collect_files(
+    base_path: &Path,
+    is_git_repo: bool,
+    follow_symlinks: bool,
+    threads: usize,
+    synced_files_count: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ignore_options: &crate::file_picker::FilePickerIgnoreOptions,
+    scope: Option<&Path>,
+) -> crate::Result<WalkOutput> {
+    let collector = WalkCollector::default();
+    let ignore_rules = walk_into(
+        base_path,
+        is_git_repo,
+        follow_symlinks,
+        threads,
+        synced_files_count,
+        ignore_options,
+        scope,
+        &collector,
+    )?;
+    let (pairs, dirs) = collector.finish();
+    Ok(WalkOutput {
+        pairs,
+        dirs,
+        ignore_rules,
+    })
 }
 
 #[cfg(test)]
