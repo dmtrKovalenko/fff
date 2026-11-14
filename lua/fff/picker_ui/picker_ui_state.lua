@@ -62,6 +62,8 @@ M.state = {
   grep_mode = 'plain',
   grep_config = nil,
   grep_regex_fallback_error = nil,
+  ---@type fff.grep.RefineState|nil Collected matches the prompt filters instead of searching
+  refine = nil,
 
   -- Selection state
   selected_files = {},
@@ -141,6 +143,7 @@ function M.reset_state()
   M.state.grep_mode = 'plain'
   M.state.grep_config = nil
   M.state.grep_regex_fallback_error = nil
+  M.state.refine = nil
 
   M.state.selected_files = {}
   M.state.selected_file_order = {}
@@ -159,6 +162,10 @@ function M.reset_state()
   M.state.combo_initial_cursor = nil
   M.state.updating_from_history = false
 end
+
+--- Grep query behind the results, which is not the prompt while refining
+--- @return string
+function M.grep_query() return M.state.refine and M.state.refine.query or M.state.query end
 
 -- Clear all selections
 function M.clear_selections()

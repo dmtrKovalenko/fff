@@ -30,10 +30,15 @@ function M.send_to_quickfix()
         end
       end
     else
-      local grep = require('fff.picker_ui.grep_renderer')
-      local exhaustive_config = vim.tbl_extend('force', S.grep_config or {}, { max_matches_per_file = 0 })
-      local exhaustive = grep.search(S.query, 0, 10000, exhaustive_config, S.grep_mode)
-      local all_items = exhaustive and exhaustive.items or {}
+      local all_items
+      if S.refine then
+        all_items = S.refine.filtered
+      else
+        local grep = require('fff.picker_ui.grep_renderer')
+        local exhaustive_config = vim.tbl_extend('force', S.grep_config or {}, { max_matches_per_file = 0 })
+        local exhaustive = grep.search(S.query, 0, 10000, exhaustive_config, S.grep_mode)
+        all_items = exhaustive and exhaustive.items or {}
+      end
 
       if #all_items == 0 then
         vim.notify('No matches to send to quickfix', vim.log.levels.WARN)

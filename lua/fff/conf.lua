@@ -38,6 +38,7 @@ local M = {}
 --- @field preview_scroll_down string
 --- @field toggle_debug string
 --- @field cycle_grep_modes string
+--- @field toggle_grep_refine string|string[]
 --- @field insert_newline_escape string
 --- @field cycle_previous_query string
 --- @field cycle_forward_query string
@@ -331,6 +332,8 @@ local function init()
       toggle_debug = '<F2>',
       -- Cycle between configured grep modes.
       cycle_grep_modes = '<S-Tab>',
+      -- grep mode only: fuzzy filter the current query's matches instead of searching again
+      toggle_grep_refine = '<C-g>',
       -- grep mode only: insert a literal `\n` to search across lines
       -- (requires a terminal with extended-key support to distinguish from <CR>)
       insert_newline_escape = '<C-CR>',
@@ -394,6 +397,7 @@ local function init()
       grep_plain_active = 'Comment', -- Highlight for keybind + label when regex is off
       grep_fuzzy_active = 'DiagnosticHint', -- Highlight for keybind + label when fuzzy is on
       grep_definition_active = 'DiagnosticOk', -- Highlight for the definitions-only mode
+      grep_refine_active = 'DiagnosticWarn', -- Highlight for the refine indicator
       -- Cross-mode suggestion highlights
       suggestion_header = 'WarningMsg', -- Highlight for the "No results found. Suggested..." banner
       -- File info panel highlights
