@@ -34,11 +34,11 @@ use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
 use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
-use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
+use crate::grep::{GrepResult, GrepSearchOptions};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+use crate::search_scope::SearchScope;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
@@ -63,7 +63,7 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
-use crate::parallelism::{SEARCH_THREAD_POOL, indexing_pool};
+use crate::parallelism::indexing_pool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FFFMode {
@@ -1254,94 +1254,7 @@ impl FilePicker {
         query_tracker: Option<&QueryTracker>,
         options: FuzzySearchOptions<'q>,
     ) -> SearchResult<'_> {
-        let files = self.get_files();
-        let max_threads = if options.max_threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        } else {
-            options.max_threads
-        };
-
-        debug!(
-            raw_query = ?query.raw_query,
-            pagination = ?options.pagination,
-            ?max_threads,
-            current_file = ?options.current_file,
-            "Fuzzy search",
-        );
-
-        let total_files = self.live_file_count();
-        let location = query.location;
-
-        // Get effective query for max_typos calculation (without location suffix)
-        let effective_query = match &query.fuzzy_query {
-            fff_query_parser::FuzzyQuery::Text(t) => *t,
-            fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
-            _ => query.raw_query.trim(),
-        };
-
-        // small queries with a large number of results can match absolutely everything
-        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
-        // Look up the last file selected for this query (combo-boost scoring)
-        let last_same_query_entry =
-            query_tracker
-                .zip(options.project_path)
-                .and_then(|(tracker, project_path)| {
-                    tracker
-                        .get_last_query_entry(
-                            query.raw_query,
-                            project_path,
-                            options.min_combo_count,
-                        )
-                        .ok()
-                        .flatten()
-                });
-
-        let context = ScoringContext {
-            query,
-            max_typos,
-            max_threads,
-            project_path: options.project_path,
-            current_file: options.current_file,
-            last_same_query_match: last_same_query_entry,
-            combo_boost_score_multiplier: options.combo_boost_score_multiplier,
-            min_combo_count: options.min_combo_count,
-            pagination: options.pagination,
-        };
-
-        let time = std::time::Instant::now();
-
-        let base_arena = self.sync_data.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
-
-        let (items, scores, total_matched) = fuzzy_match_and_score_files(
-            files,
-            &context,
-            self.sync_data.base_count,
-            base_arena,
-            overflow_arena,
-        );
-        let match_byte_offsets =
-            fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
-
-        info!(
-            ?query,
-            completed_in = ?time.elapsed(),
-            total_matched,
-            returned_count = items.len(),
-            pagination = ?options.pagination,
-            "Fuzzy search completed",
-        );
-
-        SearchResult {
-            items,
-            scores,
-            match_byte_offsets,
-            total_matched,
-            total_files,
-            location,
-        }
+        self.scope().fuzzy_search(query, query_tracker, options)
     }
 
     /// Perform fuzzy search on indexed directories.
@@ -1564,28 +1477,13 @@ impl FilePicker {
     /// cancellation flag, giving the caller full control over when to stop.
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
-        let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
         let cancel = options
             .abort_signal
             .as_deref()
             .unwrap_or(&self.signals.cancelled);
 
-        SEARCH_THREAD_POOL.install(|| {
-            grep_search(
-                self.get_files(),
-                self.live_file_count(),
-                query,
-                options,
-                self.cache_budget(),
-                self.sync_data.bigram_index.as_deref(),
-                overlay_guard.as_deref(),
-                cancel,
-                &self.base_path,
-                arena,
-                overflow_arena,
-            )
-        })
+        self.scope()
+            .grep(query, options, overlay_guard.as_deref(), cancel)
     }
 
     /// Multi-pattern grep search across indexed files.
@@ -1596,28 +1494,31 @@ impl FilePicker {
         options: &GrepSearchOptions,
     ) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
-        let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.arena_overflow_ptr();
         let cancel = options
             .abort_signal
             .as_deref()
             .unwrap_or(&self.signals.cancelled);
 
-        SEARCH_THREAD_POOL.install(|| {
-            multi_grep_search(
-                self.get_files(),
-                patterns,
-                constraints,
-                options,
-                self.cache_budget(),
-                self.sync_data.bigram_index.as_deref(),
-                overlay_guard.as_deref(),
-                cancel,
-                &self.base_path,
-                arena,
-                overflow_arena,
-            )
-        })
+        self.scope().multi_grep(
+            patterns,
+            constraints,
+            options,
+            overlay_guard.as_deref(),
+            cancel,
+        )
+    }
+
+    pub(crate) fn scope(&self) -> SearchScope<'_> {
+        SearchScope {
+            files: self.get_files(),
+            base_count: self.sync_data.base_count,
+            live_count: self.live_file_count(),
+            arena: self.sync_data.arena_base_ptr(),
+            overflow_arena: self.sync_data.arena_overflow_ptr(),
+            base_path: &self.base_path,
+            budget: &self.cache_budget,
+            bigram_index: self.sync_data.bigram_index.as_deref(),
+        }
     }
 
     // Returns an ongoing or finisshed scan progress
