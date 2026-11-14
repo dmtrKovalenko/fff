@@ -71,3 +71,36 @@ function existingDir(parent: string, name: string): string | undefined {
     return undefined;
   }
 }
+
+/**
+ * Walks up from `dir` to the filesystem root looking for a valid `.git`
+ * directory (containing `HEAD`) or a worktree/submodule `.git` gitfile.
+ */
+export function isGitRepo(dir: string): boolean {
+  let current = path.resolve(dir);
+  while (true) {
+    if (hasGitMetadata(current)) return true;
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+function hasGitMetadata(dir: string): boolean {
+  const dotGit = path.join(dir, ".git");
+  try {
+    const stat = fs.statSync(dotGit);
+    if (stat.isDirectory()) {
+      return fs.existsSync(path.join(dotGit, "HEAD"));
+    }
+    if (stat.isFile()) {
+      const content = fs.readFileSync(dotGit, "utf8").trim();
+      if (!content.startsWith("gitdir:")) return false;
+      const target = content.slice("gitdir:".length).trim();
+      return target.length > 0 && fs.existsSync(path.resolve(dir, target));
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}

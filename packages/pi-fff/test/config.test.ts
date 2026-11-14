@@ -33,6 +33,7 @@ describe("loadConfig", () => {
       enableHomeDirScanning: false,
       warnOnHomeDirScan: false,
       followSymlinks: true,
+      gitRepoOnly: true,
     };
     writeConfig(config);
 
@@ -70,6 +71,7 @@ describe("loadConfig", () => {
       [{ enableHomeDirScanning: "false" }, '"enableHomeDirScanning" must be a boolean'],
       [{ warnOnHomeDirScan: "false" }, '"warnOnHomeDirScan" must be a boolean'],
       [{ followSymlinks: "true" }, '"followSymlinks" must be a boolean'],
+      [{ gitRepoOnly: "true" }, '"gitRepoOnly" must be a boolean'],
     ];
 
     for (const [config, message] of cases) {
