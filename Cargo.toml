@@ -11,9 +11,6 @@ members = [
 
 resolver = "2"
 
-[workspace.package]
-rust-version = "1.100"
-
 [workspace.lints.clippy]
 module_inception = "allow"
 

@@ -2,7 +2,6 @@
 name = "fff-query-parser"
 version = "0.11.0"
 edition = "2024"
-rust-version.workspace = true
 description = "Query parser for fff file finder - includes specific syntax for various constraints like globs, extensions, regex etc"
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlok.com>"]

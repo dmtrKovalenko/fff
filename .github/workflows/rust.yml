@@ -171,7 +171,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.100.0
+          toolchain: stable
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
@@ -194,7 +194,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.100.0
+          toolchain: stable
           components: clippy
 
       - name: Setup sccache

@@ -531,7 +531,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.100.0
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -795,7 +795,7 @@ jobs:
         uses: leafo/gh-actions-lua@v12
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.100.0
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-edit
         run: cargo install cargo-edit --force --locked
