@@ -161,6 +161,7 @@ mod git_status_worker;
 mod ignore;
 mod scan;
 mod score;
+mod search_scope;
 mod sort_buffer;
 
 pub(crate) mod index;
