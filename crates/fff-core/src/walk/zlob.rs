@@ -4,8 +4,7 @@ use crate::file_picker::{
 };
 use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
-use crate::walk::{WalkIgnoreRules, WalkOutput};
-use parking_lot::Mutex;
+use crate::walk::{WalkCollector, WalkIgnoreRules};
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,16 +14,9 @@ use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
 const PROGRESS_STEP: usize = 13;
 
-// Keep adjacent workers' locks and vector headers on separate cache lines.
-#[repr(align(128))]
-#[derive(Default)]
-struct WorkerFiles {
-    pairs: Vec<(FileItem, String)>,
-    dirs: Vec<String>,
-}
-
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
-pub(crate) fn walk_collect_files(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walk_into(
     base_path: &Path,
     is_git_repo: bool,
     follow_symlinks: bool,
@@ -32,7 +24,8 @@ pub(crate) fn walk_collect_files(
     synced_files_count: &Arc<AtomicUsize>,
     ignore_options: &FilePickerIgnoreOptions,
     scope: Option<&Path>,
-) -> crate::Result<WalkOutput> {
+    collector: &WalkCollector,
+) -> crate::Result<Option<WalkIgnoreRules>> {
     let use_non_git_defaults = !is_git_repo && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
     if ignore_options.disable_git {
@@ -73,13 +66,11 @@ pub(crate) fn walk_collect_files(
             .map_err(|e| crate::Error::WalkFailed(format!("invalid extra ignore rules: {e:?}")))?;
     }
 
-    let collected: Vec<Mutex<WorkerFiles>> = (0..builder.max_workers())
-        .map(|_| Mutex::default())
-        .collect();
+    collector.start(builder.max_workers());
     synced_files_count.store(0, Ordering::Relaxed);
 
     let outcome = match builder.run(|entry| {
-        let collected = &collected[entry.worker_id()];
+        let worker = entry.worker_id();
         if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
         {
             return WalkState::SkipDir;
@@ -117,7 +108,7 @@ pub(crate) fn walk_collect_files(
                         Cow::Owned(path) => path,
                     };
                     relative_path.push('/');
-                    collected.lock().dirs.push(relative_path);
+                    collector.push_dir(worker, relative_path);
                 }
             }
 
@@ -163,10 +154,7 @@ pub(crate) fn walk_collect_files(
         let mut item = FileItem::new_raw(basename_offset as u16, size, modified, None, is_binary);
         item.mark_definition_language(basename);
 
-        let mut guard = collected.lock();
-        guard.pairs.push((item, relative_path));
-        let n = guard.pairs.len();
-        drop(guard);
+        let n = collector.push_file(worker, item, relative_path);
 
         if n.is_multiple_of(PROGRESS_STEP) {
             synced_files_count.fetch_add(PROGRESS_STEP, Ordering::Relaxed);
@@ -181,25 +169,13 @@ pub(crate) fn walk_collect_files(
         }
     };
 
-    let collected: Vec<_> = collected.into_iter().map(Mutex::into_inner).collect();
-    let mut pairs = Vec::with_capacity(collected.iter().map(|shard| shard.pairs.len()).sum());
-    let mut dirs = Vec::with_capacity(collected.iter().map(|shard| shard.dirs.len()).sum());
-    for mut shard in collected {
-        pairs.append(&mut shard.pairs);
-        dirs.append(&mut shard.dirs);
-    }
     // Always report the exact final total regardless of the last step.
-    synced_files_count.store(pairs.len(), Ordering::Relaxed);
+    synced_files_count.store(collector.file_count(), Ordering::Relaxed);
 
-    let ignore_rules =
+    Ok(
         (use_non_git_defaults || outcome.rules().is_some()).then_some(WalkIgnoreRules {
             inner: outcome,
             skip_hidden: use_non_git_defaults,
-        });
-
-    Ok(WalkOutput {
-        pairs,
-        dirs,
-        ignore_rules,
-    })
+        }),
+    )
 }
