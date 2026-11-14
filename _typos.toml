@@ -1,6 +1,9 @@
 [files]
 extend-exclude = ["/CHANGELOG.md", "data/filetypes/base.lua"]
 
+[default.extend-identifiers]
+rela_path = "rela_path"
+
 [default.extend-words]
 noice = "noice"
 fo = "fo"
