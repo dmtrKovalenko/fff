@@ -37,7 +37,7 @@ use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
-use crate::scan::{ScanConfig, ScanJob, ScanSignals};
+use crate::scan::{InitialScan, ScanJob, ScanSignals};
 use crate::search_scope::SearchScope;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
@@ -46,7 +46,7 @@ use crate::types::{
     ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
     PaginationArgs, Score, ScoringContext, SearchResult,
 };
-use crate::walk::WalkOutput;
+use crate::walk::WalkCollector;
 use crate::watch::BackgroundWatcher;
 use ahash::AHashMap;
 use fff_query_parser::FFFQuery;
@@ -689,6 +689,7 @@ pub struct FilePicker {
     pub base_path: PathBuf,
     sync_data: FileSync,
     pub(crate) signals: ScanSignals,
+    pub(crate) initial_scan: parking_lot::Mutex<InitialScan>,
     pub(crate) background_watcher: Option<BackgroundWatcher>,
     /// Single serialized writer for all git-status updates (scan, watcher,
     /// FFI). Owned by the picker so it exists before the first scan; its
@@ -1051,6 +1052,7 @@ impl FilePicker {
             cache_budget: Arc::new(initial_budget),
             has_explicit_cache_budget: has_explicit_budget,
             signals: crate::scan::ScanSignals::default(),
+            initial_scan: parking_lot::Mutex::new(InitialScan::Done),
             mode: options.mode,
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
@@ -1088,6 +1090,46 @@ impl FilePicker {
         options: FilePickerOptions,
         ignore_options: FilePickerIgnoreOptions,
     ) -> Result<(), Error> {
+        let picker = Self::new_for_shared_state(&shared_picker, options, ignore_options)?;
+
+        info!(
+            "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
+            picker.base_path.display(),
+            picker.enable_mmap_cache,
+            picker.enable_content_indexing,
+            picker.mode,
+        );
+
+        let job = picker.begin_initial_scan(
+            &mut picker.initial_scan.lock(),
+            &shared_picker,
+            &shared_frecency,
+        );
+        picker.publish(&shared_picker)?;
+        job.spawn();
+
+        Ok(())
+    }
+
+    /// Like [`Self::new_with_shared_state_and_ignore_options`] but nothing is
+    /// indexed until the first [`SharedFilePicker::grep_lazy`] or
+    /// [`SharedFilePicker::fuzzy_search_lazy`] call, or an explicit
+    /// [`SharedFilePicker::start_deferred_scan`].
+    pub fn new_lazy_with_shared_state(
+        shared_picker: SharedFilePicker,
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+    ) -> Result<(), Error> {
+        let picker = Self::new_for_shared_state(&shared_picker, options, ignore_options)?;
+        *picker.initial_scan.lock() = InitialScan::Deferred;
+        picker.publish(&shared_picker)
+    }
+
+    fn new_for_shared_state(
+        shared_picker: &SharedFilePicker,
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+    ) -> Result<Self, Error> {
         let extra_ignore = &ignore_options.extra_ignore;
         if !cfg!(feature = "zlob") && !extra_ignore.is_empty() {
             return Err(Error::WalkFailed(
@@ -1107,74 +1149,38 @@ impl FilePicker {
             ));
         }
 
-        let mut picker = Self::new_with_ignore_options(options, ignore_options.clone())?;
+        let mut picker = Self::new_with_ignore_options(options, ignore_options)?;
         picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
             shared_picker.git_status_pause_flag(),
         );
+        Ok(picker)
+    }
 
-        info!(
-            "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
-            picker.base_path.display(),
-            picker.enable_mmap_cache,
-            picker.enable_content_indexing,
-            picker.mode,
-        );
-
-        let warmup = picker.enable_mmap_cache;
-        let content_indexing = picker.enable_content_indexing;
-        let watch = picker.watch;
-        let mode = picker.mode;
-        let follow_symlinks = picker.follow_symlinks;
-        let enable_fs_root_scanning = picker.enable_fs_root_scanning;
-        let enable_home_dir_scanning = picker.enable_home_dir_scanning;
-
-        let signals = picker.scan_signals();
-        let scanned_files_counter = picker.scanned_files_counter();
-        let path = picker.base_path.clone();
-        let trace_span = picker.trace_span.clone();
-
-        // Pre-arm `scanning` BEFORE publishing the new picker. `ScanJob::spawn`
-        // also sets it, but that runs after this function returns; consumers
-        // (e.g. lua `wait_for_initial_scan` after `restart_index_in_path`)
-        // that grab the signal Arc between publish and spawn would otherwise
-        // observe scanning=false and skip the wait, racing the walker. The
-        // race is wide on Windows CI where notify is slow.
-        signals
-            .scanning
-            .store(true, std::sync::atomic::Ordering::Release);
-
+    fn publish(self, shared_picker: &SharedFilePicker) -> Result<(), Error> {
         // Update the watch base before publishing the new picker.
-        shared_picker.rebase_watches(&path);
+        shared_picker.rebase_watches(&self.base_path);
 
-        {
-            let mut guard = shared_picker.write()?;
-            *guard = Some(picker);
-            // dropping old picker flips its `cancelled` flag → bg threads exit cleanly
-        }
-
-        ScanJob::new_initial(
-            shared_picker,
-            shared_frecency,
-            path,
-            mode,
-            signals,
-            scanned_files_counter,
-            trace_span,
-            ScanConfig {
-                warmup,
-                content_indexing,
-                watch,
-                auto_cache_budget: true,
-                install_watcher: true,
-                follow_symlinks,
-                ignore_options,
-                enable_fs_root_scanning,
-                enable_home_dir_scanning,
-            },
-        )
-        .spawn();
-
+        let mut guard = shared_picker.write()?;
+        // dropping old picker flips its `cancelled` flag → bg threads exit cleanly
+        *guard = Some(self);
         Ok(())
+    }
+
+    // Arms the initial scan and returns its job; the caller spawns it.
+    pub(crate) fn begin_initial_scan(
+        &self,
+        state: &mut InitialScan,
+        shared_picker: &SharedFilePicker,
+        shared_frecency: &SharedFrecency,
+    ) -> ScanJob {
+        let collector = Arc::new(WalkCollector::default());
+        *state = InitialScan::Walking(Arc::clone(&collector));
+
+        // Pre-arm `scanning` before the picker is published or the job spawned:
+        // a waiter grabbing the signal in between would skip its wait and race the walker.
+        self.signals.scanning.store(true, Ordering::Release);
+
+        ScanJob::new_initial(self, shared_picker, shared_frecency, collector)
     }
 
     /// Synchronous filesystem scan — populates `self` with indexed files.
@@ -1203,9 +1209,11 @@ impl FilePicker {
             self.mode,
             self.follow_symlinks,
             &self.ignore_options,
+            &WalkCollector::default(),
         )?;
 
         self.sync_data = sync;
+        *self.initial_scan.lock() = InitialScan::Done;
 
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
@@ -2186,6 +2194,7 @@ impl FileSync {
     /// Returns files immediately (searchable) and a handle to the in-progress
     /// git status computation. This avoids blocking on `git status` which can
     /// take 10+ seconds on very large repos (e.g. chromium).
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, name = "walk_filesystem", level = Level::INFO)]
     pub(crate) fn walk_filesystem(
         base_path: &Path,
@@ -2195,6 +2204,7 @@ impl FileSync {
         mode: FFFMode,
         follow_symlinks: bool,
         ignore_options: &FilePickerIgnoreOptions,
+        collector: &WalkCollector,
     ) -> Result<FileSync, Error> {
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
@@ -2211,11 +2221,7 @@ impl FileSync {
         let pool = indexing_pool();
         let walk_threads = pool.current_num_threads();
 
-        let WalkOutput {
-            dirs: mut walked_dirs,
-            mut pairs,
-            ignore_rules,
-        } = crate::walk::walk_collect_files(
+        let ignore_rules = crate::walk::walk_into(
             base_path,
             is_git_repo,
             follow_symlinks,
@@ -2223,8 +2229,10 @@ impl FileSync {
             synced_files_count,
             ignore_options,
             None,
-        )?;
-        let ignore_rules = ignore_rules.map(Arc::new);
+            collector,
+        )?
+        .map(Arc::new);
+        let (mut pairs, mut walked_dirs) = collector.finish();
 
         // group walked dirs and files with a dir part to the same order
         pool.install(|| {

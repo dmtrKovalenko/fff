@@ -11,6 +11,7 @@ use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::{BACKGROUND_THREAD_POOL, indexing_pool};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
+use crate::walk::WalkCollector;
 use crate::watch::{BackgroundWatcher, WatcherOptions};
 
 #[derive(Clone, Default)]
@@ -27,6 +28,15 @@ pub(crate) struct ScanSignals {
     /// DO NOT set or clear this manually — it is managed exclusively by the
     /// PostScanSnapshot lifecycle.
     pub(crate) post_scan_indexing_active: Arc<AtomicBool>,
+}
+
+// Progress of the first scan of a picker; later rescans never change it.
+pub(crate) enum InitialScan {
+    // Lazy picker: nothing is walked until the first lazy search asks for it.
+    Deferred,
+    // The walk is running or is being turned into the index.
+    Walking(Arc<WalkCollector>),
+    Done,
 }
 
 /// Which optional phases a scan should run.
@@ -60,6 +70,7 @@ pub(crate) struct ScanJob {
     /// walker. Shared `Arc` so the UI polls the same atomic.
     scanned_files_counter: Arc<AtomicUsize>,
     trace_span: tracing::Span,
+    collector: Arc<WalkCollector>,
 }
 
 impl ScanJob {
@@ -108,29 +119,36 @@ impl ScanJob {
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
             trace_span,
+            collector: Arc::default(),
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new_initial(
-        shared_picker: SharedFilePicker,
-        shared_frecency: SharedFrecency,
-        base_path: PathBuf,
-        mode: FFFMode,
-        signals: ScanSignals,
-        scanned_files_counter: Arc<AtomicUsize>,
-        trace_span: tracing::Span,
-        config: ScanConfig,
+        picker: &crate::file_picker::FilePicker,
+        shared_picker: &SharedFilePicker,
+        shared_frecency: &SharedFrecency,
+        collector: Arc<WalkCollector>,
     ) -> Self {
         Self {
-            shared_picker,
-            shared_frecency,
-            base_path,
-            mode,
-            signals,
-            scanned_files_counter,
-            config,
-            trace_span,
+            shared_picker: shared_picker.clone(),
+            shared_frecency: shared_frecency.clone(),
+            base_path: picker.base_path().to_path_buf(),
+            mode: picker.mode(),
+            signals: picker.scan_signals(),
+            scanned_files_counter: picker.scanned_files_counter(),
+            trace_span: picker.trace_span(),
+            collector,
+            config: ScanConfig {
+                warmup: picker.has_mmap_cache(),
+                content_indexing: picker.has_content_indexing(),
+                watch: picker.has_watcher(),
+                auto_cache_budget: true,
+                install_watcher: true,
+                follow_symlinks: picker.follows_symlinks(),
+                ignore_options: picker.ignore_options().clone(),
+                enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
+                enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
+            },
         }
     }
 
@@ -161,9 +179,10 @@ impl ScanJob {
             scanned_files_counter,
             config,
             trace_span: _,
+            collector,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals);
+        let _scanning = ScanningGuard::new(&signals, &collector);
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
@@ -176,6 +195,7 @@ impl ScanJob {
             mode,
             config.follow_symlinks,
             &config.ignore_options,
+            &collector,
         ) {
             Ok(sync) => sync,
             Err(e) => {
@@ -197,6 +217,7 @@ impl ScanJob {
 
             let live_count = sync.live_count;
             previous = picker.commit_new_sync(sync);
+            *picker.initial_scan.lock() = InitialScan::Done;
             git_status_worker = Arc::clone(&picker.git_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
@@ -206,6 +227,8 @@ impl ScanJob {
             error!("failed to install scan results into picker");
             return;
         }
+        // Lazy searches that could not follow the walk switch to the index now.
+        collector.commit();
 
         // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
         // which is a real use case we need to have a way to start the git worker background thread dynamically
@@ -391,21 +414,23 @@ impl ScanJob {
     }
 }
 
-// Ensures early returns clear the scanning signal.
+// Ensures early returns clear the scanning signal and release lazy searches.
 struct ScanningGuard<'a> {
     signals: &'a ScanSignals,
+    collector: &'a WalkCollector,
 }
 
 impl<'a> ScanningGuard<'a> {
-    fn new(signals: &'a ScanSignals) -> Self {
+    fn new(signals: &'a ScanSignals, collector: &'a WalkCollector) -> Self {
         signals.scanning.store(true, Ordering::Relaxed);
-        Self { signals }
+        Self { signals, collector }
     }
 }
 
 impl Drop for ScanningGuard<'_> {
     fn drop(&mut self) {
         self.signals.scanning.store(false, Ordering::Relaxed);
+        self.collector.abort();
     }
 }
 

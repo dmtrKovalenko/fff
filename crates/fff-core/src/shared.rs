@@ -232,6 +232,11 @@ impl SharedFilePicker {
         shared_frecency: &SharedFrecency,
         reason: RescanReason,
     ) -> Result<bool, Error> {
+        // A lazy picker has no index yet: its first scan is the rescan.
+        if self.start_deferred_scan(shared_frecency)? {
+            return Ok(true);
+        }
+
         // for giant folders we have no other choice other than throttling rescans
         // if user is running application in millions of files with a ton of rescan events
         // we drop / throttle some of requests to avoid constant burst of IO
