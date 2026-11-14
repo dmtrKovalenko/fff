@@ -454,6 +454,19 @@ export function ffiDestroy(handle: NativeHandle): void {
   });
 }
 
+/** Run native teardown on a worker and wait for resource disposal. */
+export async function ffiDestroyAsync(handle: NativeHandle): Promise<void> {
+  loadLibrary();
+  await load({
+    library: LIBRARY_KEY,
+    funcName: "fff_destroy",
+    retType: DataType.Void,
+    paramsType: [DataType.External],
+    paramsValue: [handle],
+    runInNewThread: true,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Struct type definitions for restorePointer (must match #[repr(C)] layout)
 // ---------------------------------------------------------------------------
@@ -1860,9 +1873,7 @@ export function ffiWatchCleanupAfterDestroy(
   handle: NativeHandle,
   watchIds: Iterable<number>,
 ): void {
-  for (const id of watchIds) {
-    watchHandlers.delete(id);
-  }
+  ffiWatchDropHandlers(watchIds);
   watchInstances.delete(handle as unknown);
   releaseWatchTrampolineIfIdle();
 }
@@ -1925,4 +1936,9 @@ export function closeLibrary(): void {
     close(LIBRARY_KEY);
     isLoaded = false;
   }
+}
+
+/** Remove JS handlers without releasing the native callback trampoline. */
+export function ffiWatchDropHandlers(watchIds: Iterable<number>): void {
+  for (const id of watchIds) watchHandlers.delete(id);
 }

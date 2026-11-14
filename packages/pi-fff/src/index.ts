@@ -29,7 +29,7 @@ import type {
 import { Type, type TSchema } from "@sinclair/typebox";
 import { AuxFinderPool, routePathConstraint } from "./aux-finders";
 import { type FffMode, loadConfig, VALID_MODES } from "./config";
-import { FilePickerFactory } from "./file-picker";
+import { destroyPickers, FilePickerFactory } from "./file-picker";
 import { isFsRoot, isHomeDir, resolveDbPaths } from "./paths";
 import { buildQuery } from "./query";
 
@@ -562,18 +562,21 @@ export default function fffExtension(pi: ExtensionAPI) {
     tick();
   }
 
-  function destroyFinder() {
-    if (mainFinder && !mainFinder.isDestroyed) {
-      mainFinder.destroy();
-      mainFinder = null;
-      finderCwd = null;
-    }
-
-    auxPool?.destroy();
+  async function destroyFinder(): Promise<void> {
+    await Promise.allSettled([finderPromise]);
+    const resources = [];
+    if (mainFinder) resources.push(mainFinder);
+    if (auxPool) resources.push(auxPool);
+    mainFinder = null;
+    finderCwd = null;
     auxPool = null;
     pickers = null;
-    // UI teardown last: a throwing ctx must not leak the native finders (#948).
-    stopHomeScanStatus();
+    try {
+      await destroyPickers(resources);
+    } finally {
+      // UI teardown last: a throwing ctx must not leak native finders (#948).
+      stopHomeScanStatus();
+    }
   }
 
   async function resolveFinderForPath(
@@ -872,8 +875,11 @@ export default function fffExtension(pi: ExtensionAPI) {
   // A ctx captured from a replaced session is stale and throws on access (#948).
   pi.on("session_shutdown", async (_event, ctx) => {
     uiCtx = ctx;
-    destroyFinder();
-    uiCtx = null;
+    try {
+      await destroyFinder();
+    } finally {
+      uiCtx = null;
+    }
   });
 
   // --- Shared render helpers ---

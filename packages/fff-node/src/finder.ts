@@ -12,6 +12,7 @@ import {
   ensureLoaded,
   ffiCreate,
   ffiDestroy,
+  ffiDestroyAsync,
   ffiGetBasePath,
   ffiGetHistoricalQuery,
   ffiGetScanProgress,
@@ -31,6 +32,7 @@ import {
   ffiWaitForScan,
   ffiWatch,
   ffiWatchCleanupAfterDestroy,
+  ffiWatchDropHandlers,
   isAvailable,
   type NativeHandle,
 } from "./ffi.js";
@@ -94,6 +96,7 @@ export class FileFinder implements FileFinderApi {
   private handle: NativeHandle | null;
   /** Native ids of this instance's active watch subscriptions. */
   private watchers = new Set<number>();
+  private destroyPromise: Promise<void> | null = null;
 
   private constructor(handle: NativeHandle) {
     this.handle = handle;
@@ -167,6 +170,23 @@ export class FileFinder implements FileFinderApi {
       ffiWatchCleanupAfterDestroy(handle, this.watchers);
       this.watchers.clear();
     }
+  }
+
+  /** Destroy all native resources without blocking the Node event loop. */
+  destroyAsync(): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
+    if (this.handle === null) return Promise.resolve();
+
+    const handle = this.handle;
+    this.handle = null;
+    ffiWatchDropHandlers(this.watchers);
+    this.watchers.clear();
+    this.destroyPromise = ffiDestroyAsync(handle).then(() => {
+      // fff_destroy is the quiescence barrier; keep callback trampolines
+      // alive until its worker has finished.
+      ffiWatchCleanupAfterDestroy(handle, this.watchers);
+    });
+    return this.destroyPromise;
   }
 
   /**

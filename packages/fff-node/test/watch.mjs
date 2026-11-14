@@ -387,6 +387,80 @@ describe("fff-node watch", { concurrency: 1 }, () => {
     sub.value();
   });
 
+  for (const entry of ["../dist/index.js", "../dist/index.cjs"]) {
+    it(`async destroy releases active watches and persists history (${entry})`, async () => {
+      const script = `
+        import assert from "node:assert/strict";
+        import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+        import { tmpdir } from "node:os";
+        import { join } from "node:path";
+        const { FileFinder } = await import(${JSON.stringify(new URL(entry, import.meta.url).href)});
+        const dir = realpathSync(mkdtempSync(join(tmpdir(), "fff-async-destroy-")));
+        const workspace = join(dir, "workspace");
+        mkdirSync(workspace);
+        const file = join(workspace, "seed.txt");
+        writeFileSync(file, "seed");
+        const options = {
+          basePath: workspace,
+          frecencyDbPath: join(dir, "frecency"),
+          historyDbPath: join(dir, "history"),
+        };
+        let finder;
+        try {
+          const created = FileFinder.create(options);
+          assert.ok(created.ok, JSON.stringify(created));
+          finder = created.value;
+          await finder.waitForScan(10_000);
+          assert.ok(finder.trackQuery("async-destroy", file).ok);
+          let callbacks = 0;
+          const watch = () => finder.watch("**/*.txt", () => { callbacks++; });
+          let subscription = watch();
+          const deadline = Date.now() + 2_000;
+          while (!subscription.ok && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            subscription = watch();
+          }
+          assert.ok(subscription.ok, JSON.stringify(subscription));
+          writeFileSync(join(workspace, "queued.txt"), "queued");
+          const atStart = callbacks;
+          const closing = finder.destroyAsync();
+          subscription.value();
+          let settled = false;
+          closing.then(() => { settled = true; });
+          assert.equal(finder.isDestroyed, true);
+          assert.equal(finder.fileSearch("seed").ok, false);
+          assert.equal(finder.destroyAsync(), closing);
+          finder.destroy();
+          // Native completion must yield to the event loop, not only microtasks.
+          for (let tick = 0; tick < 4; tick++) await Promise.resolve();
+          assert.equal(settled, false, "native destroy must run asynchronously");
+          await closing;
+          assert.equal(callbacks, atStart);
+          const atClose = callbacks;
+          writeFileSync(join(workspace, "after.txt"), "after");
+          await new Promise(resolve => setTimeout(resolve, 100));
+          assert.equal(callbacks, atClose);
+          subscription.value();
+          const reopened = FileFinder.create(options);
+          assert.ok(reopened.ok, JSON.stringify(reopened));
+          finder = reopened.value;
+          assert.equal(finder.getHistoricalQuery(0).value, "async-destroy");
+          await finder.destroyAsync();
+          console.log("DONE");
+        } finally {
+          await finder?.destroyAsync();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      `;
+      const { stdout } = await promisify(execFile)(
+        process.execPath,
+        ["--input-type=module", "-e", script],
+        { timeout: 15_000 },
+      );
+      assert.match(stdout, /DONE/);
+    });
+  }
+
   it("process exits naturally after unsubscribing (trampoline released)", async () => {
     // The threadsafe_function refs the event loop; if the trampoline is not
     // freed on last unsubscribe, this child process would hang and time out.
