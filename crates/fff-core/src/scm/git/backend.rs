@@ -18,6 +18,7 @@ pub(in crate::scm) fn discover(path: &Path) -> Option<ScmWorkspace> {
         .then(|| main_checkout_root(repo.commondir()))
         .map(crate::path_utils::normalize);
     Some(ScmWorkspace {
+        base_alias: None,
         workdir,
         metadata: repo.path().to_owned(),
         shared_root,

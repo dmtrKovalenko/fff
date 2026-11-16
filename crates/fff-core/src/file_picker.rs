@@ -1235,7 +1235,10 @@ impl FilePicker {
         if let Some(workspace) = self.scm_workspace()
             && let Ok(repo) = workspace.open()
         {
-            let recency = repo.recency(&self.git_recency_config, &self.base_path);
+            let recency = repo.recency(
+                &self.git_recency_config,
+                &workspace.git_path(&self.base_path),
+            );
             self.apply_git_recency(recency.as_ref());
         }
 
@@ -1716,10 +1719,8 @@ impl FilePicker {
         let Some(workspace) = &self.sync_data.git else {
             return Ok(0);
         };
-        let subdir = self
-            .base_path
-            .strip_prefix(&workspace.workdir)?
-            .to_string_lossy();
+        let base = workspace.git_path(&self.base_path);
+        let subdir = base.strip_prefix(&workspace.workdir)?.to_string_lossy();
         let subdir = crate::path_utils::to_canonical_slashes(&subdir);
         let subdir = (!subdir.is_empty()).then_some(subdir.as_ref());
         let frecency = shared_frecency.read()?;

@@ -64,7 +64,7 @@ jobs:
         env:
           RUSTC_WRAPPER: sccache
         # fff-python requires full python o3 machinery which is very slow
-        run: cargo test --no-default-features --features zlob --workspace --exclude fff-nvim --exclude fff-python
+        run: cargo test --locked --no-default-features --features zlob --workspace --exclude fff-nvim --exclude fff-python
 
       - name: Check Neovim's gitoxide-only build
         if: matrix.os == 'ubuntu-latest'
@@ -77,6 +77,7 @@ jobs:
             exit 1
           fi
           cargo test --locked -p fff-search --no-default-features --features zlob,gitoxide --lib -- scm::
+          cargo test --locked -p fff-search --no-default-features --features zlob,gitoxide --test git_status_pause_test --test git_recency_integration
           cargo test --locked -p fff-search --no-default-features --features zlob,gitoxide,libgit2 --lib -- scm::
 
       - name: Test hidden paths with the ripgrep watcher

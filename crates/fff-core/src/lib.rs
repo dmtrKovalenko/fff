@@ -117,7 +117,6 @@ pub mod dbs;
 pub use dbs::*;
 
 pub use scm::git;
-/// Git status caching and repository detection utilities.
 mod scm;
 
 pub use git_recency::GitRecencyConfig;

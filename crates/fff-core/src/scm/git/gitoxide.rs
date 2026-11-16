@@ -23,6 +23,7 @@ pub(in crate::scm) fn discover(path: &Path) -> Option<ScmWorkspace> {
         ))
     };
     Some(ScmWorkspace {
+        base_alias: None,
         backend: ScmBackend::Gitoxide,
         workdir,
         metadata,

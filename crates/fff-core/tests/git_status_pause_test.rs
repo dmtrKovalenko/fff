@@ -136,6 +136,40 @@ fn subdirectory_refresh_counts_repo_paths_and_applies_only_matching_files() {
     assert_eq!(status_of(&shared, &sub, "file"), Some(Status::CURRENT));
 }
 
+#[cfg(unix)]
+#[test]
+fn symlinked_picker_base_preserves_status_and_recency() {
+    let (tmp, root) = init_repo();
+    let sub = root.join("src");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("file"), "original").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "seed", "--no-gpg-sign"]);
+    let alias_dir = tempfile::tempdir().unwrap();
+    let alias = alias_dir.path().join("source");
+    std::os::unix::fs::symlink(tmp.path().join("src"), &alias).unwrap();
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: alias.to_string_lossy().into_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let path = alias.join("file");
+    assert_eq!(picker.get_file_by_path(&path).unwrap().git_recency_score, 1);
+    let shared = SharedFilePicker::default();
+    *shared.write().unwrap() = Some(picker);
+    let frecency = SharedFrecency::noop();
+    assert_eq!(shared.refresh_git_status(&frecency).unwrap(), 1);
+    assert_eq!(status_of(&shared, &alias, "file"), Some(Status::CURRENT));
+    fs::remove_file(&path).unwrap();
+    shared
+        .update_git_status_for_paths(&[path], &frecency)
+        .unwrap();
+    assert_eq!(status_of(&shared, &alias, "file"), Some(Status::WT_DELETED));
+}
+
 fn start_picker(base: &Path, watch: bool) -> SharedFilePicker {
     start_picker_on(SharedFilePicker::default(), base, watch)
 }

@@ -395,7 +395,10 @@ impl SharedFilePicker {
         });
         let recency = repo
             .as_ref()
-            .and_then(|repo| repo.recency(&recency_config, &base_path));
+            .zip(git_root.as_ref())
+            .and_then(|(repo, workspace)| {
+                repo.recency(&recency_config, &workspace.git_path(&base_path))
+            });
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
@@ -426,27 +429,25 @@ impl SharedFilePicker {
             return Ok(());
         }
 
-        let git_root = {
+        let (git_root, worker) = {
             let guard = self.read()?;
             let Some(ref picker) = *guard else {
                 return Err(Error::FilePickerMissing);
             };
-            picker.scm_workspace().cloned()
+            (
+                picker.scm_workspace().cloned(),
+                Arc::clone(&picker.scm_status_worker),
+            )
         };
         let Some(git_root) = git_root else {
             return Ok(());
         };
 
-        let repo = git_root.open()?;
-        repo.wait_for_write();
-        let status = repo.status_for_paths(paths)?;
+        let status = git_root.status_for_paths(paths)?;
 
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
-        if picker
-            .scm_workspace()
-            .is_some_and(|scm| scm.workdir == git_root.workdir)
-        {
+        if Arc::ptr_eq(&worker, &picker.scm_status_worker) {
             picker.update_git_statuses(status, shared_frecency)?;
         }
         Ok(())

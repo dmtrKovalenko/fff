@@ -52,16 +52,27 @@ impl ScmBackend {
     }
 
     pub(crate) fn discover(self, path: &Path) -> Option<ScmWorkspace> {
-        match self {
-            #[cfg(feature = "gitoxide")]
-            Self::Gitoxide => git::gitoxide::discover(path),
-            #[cfg(feature = "libgit2")]
-            Self::LibGit2 => git::backend::discover(path),
-            #[cfg(not(any(feature = "gitoxide", feature = "libgit2")))]
-            Self::Disabled => {
-                let _ = path;
-                None
+        #[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+        {
+            let physical = crate::path_utils::canonicalize(path).ok()?;
+            let mut workspace = match self {
+                #[cfg(feature = "gitoxide")]
+                Self::Gitoxide => git::gitoxide::discover(&physical),
+                #[cfg(feature = "libgit2")]
+                Self::LibGit2 => git::backend::discover(&physical),
+            }?;
+            if !physical.starts_with(&workspace.workdir) {
+                return None;
             }
+            if path != physical {
+                workspace.base_alias = Some((path.to_owned(), physical));
+            }
+            Some(workspace)
+        }
+        #[cfg(not(any(feature = "gitoxide", feature = "libgit2")))]
+        {
+            let _ = path;
+            None
         }
     }
 

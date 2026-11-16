@@ -394,7 +394,7 @@ pub(crate) fn handle_debounced_events(
     let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
-        repo.as_ref(),
+        repo.as_ref().zip(git_workdir.as_ref()),
         ignore_options.disable_git,
     );
     let mut need_full_git_rescan = false;
@@ -503,7 +503,7 @@ pub(crate) fn handle_debounced_events(
                 git_workdir.as_ref().map(|workspace| workspace.backend),
             ) || git_workdir
                 .as_ref()
-                .is_some_and(|workspace| path.starts_with(&workspace.metadata))
+                .is_some_and(|workspace| workspace.git_path(path).starts_with(&workspace.metadata))
             {
                 continue;
             }
@@ -899,7 +899,7 @@ fn index_new_directory(
     let mut filter = IgnoreFilter::new(
         base_path,
         walker_rules,
-        repo.as_ref(),
+        repo.as_ref().zip(git_workdir.as_ref()),
         ignore_options.disable_git,
     );
     let mut join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
@@ -1017,7 +1017,7 @@ struct IgnoreFilter<'a> {
     // Ignore rules from the last walk.
     rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
     // Consult the active repository when the walker has no cached rules.
-    repo: Option<&'a ScmRepository>,
+    repo: Option<(&'a ScmRepository, &'a ScmWorkspace)>,
     disable_git: bool,
 }
 
@@ -1025,7 +1025,7 @@ impl<'a> IgnoreFilter<'a> {
     fn new(
         base_path: &'a Path,
         rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-        repo: Option<&'a ScmRepository>,
+        repo: Option<(&'a ScmRepository, &'a ScmWorkspace)>,
         disable_git: bool,
     ) -> Self {
         Self {
@@ -1047,7 +1047,7 @@ impl<'a> IgnoreFilter<'a> {
             return rules.is_ignored(relative, is_dir);
         }
         match self.repo {
-            Some(repo) => repo.is_ignored(path),
+            Some((repo, workspace)) => repo.is_ignored(&workspace.git_path(path)),
             None if self.disable_git => false,
             // No repo and no rules: the non-code-dir heuristic, applied to the
             // base-relative path so ancestors of the base (e.g. a temp dir
@@ -1061,7 +1061,8 @@ impl<'a> IgnoreFilter<'a> {
 
 fn is_dotgit_change_affecting_status(changed: &Path, workspace: &Option<ScmWorkspace>) -> bool {
     workspace.as_ref().is_some_and(|workspace| {
-        changed
+        workspace
+            .git_path(changed)
             .strip_prefix(&workspace.metadata)
             .is_ok_and(|relative| workspace.backend.status_metadata_changed(relative))
     })

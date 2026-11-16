@@ -16,7 +16,6 @@ use crate::constants::MAX_OVERFLOW_FILES;
 use crate::file_picker::{FFFMode, FilePicker, FilePickerOptions};
 use crate::frecency::FrecencyTracker;
 use crate::rescan_stats::{RescanReason, RescanStats};
-use crate::scm::ScmStatusWorker;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::watch::{WatchEvent, WatchEventKind, WatchOptions};
 use std::sync::mpsc;
@@ -158,6 +157,35 @@ fn recreating_the_same_paths_does_not_consume_overflow_capacity() {
         f.overflow_len() <= 200,
         "each path must claim one overflow slot at most, got {}",
         f.overflow_len()
+    );
+}
+
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+#[test]
+fn modifying_a_tracked_file_updates_its_status() {
+    let f = Fixture::with_git();
+    f.write("tracked", "initial");
+    assert!(
+        Command::new("git")
+            .args(["add", "tracked"])
+            .current_dir(&f.base)
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.index();
+    f.write("tracked", "edited");
+    f.feed([modify(f.path("tracked"))]);
+    assert!(f.picker.wait_for_git_status(Duration::from_secs(10)));
+    let guard = f.picker.read().unwrap();
+    let file = guard
+        .as_ref()
+        .unwrap()
+        .get_file_by_path(f.path("tracked"))
+        .unwrap();
+    assert_eq!(
+        file.git_status,
+        Some(crate::git::Status::INDEX_NEW | crate::git::Status::WT_MODIFIED)
     );
 }
 
@@ -662,8 +690,6 @@ struct Fixture {
     base: PathBuf,
     picker: SharedFilePicker,
     frecency: SharedFrecency,
-    git_workdir: Option<PathBuf>,
-    git_worker: Arc<dyn ScmStatusWorker>,
     // Dropped last so background work started by a triggered rescan still
     // sees the tree it was asked to walk.
     _tmp: TempDir,
@@ -688,15 +714,14 @@ impl Fixture {
     fn build(git: bool, frecency: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
-        let git_workdir = git.then(|| {
+        if git {
             let status = Command::new("git")
                 .args(["init", "-b", "main"])
                 .current_dir(&base)
                 .output()
                 .expect("git init");
             assert!(status.status.success(), "git init failed");
-            base.clone()
-        });
+        }
 
         let (shared_frecency, frecency_tmp) = if frecency {
             let db = tempfile::tempdir().unwrap();
@@ -713,8 +738,6 @@ impl Fixture {
             base,
             picker: SharedFilePicker::default(),
             frecency: shared_frecency,
-            git_workdir,
-            git_worker: crate::scm::ScmBackend::configured().create_worker(Arc::default()),
             _tmp: tmp,
             _frecency_tmp: frecency_tmp,
         }
@@ -771,22 +794,34 @@ impl Fixture {
         .unwrap();
         picker.collect_files().unwrap();
         self.picker.rebase_watches(&self.base);
+        let worker = picker
+            .scm_workspace()
+            .map(|_| Arc::clone(&picker.scm_status_worker));
         *self.picker.write().unwrap() = Some(picker);
+        if let Some(worker) = worker {
+            worker.on_workspace_scan(self.picker.weaken(), self.frecency.clone());
+            assert!(self.picker.wait_for_git_status(Duration::from_secs(10)));
+        }
     }
 
     fn feed(&self, events: impl IntoIterator<Item = DebouncedEvent>) -> RescanStats {
         let before = self.picker.rescan_stats();
+        let (workspace, worker) = {
+            let guard = self.picker.read().unwrap();
+            let picker = guard.as_ref().unwrap();
+            (
+                picker.scm_workspace().cloned(),
+                Arc::clone(&picker.scm_status_worker),
+            )
+        };
         handle_debounced_events(
             &WatcherOptions::default(),
             events.into_iter().collect(),
             &self.base,
-            &self
-                .git_workdir
-                .as_deref()
-                .and_then(crate::scm::ScmWorkspace::discover),
+            &workspace,
             &self.picker,
             &self.frecency,
-            &self.git_worker,
+            &worker,
         );
 
         self.picker.rescan_stats().since(&before)
@@ -837,6 +872,7 @@ impl Drop for Fixture {
         // the background pool; let it finish before the tree disappears.
         self.picker
             .wait_for_indexing_complete(Duration::from_secs(10));
+        self.picker.wait_for_git_status(Duration::from_secs(10));
     }
 }
 

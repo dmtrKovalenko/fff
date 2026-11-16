@@ -598,6 +598,8 @@ The Neovim binary uses gitoxide for Git status, repository discovery, ignore rul
 
 To build Neovim with libgit2 alone, run `make build-nvim NVIM_FEATURES=zlob,libgit2`. A single-backend build selects its backend at compile time. To include both backends, use `NVIM_FEATURES=zlob,gitoxide,libgit2`. A dual-backend build defaults to gitoxide. If a repository-wide status scan fails, this build uses libgit2 for that scan and subsequent repository-wide scans in the process. In that build, set `FFF_SCM_BACKEND=libgit2` before launching Neovim to select libgit2 explicitly.
 
+On Windows, close Neovim after a local build. If a downloaded `target/release/libfff_nvim.dll` exists, replace it with the newly built `target/release/fff_nvim.dll`. Restart Neovim and run `:FFFHealth` to check the active backend.
+
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
 
 ### Float colors

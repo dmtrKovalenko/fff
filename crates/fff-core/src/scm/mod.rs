@@ -5,6 +5,7 @@ mod repository;
 use crate::shared::{SharedFrecency, WeakFilePicker};
 pub(crate) use backend::ScmBackend;
 pub(crate) use repository::ScmRepository;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use git::Status;
@@ -25,6 +26,7 @@ pub(crate) struct ScmWorkspace {
     pub(crate) workdir: PathBuf,
     pub(crate) metadata: PathBuf,
     pub(crate) shared_root: Option<PathBuf>,
+    base_alias: Option<(PathBuf, PathBuf)>,
 }
 
 impl ScmWorkspace {
@@ -37,18 +39,38 @@ impl ScmWorkspace {
         self.backend.open(&self.workdir)
     }
 
+    pub(crate) fn git_path<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
+        if let Some((alias, physical)) = &self.base_alias
+            && let Ok(suffix) = path.strip_prefix(alias)
+        {
+            return if suffix.as_os_str().is_empty() {
+                Cow::Owned(physical.clone())
+            } else {
+                Cow::Owned(physical.join(suffix))
+            };
+        }
+        Cow::Borrowed(path)
+    }
+
+    pub(crate) fn status_for_paths(&self, paths: &[PathBuf]) -> Result<ScmStatusCache> {
+        let repo = self.open()?;
+        repo.wait_for_write();
+        if self.base_alias.is_some() {
+            let paths: Vec<_> = paths
+                .iter()
+                .map(|path| self.git_path(path).into_owned())
+                .collect();
+            repo.status_for_paths(&paths)
+        } else {
+            repo.status_for_paths(paths)
+        }
+    }
+
     // `base_path` re-rooted into the shared checkout, `None` outside linked worktrees
     pub(crate) fn shared_base(&self, base_path: &Path) -> Option<PathBuf> {
         let shared_root = self.shared_root.as_ref()?;
-        let relative = match base_path.strip_prefix(&self.workdir) {
-            Ok(relative) => relative.to_path_buf(),
-            // libgit2 reports a symlink-free workdir
-            Err(_) => crate::path_utils::canonicalize(base_path)
-                .ok()?
-                .strip_prefix(&self.workdir)
-                .ok()?
-                .to_path_buf(),
-        };
+        let physical = self.git_path(base_path);
+        let relative = physical.strip_prefix(&self.workdir).ok()?;
 
         // `join("")` appends a separator, changing the history key of the main checkout
         Some(if relative.as_os_str().is_empty() {
