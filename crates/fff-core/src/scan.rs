@@ -49,6 +49,7 @@ pub(crate) struct ScanConfig {
 /// current `FilePicker`) or [`ScanJob::initial`] (for the bootstrap
 /// scan, before the picker is published to `SharedPicker`).
 pub(crate) struct ScanJob {
+    backend: crate::scm::ScmBackend,
     shared_picker: SharedFilePicker,
     shared_frecency: SharedFrecency,
     base_path: PathBuf,
@@ -79,6 +80,7 @@ impl ScanJob {
             return Ok(None);
         }
 
+        let backend = picker.scm_backend;
         let mode = picker.mode();
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -100,6 +102,7 @@ impl ScanJob {
         drop(guard); // just a sanity check
 
         Ok(Some(Self {
+            backend,
             mode,
             signals,
             base_path,
@@ -113,6 +116,7 @@ impl ScanJob {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_initial(
+        backend: crate::scm::ScmBackend,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         base_path: PathBuf,
@@ -123,6 +127,7 @@ impl ScanJob {
         config: ScanConfig,
     ) -> Self {
         Self {
+            backend,
             shared_picker,
             shared_frecency,
             base_path,
@@ -153,6 +158,7 @@ impl ScanJob {
 
     fn run(self) {
         let Self {
+            backend,
             shared_picker,
             shared_frecency,
             base_path,
@@ -167,7 +173,7 @@ impl ScanJob {
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
-        let git = FileSync::discover_git(&base_path, config.ignore_options.disable_git);
+        let git = FileSync::discover_scm(backend, &base_path, config.ignore_options.disable_git);
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git.clone(),
@@ -185,7 +191,7 @@ impl ScanJob {
         };
 
         // 2. Populate the file list
-        let git_status_worker;
+        let scm_status_worker;
         let previous;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
@@ -197,7 +203,7 @@ impl ScanJob {
 
             let live_count = sync.live_count;
             previous = picker.commit_new_sync(sync);
-            git_status_worker = Arc::clone(&picker.git_status_worker);
+            scm_status_worker = Arc::clone(&picker.scm_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
                 picker.set_cache_budget(ContentCacheBudget::new_for_repo(live_count));
@@ -207,11 +213,9 @@ impl ScanJob {
             return;
         }
 
-        // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
-        // which is a real use case we need to have a way to start the git worker background thread dynamically
         if git.is_some() && !signals.cancelled.load(Ordering::Acquire) {
-            git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
-            git_status_worker.request_full_rescan(); // this runs anyway
+            Arc::clone(&scm_status_worker)
+                .on_workspace_scan(shared_picker.weaken(), shared_frecency.clone());
         }
 
         // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
@@ -274,7 +278,7 @@ impl ScanJob {
                     enable_fs_root_scanning: config.enable_fs_root_scanning,
                     enable_home_dir_scanning: config.enable_home_dir_scanning,
                 },
-                git_status_worker,
+                scm_status_worker,
                 tracing::Span::current(),
             ) {
                 Ok(watcher) => {
