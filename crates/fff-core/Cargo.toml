@@ -84,7 +84,6 @@ aho-corasick = "1"
 memchr = "2"
 heed = { workspace = true }
 ignore = { workspace = true, optional = true }
-memmap2 = { workspace = true }
 neo_frizbee = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
@@ -101,6 +100,9 @@ mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] 
 # Platform-specific: dunce for Windows to avoid \\?\ extended path prefix
 [target.'cfg(windows)'.dependencies]
 dunce = { workspace = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+memmap2 = { workspace = true }
 
 # signal-hook only compiles on unix; we wrap the SIGSEGV handler behind cfg(unix)
 [target.'cfg(unix)'.dependencies]
