@@ -1785,16 +1785,20 @@ impl FilePicker {
             let Some(path) = crate::path_utils::path_in_base(path, subdir) else {
                 continue;
             };
-            let index = self.sync_data.find_by_relative_path_with(path, self.sync_data.files.len(), |dir| {
-                if let Some((previous, index)) = last_dir
-                    && dir == previous
-                {
-                    return index;
-                }
-                let index = self.sync_data.find_base_dir_index(dir);
-                last_dir = Some((dir, index));
-                index
-            });
+            let index = self.sync_data.find_by_relative_path_with(
+                path,
+                self.sync_data.files.len(),
+                |dir| {
+                    if let Some((previous, index)) = last_dir
+                        && dir == previous
+                    {
+                        return index;
+                    }
+                    let index = self.sync_data.find_base_dir_index(dir);
+                    last_dir = Some((dir, index));
+                    index
+                },
+            );
             let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) else {
                 continue;
             };

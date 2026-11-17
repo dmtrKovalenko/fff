@@ -79,8 +79,8 @@ impl FileItemFlags {
     /// bigram indices for other files stay valid.
     pub const DELETED: u8 = 1 << 1;
     /// Mask for files owned by any overlay.
-    pub const OVERFLOW: u8 = LAYER_MASK;
-    pub(crate) const LANGUAGE_SHIFT: u8 = 4;
+    pub const OVERFLOW: u8 = 1 << 2;
+    pub(crate) const LANGUAGE_SHIFT: u8 = 3;
 }
 
 pub struct DirFlags;
@@ -283,6 +283,7 @@ pub struct FileItem {
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
+    layer: LayerId,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
@@ -307,6 +308,7 @@ impl Clone for FileItem {
             modification_frecency_score: self.modification_frecency_score,
             git_recency_score: self.git_recency_score,
             git_status: self.git_status,
+            layer: self.layer,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
@@ -353,6 +355,7 @@ impl FileItem {
             git_recency_score: 0,
             git_status,
             flags: AtomicU8::new(flags),
+            layer: 0,
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -363,6 +366,13 @@ impl FileItem {
         let mut buf = [0u8; PATH_BUF_SIZE];
         let rel = self.path.read_to_buf(arena.arena_for(self), &mut buf);
         base_path.join(rel)
+    }
+
+    pub(crate) fn reset_worktree_metadata(&mut self) {
+        self.git_status = None;
+        self.git_recency_score = 0;
+        self.access_frecency_score = 0;
+        self.modification_frecency_score = 0;
     }
 
     pub(crate) fn set_path(&mut self, path: crate::simd_path::ChunkedString) {
@@ -673,17 +683,29 @@ impl FileItem {
         }
     }
 
-    /// Returns true when this file belongs to an overlay above the base index.
+    /// Returns the public overflow flag, which the picker sets for overlay files.
     #[inline]
     pub fn is_overflow(&self) -> bool {
-        self.layer_id() != 0
+        self.flags.load(Ordering::Relaxed) & FileItemFlags::OVERFLOW != 0
     }
 
     /// Arena layer owning this file's path. `0` is the base scan, higher ids
     /// are overlay layers stacked in creation order.
     #[inline(always)]
     pub(crate) fn layer_id(&self) -> LayerId {
-        (self.flags.load(Ordering::Relaxed) & LAYER_MASK) >> LAYER_SHIFT
+        self.layer
+    }
+
+    /// Sets the overflow flag. The picker retains ownership of the path arena.
+    #[inline]
+    pub fn set_overflow(&self, val: bool) {
+        if val {
+            self.flags
+                .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
+        } else {
+            self.flags
+                .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
+        }
     }
 
     /// Moves the file onto `layer`. Only the picker may call this — the path
@@ -691,8 +713,13 @@ impl FileItem {
     #[inline]
     pub(crate) fn set_layer(&mut self, layer: LayerId) {
         debug_assert!((layer as usize) < crate::MAX_INDEX_LAYERS);
+        self.layer = layer;
         let flags = self.flags.get_mut();
-        *flags = (*flags & !LAYER_MASK) | (layer << LAYER_SHIFT);
+        if layer == 0 {
+            *flags &= !FileItemFlags::OVERFLOW;
+        } else {
+            *flags |= FileItemFlags::OVERFLOW;
+        }
     }
 }
 
@@ -1296,6 +1323,12 @@ mod definition_flag_tests {
                         assert_eq!(file.supports_definitions(), filename != "file.txt");
                     }
 
+                    file.set_overflow(false);
+                    assert!(!file.is_overflow());
+                    assert_eq!(file.layer_id(), layer);
+                    file.set_overflow(true);
+                    assert!(file.is_overflow());
+                    assert_eq!(file.layer_id(), layer);
                     let mut clone = file.clone();
                     assert_eq!(clone.is_binary(), binary);
                     assert_eq!(clone.is_deleted(), deleted);

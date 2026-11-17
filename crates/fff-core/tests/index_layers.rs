@@ -254,7 +254,16 @@ fn watcher_additions_never_renumber_or_relabel_layers() {
     assert_eq!(names(&picker, b), ["b/y.rs"]);
     let saved: Vec<String> = picker.export_layer(b).unwrap().relative_paths().collect();
     assert_eq!(saved, ["b/y.rs"]);
-    // No open layer and no free id: explicit paths are refused, not merged.
+    assert_eq!(picker.add_entries([]).unwrap(), 0);
+    assert_eq!(picker.add_entries([IndexEntry::new("a/x.rs")]).unwrap(), 0);
+    assert!(picker.remove_file_by_path(base.join("a/x.rs")));
+    assert!(matches!(
+        picker.add_entries([IndexEntry::new("a/x.rs"), IndexEntry::new("c.rs")]),
+        Err(Error::LayerLimit)
+    ));
+    assert!(names(&picker, a).is_empty());
+    assert_eq!(picker.add_entries([IndexEntry::new("a/x.rs")]).unwrap(), 1);
+    assert_eq!(names(&picker, a), ["a/x.rs"]);
     assert!(matches!(
         picker.add_entries([IndexEntry::new("c.rs")]),
         Err(Error::LayerLimit)

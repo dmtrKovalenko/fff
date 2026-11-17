@@ -7,15 +7,18 @@ use fff_search::{
 };
 use tempfile::TempDir;
 
-fn picker(base: &std::path::Path) -> FilePicker {
-    let mut picker = FilePicker::new(FilePickerOptions {
+fn unscanned(base: &std::path::Path) -> FilePicker {
+    FilePicker::new(FilePickerOptions {
         base_path: base.to_string_lossy().to_string(),
         watch: false,
         enable_home_dir_scanning: true,
         ..Default::default()
     })
-    .expect("create picker");
+    .expect("create picker")
+}
 
+fn picker(base: &std::path::Path) -> FilePicker {
+    let mut picker = unscanned(base);
     picker.collect_files().expect("initial scan");
     picker
 }
@@ -548,6 +551,35 @@ fn export_base_before_scan_is_none_and_unknown_layer_fails() {
     assert!(picker.save_layer(42, tmp.path().join("x.fff")).is_err());
 }
 
+#[cfg(any(feature = "libgit2", feature = "gitoxide"))]
+#[test]
+fn a_rescan_applies_worktree_git_status_to_the_live_overlay() {
+    let tmp = TempDir::new().unwrap();
+    let repo = git2::Repository::init(tmp.path()).unwrap();
+    let mut picker = picker(tmp.path());
+    let layer = picker.create_layer(None).unwrap();
+    picker.add_entries([IndexEntry::new("tracked.rs")]).unwrap();
+    let path = tmp.path().join("tracked.rs");
+    fs::write(&path, "original").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("tracked.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("FFF Test", "test@example.invalid").unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .unwrap();
+    fs::write(&path, "different length").unwrap();
+
+    picker.collect_files().unwrap();
+    let row = &picker.files_in_layer(layer)[0];
+    assert!(!row.is_deleted());
+    assert!(
+        row.git_status
+            .unwrap()
+            .contains(fff_search::git::Status::WT_MODIFIED)
+    );
+}
+
 #[test]
 fn an_explicit_path_stays_in_its_layer_when_a_rescan_finds_it_on_disk() {
     let tmp = TempDir::new().unwrap();
@@ -625,4 +657,57 @@ fn a_saved_base_with_names_windows_cannot_store_loads_on_unix() {
         .unwrap();
     assert_eq!(live_paths(&restored), live_paths(&scanned));
     assert_eq!(live_paths(&restored).len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "restored grep follows a replacement directory symlink"]
+fn restored_grep_skips_symlinks_when_the_target_scan_does() {
+    let source = TempDir::new().unwrap();
+    let target = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::create_dir(source.path().join("nested")).unwrap();
+    fs::write(source.path().join("nested/a.txt"), "1234567890").unwrap();
+    fs::write(outside.path().join("a.txt"), "NeedleHere").unwrap();
+    std::os::unix::fs::symlink(outside.path(), target.path().join("nested")).unwrap();
+
+    assert_eq!(
+        fresh_and_restored_grep_counts(source.path(), target.path()),
+        (0, 0)
+    );
+}
+
+#[test]
+#[ignore = "restored grep reads only the source file length"]
+fn restored_grep_finds_a_match_past_the_saved_file_length() {
+    let source = TempDir::new().unwrap();
+    let target = TempDir::new().unwrap();
+    fs::write(source.path().join("a.txt"), "tiny").unwrap();
+    fs::write(target.path().join("a.txt"), "tiny plus NeedleHere").unwrap();
+
+    assert_eq!(
+        fresh_and_restored_grep_counts(source.path(), target.path()),
+        (1, 1)
+    );
+}
+
+fn fresh_and_restored_grep_counts(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> (usize, usize) {
+    use fff_search::grep::{GrepMode, GrepSearchOptions};
+    let snapshot = picker(source).export_layer(0).unwrap();
+    let fresh = picker(target);
+    let mut restored = unscanned(target);
+    restored.import_base(snapshot, None).unwrap();
+    let query = fff_search::FFFQuery::parse("NeedleHere", fff_search::AiGrepConfig);
+    let options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        page_limit: 50,
+        ..Default::default()
+    };
+    (
+        fresh.grep(&query, &options).matches.len(),
+        restored.grep(&query, &options).matches.len(),
+    )
 }

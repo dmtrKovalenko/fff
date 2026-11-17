@@ -36,10 +36,14 @@ console.log(`files:      ${fileCount}`);
 console.log(`iterations: ${iterations}`);
 console.log();
 
-function bench(name: string, fn: () => void, setup?: () => void): number {
+async function bench(
+  name: string,
+  fn: () => void,
+  setup?: () => Promise<void>,
+): Promise<number> {
   const times: number[] = [];
   for (let i = 0; i < iterations; i++) {
-    setup?.();
+    await setup?.();
     const t0 = performance.now();
     fn();
     times.push(performance.now() - t0);
@@ -60,17 +64,17 @@ function heap(label: string): void {
 // --- fff over FFI --------------------------------------------------------
 
 // A fresh instance per iteration starts every run with free layer ids.
-let fff = openFinder();
-const fresh = () => {
+let fff = await openFinder();
+const fresh = async () => {
   fff.destroy();
-  fff = openFinder();
+  fff = await openFinder();
 };
 
 heap("baseline rss");
 console.log("\n== fff (FFI) ==");
 
-bench("addPaths  one batch", () => checked(fff.addPaths(paths)), fresh);
-bench(
+await bench("addPaths  one batch", () => checked(fff.addPaths(paths)), fresh);
+await bench(
   "addPaths  batches of 1k",
   () => {
     for (let i = 0; i < paths.length; i += 1000)
@@ -78,7 +82,7 @@ bench(
   },
   fresh,
 );
-bench(
+await bench(
   "addPaths  batches of 100",
   () => {
     for (let i = 0; i < paths.length; i += 100)
@@ -87,29 +91,33 @@ bench(
   fresh,
 );
 const trickle = 1000;
-bench(`addPaths  one at a time (${trickle} new files into ${fileCount})`, () => {
+await bench(`addPaths  one at a time (${trickle} new files into ${fileCount})`, () => {
   for (let i = 0; i < trickle; i++)
     checked(fff.addPaths([`trickle/${Math.random()}/file_${i}.ts`]));
 });
 
 const layerFile = join(work, "layer.fff");
-bench("buildLayerFile (off-instance)", () => {
+await bench("buildLayerFile (off-instance)", () => {
   checked(FileFinder.buildLayerFile(paths, layerFile, "built"));
 });
 console.log(`${"layer file size".padEnd(46)} ${fmtBytes(statSync(layerFile).size)}`);
-bench("loadLayer into empty instance", () => checked(fff.loadLayer(layerFile)), fresh);
-const indexed = () => {
-  fresh();
+await bench(
+  "loadLayer into empty instance",
+  () => checked(fff.loadLayer(layerFile)),
+  fresh,
+);
+const indexed = async () => {
+  await fresh();
   checked(fff.addPaths(paths));
 };
-bench(
+await bench(
   `loadLayer with all ${fileCount} already indexed (dedup)`,
   () => checked(fff.loadLayer(layerFile)),
   indexed,
 );
-fresh();
+await fresh();
 const loaded = checked(fff.loadLayer(layerFile));
-bench(`saveLayer (${fileCount})`, () => {
+await bench(`saveLayer (${fileCount})`, () => {
   checked(fff.saveLayer(loaded, join(work, "resave.fff")));
 });
 
@@ -118,10 +126,12 @@ const total = checked(fff.listLayers()).reduce((n, l) => n + l.liveFileCount, 0)
 console.log(`${"live files across layers".padEnd(46)} ${total}`);
 
 for (const query of queries) {
-  bench(`fileSearch "${query}"`, () => {
+  await bench(`fileSearch "${query}"`, () => {
     checked(fff.fileSearch(query, { pageSize: 50 }));
   });
 }
+
+fff.destroy();
 
 // --- naive JS index ------------------------------------------------------
 
@@ -130,30 +140,30 @@ heap("rss before js index");
 
 let jsIndex: string[] = [];
 let jsSet = new Set<string>();
-bench("push  one batch", () => {
+await bench("push  one batch", () => {
   jsIndex = [];
   jsSet = new Set();
   jsAdd(jsIndex, jsSet, paths);
 });
-bench("push  batches of 1k", () => {
+await bench("push  batches of 1k", () => {
   jsIndex = [];
   jsSet = new Set();
   for (let i = 0; i < paths.length; i += 1000) {
     jsAdd(jsIndex, jsSet, paths.slice(i, i + 1000));
   }
 });
-bench(`push  one at a time (${trickle} new files)`, () => {
+await bench(`push  one at a time (${trickle} new files)`, () => {
   for (let i = 0; i < trickle; i++) {
     jsAdd(jsIndex, jsSet, [`trickle/${Math.random()}/file_${i}.ts`]);
   }
 });
 
 const jsonFile = join(work, "index.json");
-bench("JSON.stringify + write", () => {
+await bench("JSON.stringify + write", () => {
   writeFileSync(jsonFile, JSON.stringify(jsIndex));
 });
 console.log(`${"json file size".padEnd(46)} ${fmtBytes(statSync(jsonFile).size)}`);
-bench("read + JSON.parse + rebuild Set", () => {
+await bench("read + JSON.parse + rebuild Set", () => {
   jsIndex = JSON.parse(readFileSync(jsonFile, "utf8"));
   jsSet = new Set(jsIndex);
 });
@@ -161,7 +171,7 @@ heap("rss with js index");
 
 for (const query of queries) {
   const words = query.toLowerCase().split(" ");
-  bench(`substring filter "${query}"`, () => {
+  await bench(`substring filter "${query}"`, () => {
     const hits: string[] = [];
     for (const p of jsIndex) {
       const lower = p.toLowerCase();
@@ -170,15 +180,16 @@ for (const query of queries) {
   });
 }
 
-fff.destroy();
 rmSync(work, { recursive: true, force: true });
 
 // --- utilities -----------------------------------------------------------
 
-function openFinder(): FileFinder {
+async function openFinder(): Promise<FileFinder> {
   const finder = checked(FileFinder.create({ basePath: work, disableWatch: true }));
-  if (!checked(finder.waitForScanBlocking(5000)))
-    throw new Error("Initial scan timed out");
+  if (!checked(await finder.waitForIndexReady(5000))) {
+    finder.destroy();
+    throw new Error("Initial indexing timed out");
+  }
   return finder;
 }
 

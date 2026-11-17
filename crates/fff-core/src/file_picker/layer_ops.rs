@@ -154,7 +154,13 @@ impl FileSync {
     // duplicates does not take an id.
     fn add_entries(&mut self, entries: &[IndexEntry<'_>]) -> Result<usize, Error> {
         let mut layer = self.layers.open_layer();
-        if layer.is_none() && self.layers.free_id().is_none() {
+        if layer.is_none()
+            && self.layers.free_id().is_none()
+            && entries
+                .iter()
+                .filter_map(|entry| normalize_relative_path(entry.relative_path))
+                .any(|path| self.find_relative_path_index(&path).is_none())
+        {
             return Err(Error::LayerLimit);
         }
         let (files_len, dirs_len) = (self.files.len(), self.dirs.len());
@@ -228,6 +234,9 @@ impl FileSync {
         let mut dir_map: Vec<u32> = Vec::with_capacity(dirs.len());
         let mut dir_buf = [0u8; PATH_BUF_SIZE];
         for mut dir in dirs {
+            if attach == Attach::Import {
+                dir.reset_frecency();
+            }
             let path = dir.read_relative_path(arena, &mut dir_buf);
             let idx = match self.find_dir_index(path) {
                 Some(idx) => idx as u32,
@@ -248,6 +257,9 @@ impl FileSync {
         let mut added = 0;
         let mut path_buf = [0u8; PATH_BUF_SIZE];
         for mut file in files {
+            if attach == Attach::Import {
+                file.reset_worktree_metadata();
+            }
             let path = file.path.read_to_buf(arena, &mut path_buf);
             // A rescan leaves out the parents the index already has.
             let dir_idx = match dir_map.get(file.parent_dir_index as usize) {
@@ -264,6 +276,7 @@ impl FileSync {
                         self.revive_entry(idx, file.size, file.modified, file.is_binary()) as usize;
                     continue;
                 }
+                file.git_status = existing.git_status;
                 file.size = existing.size;
                 file.modified = existing.modified;
                 file.set_binary(existing.is_binary());
@@ -459,10 +472,7 @@ impl FileSync {
 
         // An in-memory snapshot carries the source worktree's status and ranking.
         for file in &mut files {
-            file.git_status = None;
-            file.git_recency_score = 0;
-            file.access_frecency_score = 0;
-            file.modification_frecency_score = 0;
+            file.reset_worktree_metadata();
         }
         for dir in &dirs {
             dir.reset_frecency();
@@ -707,7 +717,11 @@ impl FilePicker {
         let mut sync = FileSync::from_snapshot(
             snapshot,
             &self.base_path,
-            FileSync::discover_scm(self.scm_backend, &self.base_path, self.ignore_options.disable_git),
+            FileSync::discover_scm(
+                self.scm_backend,
+                &self.base_path,
+                self.ignore_options.disable_git,
+            ),
             frecency,
             self.mode,
         );
@@ -877,10 +891,15 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_base_import_drops_the_source_status_and_ranking() {
+    fn importing_a_base_or_overlay_drops_source_status_and_ranking() {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
+        std::fs::create_dir(source.path().join("src")).unwrap();
+        std::fs::write(source.path().join("src/unique.rs"), "").unwrap();
         let mut snapshot = scanned(source.path()).export_layer(0).unwrap();
+        for dir in &snapshot.dirs {
+            dir.update_frecency_if_larger(11);
+        }
         for file in &mut snapshot.files {
             file.git_status = Some(crate::git::Status::WT_MODIFIED);
             file.git_recency_score = 5;
@@ -888,18 +907,30 @@ mod tests {
             file.modification_frecency_score = 3;
         }
 
-        let mut picker = scanned(target.path());
-        picker.import_base(snapshot, None).unwrap();
-        let file = &picker.get_files()[0];
-        assert_eq!(file.git_status, None);
-        assert_eq!(
-            (
-                file.git_recency_score,
-                file.access_frecency_score,
-                file.modification_frecency_score
-            ),
-            (0, 0, 0)
-        );
+        for as_base in [false, true] {
+            let mut picker = scanned(target.path());
+            let layer = if as_base {
+                picker.import_base(snapshot.clone(), None).unwrap();
+                0
+            } else {
+                picker.import_layer(snapshot.clone()).unwrap()
+            };
+            let file = picker
+                .get_file_by_path(target.path().join("src/unique.rs"))
+                .unwrap();
+            assert_eq!(file.layer_id(), layer);
+            assert_eq!(file.git_status, None);
+            assert_eq!(
+                (
+                    file.git_recency_score,
+                    file.access_frecency_score,
+                    file.modification_frecency_score
+                ),
+                (0, 0, 0)
+            );
+            let parent = &picker.get_dirs()[file.parent_dir_index as usize];
+            assert_eq!(parent.max_access_frecency(), 0);
+        }
     }
 
     #[test]
