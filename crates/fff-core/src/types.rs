@@ -683,7 +683,7 @@ impl FileItem {
         }
     }
 
-    /// Returns the public overflow flag, which the picker sets for overlay files.
+    /// Returns true when this file belongs to an overlay.
     #[inline]
     pub fn is_overflow(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & FileItemFlags::OVERFLOW != 0
@@ -694,18 +694,6 @@ impl FileItem {
     #[inline(always)]
     pub(crate) fn layer_id(&self) -> LayerId {
         self.layer
-    }
-
-    /// Sets the overflow flag. The picker retains ownership of the path arena.
-    #[inline]
-    pub fn set_overflow(&self, val: bool) {
-        if val {
-            self.flags
-                .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
-        } else {
-            self.flags
-                .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
-        }
     }
 
     /// Moves the file onto `layer`. Only the picker may call this — the path
@@ -1323,12 +1311,7 @@ mod definition_flag_tests {
                         assert_eq!(file.supports_definitions(), filename != "file.txt");
                     }
 
-                    file.set_overflow(false);
-                    assert!(!file.is_overflow());
-                    assert_eq!(file.layer_id(), layer);
-                    file.set_overflow(true);
-                    assert!(file.is_overflow());
-                    assert_eq!(file.layer_id(), layer);
+                    assert_eq!(file.is_overflow(), layer != 0);
                     let mut clone = file.clone();
                     assert_eq!(clone.is_binary(), binary);
                     assert_eq!(clone.is_deleted(), deleted);
@@ -1341,6 +1324,7 @@ mod definition_flag_tests {
                     clone.set_binary(false);
                     clone.set_deleted(false);
                     clone.set_layer(0);
+                    assert!(!clone.is_overflow());
                     assert!(clone.is_definition_match("fn needle() {}", &[(3, 9)]));
                     assert_eq!(file.is_binary(), binary);
                     assert_eq!(file.is_deleted(), deleted);
