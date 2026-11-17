@@ -93,8 +93,16 @@ mod tests {
         fs::write(root.join("target/out.bin"), "bin").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out =
-            walk_collect_files(root, true, false, 1, &counter, &Default::default(), None).unwrap();
+        let out = walk_collect_files(
+            root,
+            Some(crate::scm::ScmBackend::configured()),
+            false,
+            1,
+            &counter,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
 
         let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         names.sort();
@@ -125,7 +133,7 @@ mod tests {
             let counter = Arc::new(AtomicUsize::new(0));
             let out = walk_collect_files(
                 root,
-                true,
+                Some(crate::scm::ScmBackend::configured()),
                 false,
                 threads,
                 &counter,
@@ -161,8 +169,16 @@ mod tests {
         fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join("module/lib.rs"), "pub fn lib() {}\n").unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
-        let out =
-            walk_collect_files(root, true, false, 4, &counter, &Default::default(), None).unwrap();
+        let out = walk_collect_files(
+            root,
+            Some(crate::scm::ScmBackend::configured()),
+            false,
+            4,
+            &counter,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
         let mut paths: Vec<_> = out.pairs.into_iter().map(|(_, path)| path).collect();
         paths.sort();
         assert_eq!(
@@ -182,7 +198,7 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let out =
-            walk_collect_files(root, false, false, 1, &counter, &Default::default(), None).unwrap();
+            walk_collect_files(root, None, false, 1, &counter, &Default::default(), None).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
@@ -208,7 +224,7 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let out =
-            walk_collect_files(&root, false, true, 1, &counter, &Default::default(), None).unwrap();
+            walk_collect_files(&root, None, true, 1, &counter, &Default::default(), None).unwrap();
         let mut names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
         names.sort();
 
@@ -219,8 +235,8 @@ mod tests {
         assert_eq!(item.size, 10);
         assert_eq!(&rel[item.filename_offset_in_relative_path()..], "sesh.toml");
 
-        let out = walk_collect_files(&root, false, false, 1, &counter, &Default::default(), None)
-            .unwrap();
+        let out =
+            walk_collect_files(&root, None, false, 1, &counter, &Default::default(), None).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         assert_eq!(names, ["projects.toml"]);
     }
@@ -237,8 +253,16 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out =
-            walk_collect_files(root, true, false, 1, &counter, &Default::default(), None).unwrap();
+        let out = walk_collect_files(
+            root,
+            Some(crate::scm::ScmBackend::configured()),
+            false,
+            1,
+            &counter,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
         assert!(rules.is_ignored(Path::new("target/"), true));
@@ -288,8 +312,16 @@ mod tests {
 
         for base in [&root, &worktree] {
             let counter = Arc::new(AtomicUsize::new(0));
-            let out = walk_collect_files(base, true, false, 1, &counter, &Default::default(), None)
-                .unwrap();
+            let out = walk_collect_files(
+                base,
+                Some(crate::scm::ScmBackend::configured()),
+                false,
+                1,
+                &counter,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
             let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
 
             assert!(names.iter().any(|n| n == "src/a.txt"), "{names:?}");
@@ -340,8 +372,16 @@ mod tests {
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out =
-            walk_collect_files(root, true, false, 1, &counter, &Default::default(), None).unwrap();
+        let out = walk_collect_files(
+            root,
+            Some(crate::scm::ScmBackend::configured()),
+            false,
+            1,
+            &counter,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
         let names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
 
         assert!(names.iter().any(|n| n == "src/hit.ts"), "{names:?}");
@@ -392,12 +432,20 @@ mod tests {
                 ..Default::default()
             };
             let counter = Arc::new(AtomicUsize::new(0));
-            walk_collect_files(&root, true, false, 1, &counter, &options, None)
-                .unwrap()
-                .pairs
-                .into_iter()
-                .map(|(_, rel)| rel)
-                .collect()
+            walk_collect_files(
+                &root,
+                Some(crate::scm::ScmBackend::configured()),
+                false,
+                1,
+                &counter,
+                &options,
+                None,
+            )
+            .unwrap()
+            .pairs
+            .into_iter()
+            .map(|(_, rel)| rel)
+            .collect()
         };
 
         let enabled = walk(false);

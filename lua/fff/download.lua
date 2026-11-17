@@ -223,7 +223,7 @@ function M.build_binary(callback)
     return
   end
 
-  vim.system({ 'cargo', 'build', '--release' }, { cwd = plugin_dir }, function(result)
+  vim.system({ 'cargo', 'build', '--release', '-p', 'fff-nvim' }, { cwd = plugin_dir }, function(result)
     if result.code ~= 0 then
       callback(false, 'Failed to build rust binary: ' .. (result.stderr or 'unknown error'))
       return

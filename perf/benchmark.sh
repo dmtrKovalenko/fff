@@ -78,6 +78,7 @@ stage() {
   mkdir "$dest"
   for bench in fuzzy_search grep parse definition glob bigram memmem; do
     binary="$source/${bench}_bench"
+    if [[ -f "$source/targets" ]] && ! grep -Fxq "${bench}_bench" "$source/targets"; then continue; fi
     [[ -f "$binary" && ! -L "$binary" && $(stat -c %s "$binary") -le 67108864 ]]
     install -m 0555 "$binary" "$dest/${bench}_bench"
   done
@@ -86,6 +87,7 @@ stage() {
 run_bench() {
   local side=$1 bins=$2 lane=$3 bench=$4 filter=$5 fixture_path=$6
   shift 6
+  [[ -f "$bins/${bench}_bench" ]] || return 0
   echo "Measuring $side $lane $bench" >&2
   if ! (
     cd "$work" || exit
@@ -109,8 +111,11 @@ run_bench() {
       gsub(",", "", value)
       if (value <= 0 || ++count > 150) exit 1
       print "test", lane "/" name, "... bench:", value, "ns/iter (+/-", $NF
+      next
     }
-    END { if (!count) exit 1 }
+    $1 == "test" { exit 1 }
+    NF { unexpected = 1 }
+    END { if (!count && unexpected) exit 1 }
   ' "$work/stdout"
 }
 
@@ -135,7 +140,7 @@ sample_pair() {
 
 drifted() {
   awk '
-    NR == FNR { base[$2] = $5; next }
+    FILENAME == ARGV[1] { base[$2] = $5; next }
     $2 in base && (10 * $5 > 11 * base[$2] || 10 * $5 < 9 * base[$2]) { found = 1 }
     END { exit !found }
   ' "$1" "$2"
@@ -148,7 +153,7 @@ pair() {
   if [[ -n "$base" ]]; then
     sides+=(base)
   else
-    grep -F "test $1/$2/" "$output/base.bench" >"$work/base.1"
+    awk -v prefix="test $1/$2/" 'index($0, prefix) == 1' "$output/base.bench" >"$work/base.1"
   fi
   if drifted "$work/base.1" "$work/head.1"; then
     echo "Rechecking $1 $2 after a change over 10%" >&2
@@ -222,8 +227,11 @@ pair core glob '^glob_(reuse_10k|mixed_100k)/' "$path"
 pair core bigram '^bigram_query_100000/(medium_6char|long_14char|multi_word)$|^bigram_build/short_content/10000$' "$path"
 pair core memmem '/file_picker\.rs/53KB/(medium|long)/miss$' "$path"
 
-diff -u <(awk '{print $2}' "$output/base.bench" | sort) \
-  <(awk '{print $2}' "$output/head.bench" | sort)
+[[ -s "$output/base.bench" || -s "$output/head.bench" ]]
+if [[ "$mode" != compare ]]; then
+  diff -u <(awk '{print $2}' "$output/base.bench" | sort) \
+    <(awk '{print $2}' "$output/head.bench" | sort)
+fi
 if [[ "$mode" == calibrate ]]; then
   cp "$output/base.bench" "$work/reference/baseline.bench"
   sha256sum "$0" | cut -d' ' -f1 >"$work/reference/script.sha256"

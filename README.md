@@ -17,23 +17,13 @@ Originally started as [Neovim plugin](#neovim-plugin) people loved, but it turne
 
 ## Sponsors
 
-fff is MIT and open source forever. Development is supported by these companies:
+fff is MIT and open source forever. Development is supported by:
 
 <table>
   <tr>
     <td align="center" width="110"><sub><b>💎<br>DIAMOND</b></sub></td>
     <td align="center" width="420"><a href="https://anoma.ly"><img alt="Anomaly" src="./assets/sponsors/anomaly.png" width="400"></a></td>
     <td><b><a href="https://anoma.ly">Anomaly</a></b><br><sub>The team behind <a href="https://opencode.ai">opencode</a>.</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>🥇<br>GOLD</b></sub></td>
-    <td align="center"><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github"><img alt="Mango Proxy" src="./assets/sponsors/mango-proxy.png" width="280"></a></td>
-    <td><b><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github">Mango Proxy</a></b><br><sub>Fast, secure proxies for all the needs.</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>🥈<br>SILVER</b></sub></td>
-    <td align="center"><a href="https://www.rapidproxy.io/?ref=fff"><img alt="RapidProxy" src="./assets/sponsors/rapidproxy.png" width="200"></a></td>
-    <td><b><a href="https://www.rapidproxy.io/?ref=fff">RapidProxy</a></b><br><sub>Residential proxies built for scraping at scale.</sub></td>
   </tr>
 </table>
 
@@ -604,6 +594,12 @@ Caveat: the chosen file replaces the buffer in the invoking window even if it's 
 
 ### Git status highlighting
 
+The Neovim binary uses gitoxide for Git status, repository discovery, ignore rules, and commit history. The Rust SDK defaults to libgit2.
+
+To build Neovim with libgit2 alone, run `make build-nvim NVIM_FEATURES=zlob,libgit2`. A single-backend build selects its backend at compile time. To include both backends, use `NVIM_FEATURES=zlob,gitoxide,libgit2`. A dual-backend build defaults to gitoxide. If a repository-wide status scan fails, this build uses libgit2 for that scan and subsequent repository-wide scans in the process. In that build, set `FFF_SCM_BACKEND=libgit2` before launching Neovim to select libgit2 explicitly.
+
+On Windows, close Neovim after a local build. If a downloaded `target/release/libfff_nvim.dll` exists, replace it with the newly built `target/release/fff_nvim.dll`. Restart Neovim and run `:FFFHealth` to check the active backend.
+
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
 
 ### Float colors
@@ -1018,7 +1014,7 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm. It
 - **Content grep with three modes.** Plain literal (SIMD memmem), regex (the Rust `regex` crate), and fuzzy (Smith-Waterman per line). Auto-detects which mode to use from the pattern, falls back to fuzzy when a plain search returns zero hits.
 - **Multi-pattern OR search.** SIMD Aho-Corasick for "find any of these 20 identifiers at once", which is faster than regex alternation and a lot faster than 20 separate ripgrep runs.
 - **Background file watcher.** The index updates as files change. You never pay for a rescan on the hot path.
-- **Git status awareness.** Modified, staged, untracked, and ignored states are cached and returned with every result, so callers can sort or filter them without shelling out to git. The watcher talks to libgit2 directly instead of spawning the `git` CLI.
+- **Git status awareness.** Modified, staged, untracked, and ignored states are cached and returned with every result, so callers can sort or filter them without shelling out to git. The watcher reads status through the configured Git backend.
 - **Definition classifier.** A byte-level scanner on the Rust side checks whether the query matches the declared name in a `struct`, `fn`, `class`, `def`, or another supported declaration.
 
 ### Performance choices that matter
@@ -1033,7 +1029,7 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm. It
 
 ### Memory allocation
 
-Yes, fff fundamentally requires more memory than calling a single child process. That is the primary source of the speedup. In practice, alongside one of the most popular file search pickers for Neovim, [fff ends up using less RAM than a burst of ripgrep invocations](https://x.com/neogoose_btw/status/2041606853155811442).
+Yes, fff fundamentally requires more memory than calling a single child process. That is the primary source of the speedup. In practice, alongside one of the most popular file search pickers for Neovim, [fff ends up using less RAM than a burst of ripgrep invocations](https://x.com/0xfflock/status/2041606853155811442).
 
 FFF also keeps a content index, around 360 bytes per indexed file, so roughly 36 MB for a 100k-file repo. Not every file is indexed - binaries, oversized files, and anything not eligible for grep are skipped. If even that footprint is too much, the index can be backed by a memory-mapped file instead of anonymous RAM.
 

@@ -423,7 +423,7 @@ impl FileSync {
     pub(crate) fn from_snapshot(
         snapshot: LayerSnapshot,
         base_path: &Path,
-        git: Option<crate::git::GitDiscovery>,
+        git: Option<crate::scm::ScmWorkspace>,
         frecency: Option<&FrecencyTracker>,
         mode: super::FFFMode,
     ) -> Self {
@@ -707,7 +707,7 @@ impl FilePicker {
         let mut sync = FileSync::from_snapshot(
             snapshot,
             &self.base_path,
-            FileSync::discover_git(&self.base_path, self.ignore_options.disable_git),
+            FileSync::discover_scm(self.scm_backend, &self.base_path, self.ignore_options.disable_git),
             frecency,
             self.mode,
         );
@@ -882,7 +882,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let mut snapshot = scanned(source.path()).export_layer(0).unwrap();
         for file in &mut snapshot.files {
-            file.git_status = Some(git2::Status::WT_MODIFIED);
+            file.git_status = Some(crate::git::Status::WT_MODIFIED);
             file.git_recency_score = 5;
             file.access_frecency_score = 7;
             file.modification_frecency_score = 3;

@@ -12,7 +12,7 @@ const PAR_THRESHOLD: usize = 10_000;
 
 pub(crate) trait Constrainable {
     fn write_file_name(&self, arena: ArenaPtr, out: &mut String);
-    fn git_status(&self) -> Option<git2::Status>;
+    fn git_status(&self) -> Option<crate::git::Status>;
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String);
     fn layer_id(&self) -> LayerId;
 
@@ -362,16 +362,16 @@ fn evaluate<T: Constrainable>(
 }
 
 #[inline]
-fn matches_git_status(status: Option<git2::Status>, filter: &GitStatusFilter) -> bool {
+fn matches_git_status(status: Option<crate::git::Status>, filter: &GitStatusFilter) -> bool {
     match (status, filter) {
         (Some(s), GitStatusFilter::Modified) => is_modified_status(s),
-        (Some(s), GitStatusFilter::Untracked) => s.contains(git2::Status::WT_NEW),
+        (Some(s), GitStatusFilter::Untracked) => s.contains(crate::git::Status::WT_NEW),
         (Some(s), GitStatusFilter::Staged) => s.intersects(
-            git2::Status::INDEX_NEW
-                | git2::Status::INDEX_MODIFIED
-                | git2::Status::INDEX_DELETED
-                | git2::Status::INDEX_RENAMED
-                | git2::Status::INDEX_TYPECHANGE,
+            crate::git::Status::INDEX_NEW
+                | crate::git::Status::INDEX_MODIFIED
+                | crate::git::Status::INDEX_DELETED
+                | crate::git::Status::INDEX_RENAMED
+                | crate::git::Status::INDEX_TYPECHANGE,
         ),
         (Some(s), GitStatusFilter::Unmodified) => s.is_empty(),
         (None, GitStatusFilter::Unmodified) => true,
@@ -626,7 +626,7 @@ mod tests {
             out.push_str(self.relative_path);
         }
 
-        fn git_status(&self) -> Option<git2::Status> {
+        fn git_status(&self) -> Option<crate::git::Status> {
             None
         }
 

@@ -19,12 +19,13 @@ present, new revisions are measured. External contributors' workflows require
 GitHub's approval before their jobs can start.
 
 The PR workflow compiles both revisions on GitHub-hosted runners using the
-same benchmark sources and the release `zlob` feature. One job at a time runs
+benchmark sources from each revision and the release `zlob` feature. One job at a time runs
 the resulting executables directly on `load` as the runner service user.
 When a timing moves by more than 10%, the worker takes two more measurements
 of that benchmark group and uses the median across the three runs. GitHub
 Actions updates the PR with the timings and fails the head status when a
-benchmark slows down by more than 10%. After the PR workflow finishes,
+shared benchmark slows down by more than 10%. Added and removed cases show their
+available timing. Give a changed workload a new benchmark ID. After the PR workflow finishes,
 **Publish FFF performance** reads its comparison plan and timings, draws
 the chart, and posts the result. It runs from `main` for all PRs, including forks.
 

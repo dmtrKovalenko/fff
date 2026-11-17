@@ -879,26 +879,19 @@ pub fn health_check(lua: &Lua, test_path: Option<String>) -> LuaResult<LuaValue>
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let git_info = lua.create_table()?;
-    let git_version = git2::Version::get();
-    let (major, minor, rev) = git_version.libgit2_version();
-    let libgit2_version_str = format!("{}.{}.{}", major, minor, rev);
-
-    match git2::Repository::discover(&test_path) {
-        Ok(repo) => {
-            git_info.set("available", true)?;
-            git_info.set("repository_found", true)?;
-            if let Some(workdir) = repo.workdir() {
-                git_info.set("workdir", workdir.to_string_lossy().to_string())?;
-            }
-            // Get git2 version info
-            git_info.set("libgit2_version", libgit2_version_str.clone())?;
-        }
-        Err(e) => {
-            git_info.set("available", true)?;
-            git_info.set("repository_found", false)?;
-            git_info.set("error", e.message().to_string())?;
-            git_info.set("libgit2_version", libgit2_version_str)?;
-        }
+    #[cfg(feature = "libgit2")]
+    {
+        let (major, minor, patch) = git2::Version::get().libgit2_version();
+        git_info.set("libgit2_version", format!("{major}.{minor}.{patch}"))?;
+    }
+    let (backend, workdir) = fff::git::backend_info(&test_path);
+    git_info.set("available", backend.is_some())?;
+    git_info.set("backend", backend)?;
+    git_info.set("repository_found", workdir.is_some())?;
+    if let Some(root) = workdir {
+        git_info.set("workdir", root.to_string_lossy())?;
+    } else {
+        git_info.set("error", "No Git working tree found")?;
     }
     table.set("git", git_info)?;
 

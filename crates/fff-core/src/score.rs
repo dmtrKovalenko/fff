@@ -1403,7 +1403,7 @@ mod tests {
                     path.rfind('/').unwrap() as u16 + 1,
                     0,
                     index as u64,
-                    Some(git2::Status::WT_MODIFIED),
+                    Some(crate::git::Status::WT_MODIFIED),
                     false,
                 );
                 file.parent_dir_index = (index / 100) as u32;
@@ -1540,7 +1540,7 @@ mod tests {
         let files: Vec<_> = (0..132_000)
             .map(|index| {
                 let mut file =
-                    FileItem::new_raw(0, 0, index, Some(git2::Status::WT_MODIFIED), false);
+                    FileItem::new_raw(0, 0, index, Some(crate::git::Status::WT_MODIFIED), false);
                 file.access_frecency_score = (index % 97) as i16;
                 file.modification_frecency_score = (index % 29) as i16;
                 file.git_recency_score = (index % 13) as i16;
@@ -1621,7 +1621,7 @@ mod tests {
                     path.rfind('/').unwrap() as u16 + 1,
                     0,
                     index as u64,
-                    Some(git2::Status::WT_MODIFIED),
+                    Some(crate::git::Status::WT_MODIFIED),
                     false,
                 );
                 file.access_frecency_score = (index % 97) as i16;
@@ -2673,8 +2673,8 @@ mod constraint_only_query_tests {
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
         }
-        files[0].git_status = Some(git2::Status::WT_MODIFIED);
-        files[1].git_status = Some(git2::Status::CURRENT);
+        files[0].git_status = Some(crate::git::Status::WT_MODIFIED);
+        files[1].git_status = Some(crate::git::Status::CURRENT);
         std::mem::forget(store);
 
         let parser = QueryParser::default();
@@ -2729,8 +2729,8 @@ mod constraint_only_query_tests {
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
         }
-        files[0].git_status = Some(git2::Status::WT_MODIFIED);
-        files[1].git_status = Some(git2::Status::CURRENT);
+        files[0].git_status = Some(crate::git::Status::WT_MODIFIED);
+        files[1].git_status = Some(crate::git::Status::CURRENT);
         std::mem::forget(store);
 
         let parser = QueryParser::default();

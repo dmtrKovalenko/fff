@@ -260,7 +260,7 @@ impl Constrainable for DirItem {
     }
 
     #[inline]
-    fn git_status(&self) -> Option<git2::Status> {
+    fn git_status(&self) -> Option<crate::git::Status> {
         None
     }
 
@@ -279,7 +279,7 @@ pub struct FileItem {
     pub access_frecency_score: i16,
     pub modification_frecency_score: i16,
     pub git_recency_score: i16,
-    pub git_status: Option<git2::Status>,
+    pub git_status: Option<crate::git::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
@@ -332,7 +332,7 @@ impl FileItem {
         filename_start: u16,
         size: u64,
         modified: u64,
-        git_status: Option<git2::Status>,
+        git_status: Option<crate::git::Status>,
         is_binary: bool,
     ) -> Self {
         let mut flags = 0u8;
@@ -924,7 +924,7 @@ impl Constrainable for FileItem {
     }
 
     #[inline]
-    fn git_status(&self) -> Option<git2::Status> {
+    fn git_status(&self) -> Option<crate::git::Status> {
         self.git_status
     }
 

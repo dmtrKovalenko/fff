@@ -95,6 +95,16 @@
           }
         );
 
+        nvimArgs = commonArgs // { cargoExtraArgs = "-p fff-nvim --lib"; };
+
+        nvim-library = craneLib.buildPackage (
+          nvimArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly nvimArgs;
+            doCheck = false;
+          }
+        );
+
         fff-mcp-args = commonArgs // {
           pname = fffMcpCargoToml.package.name;
           version = fffMcpCargoToml.package.version;
@@ -114,16 +124,16 @@
           set -eo pipefail
           mkdir -p target/release
           if [ "$(uname)" = "Darwin" ]; then
-            cp -vf ${my-crate}/lib/libfff_nvim.dylib target/release/libfff_nvim.dylib
+            cp -vf ${nvim-library}/lib/libfff_nvim.dylib target/release/libfff_nvim.dylib
           else
-            cp -vf ${my-crate}/lib/libfff_nvim.so target/release/libfff_nvim.so
+            cp -vf ${nvim-library}/lib/libfff_nvim.so target/release/libfff_nvim.so
           fi
           echo "Library copied to target/release/"
         '';
       in
       {
         checks = {
-          inherit my-crate fff-mcp;
+          inherit my-crate nvim-library fff-mcp;
         };
 
         packages = {

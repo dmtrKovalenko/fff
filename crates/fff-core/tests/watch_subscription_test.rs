@@ -484,7 +484,14 @@ fn gitignored_files_are_never_delivered() {
     seed(&base);
     fs::create_dir_all(base.join("dist")).unwrap();
     fs::write(base.join(".gitignore"), "dist/\n*.log\n").unwrap();
-    git2::Repository::init(&base).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&base)
+            .status()
+            .unwrap()
+            .success()
+    );
     let (picker, _frecency) = make_watched_picker(&base);
 
     let events = watch_collect(&picker, "", WatchOptions::default());

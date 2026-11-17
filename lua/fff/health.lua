@@ -190,6 +190,7 @@ function M.run(opts)
     })
 
     if rust_health.git then
+      health.rust.git.backend = rust_health.git.backend or (rust_health.git.libgit2_version and 'libgit2')
       health.rust.git.available = rust_health.git.available
       health.rust.git.repository_found = rust_health.git.repository_found
       health.rust.git.workdir = rust_health.git.workdir
@@ -199,7 +200,7 @@ function M.run(opts)
       if rust_health.git.available then
         table.insert(health.messages, {
           level = 'ok',
-          msg = 'libgit2 available (version: ' .. (rust_health.git.libgit2_version or 'unknown') .. ')',
+          msg = 'Git backend: ' .. (health.rust.git.backend or 'unknown'),
         })
 
         if rust_health.git.repository_found then
@@ -217,7 +218,7 @@ function M.run(opts)
       else
         table.insert(health.messages, {
           level = 'warn',
-          msg = 'libgit2 not available',
+          msg = 'Git backend unavailable',
         })
       end
     end
@@ -361,7 +362,7 @@ function M.check()
     vim.health.info('To install the binary, run:')
     vim.health.info('  :lua require("fff.download").download_or_build_binary()')
     vim.health.info('Or build from source with:')
-    vim.health.info('  cargo build --release')
+    vim.health.info('  cargo build --release -p fff-nvim')
   end
 end
 
