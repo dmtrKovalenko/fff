@@ -118,7 +118,8 @@ describe('fff.nvim core', function()
       -- Git info should be present
       assert.is_not_nil(health.git)
       assert.is_true(health.git.available)
-      assert.is_string(health.git.libgit2_version)
+      assert.is_true(health.git.backend == 'gitoxide' or health.git.backend == 'libgit2')
+      if health.git.backend == 'libgit2' then assert.is_string(health.git.libgit2_version) end
 
       -- File picker should be initialized
       assert.is_not_nil(health.file_picker)

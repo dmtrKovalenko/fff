@@ -46,7 +46,8 @@ harness = false
 # `ripgrep` is the pure-Rust walker/glob backend and is on by default so
 # consumers build without a Zig toolchain. CI/release opt into zlob via
 # `--no-default-features --features zlob`.
-default = ["ripgrep"]
+default = ["ripgrep", "libgit2"]
+libgit2 = ["dep:git2"]
 # Enable C FFI exports
 ffi = []
 # Count full rescans and their causes. Always on in debug builds; enable this
@@ -73,7 +74,9 @@ fff-query-parser = { workspace = true }
 blake3 = { workspace = true }
 dirs = { workspace = true }
 libc = "0.2"
-git2 = { workspace = true }
+git2 = { workspace = true, optional = true }
+gitoxide = { package = "gix", version = "0.81", default-features = false, optional = true, features = ["status", "parallel", "sha1", "revision"] }
+bitflags = "2"
 glidesort = { workspace = true }
 globset = { workspace = true, optional = true }
 fff-grep = { workspace = true }
@@ -81,7 +84,6 @@ aho-corasick = "1"
 memchr = "2"
 heed = { workspace = true }
 ignore = { workspace = true, optional = true }
-memmap2 = { workspace = true }
 neo_frizbee = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
@@ -99,11 +101,15 @@ mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] 
 [target.'cfg(windows)'.dependencies]
 dunce = { workspace = true }
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+memmap2 = { workspace = true }
+
 # signal-hook only compiles on unix; we wrap the SIGSEGV handler behind cfg(unix)
 [target.'cfg(unix)'.dependencies]
 signal-hook-registry = { workspace = true }
 
 [dev-dependencies]
+git2 = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 ctor = "0.2"
 proptest = { version = "1", default-features = false, features = ["std", "fork"] }

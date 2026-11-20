@@ -116,7 +116,7 @@ jobs:
       - name: Build for Linux
         if: contains(matrix.os, 'ubuntu') && !contains(matrix.target, 'android')
         run: |
-          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-nvim --no-default-features --features zlob
+          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-nvim --no-default-features --features zlob,gitoxide
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for Android (Termux)
@@ -124,19 +124,19 @@ jobs:
         run: |
           NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          # NDK clang for C deps (libgit2, lmdb, blake3) that need Bionic sysroot headers
+          # NDK clang for C deps (lmdb, blake3) that need Bionic sysroot headers
           export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
           export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang++"
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
 
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob,gitoxide
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for macOS
         if: contains(matrix.os, 'macos')
         run: |
-          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob,gitoxide
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Ad-hoc sign macOS binary
@@ -147,7 +147,7 @@ jobs:
         if: contains(matrix.os, 'windows')
         shell: bash
         run: |
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob,gitoxide
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Upload artifacts
