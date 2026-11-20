@@ -1074,7 +1074,7 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
 pub struct BigramOverlay {
     /// Per-file bigram sets for files modified since the base was built.
     /// Key = file index in the base `Vec<FileItem>`.
-    modified: AHashMap<usize, Vec<u16>>,
+    modified: AHashMap<usize, Option<Vec<u16>>>,
 
     /// Tombstone bitset — one bit per base file. Set bits are excluded
     /// from base query results.
@@ -1095,7 +1095,13 @@ impl BigramOverlay {
     }
 
     pub(crate) fn modify_file(&mut self, file_idx: usize, content: &[u8]) {
-        self.modified.insert(file_idx, extract_bigrams(content));
+        self.modified
+            .insert(file_idx, Some(extract_bigrams(content)));
+    }
+
+    // Metadata-only imports have no content to index. Keep this slot in every candidate set.
+    pub(crate) fn invalidate_file(&mut self, file_idx: usize) {
+        self.modified.insert(file_idx, None);
     }
 
     pub(crate) fn delete_file(&mut self, file_idx: usize) {
@@ -1115,9 +1121,9 @@ impl BigramOverlay {
         self.modified
             .iter()
             .filter_map(|(&file_idx, bigrams)| {
-                pattern_bigrams
-                    .iter()
-                    .all(|pb| bigrams.contains(pb))
+                bigrams
+                    .as_ref()
+                    .is_none_or(|bigrams| pattern_bigrams.iter().all(|pb| bigrams.contains(pb)))
                     .then_some(file_idx)
             })
             .collect()
@@ -1314,7 +1320,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
         }
 
         let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
-        file.detect_binary_per_byte(abs, &mut chunk);
+        file.detect_binary_per_byte(&abs, &mut chunk);
     }
 }
 

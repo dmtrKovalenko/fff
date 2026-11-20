@@ -56,6 +56,8 @@ export type {
   GrepResult,
   HealthCheck,
   InitOptions,
+  LayerEntry,
+  LayerInfo,
   Location,
   MixedItem,
   MixedSearchResult,
