@@ -375,7 +375,11 @@ where
             self.group(b'<', b'>')?;
         }
         if self.peek() == Some(b'(') {
-            self.group(b'(', b')')?;
+            let open = self.pos;
+            if self.group(b'(', b')').is_none() {
+                // `= async (` with parameters on the following lines.
+                return self.line[open + 1..].trim_ascii().is_empty().then_some(());
+            }
         } else {
             self.identifier()?;
         }
