@@ -72,3 +72,19 @@ export class FilePickerFactory {
     return dbLess;
   }
 }
+
+/** Complete every picker cleanup before reporting any disposal failures. */
+export async function destroyPickers(
+  pickers: readonly { destroy(): void; destroyAsync?(): Promise<void> }[],
+): Promise<void> {
+  const results = await Promise.allSettled(
+    pickers.map(async (picker) => {
+      if (picker.destroyAsync) await picker.destroyAsync();
+      else picker.destroy();
+    }),
+  );
+  const errors = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (errors.length) throw new AggregateError(errors, "Failed to destroy FFF pickers");
+}

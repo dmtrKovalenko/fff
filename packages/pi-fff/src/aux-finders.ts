@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FileFinderApi } from "@ff-labs/fff-node";
-import type { FilePickerFactory } from "./file-picker";
+import { destroyPickers, type FilePickerFactory } from "./file-picker";
 import { HOME_DIR } from "./paths";
 
 export const MAX_AUX = 3;
@@ -28,6 +28,7 @@ export class AuxFinderPool {
   // root share one finder/scan instead of each starting a full duplicate
   // traversal — issue #746. Mirrors the main finder's finderPromise.
   private pending = new Map<string, Promise<AuxPicker>>();
+  private destroyPromise: Promise<void> | null = null;
   constructor(private opts: AuxOpts) {}
 
   destroy(): void {
@@ -37,6 +38,21 @@ export class AuxFinderPool {
 
     this.entries = [];
     this.pending.clear();
+  }
+
+  /** Close the pool after pending creations and all native disposals finish. */
+  destroyAsync(): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
+    const ready = this.entries;
+    this.entries = [];
+    this.destroyPromise = (async () => {
+      await Promise.allSettled(this.pending.values());
+      const entries = [...ready, ...this.entries];
+      this.entries = [];
+      this.pending.clear();
+      await destroyPickers(entries.map((entry) => entry.finder));
+    })();
+    return this.destroyPromise;
   }
 
   private sweepIdle(now = Date.now()): void {
@@ -55,6 +71,7 @@ export class AuxFinderPool {
     maybeRoot: string,
     opts?: { exact?: boolean },
   ): Promise<{ finder: FileFinderApi; root: string }> {
+    if (this.destroyPromise) throw new Error("FFF auxiliary finder pool is closing");
     this.sweepIdle();
     let covering: AuxPicker | null = null;
     for (const e of this.entries) {
