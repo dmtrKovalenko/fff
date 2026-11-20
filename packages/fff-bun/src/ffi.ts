@@ -665,7 +665,10 @@ export function ffiOpenMapped(basePath: string, indexPath: string): Result<Nativ
   return readCreateResult(library, result);
 }
 
-function readCreateResult(library: FFFLibrary, resultPtr: Pointer | null): Result<NativeHandle> {
+function readCreateResult(
+  library: FFFLibrary,
+  resultPtr: Pointer | null,
+): Result<NativeHandle> {
   if (resultPtr === null) {
     return err("FFI returned null pointer");
   }
@@ -1761,8 +1764,14 @@ export function ffiLayerSave(
 /**
  * Load a layer file as a new sealed overlay. Returns its id.
  */
-export function ffiLayerLoad(handle: NativeHandle, filePath: string, mapped = false): Result<number> {
-  const load = mapped ? mappedLibrary().symbols.fff_layer_map : loadLibrary().symbols.fff_layer_load;
+export function ffiLayerLoad(
+  handle: NativeHandle,
+  filePath: string,
+  mapped = false,
+): Result<number> {
+  const load = mapped
+    ? mappedLibrary().symbols.fff_layer_map
+    : loadLibrary().symbols.fff_layer_load;
   const resultPtr = load(handle, ptr(encodeString(filePath)));
   return parseIntResult(resultPtr);
 }

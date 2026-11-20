@@ -1987,7 +1987,11 @@ export function ffiLayerSave(
 /**
  * Load a layer file as a new sealed overlay. Returns its id.
  */
-export function ffiLayerLoad(handle: NativeHandle, filePath: string, mapped = false): Result<number> {
+export function ffiLayerLoad(
+  handle: NativeHandle,
+  filePath: string,
+  mapped = false,
+): Result<number> {
   return callIntResult(
     mapped ? "fff_layer_map" : "fff_layer_load",
     [DataType.External, DataType.String],
