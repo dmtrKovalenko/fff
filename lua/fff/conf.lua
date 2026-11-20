@@ -89,6 +89,7 @@ local M = {}
 --- @field select_window fun(current_buf: integer, action: FffSelectAction): integer|nil
 
 --- @class FffConfig
+--- @field mapped_index? string Saved base index. Only replace the file atomically while open.
 --- @field base_path string
 --- @field prompt string
 --- @field title string

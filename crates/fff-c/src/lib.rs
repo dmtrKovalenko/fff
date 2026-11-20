@@ -34,6 +34,7 @@ use ffi_types::{
 };
 
 /// Opaque handle holding all per-instance state; freed by `fff_destroy`.
+#[derive(Default)]
 struct FffInstance {
     picker: SharedFilePicker,
     frecency: SharedFrecency,

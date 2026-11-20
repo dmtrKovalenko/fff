@@ -720,6 +720,9 @@ export interface FileFinderApi {
   /** Write `layer` (0 = base scan) to a file. Returns bytes written. */
   saveLayer(layer: number, filePath: string): Result<number>;
 
+  /** Attach a mapped overlay. Keep the file immutable or replace it atomically until the finder closes. */
+  mapLayer(filePath: string): Result<number>;
+
   /** Load a layer file as a new sealed overlay. Returns its id. Fails when three overlays exist. */
   loadLayer(filePath: string): Result<number>;
 

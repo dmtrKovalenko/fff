@@ -119,7 +119,7 @@ impl FileSync {
         // Tombstoning already evicted the old cached contents.
         let file = &mut self.files[index];
         file.size = size;
-        file.unknown_size = size == 0;
+        file.size_needs_stat = size == 0;
         file.modified = modified;
         file.set_binary(binary);
         if index < self.indexable_count
@@ -223,7 +223,7 @@ impl FileSync {
 
             let mut file =
                 FileItem::new_raw(offset, entry.size, entry.modified, None, entry.binary);
-            file.unknown_size = entry.size == 0;
+            file.size_needs_stat = entry.size == 0;
             file.mark_definition_language(path);
             file.set_path(builder.add_file_immediate(path, offset));
             file.set_layer(layer);
@@ -323,7 +323,7 @@ impl FileSync {
                 file.size = existing.size;
                 file.modified = existing.modified;
                 file.set_binary(existing.is_binary());
-                file.unknown_size = existing.unknown_size;
+                file.size_needs_stat = existing.size_needs_stat;
                 file.pending_binary = !existing.is_binary();
                 self.shadowed_base_files.push(idx);
                 existing.set_deleted(true);
@@ -790,6 +790,36 @@ impl FilePicker {
 
     pub(crate) fn has_adopted_binary_classification(&self) -> bool {
         !self.sync_data.shadowed_base_files.is_empty()
+    }
+
+    /// Opens a searchable snapshot without a directory walk, watcher, or background content index.
+    pub fn new_from_snapshot(
+        shared: crate::SharedFilePicker,
+        frecency: &crate::SharedFrecency,
+        options: super::FilePickerOptions,
+        snapshot: LayerSnapshot,
+    ) -> Result<(), Error> {
+        let mut picker = Self::with_scm_pause(
+            super::FilePickerOptions {
+                watch: false,
+                enable_mmap_cache: false,
+                enable_content_indexing: false,
+                ..options
+            },
+            Default::default(),
+            shared.git_status_pause_flag(),
+        )?;
+        if !picker.base_path().is_dir() {
+            return Err(Error::InvalidPath(picker.base_path().to_owned()));
+        }
+        let file_count = snapshot.file_count();
+        picker.import_base(snapshot, frecency.read()?.as_ref())?;
+        picker
+            .scanned_files_count
+            .store(file_count, Ordering::Relaxed);
+        shared.rebase_watches(picker.base_path());
+        *shared.write()? = Some(picker);
+        Ok(())
     }
 
     /// Replaces the base scan with `snapshot`, keeping explicit overlay layers.

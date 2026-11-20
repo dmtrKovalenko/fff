@@ -93,7 +93,7 @@ impl LayerStore {
         match self {
             LayerStore::Open(Some(builder)) => builder.heap_bytes(),
             LayerStore::Open(None) => 0,
-            LayerStore::Sealed(store) => store.heap_bytes(),
+            LayerStore::Sealed(store) => store.arena_bytes(),
         }
     }
 

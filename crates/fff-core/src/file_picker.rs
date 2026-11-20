@@ -978,13 +978,13 @@ impl FilePicker {
         &self.sync_data.dirs
     }
 
-    /// Actual heap bytes used: (base arena, overlay layer arenas, 0).
+    /// Path storage bytes (owned or mapped) for the base arena, overlay arenas, and reserved slot.
     pub fn arena_bytes(&self) -> (usize, usize, usize) {
         let chunked = self
             .sync_data
             .chunked_paths
             .as_ref()
-            .map_or(0, |s| s.heap_bytes());
+            .map_or(0, |s| s.arena_bytes());
 
         (chunked, self.sync_data.layers.overlay_arena_bytes(), 0)
     }
@@ -2506,7 +2506,7 @@ impl FileSync {
             total_time,
             files.len(),
             dirs.len(),
-            chunked_paths.heap_bytes() as f64 / 1_048_576.0,
+            chunked_paths.arena_bytes() as f64 / 1_048_576.0,
             files_vec_bytes as f64 / 1_048_576.0,
             dir_table_bytes as f64 / 1_048_576.0,
             file_item_size,

@@ -386,24 +386,41 @@ const ffiDefinition = {
   },
 } as const;
 
+const mappedDefinition = {
+  fff_open_mapped_index: {
+    args: [FFIType.cstring, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  fff_layer_map: {
+    args: [FFIType.ptr, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+} as const;
+
 type FFFLibrary = ReturnType<typeof dlopen<typeof ffiDefinition>>;
 
 let lib: FFFLibrary | null = null;
+let mappedLib: ReturnType<typeof dlopen<typeof mappedDefinition>> | null = null;
 
 /**
  * Load the native library
  */
 function loadLibrary(): FFFLibrary {
-  if (lib) return lib;
+  return (lib ??= dlopen(libraryPath(), ffiDefinition));
+}
 
+function mappedLibrary() {
+  return (mappedLib ??= dlopen(libraryPath(), mappedDefinition));
+}
+
+function libraryPath(): string {
   const isEmbedded = embeddedLibPath?.includes("$bunfs") ?? false;
   const binaryPath = isEmbedded ? embeddedLibPath : (findBinary() ?? embeddedLibPath);
   if (!binaryPath) {
     throw new Error(libNotFoundMessage());
   }
 
-  lib = dlopen(binaryPath, ffiDefinition);
-  return lib;
+  return binaryPath;
 }
 
 function libNotFoundMessage(): string {
@@ -636,6 +653,19 @@ export function ffiCreate(
 
   const resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
 
+  return readCreateResult(library, resultPtr);
+}
+
+export function ffiOpenMapped(basePath: string, indexPath: string): Result<NativeHandle> {
+  const library = loadLibrary();
+  const result = mappedLibrary().symbols.fff_open_mapped_index(
+    ptr(encodeString(basePath)),
+    ptr(encodeString(indexPath)),
+  );
+  return readCreateResult(library, result);
+}
+
+function readCreateResult(library: FFFLibrary, resultPtr: Pointer | null): Result<NativeHandle> {
   if (resultPtr === null) {
     return err("FFI returned null pointer");
   }
@@ -648,7 +678,7 @@ export function ffiCreate(
     library.symbols.fff_free_result(resultPtr);
 
     if (!handle || handle === (0 as unknown as Pointer)) {
-      return err("fff_create_instance_with returned null handle");
+      return err("Native finder creation returned a null handle");
     }
 
     return { ok: true, value: handle };
@@ -1731,9 +1761,9 @@ export function ffiLayerSave(
 /**
  * Load a layer file as a new sealed overlay. Returns its id.
  */
-export function ffiLayerLoad(handle: NativeHandle, filePath: string): Result<number> {
-  const library = loadLibrary();
-  const resultPtr = library.symbols.fff_layer_load(handle, ptr(encodeString(filePath)));
+export function ffiLayerLoad(handle: NativeHandle, filePath: string, mapped = false): Result<number> {
+  const load = mapped ? mappedLibrary().symbols.fff_layer_map : loadLibrary().symbols.fff_layer_load;
+  const resultPtr = load(handle, ptr(encodeString(filePath)));
   return parseIntResult(resultPtr);
 }
 

@@ -284,7 +284,7 @@ pub struct FileItem {
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
     layer: LayerId,
-    pub(crate) unknown_size: bool,
+    pub(crate) size_needs_stat: bool,
     pub(crate) pending_binary: bool,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
@@ -311,7 +311,7 @@ impl Clone for FileItem {
             git_recency_score: self.git_recency_score,
             git_status: self.git_status,
             layer: self.layer,
-            unknown_size: self.unknown_size,
+            size_needs_stat: self.size_needs_stat,
             pending_binary: self.pending_binary,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
             // on clone we have to reset the content cache
@@ -360,7 +360,7 @@ impl FileItem {
             git_status,
             flags: AtomicU8::new(flags),
             layer: 0,
-            unknown_size: false,
+            size_needs_stat: false,
             pending_binary: false,
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
@@ -766,7 +766,7 @@ impl FileItem {
 
         if let Some(size) = new_size {
             self.size = size;
-            self.unknown_size = false;
+            self.size_needs_stat = false;
             self.pending_binary = false;
         }
     }
@@ -859,13 +859,10 @@ impl FileItem {
         follow_symlinks: bool,
     ) -> Option<&'a [u8]> {
         let limit = budget.max_file_size.min(max_file_size);
-        if self.is_binary() || self.size > limit {
+        if self.is_binary() {
             return None;
         }
-        if self.size == 0 {
-            if !self.unknown_size {
-                return None;
-            }
+        if self.size_needs_stat {
             let file = if follow_symlinks {
                 self.open_for_search(arena, base_path, base_dir)?
             } else {
@@ -879,6 +876,10 @@ impl FileItem {
             file.take(limit.saturating_add(1)).read_to_end(buf).ok()?;
             return ((buf.len() as u64) <= limit && !detect_binary_content(buf))
                 .then_some(buf.as_slice());
+        }
+
+        if self.size == 0 || self.size > limit {
+            return None;
         }
 
         #[cfg(not(target_os = "windows"))]

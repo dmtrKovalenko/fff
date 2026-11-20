@@ -182,6 +182,52 @@ pub unsafe extern "C" fn fff_layer_save(
     }
 }
 
+/// Open a saved directory index for immediate search without walking or watching the root.
+/// # Safety
+/// Supply two NUL-terminated UTF-8 paths. Until every reader closes, update the index only by atomic replacement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_open_mapped_index(
+    base_path: *const c_char,
+    index_path: *const c_char,
+) -> *mut FffResult {
+    let Some(root) = (unsafe { optional_cstr(base_path) }) else {
+        return FffResult::err("Invalid base path");
+    };
+    let Some(path) = (unsafe { optional_cstr(index_path) }) else {
+        return FffResult::err("Invalid index path");
+    };
+    let instance = crate::FffInstance::default();
+    let result = unsafe { LayerSnapshot::map(path) }.and_then(|snapshot| {
+        FilePicker::new_from_snapshot(
+            instance.picker.clone(),
+            &instance.frecency,
+            fff::FilePickerOptions {
+                base_path: root.to_owned(),
+                ..Default::default()
+            },
+            snapshot,
+        )
+    });
+    match result {
+        Ok(()) => FffResult::ok_handle(Box::into_raw(Box::new(instance)).cast()),
+        Err(e) => FffResult::err(&e.to_string()),
+    }
+}
+
+/// Attach an immutable memory-mapped layer and return its id.
+/// # Safety
+/// Provide a live handle and NUL-terminated UTF-8 path. Only atomically replace the file while readers hold it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_layer_map(
+    fff_handle: *mut c_void,
+    path: *const c_char,
+) -> *mut FffResult {
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        return FffResult::err("Path is null or invalid UTF-8");
+    };
+    unsafe { import_layer(fff_handle, LayerSnapshot::map(path)) }
+}
+
 /// Load a sealed overlay and return its layer ID. Fails when every layer ID is in use.
 /// # Safety
 /// Provide a live instance and a NUL-terminated UTF-8 path.
@@ -193,17 +239,7 @@ pub unsafe extern "C" fn fff_layer_load(
     let Some(path) = (unsafe { cstr_to_str(path) }) else {
         return FffResult::err("Path is null or invalid UTF-8");
     };
-    let snapshot = match LayerSnapshot::load(path) {
-        Ok(s) => s,
-        Err(e) => return FffResult::err(&format!("Failed to load layer: {}", e)),
-    };
-
-    unsafe {
-        with_picker_mut(fff_handle, |picker| match picker.import_layer(snapshot) {
-            Ok(id) => FffResult::ok_int(id as i64),
-            Err(e) => FffResult::err(&format!("Failed to import layer: {}", e)),
-        })
-    }
+    unsafe { import_layer(fff_handle, LayerSnapshot::load(path)) }
 }
 
 /// Start a base scan from a snapshot and return its file count.
@@ -232,6 +268,23 @@ pub unsafe extern "C" fn fff_base_load(
     match inst.picker.import_base(snapshot, &inst.frecency) {
         Ok(()) => FffResult::ok_int(file_count as i64),
         Err(e) => FffResult::err(&format!("Failed to import base: {}", e)),
+    }
+}
+
+unsafe fn import_layer(
+    fff_handle: *mut c_void,
+    snapshot: Result<LayerSnapshot, fff::Error>,
+) -> *mut FffResult {
+    let snapshot = match snapshot {
+        Ok(s) => s,
+        Err(e) => return FffResult::err(&format!("Failed to load layer: {}", e)),
+    };
+
+    unsafe {
+        with_picker_mut(fff_handle, |picker| match picker.import_layer(snapshot) {
+            Ok(id) => FffResult::ok_int(id as i64),
+            Err(e) => FffResult::err(&format!("Failed to import layer: {}", e)),
+        })
     }
 }
 

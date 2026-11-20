@@ -77,6 +77,7 @@ pub fn destroy_query_db(_: &Lua, _: ()) -> LuaResult<bool> {
 /// — callers that pass a table use the named fields instead.
 #[derive(Default)]
 struct PickerInitOpts {
+    mapped_index: Option<String>,
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
@@ -96,6 +97,7 @@ impl PickerInitOpts {
                 ..Default::default()
             }),
             mlua::Value::Table(t) => Ok(Self {
+                mapped_index: t.get("mapped_index")?,
                 follow_symlinks: t.get::<Option<bool>>("follow_symlinks")?.unwrap_or(false),
                 enable_fs_root_scanning: t
                     .get::<Option<bool>>("enable_fs_root_scanning")?
@@ -173,24 +175,45 @@ pub fn init_file_picker(
         enable_filename_constraint: opts.enable_filename_constraint,
     });
 
-    FilePicker::new_with_shared_state(
-        FILE_PICKER.clone(),
-        FRECENCY.clone(),
-        fff::FilePickerOptions {
-            base_path,
-            enable_mmap_cache: true,
-            enable_content_indexing: true,
-            mode: FFFMode::Neovim,
-            follow_symlinks: opts.follow_symlinks,
-            enable_fs_root_scanning: opts.enable_fs_root_scanning,
-            enable_home_dir_scanning: opts.enable_home_dir_scanning,
-            git_recency: opts.git_recency.unwrap_or_default(),
-            ..Default::default()
-        },
-    )
+    let options = fff::FilePickerOptions {
+        base_path,
+        enable_mmap_cache: true,
+        enable_content_indexing: true,
+        mode: FFFMode::Neovim,
+        follow_symlinks: opts.follow_symlinks,
+        enable_fs_root_scanning: opts.enable_fs_root_scanning,
+        enable_home_dir_scanning: opts.enable_home_dir_scanning,
+        git_recency: opts.git_recency.unwrap_or_default(),
+        ..Default::default()
+    };
+    if let Some(path) = opts.mapped_index {
+        // SAFETY: mapped_index is opt-in and requires atomic replacement for the mapping's lifetime.
+        let snapshot = unsafe { fff::LayerSnapshot::map(path) }.into_lua_result()?;
+        FilePicker::new_from_snapshot(FILE_PICKER.clone(), &FRECENCY, options, snapshot)
+    } else {
+        FilePicker::new_with_shared_state(FILE_PICKER.clone(), FRECENCY.clone(), options)
+    }
     .into_lua_result()?;
 
     Ok(true)
+}
+
+fn save_index(_: &Lua, path: String) -> LuaResult<u64> {
+    let snapshot = {
+        let guard = FILE_PICKER.read().into_lua_result()?;
+        let picker = guard
+            .as_ref()
+            .ok_or(Error::FilePickerMissing)
+            .into_lua_result()?;
+        if picker.is_scan_active() {
+            return Err(LuaError::RuntimeError("directory scan in progress".into()));
+        }
+        picker
+            .export_layer(0)
+            .ok_or(Error::FilePickerMissing)
+            .into_lua_result()?
+    };
+    snapshot.save(path).into_lua_result()
 }
 
 pub fn restart_index_in_path(
@@ -1017,6 +1040,7 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
         "destroy_frecency_db",
         lua.create_function(destroy_frecency_db)?,
     )?;
+    exports.set("save_index", lua.create_function(save_index)?)?;
     exports.set("init_file_picker", lua.create_function(init_file_picker)?)?;
     exports.set(
         "restart_index_in_path",

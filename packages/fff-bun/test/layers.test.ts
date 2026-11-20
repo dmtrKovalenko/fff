@@ -28,6 +28,26 @@ describe("FileFinder - index layers", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  test("opens a mapped base without scanning and attaches a mapped overlay", () => {
+    const index = path.join(tmp, "mapped.fff");
+    expect(FileFinder.buildLayerFile(["virtual/old.ts"], index).ok).toBe(true);
+    const opened = FileFinder.openMapped(tmp, index);
+    if (!opened.ok) throw new Error(opened.error);
+    try {
+      expect(opened.value.layerFileCount(0)).toEqual({ ok: true, value: 1 });
+      expect(FileFinder.buildLayerFile(["virtual/new.ts"], index).ok).toBe(true);
+      expect(opened.value.mapLayer(index)).toEqual({ ok: true, value: 2 });
+      for (const name of ["old", "new"]) {
+        const found = opened.value.fileSearch(name);
+        if (!found.ok) throw new Error(found.error);
+        expect(found.value.items[0]?.relativePath).toBe(`virtual/${name}.ts`);
+      }
+    } finally {
+      opened.value.destroy();
+    }
+    expect(FileFinder.openMapped(tmp, path.join(tmp, "absent.fff")).ok).toBe(false);
+  });
+
   test("addPaths opens a layer and dedups", () => {
     const added = finder.addPaths([
       "virtual/a.ts",

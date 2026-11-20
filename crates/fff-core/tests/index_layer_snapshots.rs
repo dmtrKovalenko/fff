@@ -696,6 +696,56 @@ fn a_saved_base_with_names_windows_cannot_store_loads_on_unix() {
     assert_eq!(live_paths(&restored).len(), 3);
 }
 
+#[cfg(target_endian = "little")]
+#[test]
+fn mapped_picker_uses_the_saved_paths_and_current_file_contents() {
+    use fff_search::{AiGrepConfig, FFFQuery, GrepSearchOptions, SharedFilePicker, SharedFrecency};
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(root.path().join("old.txt"), "x").unwrap();
+    let file = output.path().join("base.fff");
+    picker(root.path()).save_layer(0, &file).unwrap();
+    fs::write(root.path().join("old.txt"), "contents grew: NeedleHere").unwrap();
+    fs::write(root.path().join("late.txt"), "NeedleHere").unwrap();
+    let shared = SharedFilePicker::default();
+    // SAFETY: the index lives in a private tempdir and stays immutable.
+    let snapshot = unsafe { LayerSnapshot::map(&file) }.unwrap();
+    FilePicker::new_from_snapshot(
+        shared.clone(),
+        &SharedFrecency::default(),
+        FilePickerOptions {
+            base_path: root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        snapshot,
+    )
+    .unwrap();
+    let guard = shared.read().unwrap();
+    let picker = guard.as_ref().unwrap();
+    assert_eq!(live_paths(picker), ["old.txt"]);
+    assert_eq!(picker.get_scan_progress().scanned_files_count, 1);
+    let query = FFFQuery::parse("NeedleHere", AiGrepConfig);
+    assert_eq!(
+        picker
+            .grep(&query, &GrepSearchOptions::default())
+            .matches
+            .len(),
+        1
+    );
+    #[cfg(unix)]
+    {
+        fs::remove_file(root.path().join("old.txt")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("late.txt"), root.path().join("old.txt"))
+            .unwrap();
+        assert!(
+            picker
+                .grep(&query, &GrepSearchOptions::default())
+                .matches
+                .is_empty()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "restored grep follows a replacement directory symlink"]

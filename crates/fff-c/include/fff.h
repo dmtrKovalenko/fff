@@ -1474,6 +1474,22 @@ struct FffResult *fff_layer_build(const char *label,
 struct FffResult *fff_layer_save(void *fff_handle, uint8_t layer, const char *path);
 
 /**
+ * Open a saved directory index for immediate search without walking or watching the root.
+ * # Safety
+ * Supply two NUL-terminated UTF-8 paths. Until every reader closes, update the index only by atomic replacement.
+ */
+struct FffResult *fff_open_mapped_index(const char *base_path,
+                                        const char *index_path);
+
+/**
+ * Attach an immutable memory-mapped layer and return its id.
+ * # Safety
+ * Provide a live handle and NUL-terminated UTF-8 path. Only atomically replace the file while readers hold it.
+ */
+struct FffResult *fff_layer_map(void *fff_handle,
+                                const char *path);
+
+/**
  * Load a sealed overlay and return its layer ID. Fails when every layer ID is in use.
  * # Safety
  * Provide a live instance and a NUL-terminated UTF-8 path.

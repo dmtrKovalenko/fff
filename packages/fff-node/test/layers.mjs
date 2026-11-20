@@ -66,6 +66,23 @@ describe("fff-node index layers", { concurrency: 1 }, () => {
     );
   });
 
+  it("opens a mapped base without scanning and attaches a mapped overlay", () => {
+    const index = path.join(tmp, "mapped.fff");
+    assert.ok(FileFinder.buildLayerFile(["virtual/old.ts"], index).ok);
+    const opened = FileFinder.openMapped(tmp, index);
+    assert.ok(opened.ok);
+    try {
+      assert.equal(opened.value.fileSearch("scanned.ts").value.items.length, 0);
+      assert.ok(FileFinder.buildLayerFile(["virtual/new.ts"], index).ok);
+      assert.deepEqual(opened.value.mapLayer(index), { ok: true, value: 2 });
+      assert.equal(opened.value.fileSearch("old.ts").value.items[0].relativePath, "virtual/old.ts");
+      assert.equal(opened.value.fileSearch("new.ts").value.items[0].relativePath, "virtual/new.ts");
+    } finally {
+      opened.value.destroy();
+    }
+    assert.equal(FileFinder.openMapped(tmp, path.join(tmp, "absent.fff")).ok, false);
+  });
+
   it("save / load layer and base", async () => {
     assert.deepEqual(finder.createLayer("second"), { ok: true, value: 2 });
     assert.deepEqual(finder.addPaths(["second/x.ts"]), { ok: true, value: 1 });
