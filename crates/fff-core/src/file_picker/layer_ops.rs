@@ -1,5 +1,7 @@
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
@@ -79,15 +81,11 @@ impl FileSync {
             self.dirs
                 .range_mut(dirs_end..dirs_total)
                 .rotate_right(added_dirs);
-            let moved = dirs_len - dirs_end;
-            let remap = |dir: u32| match dir as usize {
-                d if d < dirs_end || d >= dirs_total => dir,
-                d if d < dirs_len => (d + added_dirs) as u32,
-                d => (d - moved) as u32,
-            };
-            let (base_count, files_total) = (self.base_count, self.files.len());
-            for file in self.files.range_mut(base_count..files_total) {
-                file.parent_dir_index = remap(file.parent_dir_index);
+            let moved_ids = &mut self.overlay_dir_ids[dirs_end - self.base_dirs_count..];
+            moved_ids.rotate_right(added_dirs);
+            for (offset, &id) in moved_ids.iter().enumerate() {
+                self.overlay_dir_slots[id as usize - self.base_dirs_count] =
+                    (dirs_end + offset) as u32;
             }
         }
         if added_files > 0 && files_end < files_len {
@@ -121,6 +119,7 @@ impl FileSync {
         // Tombstoning already evicted the old cached contents.
         let file = &mut self.files[index];
         file.size = size;
+        file.unknown_size = size == 0;
         file.modified = modified;
         file.set_binary(binary);
         if index < self.indexable_count
@@ -135,9 +134,8 @@ impl FileSync {
     // Dirs hold no mappings, so growing them alone keeps the cache budget.
     pub(super) fn ensure_capacity(&mut self, files_extra: usize, dirs_extra: usize) -> bool {
         if self.dirs.len() + dirs_extra > self.dirs.capacity() {
-            self.dirs = self
-                .dirs
-                .reallocate_with_reserve(dirs_extra + MAX_OVERFLOW_FILES);
+            let reserve = MAX_OVERFLOW_FILES.max(self.dirs.len() / 2);
+            self.dirs = self.dirs.reallocate_with_reserve(dirs_extra + reserve);
         }
         if self.files.len() + files_extra <= self.files.capacity() {
             return false;
@@ -152,66 +150,114 @@ impl FileSync {
     // Explicit paths never go to the session layer, which a rescan rebuilds
     // from disk. A layer is opened for the first new path, so a batch of
     // duplicates does not take an id.
-    fn add_entries(&mut self, entries: &[IndexEntry<'_>]) -> Result<usize, Error> {
-        let mut layer = self.layers.open_layer();
-        if layer.is_none()
-            && self.layers.free_id().is_none()
-            && entries
-                .iter()
-                .filter_map(|entry| normalize_relative_path(entry.relative_path))
-                .any(|path| self.find_relative_path_index(&path).is_none())
-        {
-            return Err(Error::LayerLimit);
-        }
-        let (files_len, dirs_len) = (self.files.len(), self.dirs.len());
-        let mut batch: AHashSet<String> = AHashSet::new();
-        let mut added = 0;
-
+    fn add_entries<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = IndexEntry<'a>>,
+        cache_budget: &ContentCacheBudget,
+    ) -> Result<usize, Error> {
+        let mut paths = SmallVec::<[LayerAddition<'a>; 4]>::new();
+        let mut revivals = SmallVec::<[_; 4]>::new();
+        let mut seen = AHashSet::new();
         for entry in entries {
             let Some(path) = normalize_relative_path(entry.relative_path) else {
                 continue;
             };
-            if let Some(idx) = self.lookup_relative_path(&path, files_len) {
-                added +=
-                    self.revive_entry(idx, entry.size, entry.modified, entry.is_binary()) as usize;
-                continue;
+            let existing = self.find_relative_path_index(&path);
+            match existing {
+                Some(idx) if self.files[idx].is_deleted() => revivals.push((idx, path, entry)),
+                Some(_) => {}
+                None => {
+                    if !paths.is_empty() {
+                        if seen.is_empty() {
+                            seen.insert(paths[0].path.clone());
+                        }
+                        if !seen.insert(path.clone()) {
+                            continue;
+                        }
+                    }
+                    paths.push(LayerAddition {
+                        path,
+                        size: entry.size,
+                        modified: entry.modified,
+                        binary: entry.is_binary(),
+                    });
+                }
             }
-            if batch.contains(path.as_str()) {
-                continue;
-            }
-            let layer = match layer {
-                Some(id) => id,
-                None => *layer.insert(self.create_layer(None)?),
-            };
+        }
 
-            let offset = filename_offset(&path) as u16;
-            let Some(dir_idx) = self.find_or_add_dir_in(layer, &path[..offset as usize]) else {
-                break;
+        let layer = if paths.is_empty() {
+            None
+        } else if let Some(id) = self.layers.open_layer() {
+            Some(id)
+        } else {
+            Some(self.create_layer(None)?)
+        };
+        if self.ensure_capacity(paths.len(), 0) {
+            cache_budget.reset();
+        }
+
+        let mut added = 0;
+        for (idx, path, entry) in revivals {
+            if self.revive_entry(idx, entry.size, entry.modified, entry.is_binary()) {
+                self.revive_ancestor_dirs(&path[..filename_offset(&path)]);
+                added += 1;
+            }
+        }
+        let Some(layer) = layer else {
+            return Ok(added);
+        };
+        let (files_len, dirs_len) = (self.files.len(), self.dirs.len());
+        let mut parents = AHashMap::new();
+        for entry in &paths {
+            let path = entry.path.as_ref();
+            let offset = filename_offset(path) as u16;
+            let parent = &path[..offset as usize];
+            let dir_id = if paths.len() == 1 {
+                self.add_ancestor_dirs(layer, parent)
+            } else {
+                *parents
+                    .entry(parent)
+                    .or_insert_with(|| self.add_ancestor_dirs(layer, parent))
             };
-            let Some(builder) = self.layers.builder(layer) else {
-                break;
-            };
+            let builder = self.layers.builder(layer).expect("writable layer");
 
             let mut file =
-                FileItem::new_raw(offset, entry.size, entry.modified, None, entry.is_binary());
-            file.mark_definition_language(&path);
-            file.set_path(builder.add_file_immediate(&path, offset));
+                FileItem::new_raw(offset, entry.size, entry.modified, None, entry.binary);
+            file.unknown_size = entry.size == 0;
+            file.mark_definition_language(path);
+            file.set_path(builder.add_file_immediate(path, offset));
             file.set_layer(layer);
-            file.parent_dir_index = dir_idx;
+            file.parent_dir_index = dir_id;
 
-            if !self.files.push(file) {
-                break;
-            }
+            assert!(self.files.push(file), "reserved space for new files");
             self.live_count += 1;
-            self.revive_dir(dir_idx);
-            batch.insert(path);
             added += 1;
         }
 
-        if let Some(layer) = layer {
-            self.settle_appended(layer, files_len, dirs_len);
-        }
+        self.settle_appended(layer, files_len, dirs_len);
         Ok(added)
+    }
+
+    fn add_ancestor_dirs(&mut self, layer: LayerId, parent: &str) -> u32 {
+        let mut dirs = ancestor_dirs(parent);
+        let mut add_dir = |dir| {
+            let id = self.find_or_add_dir_in(layer, dir).expect("writable layer");
+            self.revive_dir(id);
+            id
+        };
+        let parent_id = add_dir(dirs.next().expect("parent directory"));
+        for dir in dirs {
+            add_dir(dir);
+        }
+        parent_id
+    }
+
+    fn revive_ancestor_dirs(&mut self, parent: &str) {
+        for dir in ancestor_dirs(parent) {
+            if let Some(slot) = self.find_dir_index(dir) {
+                self.revive_dir(self.dir_id(slot));
+            }
+        }
     }
 
     // Attaches `snapshot` as layer `id`. An import skips files the index already
@@ -239,16 +285,13 @@ impl FileSync {
             }
             let path = dir.read_relative_path(arena, &mut dir_buf);
             let idx = match self.find_dir_index(path) {
-                Some(idx) => idx as u32,
+                Some(idx) => self.dir_id(idx),
                 None => {
-                    let idx = self.dirs.len() as u32;
                     dir.set_layer(id);
-                    dir.set_deleted(false);
-                    if !self.dirs.push(dir) {
+                    let Some(dir_id) = self.push_overlay_dir(dir) else {
                         break;
-                    }
-                    self.live_dirs_count += 1;
-                    idx
+                    };
+                    dir_id
                 }
             };
             dir_map.push(idx);
@@ -265,7 +308,7 @@ impl FileSync {
             let dir_idx = match dir_map.get(file.parent_dir_index as usize) {
                 Some(&idx) => idx,
                 None => match self.find_dir_index(&path[..file.path.filename_offset as usize]) {
-                    Some(idx) => idx as u32,
+                    Some(idx) => self.dir_id(idx),
                     None => continue,
                 },
             };
@@ -280,6 +323,9 @@ impl FileSync {
                 file.size = existing.size;
                 file.modified = existing.modified;
                 file.set_binary(existing.is_binary());
+                file.unknown_size = existing.unknown_size;
+                file.pending_binary = !existing.is_binary();
+                self.shadowed_base_files.push(idx);
                 existing.set_deleted(true);
                 self.live_count -= 1;
             }
@@ -337,11 +383,14 @@ impl FileSync {
         };
 
         for global in dir_start..dir_end {
-            register(global as u32, &self.dirs);
+            if !self.dirs[global].is_deleted() {
+                register(global as u32, &self.dirs);
+            }
         }
         let mut files: Vec<FileItem> = Vec::with_capacity(end - start);
         for file in self.files[start..end].iter().filter(|f| !f.is_deleted()) {
-            let Some(local) = register(file.parent_dir_index, &self.dirs) else {
+            let Some(local) = register(self.dir_slot(file.parent_dir_index) as u32, &self.dirs)
+            else {
                 continue;
             };
             let mut copy = file.clone();
@@ -389,14 +438,25 @@ impl FileSync {
                 file.clone()
             })
             .collect();
-        let dirs = self.dirs[..self.base_dirs_count]
-            .iter()
-            .map(|d| {
-                let mut dir = d.clone();
-                dir.set_deleted(false);
-                dir
-            })
-            .collect();
+        let mut dirs: Vec<_> = self.dirs[..self.base_dirs_count].to_vec();
+        let mut files: Vec<_> = files;
+        if dirs.iter().any(DirItem::is_deleted) {
+            // A live child still needs a parent record for path lookup.
+            for file in &files {
+                dirs[file.parent_dir_index as usize].set_deleted(false);
+            }
+            let mut slots = Vec::with_capacity(dirs.len());
+            let mut next = 0;
+            dirs.retain(|dir| {
+                let live = !dir.is_deleted();
+                slots.push(next);
+                next += u32::from(live);
+                live
+            });
+            for file in &mut files {
+                file.parent_dir_index = slots[file.parent_dir_index as usize];
+            }
+        }
 
         Some(LayerSnapshot {
             label: None,
@@ -509,6 +569,9 @@ impl FileSync {
             base_count,
             live_count: base_count,
             watcher_additions: 0,
+            overlay_dir_slots: Vec::new(),
+            overlay_dir_ids: Vec::new(),
+            shadowed_base_files: Vec::new(),
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,
@@ -521,6 +584,13 @@ impl FileSync {
             ignore_rules: None,
         }
     }
+}
+
+struct LayerAddition<'a> {
+    path: Cow<'a, str>,
+    size: u64,
+    modified: u64,
+    binary: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -674,9 +744,8 @@ impl FilePicker {
         &mut self,
         entries: impl IntoIterator<Item = IndexEntry<'a>>,
     ) -> Result<usize, Error> {
-        let entries: Vec<IndexEntry<'a>> = entries.into_iter().collect();
-        self.reserve_index(entries.len(), entries.len())?;
-        let added = self.sync_data.add_entries(&entries)?;
+        self.ensure_index_idle()?;
+        let added = self.sync_data.add_entries(entries, &self.cache_budget)?;
         debug!(
             added,
             layer = self.current_layer(),
@@ -699,6 +768,28 @@ impl FilePicker {
         info!(layer = id, added, "Imported index layer");
 
         Ok(id)
+    }
+
+    pub(crate) fn finish_adopted_binary_classification(&mut self) {
+        let sync = &mut self.sync_data;
+        let arena = sync.arena_base_ptr();
+        let mut buf = [0; PATH_BUF_SIZE];
+        for index in std::mem::take(&mut sync.shadowed_base_files) {
+            let base = &sync.files[index];
+            let binary = base.is_binary();
+            let path = base.path.read_to_buf(arena, &mut buf);
+            if let Some(slot) = sync.find_relative_path_index(path)
+                && let Some(file) = sync.files.get_mut(slot)
+                && file.pending_binary
+            {
+                file.pending_binary = false;
+                file.set_binary(binary);
+            }
+        }
+    }
+
+    pub(crate) fn has_adopted_binary_classification(&self) -> bool {
+        !self.sync_data.shadowed_base_files.is_empty()
     }
 
     /// Replaces the base scan with `snapshot`, keeping explicit overlay layers.
@@ -774,6 +865,12 @@ impl FilePicker {
 
         Ok(())
     }
+}
+
+fn ancestor_dirs(parent: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(parent), |dir| {
+        (!dir.is_empty()).then(|| &dir[..last_segment_offset(dir) as usize])
+    })
 }
 
 thread_local! {
@@ -928,7 +1025,7 @@ mod tests {
                 ),
                 (0, 0, 0)
             );
-            let parent = &picker.get_dirs()[file.parent_dir_index as usize];
+            let parent = &picker.get_dirs()[picker.sync_data.dir_slot(file.parent_dir_index)];
             assert_eq!(parent.max_access_frecency(), 0);
         }
     }
@@ -1003,7 +1100,7 @@ mod tests {
             let path = file
                 .path
                 .read_to_buf(arenas.get(file.layer_id()), &mut file_buf);
-            let dir = &sync.dirs[file.parent_dir_index as usize];
+            let dir = &sync.dirs[sync.dir_slot(file.parent_dir_index)];
             let dir_path = dir.read_relative_path(arenas.get(dir.layer_id()), &mut dir_buf);
             assert_eq!(dir_path, &path[..file.path.filename_offset as usize]);
         }

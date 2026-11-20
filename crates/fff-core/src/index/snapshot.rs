@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ pub enum SnapshotLayout {
 #[derive(Clone, Debug)]
 pub struct IndexEntry<'a> {
     pub relative_path: &'a str,
+    /// Size in bytes. A zero size is resolved from the file during grep.
     pub size: u64,
     /// Unix seconds. `0` when unknown.
     pub modified: u64,
@@ -113,7 +115,7 @@ impl LayerBuilder {
             binary: entry.is_binary(),
             size: entry.size,
             modified: entry.modified,
-            path,
+            path: path.into_owned(),
         });
         true
     }
@@ -183,6 +185,7 @@ impl LayerBuilder {
                 None,
                 entry.binary,
             );
+            file.unknown_size = entry.size == 0;
             file.mark_definition_language(&entry.path);
             file.set_path(store.add_file_immediate(&entry.path, entry.filename_offset));
             file.parent_dir_index = dir_idx;
@@ -534,6 +537,7 @@ impl LayerSnapshot {
 
             path.filename_offset = offset;
             let mut file = FileItem::new_raw(offset, size, modified, None, binary);
+            file.unknown_size = size == 0;
             file.mark_definition_language(text);
             file.set_path(path);
             file.parent_dir_index = parent_dir_index;
@@ -711,10 +715,18 @@ fn is_relative_file_path(path: &str) -> bool {
     !has_drive_prefix(path) && path.split('/').all(is_file_name)
 }
 
-pub(crate) fn normalize_relative_path(raw: &str) -> Option<String> {
+pub(crate) fn normalize_relative_path(raw: &str) -> Option<Cow<'_, str>> {
+    let raw = raw.trim_start_matches("./");
     let path = crate::path_utils::to_canonical_slashes(raw);
-    let path = path.trim_start_matches("./");
-    (path.len() < PATH_BUF_SIZE && is_relative_file_path(path)).then(|| path.to_owned())
+    let relative = path.trim_start_matches("./");
+    if relative.len() >= PATH_BUF_SIZE || !is_relative_file_path(relative) {
+        return None;
+    }
+    if path.len() == relative.len() {
+        Some(path)
+    } else {
+        Some(Cow::Owned(relative.to_owned()))
+    }
 }
 
 #[inline]

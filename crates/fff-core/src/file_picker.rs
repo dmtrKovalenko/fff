@@ -68,6 +68,7 @@ use tracing::{Level, debug, error, info, warn};
 use crate::parallelism::{SEARCH_THREAD_POOL, indexing_pool};
 
 mod layer_ops;
+mod restore_changes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FFFMode {
@@ -123,6 +124,10 @@ pub(crate) struct FileSync {
     /// scan-built region, `dirs[base_dirs_count..]` holds watcher-appended dirs.
     dirs: StableVec<DirItem>,
     base_dirs_count: usize,
+    // Base directory IDs are slots. Overlay IDs map to slots that may move.
+    overlay_dir_slots: Vec<u32>,
+    overlay_dir_ids: Vec<u32>,
+    shadowed_base_files: Vec<usize>,
     /// Number of dirs with at least one live file (mirrors `live_count`).
     live_dirs_count: usize,
     /// Overlay layers stacked on the base arena. Each layer owns a contiguous
@@ -145,6 +150,9 @@ impl FileSync {
             base_count: 0,
             live_count: 0,
             watcher_additions: 0,
+            overlay_dir_slots: Vec::new(),
+            overlay_dir_ids: Vec::new(),
+            shadowed_base_files: Vec::new(),
             dirs: StableVec::from_vec_with_reserve(Vec::new(), MAX_OVERFLOW_FILES),
             base_dirs_count: 0,
             live_dirs_count: 0,
@@ -425,8 +433,9 @@ impl FileSync {
     }
 
     /// Restores a dir to the live state (file appeared under it again).
-    fn revive_dir(&mut self, dir_idx: u32) {
-        if let Some(dir) = self.dirs.get_mut(dir_idx as usize)
+    fn revive_dir(&mut self, dir_id: u32) {
+        let slot = self.dir_slot(dir_id);
+        if let Some(dir) = self.dirs.get_mut(slot)
             && dir.set_deleted(false)
         {
             self.live_dirs_count += 1;
@@ -468,9 +477,10 @@ impl FileSync {
     // table until `settle_appended` moves it into the layer's range.
     fn find_or_add_dir_in(&mut self, layer: LayerId, dir_rel: &str) -> Option<u32> {
         if let Some(idx) = self.find_dir_index(dir_rel) {
-            return Some(idx as u32);
+            return Some(self.dir_id(idx));
         }
 
+        self.ensure_capacity(0, 1);
         let chunked = self.layers.builder(layer)?.add_dir_immediate(dir_rel);
 
         let last_seg = if dir_rel.is_empty() {
@@ -483,15 +493,38 @@ impl FileSync {
                 .unwrap_or(0) as u16
         };
 
-        let idx = self.dirs.len();
-        if !self
-            .dirs
-            .push(DirItem::new_in_layer(chunked, last_seg, layer))
-        {
+        self.push_overlay_dir(DirItem::new_in_layer(chunked, last_seg, layer))
+    }
+
+    fn dir_slot(&self, id: u32) -> usize {
+        let index = id as usize;
+        if index < self.base_dirs_count {
+            index
+        } else {
+            self.overlay_dir_slots
+                .get(index - self.base_dirs_count)
+                .copied()
+                .map_or(usize::MAX, |slot| slot as usize)
+        }
+    }
+
+    fn dir_id(&self, slot: usize) -> u32 {
+        if slot < self.base_dirs_count {
+            slot as u32
+        } else {
+            self.overlay_dir_ids[slot - self.base_dirs_count]
+        }
+    }
+
+    fn push_overlay_dir(&mut self, dir: DirItem) -> Option<u32> {
+        let slot = self.dirs.len() as u32;
+        if !self.dirs.push(dir) {
             return None;
         }
+        self.overlay_dir_slots.push(slot);
+        self.overlay_dir_ids.push(slot);
         self.live_dirs_count += 1;
-        Some(idx as u32)
+        Some(slot)
     }
 }
 
@@ -712,6 +745,8 @@ pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
     sync_data: FileSync,
+    restore_changes: Option<Vec<restore_changes::RestoreChange>>,
+    restored_unindexed: Vec<usize>,
     pub(crate) signals: ScanSignals,
     pub(crate) background_watcher: Option<BackgroundWatcher>,
     /// Single serialized writer for all git-status updates (scan, watcher,
@@ -1110,6 +1145,8 @@ impl FilePicker {
             mode: options.mode,
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
+            restore_changes: None,
+            restored_unindexed: Vec::new(),
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
@@ -1634,6 +1671,7 @@ impl FilePicker {
                 overlay_guard.as_deref(),
                 cancel,
                 &self.base_path,
+                self.follow_symlinks,
                 arenas,
             )
         })
@@ -1664,6 +1702,7 @@ impl FilePicker {
                 overlay_guard.as_deref(),
                 cancel,
                 &self.base_path,
+                self.follow_symlinks,
                 arenas,
             )
         })
@@ -1689,10 +1728,11 @@ impl FilePicker {
 
     pub(crate) fn set_bigram_index(&mut self, index: BigramFilter) {
         self.sync_data.bigram_index = Some(Arc::new(index));
-        // once the index is reset automatically reset the overaly
-        self.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(
-            BigramOverlay::new(self.sync_data.indexable_count),
-        )));
+        let mut overlay = BigramOverlay::new(self.sync_data.indexable_count);
+        for slot in self.restored_unindexed.drain(..) {
+            overlay.invalidate_file(slot);
+        }
+        self.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(overlay)));
     }
 
     pub(crate) fn scan_signals(&self) -> crate::scan::ScanSignals {
@@ -1751,9 +1791,12 @@ impl FilePicker {
     // Explicit layers outlive a rescan. Returns the replaced base so the caller can
     // compare against it and drop it off the lock.
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) -> FileSync {
+        let restore_changes = self.take_restore_changes();
+        self.restored_unindexed.clear();
         self.cache_budget.reset();
         let mut previous = std::mem::replace(&mut self.sync_data, sync);
         self.sync_data.adopt_overlays(&mut previous);
+        self.replay_restore_changes(restore_changes);
         previous
     }
 
@@ -1813,8 +1856,8 @@ impl FilePicker {
                 );
             }
             let score = file.access_frecency_score as i32;
-            let dir_idx = file.parent_dir_index as usize;
-            if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
+            let dir_id = file.parent_dir_index;
+            if let Some(dir) = self.sync_data.dirs.get(self.sync_data.dir_slot(dir_id)) {
                 dir.update_frecency_if_larger(score);
             }
         }
@@ -1870,8 +1913,8 @@ impl FilePicker {
 
             // Update parent dir frecency inline (atomic, &self access).
             let score = file.access_frecency_score as i32;
-            let dir_idx = file.parent_dir_index as usize;
-            if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
+            let dir_id = file.parent_dir_index;
+            if let Some(dir) = self.sync_data.dirs.get(self.sync_data.dir_slot(dir_id)) {
                 dir.update_frecency_if_larger(score);
             }
         }
@@ -1900,6 +1943,7 @@ impl FilePicker {
     #[tracing::instrument(skip(self),level = Level::DEBUG)]
     pub fn handle_create_or_modify(&mut self, path: impl AsRef<Path> + Debug) -> Option<&FileItem> {
         let path = path.as_ref();
+        self.record_restore_upsert(path);
 
         if let Some(idx) = self.sync_data.find_file_index(path, &self.base_path) {
             let slot = if idx < self.sync_data.base_count {
@@ -1911,7 +1955,7 @@ impl FilePicker {
             return self.handle_file_modify(path, slot);
         }
 
-        self.add_new_file(path)
+        self.add_new_file_inner(path)
     }
 
     #[tracing::instrument(skip_all, fields(path = ?path), level = Level::DEBUG)]
@@ -1972,10 +2016,20 @@ impl FilePicker {
     /// which indicates that it's time to trigger a new sync
     #[tracing::instrument(skip(self))]
     pub fn add_new_file(&mut self, path: &Path) -> Option<&FileItem> {
+        self.record_restore_upsert(path);
+        self.add_new_file_inner(path)
+    }
+
+    fn add_new_file_inner(&mut self, path: &Path) -> Option<&FileItem> {
         if self.sync_data.watcher_additions >= MAX_OVERFLOW_FILES
             || self.sync_data.files.len() == self.sync_data.files.capacity()
         {
-            return None;
+            if !self.is_restoring_base() {
+                return None;
+            }
+            if self.sync_data.ensure_capacity(1, 0) {
+                self.cache_budget.reset();
+            }
         }
 
         // On Windows `pathdiff::diff_paths` is byte-wise, so a short-name
@@ -1996,7 +2050,7 @@ impl FilePicker {
         #[cfg(not(windows))]
         let path_for_index: &Path = path;
 
-        let (mut file_item, rel_path) =
+        let (file_item, rel_path) =
             FileItem::new(path_for_index.to_path_buf(), &self.base_path, None);
 
         // we have to perform manual classification for every new file this will be
@@ -2007,19 +2061,22 @@ impl FilePicker {
             &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
         );
 
-        // Register (or revive) the parent dir so directory search and layer
-        // export see the file. Explicit layers share the dir table, so grow it.
-        let dir_rel = crate::path_utils::to_canonical_slashes(
-            &rel_path[..file_item.path.filename_offset as usize],
-        );
-        self.sync_data.ensure_capacity(0, 1);
-        let parent_dir = self.sync_data.find_or_add_dir(&dir_rel)?;
+        self.append_session_file(file_item, &rel_path)
+    }
+
+    fn append_session_file(
+        &mut self,
+        mut file_item: FileItem,
+        rel_path: &str,
+    ) -> Option<&FileItem> {
+        let dir_rel = &rel_path[..file_item.path.filename_offset as usize];
+        let parent_dir = self.sync_data.find_or_add_dir(dir_rel)?;
 
         let chunked = self
             .sync_data
             .layers
             .session_builder()
-            .add_file_immediate(&rel_path, file_item.path.filename_offset);
+            .add_file_immediate(rel_path, file_item.path.filename_offset);
 
         file_item.set_path(chunked);
         file_item.set_layer(SESSION_LAYER);
@@ -2066,6 +2123,7 @@ impl FilePicker {
     /// the file going to be disapperaed or if you do not have the watcher installed
     pub fn remove_file_by_path(&mut self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
+        self.record_restore_path(path, restore_changes::RestoreChange::Remove);
         if let Some(index) = self.sync_data.find_file_index(path, &self.base_path) {
             self.tombstone_file(index);
             true
@@ -2098,7 +2156,7 @@ impl FilePicker {
     fn remove_all_files_in_dirs_inner<'a>(
         &mut self,
         dirs: impl IntoIterator<Item = &'a Path>,
-        mut callback: Option<&mut dyn FnMut(&Path)>,
+        callback: Option<&mut dyn FnMut(&Path)>,
     ) -> usize {
         let mut dir_prefixes = Vec::new();
         for dir_path in dirs {
@@ -2121,6 +2179,18 @@ impl FilePicker {
             return 0;
         }
 
+        let removed = self.remove_dir_prefixes(&dir_prefixes, callback);
+        if let Some(changes) = &mut self.restore_changes {
+            changes.push(restore_changes::RestoreChange::RemoveDirs(dir_prefixes));
+        }
+        removed
+    }
+
+    fn remove_dir_prefixes(
+        &mut self,
+        dir_prefixes: &[String],
+        mut callback: Option<&mut dyn FnMut(&Path)>,
+    ) -> usize {
         let base_path = self.base_path.clone();
         let cache_budget = &self.cache_budget;
         let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
@@ -2451,6 +2521,9 @@ impl FileSync {
             base_count,
             live_count: base_count,
             watcher_additions: 0,
+            overlay_dir_slots: Vec::new(),
+            overlay_dir_ids: Vec::new(),
+            shadowed_base_files: Vec::new(),
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,

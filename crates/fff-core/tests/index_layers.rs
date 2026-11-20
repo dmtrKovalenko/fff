@@ -81,6 +81,128 @@ fn watcher_files_land_in_the_session_layer() {
     assert_eq!(base_files, vec!["scanned.rs".to_string()]);
 }
 
+#[test]
+fn adding_deep_paths_indexes_their_ancestors() {
+    let root = TempDir::new().unwrap();
+    let mut picker = picker(root.path());
+    picker
+        .add_entries([IndexEntry::new("top/middle/deep/file.rs")])
+        .unwrap();
+    let snapshot = picker.export_layer(picker.current_layer()).unwrap();
+    assert_eq!(
+        snapshot.dir_paths().collect::<Vec<_>>(),
+        ["", "top/", "top/middle/", "top/middle/deep/"]
+    );
+}
+
+#[test]
+fn path_only_entries_use_the_actual_size_for_grep() {
+    use fff_search::grep::{GrepMode, GrepSearchOptions};
+    let root = TempDir::new().unwrap();
+    let mut picker = picker(root.path());
+    fs::write(root.path().join("logged.txt"), "layerneedle").unwrap();
+    fs::write(root.path().join("binary.txt"), b"layerneedle\x00").unwrap();
+    picker
+        .add_entries(["logged.txt", "binary.txt", "missing.txt"].map(IndexEntry::new))
+        .unwrap();
+    let query = FFFQuery::parse("layerneedle", fff_search::AiGrepConfig);
+    let mut options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        ..Default::default()
+    };
+    assert_eq!(picker.grep(&query, &options).matches.len(), 1);
+    options.max_file_size = 8;
+    assert!(picker.grep(&query, &options).matches.is_empty());
+
+    let mut bytes = Vec::new();
+    picker
+        .export_layer(picker.current_layer())
+        .unwrap()
+        .write_to(&mut bytes)
+        .unwrap();
+    picker
+        .import_base(LayerSnapshot::from_bytes(&bytes).unwrap(), None)
+        .unwrap();
+    options.max_file_size = 32;
+    assert_eq!(picker.grep(&query, &options).matches.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn path_only_grep_obeys_the_symlink_setting() {
+    use fff_search::grep::{GrepMode, GrepSearchOptions};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("file.txt"), "linkedneedle").unwrap();
+    for follow_symlinks in [false, true] {
+        let worktree = root.path().join(follow_symlinks.to_string());
+        fs::create_dir(&worktree).unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: worktree.to_string_lossy().into_owned(),
+            watch: false,
+            follow_symlinks,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let traverse_only = worktree.join("traverse-only");
+        fs::create_dir(&traverse_only).unwrap();
+        fs::write(traverse_only.join("file.txt"), "linkedneedle").unwrap();
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ))]
+        fs::set_permissions(&traverse_only, fs::Permissions::from_mode(0o111)).unwrap();
+        symlink(outside.path(), worktree.join("linked")).unwrap();
+        symlink(outside.path().join("file.txt"), worktree.join("link.txt")).unwrap();
+        picker
+            .add_entries(
+                ["linked/file.txt", "link.txt", "traverse-only/file.txt"].map(IndexEntry::new),
+            )
+            .unwrap();
+        let query = FFFQuery::parse("linkedneedle", fff_search::AiGrepConfig);
+        let options = GrepSearchOptions {
+            mode: GrepMode::PlainText,
+            ..Default::default()
+        };
+        let count = picker.grep(&query, &options).matches.len();
+        fs::set_permissions(&traverse_only, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(count, 1 + usize::from(follow_symlinks) * 2);
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn duplicate_batches_leave_cached_content_in_place() {
+    use fff_search::grep::{GrepMode, GrepSearchOptions};
+    use std::sync::atomic::Ordering;
+    let root = TempDir::new().unwrap();
+    let text = format!("cachemarker{}", "x".repeat(20_000));
+    fs::write(root.path().join("cached.txt"), text).unwrap();
+    let mut picker = picker(root.path());
+    let query = FFFQuery::parse("cachemarker", fff_search::AiGrepConfig);
+    let options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        ..Default::default()
+    };
+    assert_eq!(picker.grep(&query, &options).matches.len(), 1);
+    assert_eq!(
+        picker.cache_budget().cached_count.load(Ordering::Relaxed),
+        1
+    );
+    let duplicates = (0..2048).map(|_| IndexEntry::new("cached.txt"));
+    assert_eq!(picker.add_entries(duplicates).unwrap(), 0);
+    assert_eq!(
+        picker.cache_budget().cached_count.load(Ordering::Relaxed),
+        1
+    );
+}
+
 fn write(base: &std::path::Path, relative_path: &str) {
     let path = base.join(relative_path);
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");

@@ -203,6 +203,7 @@ pub(crate) fn grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
+    follow_symlinks: bool,
     arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     let result = grep_search_parsed(
@@ -215,6 +216,7 @@ pub(crate) fn grep_search<'a>(
         bigram_overlay,
         abort_signal,
         base_path,
+        follow_symlinks,
         arenas,
     );
 
@@ -250,6 +252,7 @@ pub(crate) fn grep_search<'a>(
             bigram_overlay,
             abort_signal,
             base_path,
+            follow_symlinks,
             arenas,
         );
         if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
@@ -289,6 +292,7 @@ pub(crate) fn grep_search<'a>(
         bigram_overlay,
         abort_signal,
         base_path,
+        follow_symlinks,
         arenas,
     );
 
@@ -311,6 +315,7 @@ fn grep_search_parsed<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
+    follow_symlinks: bool,
     arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     let constraints_from_query = &query.constraints[..];
@@ -354,6 +359,7 @@ fn grep_search_parsed<'a>(
                 budget,
                 abort_signal,
                 base_path,
+                follow_symlinks,
                 arenas,
             );
         }
@@ -432,6 +438,7 @@ fn grep_search_parsed<'a>(
             filtered_file_count,
             budget,
             base_path,
+            follow_symlinks,
             arenas,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
@@ -551,6 +558,7 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) filtered_file_count: usize,
     pub(super) budget: &'a ContentCacheBudget,
     pub(super) base_path: &'a Path,
+    pub(super) follow_symlinks: bool,
     pub(super) arenas: crate::index::layers::LayerArenas,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
@@ -649,6 +657,8 @@ where
                         ctx.base_path,
                         ctx.budget,
                         base_dir.as_ref(),
+                        options.max_file_size,
+                        ctx.follow_symlinks,
                     )?;
 
                     // Fast whole-file memmem check before entering the

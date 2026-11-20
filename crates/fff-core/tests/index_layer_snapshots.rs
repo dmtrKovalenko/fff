@@ -34,6 +34,43 @@ fn live_paths(picker: &FilePicker) -> Vec<String> {
     paths
 }
 
+#[test]
+fn deleted_directories_stay_absent_after_snapshot_round_trip() {
+    let root = TempDir::new().unwrap();
+    for dir in ["aaa", "zzz"] {
+        fs::create_dir(root.path().join(dir)).unwrap();
+        fs::write(root.path().join(dir).join("file.txt"), "text").unwrap();
+    }
+    let mut source = picker(root.path());
+    source.remove_all_files_in_dir(root.path().join("aaa"));
+    source
+        .add_entries([IndexEntry::new("gone/file.txt")])
+        .unwrap();
+    source.remove_all_files_in_dir(root.path().join("gone"));
+    let base = source.export_layer(0).unwrap();
+    let overlay = source.export_layer(source.current_layer()).unwrap();
+    let mut restored = unscanned(root.path());
+    for (snapshot, is_base) in [(base, true), (overlay, false)] {
+        let mut bytes = Vec::new();
+        snapshot.write_to(&mut bytes).unwrap();
+        let snapshot = LayerSnapshot::from_bytes(&bytes).unwrap();
+        if is_base {
+            restored.import_base(snapshot, None).unwrap();
+        } else {
+            restored.import_layer(snapshot).unwrap();
+        }
+    }
+    assert_eq!(live_paths(&restored), ["zzz/file.txt"]);
+    let dirs: Vec<_> = restored
+        .get_dirs()
+        .iter()
+        .map(|dir| dir.relative_path(&restored))
+        .collect();
+    assert!(!dirs.contains(&"aaa/".to_string()));
+    assert!(!dirs.contains(&"gone/".to_string()));
+    assert!(dirs.contains(&"zzz/".to_string()));
+}
+
 fn layer_paths(picker: &FilePicker, layer: u8) -> Vec<String> {
     picker
         .files_in_layer(layer)

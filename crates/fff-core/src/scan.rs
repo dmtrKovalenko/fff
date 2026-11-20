@@ -81,8 +81,8 @@ impl ScanJob {
         shared_frecency: &SharedFrecency,
         snapshot: Option<LayerSnapshot>,
     ) -> Result<Option<Self>, Error> {
-        let guard = shared_picker.write()?;
-        let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+        let mut guard = shared_picker.write()?;
+        let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
         Ok(Self::reserve_rescan(
             picker,
             shared_picker,
@@ -92,7 +92,7 @@ impl ScanJob {
     }
 
     fn reserve_rescan(
-        picker: &FilePicker,
+        picker: &mut FilePicker,
         shared_picker: &SharedFilePicker,
         shared_frecency: &SharedFrecency,
         snapshot: Option<LayerSnapshot>,
@@ -128,6 +128,9 @@ impl ScanJob {
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
         };
 
+        if snapshot.is_some() {
+            picker.record_restore_changes();
+        }
         signals.scanning.store(true, Ordering::Release);
 
         Some(Self {
@@ -239,6 +242,7 @@ impl ScanJob {
         // 2. Populate the file list
         let scm_status_worker;
         let previous;
+        let classify_adopted;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
@@ -252,6 +256,7 @@ impl ScanJob {
             }
             let live_count = sync.live_count;
             previous = picker.commit_new_sync(sync);
+            classify_adopted = picker.has_adopted_binary_classification();
             scm_status_worker = Arc::clone(&picker.scm_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
@@ -306,6 +311,12 @@ impl ScanJob {
             && let Some(snap) = snapshot.as_ref()
         {
             Self::run_post_scan(&shared_picker, &signals, &config, snap, &known_text);
+            if classify_adopted
+                && let Ok(mut guard) = shared_picker.write()
+                && let Some(picker) = guard.as_mut().filter(|picker| signals.owns(picker))
+            {
+                picker.finish_adopted_binary_classification();
+            }
         }
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
@@ -346,8 +357,8 @@ impl ScanJob {
         }
 
         // Drain and reserve under the same lock so pending work stays with its picker.
-        let follow_up = shared_picker.write().ok().and_then(|guard| {
-            let picker = guard.as_ref()?;
+        let follow_up = shared_picker.write().ok().and_then(|mut guard| {
+            let picker = guard.as_mut()?;
             if !signals.owns(picker) || !signals.rescan_pending.swap(false, Ordering::AcqRel) {
                 return None;
             }
@@ -539,6 +550,119 @@ mod tests {
         let rules = guard.as_ref().unwrap().ignore_rules().unwrap();
         assert!(rules.is_ignored(std::path::Path::new("debug.log"), false));
         assert!(!rules.is_ignored(std::path::Path::new("keep.rs"), false));
+    }
+
+    #[test]
+    fn restoring_a_base_replays_events_received_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        std::fs::create_dir(path.join("removed")).unwrap();
+        for file in ["modified.rs", "deleted.rs", "removed/child.rs"] {
+            std::fs::write(path.join(file), "old").unwrap();
+        }
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: path.to_string_lossy().into_owned(),
+            watch: false,
+            enable_content_indexing: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let snapshot = picker.export_layer(0).unwrap();
+        for i in 0..crate::constants::MAX_OVERFLOW_FILES {
+            let file = path.join(format!("session_{i}.rs"));
+            std::fs::write(&file, "").unwrap();
+            assert!(picker.handle_create_or_modify(&file).is_some());
+        }
+        let shared = SharedFilePicker::default();
+        *shared.write().unwrap() = Some(picker);
+        let job = ScanJob::new_rescan(&shared, &SharedFrecency::default(), Some(snapshot))
+            .unwrap()
+            .unwrap();
+
+        let grown = format!(
+            "{}\nunique_restore_suffix\n",
+            "z".repeat(crate::constants::MAX_INDEXABLE_FILE_SIZE)
+        );
+        {
+            let mut guard = shared.write().unwrap();
+            let picker = guard.as_mut().unwrap();
+            for (file, text) in [("added.rs", "updated"), ("modified.rs", grown.as_str())] {
+                let file = path.join(file);
+                std::fs::write(&file, text).unwrap();
+                assert!(picker.handle_create_or_modify(&file).is_some());
+            }
+            let deleted = path.join("deleted.rs");
+            std::fs::remove_file(&deleted).unwrap();
+            assert!(picker.remove_file_by_path(&deleted));
+            assert_eq!(picker.remove_all_files_in_dir(path.join("removed")), 1);
+        }
+
+        job.run();
+        let guard = shared.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        assert_eq!(picker.live_file_count(), 2);
+        assert_eq!(
+            picker.get_file_by_path(path.join("added.rs")).unwrap().size,
+            7
+        );
+        assert_eq!(
+            picker
+                .get_file_by_path(path.join("modified.rs"))
+                .unwrap()
+                .size,
+            grown.len() as u64
+        );
+        assert!(
+            picker
+                .get_file_by_path(path.join("deleted.rs"))
+                .unwrap()
+                .is_deleted()
+        );
+        assert!(
+            picker
+                .get_file_by_path(path.join("removed/child.rs"))
+                .unwrap()
+                .is_deleted()
+        );
+        let query = crate::grep::parse_grep_query("unique_restore_suffix");
+        let options = crate::grep::GrepSearchOptions {
+            mode: crate::grep::GrepMode::PlainText,
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(picker.grep(&query, &options).matches.len(), 1);
+    }
+
+    #[test]
+    fn post_scan_marks_the_live_overlay_binary() {
+        let root = tempfile::tempdir().unwrap();
+        for enable_content_indexing in [false, true] {
+            let path = root.path().join("payload.unknown");
+            let mut picker = FilePicker::new(FilePickerOptions {
+                base_path: root.path().to_string_lossy().into_owned(),
+                watch: false,
+                enable_content_indexing,
+                ..Default::default()
+            })
+            .unwrap();
+            picker
+                .add_entries([crate::IndexEntry::new("payload.unknown")])
+                .unwrap();
+            std::fs::write(&path, b"binary\x00").unwrap();
+            let shared = SharedFilePicker::default();
+            *shared.write().unwrap() = Some(picker);
+
+            ScanJob::new_rescan(&shared, &SharedFrecency::default(), None)
+                .unwrap()
+                .unwrap()
+                .run();
+            let guard = shared.read().unwrap();
+            let file = guard.as_ref().unwrap().get_file_by_path(&path).unwrap();
+            assert!(file.is_overflow());
+            assert!(file.is_binary());
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

@@ -284,6 +284,8 @@ pub struct FileItem {
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
     layer: LayerId,
+    pub(crate) unknown_size: bool,
+    pub(crate) pending_binary: bool,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
@@ -309,6 +311,8 @@ impl Clone for FileItem {
             git_recency_score: self.git_recency_score,
             git_status: self.git_status,
             layer: self.layer,
+            unknown_size: self.unknown_size,
+            pending_binary: self.pending_binary,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
@@ -356,6 +360,8 @@ impl FileItem {
             git_status,
             flags: AtomicU8::new(flags),
             layer: 0,
+            unknown_size: false,
+            pending_binary: false,
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -760,6 +766,8 @@ impl FileItem {
 
         if let Some(size) = new_size {
             self.size = size;
+            self.unknown_size = false;
+            self.pending_binary = false;
         }
     }
 
@@ -837,6 +845,7 @@ impl FileItem {
     }
 
     // Uncached files remain searchable after the persistent cache budget fills.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -846,20 +855,40 @@ impl FileItem {
         base_path: &Path,
         budget: &ContentCacheBudget,
         base_dir: Option<&std::fs::File>,
+        max_file_size: u64,
+        follow_symlinks: bool,
     ) -> Option<&'a [u8]> {
+        let limit = budget.max_file_size.min(max_file_size);
+        if self.is_binary() || self.size > limit {
+            return None;
+        }
+        if self.size == 0 {
+            if !self.unknown_size {
+                return None;
+            }
+            let file = if follow_symlinks {
+                self.open_for_search(arena, base_path, base_dir)?
+            } else {
+                self.open_without_symlinks(arena, base_path, base_dir)?
+            };
+            let metadata = file.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+                return None;
+            }
+            buf.clear();
+            file.take(limit.saturating_add(1)).read_to_end(buf).ok()?;
+            return ((buf.len() as u64) <= limit && !detect_binary_content(buf))
+                .then_some(buf.as_slice());
+        }
+
         #[cfg(not(target_os = "windows"))]
         {
             // Fast path: persistent cache hit (zero-copy). Safe here because
             // grep callers hold the picker read lock for the lifetime of the
             // returned slice — see [`Self::get_cached_content`] safety note.
             if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
-                return Some(cached);
+                return self.searchable_contents(cached);
             }
-        }
-
-        let max_file_size = budget.max_file_size;
-        if self.is_binary() || self.size == 0 || self.size > max_file_size {
-            return None;
         }
 
         let mut file = self.open_for_search(arena, base_path, base_dir)?;
@@ -868,7 +897,7 @@ impl FileItem {
         if self.size >= FRESH_MMAP_THRESHOLD {
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
-            return Some(&stored[..]);
+            return self.searchable_contents(stored);
         } else {
             let _ = (mmap_slot, arena);
         }
@@ -877,7 +906,12 @@ impl FileItem {
         buf.resize(len, 0);
 
         file.read_exact(buf).ok()?;
-        Some(buf.as_slice())
+        self.searchable_contents(buf)
+    }
+
+    #[inline]
+    fn searchable_contents<'a>(&self, content: &'a [u8]) -> Option<&'a [u8]> {
+        (!self.pending_binary || !detect_binary_content(content)).then_some(content)
     }
 
     fn open_for_search(
@@ -891,26 +925,148 @@ impl FileItem {
         if let Some(dir) = base_dir
             && self.relative_path_len() < path_buf.len()
         {
-            use std::os::fd::{AsRawFd, FromRawFd};
             let path = self.write_relative_cstr(arena, &mut path_buf);
-            // The directory FD stays borrowed; a successful openat returns an owned FD.
-            loop {
-                let fd = unsafe {
-                    libc::openat(
-                        dir.as_raw_fd(),
-                        path.as_ptr(),
-                        libc::O_RDONLY | libc::O_CLOEXEC,
-                    )
-                };
-                if fd >= 0 {
-                    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
-                }
-                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                    return None;
-                }
-            }
+            return open_file_at(dir, path, 0);
         }
-        std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        options
+            .open(self.write_absolute_path(arena, base_path, &mut path_buf))
+            .ok()
+    }
+
+    #[cfg(unix)]
+    fn open_without_symlinks(
+        &self,
+        arena: ArenaPtr,
+        base_path: &Path,
+        base_dir: Option<&std::fs::File>,
+    ) -> Option<std::fs::File> {
+        let mut buf = [0; PATH_BUF_SIZE];
+        let len = self.write_relative_cstr(arena, &mut buf).to_bytes().len();
+        let root;
+        let root = match base_dir {
+            Some(dir) => dir,
+            None => {
+                use std::os::unix::fs::OpenOptionsExt;
+                root = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | DIRECTORY_SEARCH)
+                    .open(base_path)
+                    .ok()?;
+                &root
+            }
+        };
+        let mut parent = None;
+        let mut start = 0;
+        while let Some(next) = memchr::memchr(b'/', &buf[start..len]) {
+            let end = start + next;
+            buf[end] = 0;
+            let component = std::ffi::CStr::from_bytes_with_nul(&buf[start..=end]).ok()?;
+            parent = Some(open_file_at(
+                parent.as_ref().unwrap_or(root),
+                component,
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | DIRECTORY_SEARCH,
+            )?);
+            start = end + 1;
+        }
+        let filename = std::ffi::CStr::from_bytes_with_nul(&buf[start..=len]).ok()?;
+        open_file_at(parent.as_ref().unwrap_or(root), filename, libc::O_NOFOLLOW)
+    }
+
+    #[cfg(windows)]
+    fn open_without_symlinks(
+        &self,
+        arena: ArenaPtr,
+        base_path: &Path,
+        _: Option<&std::fs::File>,
+    ) -> Option<std::fs::File> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+        let mut buf = [0; PATH_BUF_SIZE];
+        let relative = self.path.read_to_buf(arena, &mut buf);
+        let mut components = relative.split('/').peekable();
+        let mut path = std::fs::canonicalize(base_path).ok()?;
+        let mut parents = smallvec::SmallVec::<[std::fs::File; 8]>::new();
+        while let Some(component) = components.next() {
+            if component.contains(':') || component.ends_with(['.', ' ']) {
+                return None;
+            }
+            path.push(component);
+            let mut options = std::fs::OpenOptions::new();
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let is_parent = components.peek().is_some();
+            if is_parent {
+                // Hold each directory open without write or delete sharing during descent.
+                options
+                    .access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            } else {
+                options.read(true);
+            }
+            let file = options.open(&path).ok()?;
+            if file.metadata().ok()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return None;
+            }
+            if !is_parent {
+                return Some(file);
+            }
+            parents.push(file);
+        }
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DIRECTORY_SEARCH: libc::c_int = libc::O_PATH;
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd"))]
+const DIRECTORY_SEARCH: libc::c_int = libc::O_SEARCH;
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    ))
+))]
+const DIRECTORY_SEARCH: libc::c_int = 0;
+
+#[cfg(unix)]
+fn open_file_at(
+    dir: &std::fs::File,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    loop {
+        // The directory FD stays borrowed. A successful openat returns an owned FD.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | flags,
+            )
+        };
+        if fd >= 0 {
+            return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
     }
 }
 
@@ -1218,6 +1374,8 @@ mod content_cache_budget_tests {
                         root.path(),
                         &budget,
                         base_dir,
+                        budget.max_file_size,
+                        false,
                     )
                     .unwrap();
                 assert_eq!(actual, contents);

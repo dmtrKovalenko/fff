@@ -19,6 +19,7 @@ pub(super) fn fuzzy_grep_search<'a>(
     budget: &ContentCacheBudget,
     abort_signal: &AtomicBool,
     base_path: &Path,
+    follow_symlinks: bool,
     arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     #[cfg(unix)]
@@ -174,6 +175,8 @@ pub(super) fn fuzzy_grep_search<'a>(
                         base_path,
                         budget,
                         base_dir.as_ref(),
+                        options.max_file_size,
+                        follow_symlinks,
                     )?;
 
                     if min_chars_required > 0 {

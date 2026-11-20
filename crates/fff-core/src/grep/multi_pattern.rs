@@ -113,6 +113,7 @@ pub(crate) fn multi_grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     abort_signal: &AtomicBool,
     base_path: &Path,
+    follow_symlinks: bool,
     arenas: crate::index::layers::LayerArenas,
 ) -> GrepResult<'a> {
     let total_files = files.live_count();
@@ -162,6 +163,7 @@ pub(crate) fn multi_grep_search<'a>(
             filtered_file_count,
             budget,
             base_path,
+            follow_symlinks,
             arenas,
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,

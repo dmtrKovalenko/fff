@@ -596,6 +596,7 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
+        false,
         crate::index::layers::LayerArenas::uniform(arena),
     );
 
@@ -635,6 +636,7 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
+        false,
         crate::index::layers::LayerArenas::uniform(arena),
     );
     assert_eq!(
@@ -654,6 +656,7 @@ fn test_multi_grep_search() {
         None,
         &no_cancel,
         dir.path(),
+        false,
         crate::index::layers::LayerArenas::uniform(arena),
     );
     assert_eq!(
