@@ -316,6 +316,35 @@ function M.render_debounced()
   end)
 end
 
+--- Get effective preview-enabled state, considering runtime override.
+--- @return boolean
+function M.is_preview_enabled()
+  if M.state.preview_enabled ~= nil then return M.state.preview_enabled end
+  return conf.preview_enabled(M.state.config)
+end
+
+--- Toggle the preview panel at runtime. When disabled, the list and prompt
+--- expand to fill the space previously used by the preview.
+function M.toggle_preview()
+  if not M.state.active then return end
+  if M.state.preview_enabled == nil then
+    M.state.preview_enabled = not conf.preview_enabled(M.state.config)
+  else
+    M.state.preview_enabled = not M.state.preview_enabled
+  end
+  M.state.last_status_info = nil
+  M.relayout()
+  if M.state.preview_enabled then M.update_preview() end
+end
+
+--- Toggle maximize mode. When maximized, the picker fills the entire editor.
+function M.toggle_maximize()
+  if not M.state.active then return end
+  M.state.maximized = not M.state.maximized
+  M.state.last_status_info = nil
+  M.relayout()
+end
+
 --- Update status information on the right side of input using virtual text
 function M.update_status(progress)
   if not M.state.active or not M.state.ns_id then return end
