@@ -190,6 +190,31 @@ describe('fff.utils.version', function()
       vim.fn.delete(tmp, 'rf')
     end)
 
+    it('should use a 7 char sha even when git abbreviates longer', function()
+      local tmp = vim.fn.tempname()
+      vim.fn.mkdir(tmp .. '/crates/fff-core', 'p')
+
+      vim.fn.system({ 'git', 'init', '-q', '-b', 'main', tmp })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.email', 'test@test.com' })
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'user.name', 'Test' })
+      -- a full clone abbreviates longer than CI's shallow checkout that creates the tags
+      vim.fn.system({ 'git', '-C', tmp, 'config', 'core.abbrev', '12' })
+
+      local f = io.open(tmp .. '/crates/fff-core/Cargo.toml', 'w')
+      f:write('[package]\nname = "test"\nversion = "2.0.0"\nedition = "2024"\n')
+      f:close()
+
+      vim.fn.system({ 'git', '-C', tmp, 'add', '.' })
+      vim.fn.system({ 'git', '-C', tmp, 'commit', '-q', '-m', 'init' })
+
+      local head = vim.trim(vim.fn.system({ 'git', '-C', tmp, 'rev-parse', 'HEAD' }))
+      local info = version.resolve(tmp)
+      assert.is_not_nil(info)
+      assert.are.equal('2.0.1-nightly.' .. head:sub(1, 7), info.release_tag)
+
+      vim.fn.delete(tmp, 'rf')
+    end)
+
     it('should return stable release for v* tagged commit', function()
       local tmp = vim.fn.tempname()
       vim.fn.mkdir(tmp .. '/crates/fff-core', 'p')
