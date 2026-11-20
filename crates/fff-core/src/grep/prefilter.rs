@@ -139,8 +139,7 @@ pub(super) fn prefilter_files<'a>(
     fn basic_prefilter(file: &FileItem, max: u64, definition_only: bool) -> bool {
         !file.is_deleted()
             && !file.is_binary()
-            && (file.size > 0 || file.unknown_size)
-            && file.size <= max
+            && (file.size_needs_stat || (file.size > 0 && file.size <= max))
             && (!definition_only || file.supports_definitions())
     }
 

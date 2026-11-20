@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -185,7 +186,7 @@ impl LayerBuilder {
                 None,
                 entry.binary,
             );
-            file.unknown_size = entry.size == 0;
+            file.size_needs_stat = entry.size == 0;
             file.mark_definition_language(&entry.path);
             file.set_path(store.add_file_immediate(&entry.path, entry.filename_offset));
             file.parent_dir_index = dir_idx;
@@ -223,7 +224,7 @@ impl std::fmt::Debug for LayerSnapshot {
             .field("label", &self.label)
             .field("files", &self.files.len())
             .field("dirs", &self.dirs.len())
-            .field("arena_bytes", &self.store.heap_bytes())
+            .field("arena_bytes", &self.store.arena_bytes())
             .field("layout", &self.layout)
             .finish()
     }
@@ -243,7 +244,7 @@ impl LayerSnapshot {
     }
 
     pub fn arena_bytes(&self) -> usize {
-        self.store.heap_bytes()
+        self.store.arena_bytes()
     }
 
     pub fn layout(&self) -> SnapshotLayout {
@@ -315,6 +316,42 @@ impl LayerSnapshot {
         })?;
 
         Self::from_bytes(&bytes)
+    }
+
+    /// Maps the path arena of a saved layer. File and directory metadata remain picker-owned.
+    /// # Safety
+    /// Keep the file contents immutable until every picker and snapshot using it is dropped.
+    /// Publish updates with [`Self::save`] or atomic replacement. In-place writes and truncation are unsafe.
+    pub unsafe fn map(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let io_err = |source| Error::LayerFile {
+            path: path.to_owned(),
+            source,
+        };
+        if cfg!(target_endian = "big") {
+            return Err(io_err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped layer indices require little-endian words",
+            )));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+        let file = options.open(path).map_err(io_err)?;
+        if !file.metadata().map_err(io_err)?.is_file() {
+            return Err(io_err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a regular index file",
+            )));
+        }
+        // SAFETY: the caller keeps this file immutable for the lifetime of the mapping.
+        let map = Arc::new(unsafe { memmap2::Mmap::map(&file) }.map_err(io_err)?);
+        Self::decode(&map, |chunks, words| ChunkedPathStore::Mapped {
+            map: Arc::clone(&map),
+            chunks,
+            words,
+        })
     }
 
     // Little-endian: 32 B header, label padded to 16 B, raw chunk arena, raw
@@ -406,6 +443,20 @@ impl LayerSnapshot {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes, |chunks, words| {
+            let (chunks, _) = bytes[chunks].as_chunks::<SIMD_CHUNK_BYTES>();
+            let (words, _) = bytes[words].as_chunks::<4>();
+            ChunkedPathStore::from_parts(
+                chunks.iter().copied().map(SimdChunk).collect(),
+                words.iter().copied().map(u32::from_le_bytes).collect(),
+            )
+        })
+    }
+
+    fn decode(
+        bytes: &[u8],
+        make_store: impl FnOnce(Range<usize>, Range<usize>) -> ChunkedPathStore,
+    ) -> Result<Self, Error> {
         let mut cur = Cursor { bytes, pos: 0 };
         if cur.take(8)? != MAGIC {
             return Err(Error::LayerFormat("bad magic"));
@@ -441,8 +492,10 @@ impl LayerSnapshot {
                 .checked_mul(width)
                 .ok_or(Error::LayerFormat("section too large"))
         };
-        let arena_bytes = cur.take(byte_count(chunk_count, SIMD_CHUNK_BYTES)?)?;
-        let index_bytes = cur.take(byte_count(index_count, 4)?)?;
+        let chunks = cur.pos;
+        cur.take(byte_count(chunk_count, SIMD_CHUNK_BYTES)?)?;
+        let words = cur.pos;
+        cur.take(byte_count(index_count, 4)?)?;
         if cur
             .remaining()
             .checked_sub(byte_count(dir_count, MIN_DIR_RECORD)?)
@@ -450,24 +503,13 @@ impl LayerSnapshot {
         {
             return Err(Error::LayerFormat("inconsistent record counts"));
         }
-        let mut arena: Vec<SimdChunk> = Vec::with_capacity(chunk_count);
-        // SAFETY: `arena_bytes` holds exactly `chunk_count * 16` bytes and any
-        // byte pattern is a valid SimdChunk; the Vec allocation is aligned.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                arena_bytes.as_ptr(),
-                arena.as_mut_ptr() as *mut u8,
-                arena_bytes.len(),
-            );
-            arena.set_len(chunk_count);
-        }
-
-        let (words, _) = index_bytes.as_chunks::<4>();
-        let indices: Vec<u32> = words.iter().copied().map(u32::from_le_bytes).collect();
+        let store = make_store(chunks..words, words..cur.pos);
+        let indices = store.indices();
+        let chunks = store.chunks();
+        let arena = store.as_arena_ptr();
         if indices.iter().any(|&idx| idx as usize >= chunk_count) {
             return Err(Error::LayerFormat("chunk index out of range"));
         }
-        let store = ChunkedPathStore::from_parts(arena, indices);
 
         let mut dirs: Vec<DirItem> = Vec::new();
         dirs.try_reserve_exact(dir_count)
@@ -477,7 +519,7 @@ impl LayerSnapshot {
             (&mut [0u8; PATH_BUF_SIZE], &mut [0u8; PATH_BUF_SIZE]);
         for _ in 0..dir_count {
             let last_segment = cur.u16()?;
-            let (mut path, text) = read_chunked(&mut cur, &store, path_buf)?;
+            let (mut path, text) = read_chunked(&mut cur, chunks, indices, path_buf)?;
             if !(text.is_empty() || text.strip_suffix('/').is_some_and(is_relative_file_path))
                 || last_segment != last_segment_offset(text)
             {
@@ -494,6 +536,7 @@ impl LayerSnapshot {
             std::mem::swap(&mut path_buf, &mut previous_buf);
         }
 
+        let mapped = matches!(store, ChunkedPathStore::Mapped { .. });
         let mut sorted = true;
         let mut partitioned = true;
         let mut files: Vec<FileItem> = Vec::new();
@@ -513,7 +556,7 @@ impl LayerSnapshot {
             let parent = dirs
                 .get(parent_dir_index as usize)
                 .ok_or(Error::LayerFormat("parent dir out of range"))?;
-            let (mut path, text) = read_chunked(&mut cur, &store, path_buf)?;
+            let (mut path, text) = read_chunked(&mut cur, chunks, indices, path_buf)?;
             let (prefix, name) = text
                 .split_at_checked(offset as usize)
                 .ok_or(Error::LayerFormat("invalid filename offset"))?;
@@ -527,9 +570,7 @@ impl LayerSnapshot {
             let parent_path = if same_dir {
                 &previous_buf[..parent.path.byte_len as usize]
             } else {
-                parent
-                    .read_relative_path(store.as_arena_ptr(), previous_buf)
-                    .as_bytes()
+                parent.read_relative_path(arena, previous_buf).as_bytes()
             };
             if prefix.as_bytes() != parent_path {
                 return Err(Error::LayerFormat("parent directory does not match path"));
@@ -537,7 +578,7 @@ impl LayerSnapshot {
 
             path.filename_offset = offset;
             let mut file = FileItem::new_raw(offset, size, modified, None, binary);
-            file.unknown_size = size == 0;
+            file.size_needs_stat = mapped || size == 0;
             file.mark_definition_language(text);
             file.set_path(path);
             file.parent_dir_index = parent_dir_index;
@@ -632,7 +673,8 @@ fn write_chunked(buf: &mut Vec<u8>, path: &ChunkedString) {
 // readers assume that invariant, so they cannot be used on unvalidated bytes.
 fn read_chunked<'a>(
     cur: &mut Cursor<'_>,
-    store: &ChunkedPathStore,
+    chunks: &[SimdChunk],
+    indices: &[u32],
     buf: &'a mut [u8; PATH_BUF_SIZE],
 ) -> Result<(ChunkedString, &'a str), Error> {
     let index_offset = cur.u32()?;
@@ -642,11 +684,11 @@ fn read_chunked<'a>(
     let len = byte_len as usize;
     let indices = start
         .checked_add(path.chunk_count())
-        .and_then(|end| store.indices().get(start..end))
+        .and_then(|end| indices.get(start..end))
         .filter(|_| len < PATH_BUF_SIZE)
         .ok_or(Error::LayerFormat("inconsistent path record"))?;
     for (out, &index) in buf[..len].chunks_mut(SIMD_CHUNK_BYTES).zip(indices) {
-        out.copy_from_slice(&store.chunks()[index as usize].0[..out.len()]);
+        out.copy_from_slice(&chunks[index as usize].0[..out.len()]);
     }
     let text =
         std::str::from_utf8(&buf[..len]).map_err(|_| Error::LayerFormat("path is not utf-8"))?;
@@ -1077,6 +1119,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["old"]
         );
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn mapping_keeps_the_original_paths_after_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.fff");
+        let original = snapshot(&["é/a.rs", "é/long-directory-name/file.rs"]);
+        original.save(&path).unwrap();
+        // SAFETY: this test only publishes by atomic replacement while a reader is live.
+        let mapped = unsafe { LayerSnapshot::map(&path) }.unwrap();
+        let ChunkedPathStore::Mapped { map, .. } = mapped.store.as_ref() else {
+            panic!("expected mapped storage")
+        };
+        let bytes = map.as_ptr_range();
+        assert!(bytes.contains(&mapped.store.chunks().as_ptr().cast()));
+        assert!(bytes.contains(&mapped.store.indices().as_ptr().cast()));
+        let mut encoded = Vec::new();
+        mapped.write_to(&mut encoded).unwrap();
+        assert_eq!(encoded, std::fs::read(&path).unwrap());
+        let retained = mapped.clone();
+        drop(mapped);
+        snapshot(&[]).save(&path).unwrap();
+        assert!(retained.relative_paths().eq(original.relative_paths()));
+        assert_eq!(
+            unsafe { LayerSnapshot::map(&path) }.unwrap().file_count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn mapped_loader_validates_chunk_references_before_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("broken.fff");
+        let mut bytes = Vec::new();
+        snapshot(&["é.rs"]).write_to(&mut bytes).unwrap();
+        let chunks = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        let words = HEADER_BYTES + SIMD_CHUNK_BYTES + chunks * SIMD_CHUNK_BYTES;
+        bytes[words..words + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        // SAFETY: the test owns the file and leaves it unchanged.
+        assert!(matches!(
+            unsafe { LayerSnapshot::map(file) },
+            Err(Error::LayerFormat("chunk index out of range"))
+        ));
     }
 
     #[test]

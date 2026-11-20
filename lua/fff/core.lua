@@ -138,7 +138,8 @@ M.change_indexing_directory = function(new_path)
     return false
   end
 
-  require('fff.conf').get().base_path = expanded_path
+  if expanded_path ~= config.base_path then config.mapped_index = nil end
+  config.base_path = expanded_path
   return true
 end
 
@@ -197,6 +198,7 @@ M.ensure_initialized = function()
     if M.git_status_updates() ~= 'always' then pcall(fuzzy.pause_git_status) end
 
     local ok, result = pcall(fuzzy.init_file_picker, config.base_path, {
+      mapped_index = config.mapped_index and vim.fn.fnamemodify(config.mapped_index, ':p'),
       follow_symlinks = config.follow_symlinks,
       enable_fs_root_scanning = config.enable_fs_root_scanning,
       enable_home_dir_scanning = config.enable_home_dir_scanning,

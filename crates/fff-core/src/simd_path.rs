@@ -1,11 +1,14 @@
 use ahash::AHashMap;
+use memmap2::Mmap;
+use std::ops::Range;
+use std::sync::Arc;
 
 /// SIMD chunk size in bytes (matches NEON/SSE2 register width).
 /// This must stay in sync with neo_frizbee's internal chunk size.
 pub(crate) const SIMD_CHUNK_BYTES: usize = 16;
 
 /// Read-only view of a path store: 16-byte chunk arena plus the flat table of
-/// per-path chunk indices. Both point into the owning store's Vecs.
+/// per-path chunk indices. Both point into the owning store.
 #[derive(Clone, Copy)]
 pub struct ArenaPtr {
     chunks: *const u8,
@@ -336,50 +339,57 @@ const fn chunks_needed(byte_len: usize) -> usize {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChunkedPathStore {
-    arena: Vec<SimdChunk>,
-    indices: Vec<u32>,
+pub(crate) enum ChunkedPathStore {
+    Owned {
+        arena: Vec<SimdChunk>,
+        indices: Vec<u32>,
+    },
+    Mapped {
+        map: Arc<Mmap>,
+        chunks: Range<usize>,
+        words: Range<usize>,
+    },
 }
-
-// SAFETY: arena is immutable after construction. Pointers derived from it are
-// only read during scoring (no mutation, no reallocation).
-unsafe impl Send for ChunkedPathStore {}
-unsafe impl Sync for ChunkedPathStore {}
 
 impl ChunkedPathStore {
     pub fn empty() -> Self {
-        Self {
-            arena: Vec::new(),
-            indices: Vec::new(),
-        }
+        Self::from_parts(Vec::new(), Vec::new())
     }
 
     pub fn from_parts(arena: Vec<SimdChunk>, indices: Vec<u32>) -> Self {
-        Self { arena, indices }
+        Self::Owned { arena, indices }
     }
 
-    #[inline]
     pub fn chunks(&self) -> &[SimdChunk] {
-        &self.arena
+        match self {
+            Self::Owned { arena, .. } => arena,
+            // SAFETY: SimdChunk accepts all bit patterns. The snapshot header aligns this section to 16.
+            Self::Mapped { map, chunks, .. } => unsafe {
+                map[chunks.clone()].align_to::<SimdChunk>().1
+            },
+        }
     }
 
-    #[inline]
     pub fn indices(&self) -> &[u32] {
-        &self.indices
+        match self {
+            Self::Owned { indices, .. } => indices,
+            // SAFETY: all u32 bit patterns are valid. The index section follows whole aligned chunks.
+            Self::Mapped { map, words, .. } => unsafe { map[words.clone()].align_to::<u32>().1 },
+        }
     }
 
-    pub fn heap_bytes(&self) -> usize {
-        self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
+    pub fn arena_bytes(&self) -> usize {
+        std::mem::size_of_val(self.chunks()) + std::mem::size_of_val(self.indices())
     }
 
     #[cfg(test)]
     fn unique_chunks(&self) -> usize {
-        self.arena.len()
+        self.chunks().len()
     }
 
     #[inline]
     pub fn as_arena_ptr(&self) -> ArenaPtr {
-        ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
+        ArenaPtr::new(self.chunks().as_ptr().cast(), self.indices().as_ptr())
     }
 }
 
@@ -407,10 +417,10 @@ impl ChunkedPathStoreBuilder {
     // Reopens a sealed store: rebuilds the dedup table from its chunks so new
     // paths keep sharing prefixes with the existing ones.
     pub fn from_store(store: ChunkedPathStore, extra_files: usize) -> Self {
-        let ChunkedPathStore {
-            mut arena,
-            mut indices,
-        } = store;
+        let (mut arena, mut indices) = match store {
+            ChunkedPathStore::Owned { arena, indices } => (arena, indices),
+            mapped => (mapped.chunks().to_vec(), mapped.indices().to_vec()),
+        };
         let extra = extra_files * EST_CHUNKS_PER_PATH;
         arena.reserve(extra / 2);
         indices.reserve(extra);
@@ -434,14 +444,14 @@ impl ChunkedPathStoreBuilder {
         } = self;
         arena.shrink_to_fit();
         indices.shrink_to_fit();
-        ChunkedPathStore { arena, indices }
+        ChunkedPathStore::from_parts(arena, indices)
     }
 
     pub fn as_arena_ptr(&self) -> ArenaPtr {
         ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())
     }
 
-    /// Chunks + index table, like [`ChunkedPathStore::heap_bytes`]; the dedup
+    /// Chunks + index table, like [`ChunkedPathStore::arena_bytes`]; the dedup
     /// table is transient and dropped by `finish`.
     pub fn heap_bytes(&self) -> usize {
         self.arena.len() * SIMD_CHUNK_BYTES + self.indices.len() * std::mem::size_of::<u32>()
@@ -620,11 +630,15 @@ mod tests {
         }
         let expected = expected.finish();
         let actual = actual.finish();
-        assert_eq!(actual.indices, expected.indices);
+        assert_eq!(actual.indices(), expected.indices());
         assert_eq!(
-            actual.arena.iter().map(|chunk| chunk.0).collect::<Vec<_>>(),
+            actual
+                .chunks()
+                .iter()
+                .map(|chunk| chunk.0)
+                .collect::<Vec<_>>(),
             expected
-                .arena
+                .chunks()
                 .iter()
                 .map(|chunk| chunk.0)
                 .collect::<Vec<_>>(),

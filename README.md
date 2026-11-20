@@ -375,6 +375,7 @@ Defaults are sensible. Override only what you care about.
 ```lua
 require('fff').setup({
   base_path = vim.fn.getcwd(),
+  mapped_index = nil, -- optional saved .fff index for this directory
   prompt = '🪿 ',
   title = 'FFFiles',
   max_results = 100,
@@ -910,6 +911,38 @@ struct FffResult *added = fff_layer_add_paths(handle, paths, sizeof(paths), NULL
 if (!added->success) fprintf(stderr, "%s\n", added->error);
 fff_free_result(added);
 ```
+
+### Open a saved directory index
+
+Save the base scan once, outside the indexed tree. In Neovim, run
+`:lua require('fff').save_index(vim.fn.stdpath('cache') .. '/project.fff')` after the scan finishes.
+On a later launch, set `vim.g.fff = { base_path = '/path/to/project', mapped_index = vim.fn.stdpath('cache') .. '/project.fff' }`
+before plugin initialization.
+
+Node and Bun can open the same file and search immediately.
+
+```ts
+// In a normal finder, after waitForIndexReady(), call finder.saveLayer(0, indexPath).
+const result = FileFinder.openMapped("/path/to/project", indexPath);
+if (!result.ok) throw new Error(result.error);
+try {
+  console.log(result.value.fileSearch("src/main"));
+} finally {
+  result.value.destroy();
+}
+```
+
+Opening validates the snapshot synchronously. The mapped finder uses the saved file list without walking or watching the directory.
+Grep reads current file contents under the supplied root. To add a mapped overlay to
+a running Node or Bun finder, use `finder.mapLayer(indexPath)`. The C equivalents
+are `fff_open_mapped_index` and `fff_layer_map`. Rust callers can pass
+`LayerSnapshot::map` to `import_base` or `import_layer`.
+
+The chunked paths and their index table are file-backed. Each finder owns its mutable
+file and directory metadata. Use a trusted index and publish changes with `saveLayer`,
+`save_index`, or atomic rename. In-place writes and truncation invalidate active mappings.
+An open finder keeps its original snapshot after replacement. Mapped indices require a
+little-endian host.
 
 ### Notes
 

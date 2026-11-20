@@ -419,6 +419,23 @@ export function ffiCreate(
     freeResultMemory: false,
   }) as JsExternal;
 
+  return readCreateResult(rawPtr);
+}
+
+export function ffiOpenMapped(basePath: string, indexPath: string): Result<NativeHandle> {
+  loadLibrary();
+  const rawPtr = load({
+    library: LIBRARY_KEY,
+    funcName: "fff_open_mapped_index",
+    retType: DataType.External,
+    paramsType: [DataType.String, DataType.String],
+    paramsValue: [basePath, indexPath],
+    freeResultMemory: false,
+  }) as JsExternal;
+  return readCreateResult(rawPtr);
+}
+
+function readCreateResult(rawPtr: JsExternal): Result<NativeHandle> {
   const [structData] = restorePointer({
     retType: [FFF_RESULT_STRUCT],
     paramsValue: wrapPointer([rawPtr]),
@@ -430,7 +447,7 @@ export function ffiCreate(
     if (success) {
       const handle = structData.handle;
       if (isNullPointer(handle)) {
-        return err("fff_create_instance_with returned null handle");
+        return err("Native finder creation returned a null handle");
       }
       return { ok: true, value: handle };
     } else {
@@ -1970,9 +1987,13 @@ export function ffiLayerSave(
 /**
  * Load a layer file as a new sealed overlay. Returns its id.
  */
-export function ffiLayerLoad(handle: NativeHandle, filePath: string): Result<number> {
+export function ffiLayerLoad(
+  handle: NativeHandle,
+  filePath: string,
+  mapped = false,
+): Result<number> {
   return callIntResult(
-    "fff_layer_load",
+    mapped ? "fff_layer_map" : "fff_layer_load",
     [DataType.External, DataType.String],
     [handle, filePath],
   );

@@ -171,6 +171,14 @@ function M.search(query, max_results)
   return {}
 end
 
+--- Save the completed base scan for use with `mapped_index`. Returns the byte count.
+--- @param path string
+--- @return number
+function M.save_index(path)
+  vim.validate({ path = { path, 'string' } })
+  return require('fff.core').ensure_initialized().save_index(vim.fn.fnamemodify(path, ':p'))
+end
+
 --- @class fff.FileSearchOpts
 --- @field mode? "files"|"directories"|"mixed" Item type to search (default: 'files').
 --- @field max_results? number Max items per page (default: config.max_results).

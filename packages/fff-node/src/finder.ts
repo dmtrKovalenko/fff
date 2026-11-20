@@ -12,6 +12,7 @@ import {
   ensureLoaded,
   ffiBaseLoad,
   ffiCreate,
+  ffiOpenMapped,
   ffiDestroy,
   ffiGetBasePath,
   ffiGetHistoricalQuery,
@@ -108,6 +109,15 @@ export class FileFinder implements FileFinderApi {
 
   private constructor(handle: NativeHandle) {
     this.handle = handle;
+  }
+
+  /** Open a saved directory index without walking or watching the directory. Only replace the index atomically while open. */
+  static openMapped(basePath: string, indexPath: string): Result<FileFinder> {
+    if (!basePath || !indexPath || basePath.includes("\0") || indexPath.includes("\0")) {
+      return err("Mapped index paths must be nonempty and cannot contain NUL");
+    }
+    const result = ffiOpenMapped(basePath, indexPath);
+    return result.ok ? { ok: true, value: new FileFinder(result.value) } : result;
   }
 
   /**
@@ -753,6 +763,14 @@ export class FileFinder implements FileFinderApi {
     const id = checkLayerId(layer);
     if (!id.ok) return id;
     return ffiLayerSave(guard.value, id.value, filePath);
+  }
+
+  /** Attach a sealed mapped overlay. Only replace its file atomically while the finder is open. */
+  mapLayer(filePath: string): Result<number> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+    if (!filePath || filePath.includes("\0")) return err("Invalid mapped layer path");
+    return ffiLayerLoad(guard.value, filePath, true);
   }
 
   /** Load a layer file as a new sealed overlay. Returns its id. Fails when three overlays exist. */

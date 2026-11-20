@@ -165,6 +165,13 @@ fn bench_persist(c: &mut Criterion) {
         b.iter(|| black_box(LayerSnapshot::load(&file).unwrap()))
     });
 
+    if cfg!(target_endian = "little") {
+        group.bench_function("map_100k", |b| {
+            // SAFETY: this benchmark owns the snapshot and only replaces it between iterations.
+            b.iter(|| black_box(unsafe { LayerSnapshot::map(&file) }.unwrap()))
+        });
+    }
+
     let mut picker = empty_picker(dir.path());
     let layer = picker
         .import_layer(LayerSnapshot::load(&file).unwrap())
