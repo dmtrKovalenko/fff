@@ -119,11 +119,11 @@ fn drop_picker_concurrent_with_search_no_segfault() {
     let searcher = std::thread::spawn(move || {
         let parser = QueryParser::default();
         while running_clone.load(Ordering::Relaxed) {
-            if let Ok(guard) = sp_clone.read() {
-                if let Some(picker) = guard.as_ref() {
-                    let query = parser.parse("func");
-                    let _ = picker.fuzzy_search(&query, None, FuzzySearchOptions::default());
-                }
+            if let Ok(guard) = sp_clone.read()
+                && let Some(picker) = guard.as_ref()
+            {
+                let query = parser.parse("func");
+                let _ = picker.fuzzy_search(&query, None, FuzzySearchOptions::default());
             }
             std::thread::sleep(Duration::from_millis(1));
         }

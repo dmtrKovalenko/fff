@@ -205,7 +205,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// readiness-signal gap: `scanning` was cleared before `post_scan_indexing_active`
 /// was set, so `wait_for_indexing_complete` could return before the binary sniff
 /// ran. Uses synthetic fixtures (no repo/fixture dependency) covering both the
-/// >2 MB non-indexable sniff path and the <2 MB bigram path, repeated to stress
+/// large non-indexable files and the small-file bigram path, repeated to stress
 /// the signal ordering. With the fix it must pass every iteration.
 #[test]
 fn binary_classification_done_before_indexing_wait_returns() {

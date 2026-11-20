@@ -101,10 +101,10 @@ fn poll_until(
     loop {
         {
             let guard = shared_picker.read().unwrap();
-            if let Some(ref picker) = *guard {
-                if predicate(picker) {
-                    return start.elapsed();
-                }
+            if let Some(ref picker) = *guard
+                && predicate(picker)
+            {
+                return start.elapsed();
             }
         }
         if start.elapsed() >= timeout {

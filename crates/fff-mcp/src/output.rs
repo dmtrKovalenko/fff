@@ -100,8 +100,8 @@ fn trauncate_line_for_ai(
         let win_end = (match_end + after).min(trimmed.len());
 
         // Clamp to char boundaries
-        let win_start = floor_char_boundary(trimmed, win_start);
-        let win_end = ceil_char_boundary(trimmed, win_end);
+        let win_start = trimmed.floor_char_boundary(win_start);
+        let win_end = trimmed.ceil_char_boundary(win_end);
 
         let mut result = trimmed[win_start..win_end].to_string();
         if win_start > 0 {
@@ -114,30 +114,8 @@ fn trauncate_line_for_ai(
     }
 
     // No match ranges — truncate from start
-    let end = ceil_char_boundary(trimmed, max_len);
+    let end = trimmed.ceil_char_boundary(max_len);
     format!("{}…", &trimmed[..end])
-}
-
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn ceil_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 struct FileMeta<'a> {
@@ -638,6 +616,17 @@ mod tests {
         let ranges = [(0, 5)];
         let result = trauncate_line_for_ai(line, Some(&ranges), 180);
         assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn trunc_preserves_multibyte_characters() {
+        for (max_len, expected) in [(1, "é…"), (3, "é🦀…"), (6, "é🦀…")] {
+            assert_eq!(trauncate_line_for_ai("é🦀tail", None, max_len), expected);
+        }
+        assert_eq!(
+            trauncate_line_for_ai("abé🦀needleé🦀tail", Some(&[(8, 14)]), 10),
+            "…🦀needleé🦀…"
+        );
     }
 
     #[test]

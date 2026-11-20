@@ -599,10 +599,10 @@ fn write_diverse_file_with_domain(dir: &Path, name: &str, token: &str, domain_id
          fn marker_function_{token}() {{ println!(\"{token}\"); }}\n"
     );
 
-    if let Some(parent) = PathBuf::from(name).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(dir.join(parent)).unwrap();
-        }
+    if let Some(parent) = PathBuf::from(name).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir.join(parent)).unwrap();
     }
     fs::write(dir.join(name), content).unwrap();
 }
@@ -716,7 +716,7 @@ fn wait_for_bigram(shared_picker: &SharedFilePicker) {
             .map(|guard| {
                 guard
                     .as_ref()
-                    .map_or(false, |p| !p.is_scan_active() && p.bigram_index().is_some())
+                    .is_some_and(|p| !p.is_scan_active() && p.bigram_index().is_some())
             })
             .unwrap_or(false);
         if ready {
@@ -810,13 +810,12 @@ fn drop_during_post_scan_does_not_crash() {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut was_active = false;
         loop {
-            if let Ok(guard) = shared_picker.read() {
-                if let Some(picker) = guard.as_ref() {
-                    if picker.is_post_scan_active() {
-                        was_active = true;
-                        break;
-                    }
-                }
+            if let Ok(guard) = shared_picker.read()
+                && let Some(picker) = guard.as_ref()
+                && picker.is_post_scan_active()
+            {
+                was_active = true;
+                break;
             }
             if std::time::Instant::now() > deadline {
                 break;

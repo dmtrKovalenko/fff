@@ -87,6 +87,29 @@ fn main_checkout_root(common_dir: &Path) -> PathBuf {
     }
 }
 
+#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
+fn wait_for_git_index_lock_release(git_dir: &Path) {
+    const GIT_LOCK_POLL: Duration = Duration::from_millis(10);
+    const GIT_LOCK_MAX_WAIT: Duration = Duration::from_millis(500);
+
+    let lock = git_dir.join("index.lock");
+    // Fast path: no lock present.
+    if !lock.exists() {
+        return;
+    }
+    let deadline = Instant::now() + GIT_LOCK_MAX_WAIT;
+    while lock.exists() && Instant::now() < deadline {
+        std::thread::sleep(GIT_LOCK_POLL);
+    }
+    if lock.exists() {
+        tracing::warn!(
+            "Proceeding with git status refresh despite lingering \
+             .git/index.lock at {} — will retry once it clears",
+            lock.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "libgit2")]
@@ -371,28 +394,5 @@ mod tests {
         );
 
         assert_eq!(cache.len(), 3);
-    }
-}
-
-#[cfg(any(feature = "gitoxide", feature = "libgit2"))]
-fn wait_for_git_index_lock_release(git_dir: &Path) {
-    const GIT_LOCK_POLL: Duration = Duration::from_millis(10);
-    const GIT_LOCK_MAX_WAIT: Duration = Duration::from_millis(500);
-
-    let lock = git_dir.join("index.lock");
-    // Fast path: no lock present.
-    if !lock.exists() {
-        return;
-    }
-    let deadline = Instant::now() + GIT_LOCK_MAX_WAIT;
-    while lock.exists() && Instant::now() < deadline {
-        std::thread::sleep(GIT_LOCK_POLL);
-    }
-    if lock.exists() {
-        tracing::warn!(
-            "Proceeding with git status refresh despite lingering \
-             .git/index.lock at {} — will retry once it clears",
-            lock.display()
-        );
     }
 }

@@ -101,16 +101,6 @@ fn copy_repo_to_workdir(cached: &Path, workdir: &Path) {
 }
 
 fn collect_text_files(base: &Path) -> Vec<PathBuf> {
-    // Use `git ls-files` without --cached to get only files that are both
-    // tracked AND not gitignored. Files like Cargo.lock that are committed
-    // but in .gitignore would appear with --cached but the fff picker skips
-    // them during walk (respects .gitignore), causing false test failures.
-    let out = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .current_dir(base)
-        .output()
-        .unwrap();
-
     // Get tracked files that aren't ignored
     let tracked = Command::new("git")
         .args(["ls-files", "-z"])
@@ -134,10 +124,10 @@ fn collect_text_files(base: &Path) -> Vec<PathBuf> {
         }
         if let Ok(output) = child.wait_with_output() {
             for path in output.stdout.split(|&b| b == 0) {
-                if !path.is_empty() {
-                    if let Ok(s) = std::str::from_utf8(path) {
-                        ignored_set.insert(s.to_string());
-                    }
+                if !path.is_empty()
+                    && let Ok(s) = std::str::from_utf8(path)
+                {
+                    ignored_set.insert(s.to_string());
                 }
             }
         }
@@ -163,20 +153,16 @@ fn collect_text_files(base: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Edit a file by injecting a marker line at a deterministic position,
-/// preserving the rest of the content. Returns the original line that was
-/// replaced so it can be restored on revert.
-fn inject_marker(path: &Path, marker: &str, seed: u32) -> Option<String> {
+fn inject_marker(path: &Path, marker: &str, seed: u32) -> Option<()> {
     let content = fs::read_to_string(path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         fs::write(path, format!("// {marker}\n")).ok()?;
-        return Some(String::new());
+        return Some(());
     }
 
     // Pick a stable line position based on seed and file length
     let line_idx = seed as usize % lines.len();
-    let original_line = lines[line_idx].to_string();
 
     let mut result = String::with_capacity(content.len() + marker.len() + 10);
     for (i, line) in lines.iter().enumerate() {
@@ -188,23 +174,7 @@ fn inject_marker(path: &Path, marker: &str, seed: u32) -> Option<String> {
         result.push('\n');
     }
     fs::write(path, &result).ok()?;
-    Some(original_line)
-}
-
-/// Revert a file by restoring the original line at the same position
-/// where inject_marker placed the marker.
-fn revert_marker(path: &Path, marker: &str, original_line: &str) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
-    };
-    let marker_line = format!("// {marker}");
-    let result: String = content
-        .lines()
-        .map(|l| if l == marker_line { original_line } else { l })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    let _ = fs::write(path, result);
+    Some(())
 }
 
 fn grep_opts(mode: GrepMode) -> GrepSearchOptions {
@@ -255,7 +225,7 @@ fn wait_for_bigram(sp: &SharedFilePicker) {
             .ok()
             .map(|g| {
                 g.as_ref()
-                    .map_or(false, |p| !p.is_scan_active() && p.bigram_index().is_some())
+                    .is_some_and(|p| !p.is_scan_active() && p.bigram_index().is_some())
             })
             .unwrap_or(false);
         if ready {
@@ -278,8 +248,6 @@ fn epoch_secs() -> u64 {
 struct TrackedFile {
     relative: String,
     marker: String,
-    /// The original line content that was replaced, for revert
-    original_line: String,
     is_created: bool,
     last_write_sec: u64,
 }
@@ -362,7 +330,6 @@ fn run_scenario(ops: &[Op]) {
                 tracked.push(TrackedFile {
                     relative: name,
                     marker,
-                    original_line: String::new(),
                     is_created: true,
                     last_write_sec: epoch_secs(),
                 });
@@ -412,10 +379,10 @@ fn run_scenario(ops: &[Op]) {
                     .to_string_lossy()
                     .to_string();
 
-                if let Some(t) = tracked.iter().find(|t| t.relative == relative) {
-                    if t.last_write_sec >= epoch_secs() {
-                        std::thread::sleep(Duration::from_millis(1100));
-                    }
+                if let Some(t) = tracked.iter().find(|t| t.relative == relative)
+                    && t.last_write_sec >= epoch_secs()
+                {
+                    std::thread::sleep(Duration::from_millis(1100));
                 }
 
                 let marker = format!("FFF_FUZZ_RAND_{seed:08x}");
@@ -442,11 +409,10 @@ fn run_scenario(ops: &[Op]) {
                     tracked[pos].last_write_sec = epoch_secs();
                 } else {
                     // First edit: inject marker at a deterministic line
-                    let original = inject_marker(target, &marker, *seed).unwrap_or_default();
+                    let _ = inject_marker(target, &marker, *seed);
                     tracked.push(TrackedFile {
                         relative,
                         marker,
-                        original_line: original,
                         is_created: false,
                         last_write_sec: epoch_secs(),
                     });
@@ -641,10 +607,10 @@ fn run_scenario(ops: &[Op]) {
 
     // Teardown
     shared_picker.wait_for_indexing_complete(Duration::from_secs(30));
-    if let Ok(mut guard) = shared_picker.write() {
-        if let Some(mut picker) = guard.take() {
-            picker.stop_background_monitor();
-        }
+    if let Ok(mut guard) = shared_picker.write()
+        && let Some(mut picker) = guard.take()
+    {
+        picker.stop_background_monitor();
     }
 
     eprintln!(

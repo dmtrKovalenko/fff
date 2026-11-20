@@ -51,7 +51,10 @@ docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
 for name in "${benches[@]}"; do
   binary=$(awk -F '\t' -v name="$name" '$1 == name { print $2 }' "$output/build.log")
   [[ -n "$binary" ]] || continue
-  [[ "$binary" =~ ^/build/target/$target/ci/(deps/)?${name}(-[0-9a-f]+)?$ ]]
+  if [[ ! "$binary" =~ ^/build/target/$target/ci/(deps/|build/fff-search/[0-9a-f]+/out/)?${name}(-[0-9a-f]+)?$ ]]; then
+    echo "Unexpected benchmark executable path: $binary" >&2
+    exit 1
+  fi
   binary=$(realpath -e "$output/work/${binary#/build/}")
   [[ "$binary" == "$output/work/target/$target/ci/"* && -f "$binary" ]]
   headers=$(readelf -l "$binary")

@@ -256,10 +256,10 @@ fn debounced_nonrecursive_detects_deletion() {
         .watch(dir.as_path(), RecursiveMode::NonRecursive)
         .unwrap();
     debouncer
-        .watch(&dir.join("src"), RecursiveMode::NonRecursive)
+        .watch(dir.join("src"), RecursiveMode::NonRecursive)
         .unwrap();
     debouncer
-        .watch(&dir.join(".git"), RecursiveMode::NonRecursive)
+        .watch(dir.join(".git"), RecursiveMode::NonRecursive)
         .unwrap();
 
     // Longer stabilization — each watch() restarts the FSEvents stream
