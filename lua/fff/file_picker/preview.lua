@@ -683,7 +683,7 @@ function M.scroll(lines)
 
     vim.api.nvim_win_call(M.state.winid, function()
       vim.api.nvim_win_set_cursor(M.state.winid, { target_line, 0 })
-      vim.cmd('normal! zt')
+      vim.fn.winrestview({ topline = target_line })
     end)
   end
 end
@@ -837,18 +837,9 @@ function M.clear_preview_visual_state(bufnr)
   -- Clear location highlights
   if M.state.location_namespace then location_utils.clear_location_highlights(bufnr, M.state.location_namespace) end
 
-  local wins = vim.fn.win_findbuf(bufnr)
-
-  for _, win in ipairs(wins) do
-    if vim.api.nvim_win_is_valid(win) then
-      -- Reset folds
-      pcall(vim.api.nvim_win_call, win, function()
-        if vim.fn.has('folding') == 1 then
-          vim.cmd('normal! zE') -- eliminate all folds
-          vim.opt_local.foldenable = false -- disable folding
-        end
-      end)
-    end
+  -- no `normal!` here: it drops the prompt out of insert mode
+  for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+    vim.api.nvim_set_option_value('foldenable', false, { win = win, scope = 'local' })
   end
 
   image.clear_buffer_images(bufnr)
@@ -939,7 +930,7 @@ function M.scroll_to_line(line)
   M.state.scroll_offset = new_offset
   pcall(vim.api.nvim_win_call, M.state.winid, function()
     vim.api.nvim_win_set_cursor(M.state.winid, { target_line, 0 })
-    vim.cmd('normal! zt')
+    vim.fn.winrestview({ topline = target_line })
   end)
 end
 
