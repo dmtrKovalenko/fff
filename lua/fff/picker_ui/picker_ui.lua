@@ -50,6 +50,7 @@ M.load_next_page = search_manager.load_next_page
 M.load_previous_page = search_manager.load_previous_page
 M.on_input_change = search_manager.on_input_change
 M.cycle_grep_modes = search_manager.cycle_grep_modes
+M.toggle_grep_refine = search_manager.toggle_grep_refine
 M.recall_query_from_history = search_manager.recall_query_from_history
 M.cycle_forward_query = search_manager.cycle_forward_query
 M.clear_query = search_manager.clear_query
@@ -95,7 +96,7 @@ local resume_state = { files = nil, grep = nil, last_mode = nil }
 
 --- Save the current picker state for later resume, then close.
 function M.close()
-  if M.state.query == '' then
+  if M.state.query == '' and not M.state.refine then
     layout_manager.close()
     return
   end
@@ -134,6 +135,7 @@ local function restore_from_state(state, source_label)
   M.state.mode = state.mode
   M.state.grep_config = state.grep_config
   M.state.grep_mode = state.grep_mode
+  M.state.refine = state.refine
   M.state.selected_files = vim.deepcopy(state.selected_files or {})
   M.state.selected_file_order = vim.deepcopy(state.selected_file_order or {})
   M.state.selected_items = vim.deepcopy(state.selected_items or {})
@@ -271,6 +273,7 @@ function M.toggle_debug()
     local current_renderer = M.state.renderer
     local current_grep_mode = M.state.grep_mode
     local current_grep_config = M.state.grep_config
+    local current_refine = M.state.refine
     local current_filtered_items = M.state.filtered_items
     local current_selected_files = M.state.selected_files
     local current_selected_file_order = M.state.selected_file_order
@@ -287,6 +290,7 @@ function M.toggle_debug()
     M.state.items = current_items
     M.state.cursor = current_cursor
     M.state.grep_mode = current_grep_mode
+    M.state.refine = current_refine
     M.state.filtered_items = current_filtered_items
     M.state.selected_files = current_selected_files
     M.state.selected_file_order = current_selected_file_order
@@ -316,11 +320,44 @@ function M.render_debounced()
   end)
 end
 
+local function update_refine_status()
+  local config = M.state.config
+  local refine = M.state.refine
+  local keybind = config.keymaps.toggle_grep_refine
+  if type(keybind) == 'table' then keybind = keybind[1] end
+
+  local count = string.format('%d/%d%s', #refine.filtered, #refine.items, refine.truncated and '+' or '')
+  local query = refine.query
+  if vim.fn.strchars(query) > 24 then query = vim.fn.strcharpart(query, 0, 23) .. '…' end
+  local label = (keybind and keybind .. ' ' or '') .. 'refine "' .. query .. '"'
+
+  local cache_key = 'refine' .. count .. label
+  if cache_key == M.state.last_status_info then return end
+  M.state.last_status_info = cache_key
+
+  vim.api.nvim_buf_clear_namespace(M.state.input_buf, M.state.ns_id, 0, -1)
+
+  local available_width = vim.api.nvim_win_get_width(M.state.input_win) - 2
+  local total_width = vim.fn.strdisplaywidth(count .. '  ' .. label)
+  vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
+    virt_text = {
+      { count, 'LineNr' },
+      { '  ' .. label, config.hl.grep_refine_active or 'DiagnosticWarn' },
+    },
+    virt_text_win_col = math.max(0, available_width - total_width),
+  })
+end
+
 --- Update status information on the right side of input using virtual text
 function M.update_status(progress)
   if not M.state.active or not M.state.ns_id then return end
   local config = M.state.config
   if config == nil then return end
+
+  if M.state.refine then
+    update_refine_status()
+    return
+  end
 
   if M.state.mode == 'grep' then
     -- Determine available modes to decide if we should show the mode indicator
@@ -469,7 +506,7 @@ function M.select(action)
   if not abs_path then return end
   local relative_path = vim.fn.fnamemodify(abs_path, ':.')
   local location = M.state.location -- Capture location before closing
-  local query = M.state.query -- Capture query before closing for tracking
+  local query = picker_ui_state.grep_query() -- Capture query before closing for tracking
   local mode = M.state.mode -- Capture mode before closing for tracking
   local suggestion_source = M.state.suggestion_source -- Capture suggestion context
   local config = M.state.config -- Capture config before M.close() resets state
