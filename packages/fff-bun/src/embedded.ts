@@ -37,6 +37,14 @@ async function resolveEmbeddedLibPath(): Promise<string | null> {
     );
   }
 
+  if (process.platform === "freebsd") {
+    return importFile(
+      import(`@ff-labs/fff-bin-freebsd-${process.arch}/libfff_c.so`, {
+        with: { type: "file" },
+      }),
+    );
+  }
+
   if (process.platform === "linux") {
     return importFile(
       import(
