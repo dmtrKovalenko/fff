@@ -555,6 +555,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn js_arrow_parameters_continuing_on_later_lines_are_definitions() {
+        assert_definitions(
+            "x.ts",
+            &[
+                (
+                    "export const inlineArrow = async (a: string) => { return a }",
+                    "inlineArrow",
+                    true,
+                ),
+                (
+                    "export const multiLineArrow = async (",
+                    "multiLineArrow",
+                    true,
+                ),
+                ("export const multiLineArrow = (", "multiLineArrow", true),
+                ("const multiLineArrow = <T>(", "multiLineArrow", true),
+                ("let multiLineArrow = async (", "multiLineArrow", true),
+                ("const value = compute(", "value", false),
+                ("const value = async(arg) + 1;", "value", false),
+                ("const value = (a, b) + 1;", "value", false),
+            ],
+        );
+    }
+
     fn assert_definitions(filename: &str, cases: &[(&str, &str, bool)]) {
         let language = Language::from_filename(filename) as u8;
         for &(line, name, expected) in cases {
