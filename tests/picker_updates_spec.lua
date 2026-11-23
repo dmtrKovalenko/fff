@@ -1,4 +1,5 @@
-vim.g.fff = { git = { status_updates = 'manual' } }
+local assert = require('luassert')
+require('fff.main').setup({ git = { status_updates = 'manual' } })
 
 local ui = require('fff.picker_ui.picker_ui')
 local files = require('fff.file_picker')
