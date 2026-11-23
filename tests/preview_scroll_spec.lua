@@ -29,6 +29,7 @@ describe('preview horizontal scroll', function()
       'short line with SSE near start',
       string.rep(' ', 12) .. 'vars(dashboard.curses).pop("BUTTON5_PRESSED", None)',
       string.rep('中文', 25) .. 'SSE_TAIL',
+      '\tindented with wide tab',
     })
     win = vim.api.nvim_open_win(buf, false, {
       relative = 'editor',
@@ -103,5 +104,21 @@ describe('preview horizontal scroll', function()
     local cursor = vim.api.nvim_win_get_cursor(win)
     assert.are.equal(1, cursor[1])
     assert.are.equal(29, cursor[2])
+  end)
+
+  it('keeps leftcol at 0 for line-only or column-1 locations with a wide leading tab', function()
+    vim.api.nvim_set_option_value('tabstop', 64, { buf = buf })
+
+    preview.state.location = { line = 2, col = 52 }
+    preview.apply_location_highlighting(buf)
+    assert.is_true(get_leftcol() > 0)
+
+    preview.state.location = { line = 4 }
+    preview.apply_location_highlighting(buf)
+    assert.are.equal(0, get_leftcol())
+
+    preview.state.location = { line = 4, col = 1 }
+    preview.apply_location_highlighting(buf)
+    assert.are.equal(0, get_leftcol())
   end)
 end)

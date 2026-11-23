@@ -950,12 +950,14 @@ function M.scroll_to_line(line, col)
     vim.cmd('normal! zt')
 
     if not vim.api.nvim_get_option_value('wrap', { win = M.state.winid }) then
-      local win_info = vim.fn.getwininfo(M.state.winid)[1]
-      local text_width = math.max(1, vim.api.nvim_win_get_width(M.state.winid) - (win_info and win_info.textoff or 0))
-      local virt_col = vim.fn.virtcol('.') - 1
-      local margin = math.min(10, math.floor(text_width / 4))
       local leftcol = 0
-      if virt_col >= text_width - margin then leftcol = math.max(0, virt_col - math.floor(text_width / 2)) end
+      if target_col > 0 then
+        local win_info = vim.fn.getwininfo(M.state.winid)[1]
+        local text_width = math.max(1, vim.api.nvim_win_get_width(M.state.winid) - (win_info and win_info.textoff or 0))
+        local virt_col = vim.fn.virtcol('.') - 1
+        local margin = math.min(10, math.floor(text_width / 4))
+        if virt_col >= text_width - margin then leftcol = math.max(0, virt_col - math.floor(text_width / 2)) end
+      end
       vim.fn.winrestview({ leftcol = leftcol })
     end
   end)
