@@ -700,6 +700,16 @@ const hits = finder.value.grep("GetOffTheRecordProfile", {
 // Run extremely fast glob matching which is significantly (10-100 times) faster than Bun's and Node implementation
 const rustFiles = finder.value.glob("**/*.rs", { pageSize: 100 });
 
+// Layer changes require the post-scan index to be ready.
+const ready = await finder.value.waitForIndexReady(10_000);
+if (!ready.ok) throw new Error(ready.error);
+if (!ready.value) throw new Error("Indexing timed out");
+
+const built = FileFinder.buildLayerFile(["build/out/a.js", "build/out/b.js"], "/tmp/prebuilt.fff");
+if (!built.ok) throw new Error(built.error);
+const layer = finder.value.loadLayer("/tmp/prebuilt.fff");
+if (!layer.ok) throw new Error(layer.error);
+
 finder.value.destroy();
 ```
 
@@ -883,6 +893,22 @@ fuzzy matching layered on top.
 ```c
 FffResult *res = fff_glob(handle, "**/*.rs", "", 0, 0, 100);
 // FffSearchResult in res->handle, free with fff_free_search_result.
+```
+
+### Index layers
+
+`fff_layer_create` / `fff_layer_add_paths` append paths the scanner can't see;
+`fff_layer_save` writes any layer (0 = base scan) to a file and
+`fff_layer_load` attaches it back as a sealed overlay. Layer IDs never change, and the
+watcher writes only to layer 1. `fff_base_load` installs
+it as the base scan in the background (wait with `fff_wait_for_scan`).
+`fff_layer_build` packs a layer file without an instance. Pass NUL-terminated UTF-8 paths in one buffer, with optional parallel `sizes` / `modified` arrays (NULL to omit).
+
+```c
+const char paths[] = "build/out/a.js\0build/out/b.js";
+struct FffResult *added = fff_layer_add_paths(handle, paths, sizeof(paths), NULL, NULL, 2);
+if (!added->success) fprintf(stderr, "%s\n", added->error);
+fff_free_result(added);
 ```
 
 ### Notes
