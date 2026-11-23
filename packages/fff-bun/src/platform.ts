@@ -112,6 +112,8 @@ const TRIPLE_TO_NPM_PACKAGE: Record<string, string> = {
   "x86_64-pc-windows-msvc": "@ff-labs/fff-bin-win32-x64",
   "aarch64-pc-windows-msvc": "@ff-labs/fff-bin-win32-arm64",
   "aarch64-linux-android": "@ff-labs/fff-bin-android-arm64",
+  "x86_64-unknown-freebsd": "@ff-labs/fff-bin-freebsd-x64",
+  "aarch64-unknown-freebsd": "@ff-labs/fff-bin-freebsd-arm64",
 };
 
 /**
