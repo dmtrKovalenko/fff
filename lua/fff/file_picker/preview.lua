@@ -918,14 +918,16 @@ function M.apply_location_highlighting(bufnr)
         ensure_content_loaded_async(target_line)
         return
       end
-      M.scroll_to_line(target_line)
+      local target_col = location_utils.get_target_col(M.state.location)
+      M.scroll_to_line(target_line, target_col)
     end
   end
 end
 
---- Scroll preview to a specific line
+--- Scroll preview to a specific line and optional column
 --- @param line number Target line number (1-indexed)
-function M.scroll_to_line(line)
+--- @param col number|nil Target column (1-indexed byte offset)
+function M.scroll_to_line(line, col)
   if not M.state.winid or not vim.api.nvim_win_is_valid(M.state.winid) then return end
   if not M.state.bufnr or not vim.api.nvim_buf_is_valid(M.state.bufnr) then return end
 
@@ -936,10 +938,26 @@ function M.scroll_to_line(line)
   local half_screen = math.floor(win_height / 2)
   local new_offset = math.max(0, target_line - half_screen)
 
+  local target_col = 0
+  if col and col > 1 then
+    local line_text = vim.api.nvim_buf_get_lines(M.state.bufnr, target_line - 1, target_line, false)[1] or ''
+    if #line_text > 0 then target_col = math.min(col - 1, #line_text - 1) end
+  end
+
   M.state.scroll_offset = new_offset
   pcall(vim.api.nvim_win_call, M.state.winid, function()
-    vim.api.nvim_win_set_cursor(M.state.winid, { target_line, 0 })
+    vim.api.nvim_win_set_cursor(M.state.winid, { target_line, target_col })
     vim.cmd('normal! zt')
+
+    if not vim.api.nvim_get_option_value('wrap', { win = M.state.winid }) then
+      local win_info = vim.fn.getwininfo(M.state.winid)[1]
+      local text_width = math.max(1, vim.api.nvim_win_get_width(M.state.winid) - (win_info and win_info.textoff or 0))
+      local virt_col = vim.fn.virtcol('.') - 1
+      local margin = math.min(10, math.floor(text_width / 4))
+      local leftcol = 0
+      if virt_col >= text_width - margin then leftcol = math.max(0, virt_col - math.floor(text_width / 2)) end
+      vim.fn.winrestview({ leftcol = leftcol })
+    end
   end)
 end
 
