@@ -150,16 +150,15 @@ local function move_list_cursor(direction)
   end
 end
 
-function M.create_ui()
+--- @param query? string
+--- @return boolean
+function M.create_ui(query)
   local config = S.config
   if not config then return false end
 
   -- Prompt editing should behave consistently even if the user has :set paste.
-  S.restore_paste = (function()
-    if not vim.o.paste then return false end
-    vim.o.paste = false
-    return true
-  end)()
+  S.restore_paste = vim.o.paste
+  if S.restore_paste then vim.o.paste = false end
 
   if not S.ns_id then
     S.ns_id = vim.api.nvim_create_namespace('fff_picker_status')
@@ -199,13 +198,11 @@ function M.create_ui()
 
   M.setup_buffers()
   M.setup_windows()
+  -- Fill the prompt before attaching on_lines so opening only searches once.
+  if query then vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, { config.prompt .. query }) end
   M.setup_keymaps()
 
   vim.api.nvim_set_current_win(S.input_win)
-
-  P.update_results_sync()
-  P.clear_preview()
-  P.update_status()
 
   return true
 end
@@ -471,9 +468,18 @@ function M.setup_keymaps()
     end
   end
 
-  vim.api.nvim_buf_attach(S.input_buf, false, {
+  local input_buf = S.input_buf
+  local pending = false
+  local function update_query()
+    pending = false
+    if S.input_buf == input_buf then P.on_input_change() end
+  end
+
+  vim.api.nvim_buf_attach(input_buf, false, {
     on_lines = function()
-      vim.schedule(function() P.on_input_change() end)
+      if pending then return end
+      pending = true
+      vim.schedule(update_query)
     end,
   })
 
