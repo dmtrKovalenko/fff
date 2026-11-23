@@ -490,6 +490,33 @@ fn events_after_a_suppressed_kernel_rescan_are_still_applied() {
 }
 
 #[test]
+fn a_throttled_kernel_rescan_does_not_walk_the_flagged_directory() {
+    let f = Fixture::new();
+    f.write("src/main.rs", "fn main() {}");
+    f.index();
+
+    // macOS reports "rescan: user dropped" with the watch root as the only path.
+    let dropped = || {
+        DebouncedEvent::new(
+            Event::new(EventKind::Other)
+                .add_path(f.base.clone())
+                .set_flag(Flag::Rescan),
+            Instant::now(),
+        )
+    };
+    let (delta, _) = f.feed_with_new_dirs([dropped()]);
+    assert_eq!(delta.count(RescanReason::KernelEventLoss), 1);
+    f.picker.wait_for_indexing_complete(Duration::from_secs(10));
+
+    let (delta, new_dirs) = f.feed_with_new_dirs([dropped()]);
+    assert_eq!(delta.count_throttled(RescanReason::KernelEventLoss), 1);
+    assert!(
+        new_dirs.is_empty(),
+        "a throttled rescan must not re-walk the root as a new directory, got {new_dirs:?}"
+    );
+}
+
+#[test]
 fn a_throttled_ignore_file_event_is_still_applied_incrementally() {
     let f = Fixture::with_git();
     f.write(".gitignore", "target/\n");
@@ -805,6 +832,13 @@ impl Fixture {
     }
 
     fn feed(&self, events: impl IntoIterator<Item = DebouncedEvent>) -> RescanStats {
+        self.feed_with_new_dirs(events).0
+    }
+
+    fn feed_with_new_dirs(
+        &self,
+        events: impl IntoIterator<Item = DebouncedEvent>,
+    ) -> (RescanStats, Vec<PathBuf>) {
         let before = self.picker.rescan_stats();
         let (workspace, worker) = {
             let guard = self.picker.read().unwrap();
@@ -814,7 +848,7 @@ impl Fixture {
                 Arc::clone(&picker.scm_status_worker),
             )
         };
-        handle_debounced_events(
+        let new_dirs = handle_debounced_events(
             &WatcherOptions::default(),
             events.into_iter().collect(),
             &self.base,
@@ -824,7 +858,7 @@ impl Fixture {
             &worker,
         );
 
-        self.picker.rescan_stats().since(&before)
+        (self.picker.rescan_stats().since(&before), new_dirs)
     }
 
     fn assert_no_rescan(&self, delta: &RescanStats, what: &str) {

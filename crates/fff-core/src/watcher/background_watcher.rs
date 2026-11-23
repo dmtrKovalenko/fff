@@ -550,7 +550,9 @@ pub(crate) fn handle_debounced_events(
 
                 paths_to_remove.push((path.as_path(), maybe_directory));
             } else if is_dir {
-                if !is_ignored {
+                // A throttled rescan marker names a subtree to rescan, not a new directory:
+                // walking it would bypass the throttle. The next admitted rescan catches up.
+                if !is_ignored && !debounced_event.event.need_rescan() {
                     new_dirs_to_watch.push(path.to_path_buf());
                 }
             } else if !is_ignored {
