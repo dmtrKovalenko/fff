@@ -256,6 +256,7 @@ const CONFIG_ENV_KEYS = [
   "FFF_ENABLE_HOME_SCAN",
   "FFF_WARN_HOME_SCAN",
   "FFF_FOLLOW_SYMLINKS",
+  "FFF_GIT_REPO_ONLY",
 ] as const;
 
 const savedEnv: Record<string, string | undefined> = {};
@@ -709,6 +710,61 @@ describe("pi-fff $HOME scan warning", () => {
     expect(level).toBe("warning");
     expect(message).toContain("enableFsRootScanning");
     await shutdown(setup);
+  });
+
+  test("skips the picker outside a git repository when gitRepoOnly is enabled", async () => {
+    const plainDir = fs.mkdtempSync(path.join(agentDir, "non-git-"));
+    writeConfig({ gitRepoOnly: true });
+
+    const setup = await start("override", plainDir);
+
+    expect(createCalls).toHaveLength(0);
+    expect(setup.ctx.ui.setStatus).not.toHaveBeenCalled();
+
+    const [message, level] = setup.ctx.ui.notify.mock.calls[0];
+    expect(setup.ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(level).toBe("warning");
+    expect(message).toContain("gitRepoOnly");
+
+    const toolNames = setup.pi.registerTool.mock.calls.map(([tool]) => tool.name);
+    expect(toolNames).toEqual(["ffgrep", "fffind"]);
+    await shutdown(setup);
+  });
+
+  test("indexes a git repository when gitRepoOnly is enabled", async () => {
+    const repoDir = fs.mkdtempSync(path.join(agentDir, "git-repo-"));
+    const subDir = path.join(repoDir, "src");
+    fs.mkdirSync(path.join(repoDir, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+    fs.mkdirSync(subDir, { recursive: true });
+    process.env.FFF_GIT_REPO_ONLY = "1";
+
+    const setup = await start(undefined, subDir);
+
+    expect(createCalls).toHaveLength(1);
+    expect((createCalls[0] as { basePath: string }).basePath).toBe(subDir);
+    await shutdown(setup);
+  });
+
+  test("respects flag > env > config precedence for gitRepoOnly", async () => {
+    const plainDir = fs.mkdtempSync(path.join(agentDir, "non-git-precedence-"));
+    writeConfig({ gitRepoOnly: true });
+    process.env.FFF_GIT_REPO_ONLY = "1";
+
+    const allowedByFlag = await start(undefined, plainDir, {
+      "fff-git-repo-only": false,
+    });
+    expect(createCalls).toHaveLength(1);
+    await shutdown(allowedByFlag);
+
+    createCalls.length = 0;
+    writeConfig({ gitRepoOnly: false });
+    process.env.FFF_GIT_REPO_ONLY = "1";
+
+    const blockedByEnv = await start(undefined, plainDir);
+    expect(createCalls).toHaveLength(0);
+    expect(blockedByEnv.ctx.ui.notify).toHaveBeenCalledTimes(1);
+    await shutdown(blockedByEnv);
   });
 
   test("still indexes $HOME when the opt-out is not set", async () => {
