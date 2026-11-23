@@ -35,9 +35,9 @@ function M.lang_from_filename(filename)
   local lang_ok, lang = pcall(vim.treesitter.language.get_lang, ft)
   if not lang_ok or not lang then lang = ft end
 
-  -- Check if the parser is actually installed
-  local has_parser = pcall(vim.treesitter.language.add, lang)
-  if not has_parser then return nil end
+  -- Neovim 0.10 returns nothing on success. Newer versions return nil and an error on failure.
+  local ok, loaded, err = pcall(vim.treesitter.language.add, lang)
+  if not ok or loaded == false or err then return nil end
 
   return lang
 end

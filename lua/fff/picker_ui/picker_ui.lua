@@ -191,8 +191,9 @@ local function restore_from_state(state, source_label)
   vim.api.nvim_set_current_win(M.state.input_win)
 
   -- Position cursor at end of query
+  local input_buf = M.state.input_buf
   vim.schedule(function()
-    if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
+    if M.state.active and M.state.input_buf == input_buf and vim.api.nvim_win_is_valid(M.state.input_win) then
       local prompt_len = #M.state.config.prompt
       vim.api.nvim_win_set_cursor(M.state.input_win, { 1, prompt_len + #state.query })
       vim.cmd('stopinsert')
@@ -307,8 +308,9 @@ function M.toggle_debug()
 end
 
 function M.render_debounced()
+  local input_buf = M.state.input_buf
   vim.schedule(function()
-    if M.state.active then
+    if M.state.active and M.state.input_buf == input_buf then
       M.render_list()
       M.update_preview()
       M.update_status()
@@ -635,55 +637,25 @@ local function initialize_picker(opts)
   return merged_config, base_path
 end
 
---- Helper function to open UI with optional prefetched results
---- @param query string|nil Pre-filled query (nil for empty)
---- @param results table|nil Pre-fetched results (nil to search normally)
---- @param location table|nil Pre-fetched location data
---- @param merged_config table Merged configuration
---- @param current_file_cache string|nil Current file cache
-local function open_ui_with_state(query, results, location, merged_config, current_file_cache)
+local function open_ui_with_state(query, merged_config, current_file_cache)
   M.state.config = merged_config
 
-  if not M.create_ui() then
+  if not M.create_ui(query or '') then
     vim.notify('Failed to create picker UI', vim.log.levels.ERROR)
     return false
   end
 
   M.state.active = true
   M.state.current_file_cache = current_file_cache
+  M.state.query = query or ''
   file_picker.resume_git_status()
-
-  -- Set up initial state
-  if query then
-    M.state.query = query
-    vim.api.nvim_buf_set_lines(M.state.input_buf, 0, -1, false, { M.state.config.prompt .. query })
-  else
-    M.state.query = ''
-  end
-
-  if results then
-    -- Use prefetched results
-    M.state.items = results
-    M.state.filtered_items = results
-    M.state.cursor = #results > 0 and 1 or 1
-    M.state.location = location
-
-    M.render_list()
-    M.update_preview()
-    M.update_status()
-  else
-    M.update_results()
-    M.clear_preview()
-    M.update_status()
-  end
-
-  vim.api.nvim_set_current_win(M.state.input_win)
 
   -- Position cursor at end of query if there is one
   if query then
+    local input_buf = M.state.input_buf
     vim.schedule(function()
-      if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
-        local line = vim.api.nvim_buf_get_lines(M.state.input_buf, 0, 1, false)[1] or ''
+      if M.state.active and M.state.input_buf == input_buf and vim.api.nvim_win_is_valid(M.state.input_win) then
+        local line = vim.api.nvim_buf_get_lines(input_buf, 0, 1, false)[1] or ''
         vim.api.nvim_win_set_cursor(M.state.input_win, { 1, #line })
         vim.cmd('startinsert!')
       end
@@ -734,7 +706,7 @@ function M.open_with_callback(query, callback, opts)
   end
 
   if callback_handled then return true end
-  open_ui_with_state(query, results, location, merged_config, current_file_cache)
+  open_ui_with_state(query, merged_config, current_file_cache)
 
   return false
 end
@@ -768,15 +740,18 @@ function M.open(opts)
 
   local current_file_cache = get_current_file_cache(base_path)
   local query = opts and opts.query or nil ---@type string|nil
-  return open_ui_with_state(query, nil, nil, merged_config, current_file_cache)
+  return open_ui_with_state(query, merged_config, current_file_cache)
 end
 
+--- @param iteration integer
 function M.monitor_scan_progress(iteration)
   if not M.state.active then return end
 
   local progress = file_picker.get_scan_progress()
 
   if progress.is_scanning then
+    -- Show available results on open, then search again when the scan completes.
+    if iteration == 0 then M.update_results() end
     M.update_status(progress)
 
     -- progressive decay for larger directories
@@ -789,7 +764,10 @@ function M.monitor_scan_progress(iteration)
       timeout = 500
     end
 
-    vim.defer_fn(function() M.monitor_scan_progress(iteration + 1) end, timeout)
+    local input_buf = M.state.input_buf
+    vim.defer_fn(function()
+      if M.state.input_buf == input_buf then M.monitor_scan_progress(iteration + 1) end
+    end, timeout)
   else
     local git_status_refreshing = file_picker.is_git_status_refreshing()
     M.update_results()
@@ -803,9 +781,10 @@ local git_refresh_monitor_id = 0
 function M.monitor_git_status_refresh()
   git_refresh_monitor_id = git_refresh_monitor_id + 1
   local monitor_id = git_refresh_monitor_id
+  local input_buf = M.state.input_buf
 
   local function poll(iteration)
-    if not M.state.active or monitor_id ~= git_refresh_monitor_id then return end
+    if not M.state.active or M.state.input_buf ~= input_buf or monitor_id ~= git_refresh_monitor_id then return end
 
     if file_picker.is_git_status_refreshing() then
       vim.defer_fn(function() poll(iteration + 1) end, iteration < 20 and 50 or 250)
