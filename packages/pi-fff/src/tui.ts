@@ -32,7 +32,11 @@ export interface AutocompleteProvider {
     item: AutocompleteItem,
     prefix: string,
   ): { lines: string[]; cursorLine: number; cursorCol: number };
-  shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
+  shouldTriggerFileCompletion?(
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+  ): boolean;
 }
 
 export interface TuiAdapter {

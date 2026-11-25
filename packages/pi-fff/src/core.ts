@@ -325,7 +325,10 @@ export function createFffExtension(tui: TuiAdapter) {
   return (pi: ExtensionAPI) => fffExtension(pi, tui);
 }
 
-function fffExtension(pi: ExtensionAPI, { Text, sliceByColumn, visibleWidth }: TuiAdapter) {
+function fffExtension(
+  pi: ExtensionAPI,
+  { Text, sliceByColumn, visibleWidth }: TuiAdapter,
+) {
   let mainFinder: FileFinderApi | null = null;
   let finderCwd: string | null = null;
   // Concurrent ensureFinder() callers share the same in-flight promise so
@@ -956,7 +959,8 @@ function fffExtension(pi: ExtensionAPI, { Text, sliceByColumn, visibleWidth }: T
     context: any,
     maxLines = 15,
   ) => {
-    const text = (context.lastComponent as TextComponent | undefined) ?? new Text("", 0, 0);
+    const text =
+      (context.lastComponent as TextComponent | undefined) ?? new Text("", 0, 0);
     const output = result.content?.find((c) => c.type === "text")?.text?.trim() ?? "";
     if (!output) {
       text.setText(theme.fg("muted", "No output"));
@@ -1523,7 +1527,8 @@ function fffExtension(pi: ExtensionAPI, { Text, sliceByColumn, visibleWidth }: T
       },
 
       renderCall(args, theme, context) {
-        const text = (context.lastComponent as TextComponent | undefined) ?? new Text("", 0, 0);
+        const text =
+          (context.lastComponent as TextComponent | undefined) ?? new Text("", 0, 0);
         const patterns = args?.patterns ?? [];
         const constraints = args?.constraints;
         let content =
