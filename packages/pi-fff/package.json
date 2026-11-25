@@ -29,6 +29,11 @@
       "./src/index.ts"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./src/omp.ts"
+    ]
+  },
   "files": [
     "src",
     "pi-fff.schema.json"

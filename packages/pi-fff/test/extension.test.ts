@@ -875,6 +875,42 @@ describe("pi-fff autocomplete registration", () => {
     expect(current.getSuggestions).not.toHaveBeenCalled();
   });
 
+  test("accepts omp-style bare AbortSignal for @ mentions", async () => {
+    mixedSearchImpl = () => ({
+      ok: true,
+      value: {
+        items: [
+          {
+            type: "directory",
+            item: { relativePath: "src/", dirName: "src/", maxAccessFrecency: 0 },
+          },
+        ],
+        scores: [],
+        totalMatched: 1,
+        totalFiles: 0,
+        totalDirs: 1,
+      },
+    });
+
+    const { ctx } = await start();
+    const factory = ctx.ui.addAutocompleteProvider.mock.calls[0][0];
+    const current = currentProvider();
+    const provider = factory(current);
+
+    const result = await provider.getSuggestions(
+      ["@src"],
+      0,
+      4,
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({
+      prefix: "@src",
+      items: [{ value: "@src/", label: "src/", description: "src/" }],
+    });
+    expect(current.getSuggestions).not.toHaveBeenCalled();
+  });
+
   test("delegates when FFF lookup fails", async () => {
     mixedSearchImpl = () => {
       throw new Error("native lookup failed");
