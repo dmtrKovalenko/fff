@@ -370,8 +370,6 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
     open_grep(prompt, 'SCROLL_MATCH')
     assert_snapshot_match()
 
-    if prompt == 'top' then return end
-
     for line = 2, 3 do
       child.type_keys(SCROLL_KEY[prompt])
       child.lua(
@@ -398,6 +396,12 @@ end
 T['preview_scroll']['wide_tab_bottom'] = function()
   setup_scroll_preview({ tabstop = 128 })
   open_picker('bottom', 'preview-scroll.rs:4')
+  assert_snapshot_match()
+end
+
+T['preview_scroll']['after_wide_tab_bottom'] = function()
+  setup_scroll_preview({ tabstop = 128 })
+  open_picker('bottom', 'preview-scroll.rs:4:2')
   assert_snapshot_match()
 end
 
