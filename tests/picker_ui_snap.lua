@@ -343,4 +343,22 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
   end
 end
 
+T['grep_refine'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['grep_refine']['filtered_' .. prompt] = function()
+    open_grep(prompt, 'pub fn')
+    child.type_keys('<C-g>')
+    vim.loop.sleep(300)
+    child.type_keys('helper')
+    vim.loop.sleep(400)
+    assert_snapshot_match()
+  end
+end
+
 return T

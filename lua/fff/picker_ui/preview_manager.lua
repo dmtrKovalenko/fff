@@ -176,7 +176,7 @@ function M.update_preview()
   if is_grep_item and item.line_number and item.line_number > 0 then
     effective_location = { line = item.line_number }
     if item.col and item.col > 0 then effective_location.col = item.col + 1 end
-    effective_location.grep_query = S.query
+    effective_location.grep_query = picker_ui_state.grep_query()
     if S.grep_mode == 'fuzzy' and item.match_ranges then effective_location.fuzzy_match_ranges = item.match_ranges end
   end
 
