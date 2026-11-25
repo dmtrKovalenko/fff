@@ -21,11 +21,12 @@ let fileSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
 let grepImpl: ((query: string, options: unknown) => unknown) | undefined;
 let multiGrepImpl: ((options: unknown) => unknown) | undefined;
 let scanProgressImpl: (() => unknown) | undefined;
+let waitForScanImpl: (() => Promise<void>) | undefined;
 
 function createMockFinder(): MockFinder {
   return {
     isDestroyed: false,
-    waitForScan: mock(async () => undefined),
+    waitForScan: mock(async () => waitForScanImpl?.()),
     getScanProgress: mock(() => {
       if (scanProgressImpl) return scanProgressImpl();
       return {
@@ -272,6 +273,7 @@ beforeEach(() => {
   grepImpl = undefined;
   multiGrepImpl = undefined;
   scanProgressImpl = undefined;
+  waitForScanImpl = undefined;
 
   for (const key of CONFIG_ENV_KEYS) delete process.env[key];
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -662,6 +664,66 @@ describe("pi-fff $HOME scan warning", () => {
     // session_shutdown must stop the poller and clear the footer.
     await shutdown(setup);
     expect(setup.ctx.ui.setStatus).toHaveBeenLastCalledWith("fff", undefined);
+  });
+
+  test("session_shutdown awaits async native cleanup", async () => {
+    const setup = await start();
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const finder = Object.assign(finders[0], {
+      destroyAsync: mock(() => {
+        entered();
+        return pending;
+      }),
+    });
+    let settled = false;
+    const closing = shutdown(setup).then(() => {
+      settled = true;
+    });
+    await started;
+    expect(settled).toBe(false);
+    expect(finder.destroy).not.toHaveBeenCalled();
+    release();
+    await closing;
+    expect(finder.destroyAsync).toHaveBeenCalledTimes(1);
+    expect(setup.ctx.ui.setStatus).toHaveBeenLastCalledWith("fff", undefined);
+  });
+
+  test("session_shutdown waits for a main finder still being created", async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    waitForScanImpl = () => {
+      entered();
+      return pending;
+    };
+    const setup = createPi();
+    const ctx = createContext();
+    fffExtension(setup.pi as any);
+    const initializing = setup.events.get("session_start")?.({ reason: "startup" }, ctx);
+    await started;
+    let settled = false;
+    const closing = shutdown({ ...setup, ctx }).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(finders[0].destroy).not.toHaveBeenCalled();
+    release();
+    await initializing;
+    await closing;
+    expect(finders[0].destroy).toHaveBeenCalledTimes(1);
   });
 
   // #948: after session replacement the session_start ctx throws on access.
