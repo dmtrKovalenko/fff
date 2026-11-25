@@ -43,6 +43,7 @@ local function setup(geometry, opts)
         package.path = plugin .. '/lua/?.lua;' .. plugin .. '/lua/?/init.lua;' .. package.path
         vim.cmd('cd ' .. vim.fn.fnameescape(%q))
         vim.cmd('syntax off')
+        vim.o.tabstop = %d
         local winborder = %q
         if winborder ~= '' then vim.o.winborder = winborder end
         vim.g.fff = {
@@ -52,6 +53,7 @@ local function setup(geometry, opts)
           layout = {
             show_path_first = %s,
           },
+          preview = { wrap_lines = %s },
           logging  = { enabled = false },
           debug    = {
             enabled = %s,
@@ -64,10 +66,12 @@ local function setup(geometry, opts)
       ]],
       PLUGIN_DIR,
       fixture.root,
+      opts.tabstop or 8,
       geometry.winborder or '',
       fixture.frecency_db,
       fixture.history_db,
       tostring(show_path_first),
+      tostring(opts.wrap_lines == true),
       tostring(debug_enabled),
       tostring(debug_enabled),
       vim.inspect(show_file_info)
@@ -341,6 +345,64 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
     vim.loop.sleep(300)
     assert_snapshot_match()
   end
+end
+
+T['preview_scroll'] = MiniTest.new_set({ hooks = { post_case = teardown } })
+
+local function setup_scroll_preview(opts)
+  opts = opts or {}
+  opts.extra_files = {
+    ['preview-scroll.rs'] = table.concat({
+      string.rep('0123456789', 8) .. 'SCROLL_MATCH ascii tail',
+      string.rep('中文', 32) .. 'SCROLL_MATCH multibyte tail',
+      'near SCROLL_MATCH',
+      '\twide tab',
+      'left edge stays visible',
+      '',
+    }, '\n'),
+  }
+  setup(LAYOUTS[2], opts)
+end
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['preview_scroll']['grep_matches_' .. prompt] = function()
+    setup_scroll_preview()
+    open_grep(prompt, 'SCROLL_MATCH')
+    assert_snapshot_match()
+
+    for line = 2, 3 do
+      child.type_keys(SCROLL_KEY[prompt])
+      child.lua(
+        [[
+        local line = ...
+        local preview = require('fff.file_picker.preview')
+        assert(vim.wait(3000, function()
+          return vim.api.nvim_win_get_cursor(preview.state.winid)[1] == line
+        end), 'preview did not move to line ' .. line)
+      ]],
+        { line }
+      )
+      assert_snapshot_match()
+    end
+  end
+end
+
+T['preview_scroll']['wrapped_match_bottom'] = function()
+  setup_scroll_preview({ wrap_lines = true })
+  open_grep('bottom', 'SCROLL_MATCH')
+  assert_snapshot_match()
+end
+
+T['preview_scroll']['wide_tab_bottom'] = function()
+  setup_scroll_preview({ tabstop = 128 })
+  open_picker('bottom', 'preview-scroll.rs:4')
+  assert_snapshot_match()
+end
+
+T['preview_scroll']['after_wide_tab_bottom'] = function()
+  setup_scroll_preview({ tabstop = 128 })
+  open_picker('bottom', 'preview-scroll.rs:4:2')
+  assert_snapshot_match()
 end
 
 return T

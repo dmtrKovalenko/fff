@@ -259,6 +259,23 @@ function M.get_target_line(location)
   return nil
 end
 
+--- Get the target column for scrolling preview to location
+--- @param location table|nil Location data from search results
+--- @return number|nil Target column (1-indexed byte offset) for scrolling
+function M.get_target_col(location)
+  if not location then return nil end
+
+  if location.col then
+    return location.col
+  elseif location.start and location.start.col then
+    return location.start.col
+  elseif location.fuzzy_match_ranges and location.fuzzy_match_ranges[1] then
+    return location.fuzzy_match_ranges[1][1] + 1
+  end
+
+  return nil
+end
+
 --- Check if location is valid for a buffer
 --- @param location table|nil Location data
 --- @param bufnr number Buffer number

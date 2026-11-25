@@ -1,6 +1,19 @@
 ---@diagnostic disable: undefined-field, need-check-nil
 local location_utils = require('fff.location_utils')
 
+describe('location_utils.get_target_col', function()
+  it('extracts 1-indexed column from line:col, range, and fuzzy locations', function()
+    assert.are.equal(52, location_utils.get_target_col({ line = 10, col = 52 }))
+    assert.are.equal(
+      12,
+      location_utils.get_target_col({ start = { line = 1, col = 12 }, ['end'] = { line = 1, col = 18 } })
+    )
+    assert.are.equal(9, location_utils.get_target_col({ line = 2, fuzzy_match_ranges = { { 8, 12 } } }))
+    assert.is_nil(location_utils.get_target_col({ line = 10 }))
+    assert.is_nil(location_utils.get_target_col(nil))
+  end)
+end)
+
 --- Collect extmarks grouped by hl_group, asserting none use line_hl_group
 --- @param buf number Buffer number
 --- @param ns number Namespace to read extmarks from
