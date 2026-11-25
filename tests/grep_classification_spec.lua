@@ -64,7 +64,8 @@ describe('native grep page classification', function()
     require('fff.file_picker').setup()
     rust.cleanup_file_picker()
     rust.init_file_picker(root)
-    rust.wait_for_initial_scan(30000)
+    -- Both pages must observe the same content-index state when we compare them.
+    assert.is_true(vim.wait(30000, function() return rust.get_scan_progress().is_index_ready end))
   end)
 
   after_each(function()

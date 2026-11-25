@@ -13,6 +13,8 @@ local tresitter_highlight = require('fff.treesitter_hl')
 ---@field is_definition boolean
 
 ---@class fff.grep.SearchResult
+---@field base_path string Root of the index that produced these matches
+---@field is_index_ready boolean Whether this index has completed its initial scan
 ---@field items fff.grep.Match[] Array of grep match items
 ---@field total_matched number Total matches found in this call
 ---@field total_files_searched number Files actually searched in this call
