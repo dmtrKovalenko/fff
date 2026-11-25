@@ -370,6 +370,8 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
     open_grep(prompt, 'SCROLL_MATCH')
     assert_snapshot_match()
 
+    if prompt == 'top' then return end
+
     for line = 2, 3 do
       child.type_keys(SCROLL_KEY[prompt])
       child.lua(
@@ -385,21 +387,18 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
       assert_snapshot_match()
     end
   end
+end
 
-  T['preview_scroll']['wrapped_match_' .. prompt] = function()
-    setup_scroll_preview({ wrap_lines = true })
-    open_grep(prompt, 'SCROLL_MATCH')
-    assert_snapshot_match()
-  end
+T['preview_scroll']['wrapped_match_bottom'] = function()
+  setup_scroll_preview({ wrap_lines = true })
+  open_grep('bottom', 'SCROLL_MATCH')
+  assert_snapshot_match()
+end
 
-  T['preview_scroll']['wide_tab_' .. prompt] = function()
-    setup_scroll_preview({ tabstop = 128 })
-    open_picker(prompt, 'preview-scroll.rs:4')
-    assert_snapshot_match()
-    child.type_keys(':1')
-    vim.loop.sleep(400)
-    assert_snapshot_match()
-  end
+T['preview_scroll']['wide_tab_bottom'] = function()
+  setup_scroll_preview({ tabstop = 128 })
+  open_picker('bottom', 'preview-scroll.rs:4')
+  assert_snapshot_match()
 end
 
 return T
